@@ -271,19 +271,16 @@ private:
 
   void PushSimtVFThreadContext(const ForNode *op) {
     IterVar active_thread_var = thread_var_;
-    if (!active_thread_var.defined()) {
-      active_thread_var = IterVar(Range::FromMinExtent(0, 1), Var("v_thread"),
-                                  IterVarType::kDataPar);
-    }
-    DataType dtype = active_thread_var->var.dtype();
-    Range thread_bounds = Range::FromMinExtent(0, 1);
-    if (op->annotations.count(tilelang_simt_vf_threads)) {
-      PrimExpr threads = Downcast<PrimExpr>(
-          op->annotations.Get(tilelang_simt_vf_threads).value());
-      thread_bounds = Range::FromMinExtent(make_zero(dtype), threads);
-    } else {
-      thread_bounds = InferThreadBoundsFromIterVar(active_thread_var);
-    }
+    ICHECK(op->annotations.count(tilelang_simt_vf_threads))
+        << "SimtVF loop must carry " << tilelang_simt_vf_threads
+        << " annotation";
+    PrimExpr threads = Downcast<PrimExpr>(
+        op->annotations.Get(tilelang_simt_vf_threads).value());
+    DataType dtype = threads.dtype();
+    active_thread_var = IterVar(
+        Range::FromMinExtent(make_zero(dtype), threads), Var("simtvf_tx", dtype),
+        IterVarType::kThreadIndex, "threadIdx.x");
+    Range thread_bounds = active_thread_var->dom;
     simt_vf_thread_ctx_stack_.push_back({active_thread_var, thread_bounds});
   }
 
@@ -1059,8 +1056,14 @@ private:
       ICHECK_NE(iv->thread_tag.length(), 0U);
       if (iv->thread_tag == "threadIdx.x") {
         thread_var_ = iv;
-        ICHECK(iv->dom->extent.as<IntImmNode>());
-        thread_block_size_ = iv->dom->extent.as<IntImmNode>()->value;
+        if (const auto *imm = iv->dom->extent.as<IntImmNode>()) {
+          thread_block_size_ = imm->value;
+        }
+        if (!simt_vf_thread_ctx_stack_.empty()) {
+          simt_vf_thread_ctx_stack_.back().thread_var = iv;
+          simt_vf_thread_ctx_stack_.back().thread_bounds =
+              Range::FromMinExtent(make_zero(op->value.dtype()), op->value);
+        }
       }
     }
     return arith::IRMutatorWithAnalyzer::VisitStmt_(op);
@@ -1088,7 +1091,7 @@ private:
    * @return Stmt The lowered statement.
    */
   Stmt VisitStmt_(const ForNode *op) final {
-    bool is_simt_vf = op->annotations.count(tilelang_simt_vf);
+    bool is_simt_vf = op->annotations.count(tilelang_simt_vf_threads);
     if (is_simt_vf) {
       PushSimtVFThreadContext(op);
     }

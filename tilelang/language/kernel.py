@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import deque
 from tvm import tir
 from tvm.tir import Var
+from tvm.target import Target
 from tvm.script.ir_builder.tir.frame import TIRFrame, BlockFrame
 from tvm.ffi import register_object
 from tilelang import _ffi_api
@@ -290,18 +291,33 @@ def Kernel(
         raise JITNoBuilderError("T.Kernel() can only be used inside @tilelang.jit or @T.prim_func context. No Builder is available.")
 
     attrs: dict = {}
+    current_target = Target.current(allow_none=True)
+    is_ascend_target = bool(
+        current_target is not None
+        and (current_target.kind.name == "ascend" or "ascend" in current_target.keys)
+    )
 
-    if not is_cpu and threads is None:
+    if is_ascend_target and not is_cpu:
+        if threads is not None:
+            raise ValueError(
+                "Ascend backend does not support `threads=` in `T.Kernel(...)`. "
+                "Use `T.SimtVF(threads=...)` to define thread domains."
+            )
+    elif not is_cpu and threads is None:
+        # Keep backward compatibility when target is not Ascend (or unknown).
         threads = 128  # default thread number
 
-    if isinstance(threads, int):
-        threads = [threads, 1, 1]
+    if threads is None:
+        normalized_threads = None
+    elif isinstance(threads, int):
+        normalized_threads = [threads, 1, 1]
     elif isinstance(threads, list):
-        threads = threads + [1] * (3 - len(threads))
+        normalized_threads = threads + [1] * (3 - len(threads))
     elif isinstance(threads, tuple):
-        threads = list(threads) + [1] * (3 - len(threads))
+        normalized_threads = list(threads) + [1] * (3 - len(threads))
     else:
         assert is_cpu, "threads must be an integer or a list of integers"
+        normalized_threads = None
 
     if is_cpu:
         attrs["tilelang.is_cpu_kernel_frame"] = True
@@ -309,7 +325,7 @@ def Kernel(
     if prelude is not None:
         attrs["pragma_import_c"] = prelude
 
-    return _ffi_api.KernelLaunch(blocks, threads, attrs)
+    return _ffi_api.KernelLaunch(blocks, normalized_threads, attrs)
 
 
 def get_thread_binding(dim: int = 0) -> Var:

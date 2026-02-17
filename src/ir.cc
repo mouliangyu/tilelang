@@ -114,8 +114,24 @@ ForFrame SimtVFFor(int threads) {
     ICHECK_EQ(vars.size(), 1);
     ICHECK_EQ(doms.size(), 1);
     Map<String, tvm::ffi::Any> loop_annotations;
-    loop_annotations.Set(tilelang_simt_vf, Integer(1));
     loop_annotations.Set(tilelang_simt_vf_threads, Integer(threads));
+
+    auto make_thread_extent = [&](const String &name, const String &thread_tag,
+                                  const PrimExpr &extent, Stmt inner) {
+      DataType dtype = extent.dtype();
+      IterVar iv(Range::FromMinExtent(make_zero(dtype), extent), Var(name, dtype),
+                 IterVarType::kThreadIndex, thread_tag);
+      return AttrStmt(iv, tir::attr::thread_extent, extent, inner);
+    };
+
+    DataType dtype = DataType::Int(32);
+    body = make_thread_extent("simtvf_tz", "threadIdx.z", make_const(dtype, 1),
+                              std::move(body));
+    body = make_thread_extent("simtvf_ty", "threadIdx.y", make_const(dtype, 1),
+                              std::move(body));
+    body = make_thread_extent("simtvf_tx", "threadIdx.x",
+                              make_const(dtype, threads), std::move(body));
+
     Optional<PrimExpr> step =
         !steps.empty() ? steps[0] : Optional<PrimExpr>(std::nullopt);
     return For(vars[0], doms[0]->min, doms[0]->extent, ForKind::kSerial, body,

@@ -21,6 +21,20 @@ bool TargetIsRocm(Target target) {
 bool TargetIsMetal(Target target) {
   return target->GetTargetDeviceType() == kDLMetal;
 }
+bool TargetIsAscend(Target target) {
+  if (!target.defined()) {
+    return false;
+  }
+  if (target->kind->name == "ascend") {
+    return true;
+  }
+  for (const String &key : target->keys) {
+    if (key == "ascend") {
+      return true;
+    }
+  }
+  return false;
+}
 
 int GetArchInt(Target target) {
   auto s = target->GetAttr<tvm::ffi::String>("arch");

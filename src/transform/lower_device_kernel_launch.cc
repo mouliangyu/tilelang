@@ -29,6 +29,7 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include "../target/utils.h"
 #include "runtime/thread_storage_scope.h"
 #include "tir/transforms/ir_utils.h"
 
@@ -256,8 +257,11 @@ public:
     func = WithAttr(func, tvm::attr::kGlobalSymbol, gvar->name_hint);
 
     const auto &info = device_info_map_.at(gvar.get());
-    const auto &thread_extent = info.thread_extent;
-    func = WithAttr(std::move(func), "thread_extent", thread_extent);
+    if (!TargetIsAscend(
+            func->GetAttr<Target>(tvm::attr::kTarget).value_or(info.target))) {
+      const auto &thread_extent = info.thread_extent;
+      func = WithAttr(std::move(func), "thread_extent", thread_extent);
+    }
     if (info.dyn_shmem_size.defined()) {
       func = WithAttr(std::move(func), "dyn_shared_memory_buf",
                       info.dyn_shmem_size.value());
