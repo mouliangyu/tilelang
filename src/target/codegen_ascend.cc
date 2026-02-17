@@ -10,21 +10,6 @@ namespace codegen {
 void CodeGenTileLangAscend::Init(bool output_ssa) {
   CodeGenTileLangCPP::Init(output_ssa, /*emit_asserts=*/false,
                            /*emit_fwd_func_decl=*/false, "ascend", {});
-  decl_stream << "// Ascend text backend (no compile path).\n";
-  decl_stream << "#define __simt_vf__\n";
-  decl_stream << "#define __launch_bounds__(x)\n";
-  decl_stream << "struct dim3 { int x; int y; int z; dim3(int vx, int vy=1, int vz=1): x(vx), y(vy), z(vz) {} };\n";
-  decl_stream << "static dim3 threadIdx(0, 0, 0);\n";
-  decl_stream << "static dim3 blockIdx(0, 0, 0);\n";
-  decl_stream << "static dim3 blockDim(1, 1, 1);\n";
-  decl_stream << "enum class pipe_t { PIPE_ALL };\n";
-  decl_stream << "inline void pipe_barrier(pipe_t) {}\n";
-  decl_stream << "template <typename F, typename... Args>\n";
-  decl_stream << "inline void asc_vf_call(dim3 d, Args... args) {\n";
-  decl_stream << "  blockDim = d;\n";
-  decl_stream << "  threadIdx = dim3(0, 0, 0);\n";
-  decl_stream << "  F(args...);\n";
-  decl_stream << "}\n\n";
 }
 
 void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
