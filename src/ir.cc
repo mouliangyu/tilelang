@@ -101,6 +101,31 @@ ForFrame ParallelFor(const Array<PrimExpr> &extents,
   return ForFrame(n);
 }
 
+ForFrame SimtVFFor(int threads) {
+  using namespace tvm::tir;
+  ICHECK_GT(threads, 0) << "SimtVF requires threads > 0";
+  ObjectPtr<ForFrameNode> n = tvm::ffi::make_object<ForFrameNode>();
+  DataType dtype = DataType::Int(32);
+  n->vars.push_back(Var("simt_vf", dtype));
+  n->doms.push_back(Range(make_const(dtype, 0), make_const(dtype, 1)));
+  n->f_make_for_loop = [threads](const Array<Var> &vars, const Array<Range> &doms,
+                                 const Array<Optional<PrimExpr>> &steps,
+                                 Stmt body) -> Stmt {
+    ICHECK_EQ(vars.size(), 1);
+    ICHECK_EQ(doms.size(), 1);
+    Map<String, tvm::ffi::Any> loop_annotations;
+    loop_annotations.Set(tilelang_simt_vf, Integer(1));
+    loop_annotations.Set(tilelang_simt_vf_threads, Integer(threads));
+    Optional<PrimExpr> step =
+        !steps.empty() ? steps[0] : Optional<PrimExpr>(std::nullopt);
+    return For(vars[0], doms[0]->min, doms[0]->extent, ForKind::kSerial, body,
+               /*thread_binding=*/std::nullopt,
+               /*annotations=*/loop_annotations,
+               /*step=*/step);
+  };
+  return ForFrame(n);
+}
+
 ForFrame PipelinedFor(PrimExpr start, const PrimExpr &stop, int num_stages,
                       const Array<PrimExpr> &order,
                       const Array<PrimExpr> &stages,
@@ -330,6 +355,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef()
       .def("tl.Parallel", ParallelFor)
+      .def("tl.SimtVF", SimtVFFor)
       .def("tl.Pipelined", PipelinedFor)
       .def("tl.Persistent", PersistentFor)
       .def("tl.KernelLaunch", KernelLaunch);

@@ -17,6 +17,7 @@ from tilelang.layout import Layout, Fragment  # noqa: F401
 from .proxy import ptr, make_tensor, Buffer, Tensor, StridedTensor, FragmentBuffer, SharedBuffer, LocalBuffer  # noqa: F401
 from .loop import (
     Parallel,  # noqa: F401
+    SimtVF,  # noqa: F401
     Persistent,  # noqa: F401
     Pipelined,  # noqa: F401
     serial,  # noqa: F401

@@ -21,12 +21,14 @@
 #include "../op/copy.h"
 #include "../op/parallel.h"
 #include "../op/region.h"
+#include "../op/simt_vf.h"
 #include "../op/utils.h"
 #include "../target/utils.h"
 
 #include "arith/ir_mutator_with_analyzer.h"
 #include "arith/ir_visitor_with_analyzer.h"
 #include "common/loop_fusion_utils.h"
+#include "common/attr.h"
 #include "common/union_find.h"
 #include "layout_reducer.h"
 #include "parallel_loop_layout_validator.h"
@@ -463,6 +465,59 @@ public:
   }
 
 private:
+  struct SimtVFThreadContext {
+    IterVar thread_var;
+    Range thread_bounds;
+  };
+
+  IterVar GetActiveThreadVar() const {
+    if (!simt_vf_thread_ctx_stack_.empty()) {
+      return simt_vf_thread_ctx_stack_.back().thread_var;
+    }
+    return thread_var_;
+  }
+
+  Range InferThreadBoundsFromIterVar(const IterVar &iter_var) const {
+    if (iter_var.defined() && analyzer_.const_int_bound.IsBound(iter_var->var)) {
+      auto const_int_bound = analyzer_.const_int_bound(iter_var->var);
+      auto dtype = iter_var->var.dtype();
+      auto extent = const_int_bound->max_value - const_int_bound->min_value + 1;
+      return Range::FromMinExtent(IntImm(dtype, const_int_bound->min_value),
+                                  IntImm(dtype, extent));
+    }
+    return Range::FromMinExtent(0, 1);
+  }
+
+  Range GetActiveThreadBounds() const {
+    if (!simt_vf_thread_ctx_stack_.empty()) {
+      return simt_vf_thread_ctx_stack_.back().thread_bounds;
+    }
+    return InferThreadBoundsFromIterVar(thread_var_);
+  }
+
+  void PushSimtVFThreadContext(const ForNode *op) {
+    IterVar active_thread_var = thread_var_;
+    if (!active_thread_var.defined()) {
+      active_thread_var = IterVar(Range::FromMinExtent(0, 1), Var("v_thread"),
+                                  IterVarType::kDataPar);
+    }
+    DataType dtype = active_thread_var->var.dtype();
+    Range thread_bounds = Range::FromMinExtent(0, 1);
+    if (op->annotations.count(tilelang_simt_vf_threads)) {
+      PrimExpr threads = Downcast<PrimExpr>(
+          op->annotations.Get(tilelang_simt_vf_threads).value());
+      thread_bounds = Range::FromMinExtent(make_zero(dtype), threads);
+    } else {
+      thread_bounds = InferThreadBoundsFromIterVar(active_thread_var);
+    }
+    simt_vf_thread_ctx_stack_.push_back({active_thread_var, thread_bounds});
+  }
+
+  void PopSimtVFThreadContext() {
+    ICHECK(!simt_vf_thread_ctx_stack_.empty());
+    simt_vf_thread_ctx_stack_.pop_back();
+  }
+
   Map<Var, Buffer> GetBufferMap() const {
     Map<Var, Buffer> buffer_map;
     for (const auto &[var, buffers] : buffer_data_to_buffers_) {
@@ -526,19 +581,9 @@ private:
         // This handles cases like: a = block_mask_f[i]; T.copy(A[a, 0], ...)
         CollectFragmentBuffersFromExpr(arg);
       }
-      // Compute thread_var_ and thread_bounds_
-      thread_var_vec_.push_back(thread_var_);
-      if (analyzer_.const_int_bound.IsBound(thread_var_->var)) {
-        auto const_int_bound = analyzer_.const_int_bound(thread_var_);
-        auto min_value = const_int_bound->min_value;
-        auto max_value = const_int_bound->max_value;
-        auto extent = max_value - min_value + 1;
-        auto dtype = thread_var_->var.dtype();
-        thread_bounds_vec_.push_back(Range::FromMinExtent(
-            IntImm(dtype, min_value), IntImm(dtype, extent)));
-      } else {
-        thread_bounds_vec_.push_back(Range::FromMinExtent(0, 1));
-      }
+      // Compute thread var/bounds with SimtVF-local context if present.
+      thread_var_vec_.push_back(GetActiveThreadVar());
+      thread_bounds_vec_.push_back(GetActiveThreadBounds());
       analyzer_vec_.push_back(analyzer_.Clone());
 
       // Compute buffer oob for each buffer in the op
@@ -636,6 +681,22 @@ private:
   }
 
   void VisitStmt_(const ForNode *op) final {
+    if (op->annotations.count(tilelang_simt_vf)) {
+      PushSimtVFThreadContext(op);
+      // SimtVF is a control-style TileOperator wrapper. Visit body first so
+      // nested TileOps (e.g. Parallel) are still collected normally.
+      IRVisitorWithAnalyzer::VisitStmt(op->body);
+      auto infer = SimtVFOp(tvm::ffi::GetRef<For>(op));
+      infer_list_stmt_.push_back(tvm::ffi::GetRef<ObjectRef>(op));
+      infer_list_.push_back(std::move(infer));
+      thread_var_vec_.push_back(GetActiveThreadVar());
+      thread_bounds_vec_.push_back(GetActiveThreadBounds());
+      analyzer_vec_.push_back(analyzer_.Clone());
+      buffer_oob_vec_.push_back(false);
+      PopSimtVFThreadContext();
+      return;
+    }
+
     if (op->kind == ForKind::kParallel) {
       auto infer = ParallelOp(tvm::ffi::GetRef<For>(op));
       for (const auto &[buffer, _] : infer->GetIndiceMap()) {
@@ -708,18 +769,8 @@ private:
       });
       infer_list_stmt_.push_back(tvm::ffi::GetRef<ObjectRef>(op));
       infer_list_.push_back(std::move(infer));
-      thread_var_vec_.push_back(thread_var_);
-      if (thread_var_.defined() &&
-          analyzer_.const_int_bound.IsBound(thread_var_->var)) {
-        auto const_int_bound = analyzer_.const_int_bound(thread_var_);
-        auto dtype = thread_var_->var.dtype();
-        auto extent =
-            const_int_bound->max_value - const_int_bound->min_value + 1;
-        thread_bounds_vec_.push_back(Range::FromMinExtent(
-            IntImm(dtype, const_int_bound->min_value), IntImm(dtype, extent)));
-      } else {
-        thread_bounds_vec_.push_back(Range::FromMinExtent(0, 1));
-      }
+      thread_var_vec_.push_back(GetActiveThreadVar());
+      thread_bounds_vec_.push_back(GetActiveThreadBounds());
       analyzer_vec_.push_back(analyzer_.Clone());
       buffer_oob_vec_.push_back(false);
     } else {
@@ -1003,6 +1054,7 @@ private:
   // we need to define a thread_var for the serial loop.
   IterVar thread_var_ = IterVar(Range::FromMinExtent(0, 1), Var("v_thread"),
                                 IterVarType::kDataPar);
+  std::vector<SimtVFThreadContext> simt_vf_thread_ctx_stack_;
   std::vector<IterVar> thread_var_vec_;
   std::vector<Range> thread_bounds_vec_;
   std::vector<std::unique_ptr<arith::Analyzer>> analyzer_vec_;

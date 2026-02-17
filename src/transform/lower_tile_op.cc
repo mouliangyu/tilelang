@@ -18,10 +18,12 @@
 #include "../op/gemm.h"
 #include "../op/gemm_sp.h"
 #include "../op/operator.h"
+#include "../op/simt_vf.h"
 #include "../op/utils.h"
 #include "../target/utils.h"
 
 #include "arith/ir_mutator_with_analyzer.h"
+#include "common/attr.h"
 #include "layout_reducer.h"
 #include "loop_partition.h"
 
@@ -235,6 +237,60 @@ public:
 
 private:
   using arith::IRMutatorWithAnalyzer::IRMutatorWithAnalyzer;
+
+  struct SimtVFThreadContext {
+    IterVar thread_var;
+    Range thread_bounds;
+  };
+
+  IterVar GetActiveThreadVar() const {
+    if (!simt_vf_thread_ctx_stack_.empty()) {
+      return simt_vf_thread_ctx_stack_.back().thread_var;
+    }
+    return thread_var_;
+  }
+
+  Range InferThreadBoundsFromIterVar(const IterVar &iter_var) const {
+    if (iter_var.defined() && analyzer_->const_int_bound.IsBound(iter_var->var)) {
+      auto const_int_bound = analyzer_->const_int_bound(iter_var->var);
+      auto min_value = const_int_bound->min_value;
+      auto max_value = const_int_bound->max_value;
+      auto extent = max_value + 1 - min_value;
+      return Range::FromMinExtent(IntImm(iter_var->var.dtype(), min_value),
+                                  IntImm(iter_var->var.dtype(), extent));
+    }
+    return Range::FromMinExtent(0, 1);
+  }
+
+  Range GetActiveThreadBounds() const {
+    if (!simt_vf_thread_ctx_stack_.empty()) {
+      return simt_vf_thread_ctx_stack_.back().thread_bounds;
+    }
+    return InferThreadBoundsFromIterVar(thread_var_);
+  }
+
+  void PushSimtVFThreadContext(const ForNode *op) {
+    IterVar active_thread_var = thread_var_;
+    if (!active_thread_var.defined()) {
+      active_thread_var = IterVar(Range::FromMinExtent(0, 1), Var("v_thread"),
+                                  IterVarType::kDataPar);
+    }
+    DataType dtype = active_thread_var->var.dtype();
+    Range thread_bounds = Range::FromMinExtent(0, 1);
+    if (op->annotations.count(tilelang_simt_vf_threads)) {
+      PrimExpr threads = Downcast<PrimExpr>(
+          op->annotations.Get(tilelang_simt_vf_threads).value());
+      thread_bounds = Range::FromMinExtent(make_zero(dtype), threads);
+    } else {
+      thread_bounds = InferThreadBoundsFromIterVar(active_thread_var);
+    }
+    simt_vf_thread_ctx_stack_.push_back({active_thread_var, thread_bounds});
+  }
+
+  void PopSimtVFThreadContext() {
+    ICHECK(!simt_vf_thread_ctx_stack_.empty());
+    simt_vf_thread_ctx_stack_.pop_back();
+  }
 
   Stmt VisitStmt_(const BlockNode *op) final {
     // Record the mapping from buffer data var to buffer for later lookup
@@ -981,19 +1037,8 @@ private:
       return workspace.access_ptr(2); // write
     };
 
-    Range thread_bounds;
-
-    if (analyzer_->const_int_bound.IsBound(thread_var_->var)) {
-      auto const_int_bound = analyzer_->const_int_bound(thread_var_);
-      auto min_value = const_int_bound->min_value;
-      auto max_value = const_int_bound->max_value;
-      auto extent = max_value + 1 - min_value;
-      thread_bounds =
-          Range::FromMinExtent(IntImm(thread_var_->var.dtype(), min_value),
-                               IntImm(thread_var_->var.dtype(), extent));
-    } else {
-      thread_bounds = Range::FromMinExtent(0, 1);
-    }
+    Range thread_bounds = GetActiveThreadBounds();
+    IterVar active_thread_var = GetActiveThreadVar();
 
     // Convert let_bindings_ to Map<Var, PrimExpr> for LowerArgs
     Map<Var, PrimExpr> let_var_to_expr;
@@ -1002,7 +1047,7 @@ private:
     }
 
     auto lowered = tile_op->Lower(
-        LowerArgs{target_, thread_bounds, thread_var_->var, callback,
+        LowerArgs{target_, thread_bounds, active_thread_var->var, callback,
                   layout_map_, buffer_remap_, let_var_to_expr},
         analyzer_);
     return IRMutatorWithAnalyzer::VisitStmt(lowered);
@@ -1043,6 +1088,11 @@ private:
    * @return Stmt The lowered statement.
    */
   Stmt VisitStmt_(const ForNode *op) final {
+    bool is_simt_vf = op->annotations.count(tilelang_simt_vf);
+    if (is_simt_vf) {
+      PushSimtVFThreadContext(op);
+    }
+
     // Extract reducer info from annotations
     Map<Var, ReducerInfo> reducer_info;
     if (op->annotations.count(attr::kReducerInfo)) {
@@ -1054,8 +1104,42 @@ private:
     // First visit the body
     For for_node = Downcast<For>(arith::IRMutatorWithAnalyzer::VisitStmt_(op));
 
+    if (is_simt_vf) {
+      Map<Var, PrimExpr> let_var_to_expr;
+      for (const auto &[var, expr] : let_bindings_) {
+        let_var_to_expr.Set(var, expr);
+      }
+
+      Range thread_bounds = GetActiveThreadBounds();
+      IterVar active_thread_var = GetActiveThreadVar();
+
+      AddWorkspaceCallback callback = [this](int num_elem, DataType dtype) {
+        auto workspace =
+            decl_buffer({PrimExpr(num_elem)}, dtype, "workspace", "shared.dyn");
+        if (!workspace_stack_.empty()) {
+          workspace_stack_.back().push_back(workspace);
+        } else {
+          workspace_stack_.emplace_back(Array<Buffer>{workspace});
+        }
+        return workspace.access_ptr(2);
+      };
+
+      auto simt_vf_op = SimtVFOp(for_node);
+      Stmt lowered =
+          simt_vf_op->Lower(LowerArgs{target_, thread_bounds,
+                                      active_thread_var->var, callback,
+                                      layout_map_, buffer_remap_,
+                                      let_var_to_expr},
+                            analyzer_);
+      PopSimtVFThreadContext();
+      return lowered;
+    }
+
     // Only process parallel loops
     if (op->kind != ForKind::kParallel) {
+      if (is_simt_vf) {
+        PopSimtVFThreadContext();
+      }
       return for_node;
     }
 
@@ -1066,6 +1150,9 @@ private:
     // loop is the correct place to carry layout so we can rewrite the whole
     // nested region in one place.
     if (!op->annotations.count(attr::kParallelLoopLayout)) {
+      if (is_simt_vf) {
+        PopSimtVFThreadContext();
+      }
       return for_node;
     }
 
@@ -1188,8 +1275,13 @@ private:
     // - AND no reducers are present
     bool should_vectorize =
         (has_non_local || has_cast_operations) && !has_reducer;
+    IterVar active_thread_var = GetActiveThreadVar();
+    if (is_simt_vf) {
+      PopSimtVFThreadContext();
+    }
     // Lower the parallel loop using the common function
-    return LowerParallelLoop(for_node, loop_layout, thread_var_->var, analyzer_,
+    return LowerParallelLoop(for_node, loop_layout, active_thread_var->var,
+                             analyzer_,
                              layout_map_, predicate, parallel_loop,
                              should_vectorize);
   }
@@ -1203,6 +1295,7 @@ private:
   // we need to define a thread_var for the serial loop.
   IterVar thread_var_ = IterVar(Range::FromMinExtent(0, 1), Var("v_thread"),
                                 IterVarType::kDataPar);
+  std::vector<SimtVFThreadContext> simt_vf_thread_ctx_stack_;
   size_t thread_block_size_ = 0;
   // Stack of per-Block workspace buffers gathered while visiting children
   std::vector<Array<Buffer>> workspace_stack_;

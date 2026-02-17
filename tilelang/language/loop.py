@@ -72,6 +72,24 @@ def Parallel(
     return _ffi_api.Parallel(extents, annotations)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
+def SimtVF(threads: int = 128) -> frame.ForFrame:
+    """Construct a dedicated SIMT vector-fragment region frame.
+
+    Parameters
+    ----------
+    threads : int
+        Thread count metadata attached to the SimtVF frame.
+
+    Returns
+    -------
+    res : frame.ForFrame
+        The ForFrame used to denote a SimtVF region.
+    """
+    if threads <= 0:
+        raise ValueError("SimtVF requires threads > 0")
+    return _ffi_api.SimtVF(threads)  # type: ignore[attr-defined] # pylint: disable=no-member
+
+
 def Persistent(
     domain: list[tir.PrimExpr],
     wave_size: tir.PrimExpr,

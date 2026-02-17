@@ -19,6 +19,7 @@ SUPPORTED_TARGETS: dict[str, str] = {
     "llvm": "LLVM CPU target (accepts standard TVM LLVM options).",
     "webgpu": "WebGPU target for browser/WebGPU runtimes.",
     "c": "C source backend.",
+    "ascend": "Ascend backend (normalized to a TVM-compatible target with `ascend` key).",
     "cutedsl": "CuTe DSL GPU target.",
 }
 
@@ -117,6 +118,31 @@ def normalize_cutedsl_target(target: str | Target) -> Target | None:
     return None
 
 
+def normalize_ascend_target(target: str | Target) -> Target | None:
+    if isinstance(target, Target):
+        if target.kind.name == "ascend" or "ascend" in target.keys:
+            target_dict = dict(target.export())
+            target_dict["keys"] = list(set(target_dict.get("keys", [])) | {"ascend"})
+            return Target(target_dict)
+        return None
+
+    normalized_target = target.strip()
+    if not normalized_target:
+        return None
+    if not normalized_target.startswith("ascend"):
+        return None
+
+    target_suffix = normalized_target[len("ascend") :].strip()
+    tvm_compatible_target = "c" if not target_suffix else f"c {target_suffix}"
+    try:
+        temp_target = Target(tvm_compatible_target)
+        target_dict = dict(temp_target.export())
+        target_dict["keys"] = list(set(target_dict.get("keys", [])) | {"ascend"})
+        return Target(target_dict)
+    except Exception:
+        return None
+
+
 def determine_target(target: str | Target | Literal["auto"] = "auto", return_object: bool = False) -> str | Target:
     """
     Determine the appropriate target for compilation (CUDA, HIP, or manual selection).
@@ -159,6 +185,7 @@ def determine_target(target: str | Target | Literal["auto"] = "auto", return_obj
 
     else:
         possible_cutedsl_target = normalize_cutedsl_target(target)
+        possible_ascend_target = normalize_ascend_target(target)
         if possible_cutedsl_target is not None:
             try:
                 from tilelang.jit.adapter.cutedsl.checks import check_cutedsl_available  # lazy
@@ -168,6 +195,8 @@ def determine_target(target: str | Target | Literal["auto"] = "auto", return_obj
                 raise AssertionError(f"CuTeDSL backend is not available. Please install tilelang-cutedsl package. {str(e)}") from e
 
             return_var = possible_cutedsl_target
+        elif possible_ascend_target is not None:
+            return_var = possible_ascend_target
         else:
             # Validate the target if it's not "auto"
             if isinstance(target, Target):
