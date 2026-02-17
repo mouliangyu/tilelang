@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from collections import defaultdict
+
 from tvm import tir
-from tvm.tir import Buffer, BufferLoad, BufferStore, For, PrimFunc, PyStmtExprVisitor
+from tvm.tir import Buffer, BufferLoad, BufferStore, For, PrimFunc, PyStmtExprVisitor, Var
 from tvm.tir.transform import prim_func_pass
 
 
-def _is_fragment_buffer(buf: Buffer) -> bool:
-    return buf.scope().startswith("local.fragment")
+def _is_fragment_layout(layout) -> bool:
+    cls = layout.__class__
+    return cls.__name__ == "Fragment" and cls.__module__.startswith("tilelang.layout")
 
 
 def _is_simtvf_loop(op: For) -> bool:
@@ -20,12 +23,31 @@ class _SimtVFFragmentNarrowVisitor(PyStmtExprVisitor):
     def __init__(self) -> None:
         super().__init__()
         self._simtvf_depth = 0
+        self._fragment_data_var_depth = defaultdict(int)
 
     def _in_simtvf(self) -> bool:
         return self._simtvf_depth > 0
 
+    def _mark_fragment_buffer(self, data: Var) -> None:
+        self._fragment_data_var_depth[data] += 1
+
+    def _unmark_fragment_buffer(self, data: Var) -> None:
+        depth = self._fragment_data_var_depth.get(data, 0)
+        if depth <= 1:
+            self._fragment_data_var_depth.pop(data, None)
+        else:
+            self._fragment_data_var_depth[data] = depth - 1
+
+    def _is_known_fragment_buffer(self, buf: Buffer) -> bool:
+        return bool(self._fragment_data_var_depth.get(buf.data, 0))
+
+    def _is_fragment_buffer(self, buf: Buffer) -> bool:
+        if buf.scope().startswith("local.fragment"):
+            return True
+        return self._is_known_fragment_buffer(buf)
+
     def _check_fragment_in_simtvf(self, buf: Buffer, action: str) -> None:
-        if not _is_fragment_buffer(buf):
+        if not self._is_fragment_buffer(buf):
             return
         if self._in_simtvf():
             return
@@ -34,6 +56,16 @@ class _SimtVFFragmentNarrowVisitor(PyStmtExprVisitor):
             f"Buffer {buf.name} in scope {buf.scope()} is {action} outside any T.SimtVF region. "
             "On Ascend path, all local.fragment buffers must be narrowed and defined inside T.SimtVF."
         )
+
+    def _extract_fragment_layout_buffers(self, op: tir.Block) -> list[Buffer]:
+        if op.annotations is None or "layout_map" not in op.annotations:
+            return []
+        layout_map = op.annotations["layout_map"]
+        fragment_buffers: list[Buffer] = []
+        for buf, layout in layout_map.items():
+            if _is_fragment_layout(layout):
+                fragment_buffers.append(buf)
+        return fragment_buffers
 
     def visit_for_(self, op: For) -> None:
         is_simtvf = _is_simtvf_loop(op)
@@ -44,11 +76,18 @@ class _SimtVFFragmentNarrowVisitor(PyStmtExprVisitor):
             self._simtvf_depth -= 1
 
     def visit_block_(self, op: tir.Block) -> None:
+        fragment_layout_buffers = self._extract_fragment_layout_buffers(op)
+        for buf in fragment_layout_buffers:
+            self._mark_fragment_buffer(buf.data)
+
         for buf in op.alloc_buffers:
             self._check_fragment_in_simtvf(buf, action="defined")
         for match_buffer in op.match_buffers:
             self._check_fragment_in_simtvf(match_buffer.buffer, action="defined")
         super().visit_block_(op)
+
+        for buf in reversed(fragment_layout_buffers):
+            self._unmark_fragment_buffer(buf.data)
 
     def visit_buffer_load_(self, op: BufferLoad) -> None:
         self._check_fragment_in_simtvf(op.buffer, action="accessed")
