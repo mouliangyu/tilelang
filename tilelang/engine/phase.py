@@ -252,6 +252,8 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     else:
         mod = tilelang.transform.IfStmtBinding()(mod)
         mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
+        if is_ascend_target(target):
+            mod = tilelang.analysis.SimtVFFragmentNarrowChecker()(mod)
         mod = tilelang.transform.PipelinePlanning()(mod)
         mod = tilelang.transform.InjectSoftwarePipeline()(mod)
 
