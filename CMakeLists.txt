@@ -157,6 +157,8 @@ file(GLOB TILE_LANG_SRCS
   src/target/codegen_c_host.cc
   src/target/codegen_cpp.cc
   src/target/rt_mod_cpp.cc
+  src/target/codegen_ascend.cc
+  src/target/rt_mod_ascend.cc
   # intrin_rule doesn't have system dependency
   src/target/intrin_rule*.cc
 )

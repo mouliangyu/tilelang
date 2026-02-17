@@ -190,11 +190,15 @@ def device_codegen_without_compile(device_mod: tvm.IRModule, target: Target) -> 
     device_mod = tir.transform.Simplify()(device_mod)
     device_mod = tilelang.transform.HoistBroadcastValues()(device_mod)
 
+    is_ascend = target.kind.name == "ascend" or "ascend" in target.keys
+
     if target.kind.name == "cuda":
         global_func = "target.build.tilelang_" + ("cutedsl" if "cutedsl" in target.keys else "cuda") + "_without_compile"
         device_mod = tvm.ffi.get_global_func(global_func)(device_mod, target)
     elif target.kind.name == "hip":
         device_mod = tvm.ffi.get_global_func("target.build.tilelang_hip_without_compile")(device_mod, target)
+    elif is_ascend:
+        device_mod = tvm.ffi.get_global_func("target.build.tilelang_ascend_without_compile")(device_mod, target)
     elif target.kind.name == "c":
         device_mod = tvm.ffi.get_global_func("target.build.tilelang_cpp")(device_mod, target)
     elif target.kind.name == "llvm":
@@ -242,14 +246,16 @@ def lower(
     _is_host_call = get_host_call(is_device_c=is_cpu_device_backend(target))
     _is_device_call = get_device_call(is_device_c=is_cpu_device_backend(target))
 
-    # Before lowering, do semantic check
-    PreLowerSemanticCheck(mod)
+    # Keep target context active for passes that rely on Target::Current.
+    with target:
+        # Before lowering, do semantic check
+        PreLowerSemanticCheck(mod)
 
-    # Phase 1: Lower and legalize the IR
-    mod = LowerAndLegalize(mod, target)
+        # Phase 1: Lower and legalize the IR
+        mod = LowerAndLegalize(mod, target)
 
-    # Phase 2: Optimize the IR for the target
-    mod = OptimizeForTarget(mod, target)
+        # Phase 2: Optimize the IR for the target
+        mod = OptimizeForTarget(mod, target)
 
     host_mod = tir.transform.Filter(_is_host_call)(mod)
     device_mod = tir.transform.Filter(_is_device_call)(mod)
