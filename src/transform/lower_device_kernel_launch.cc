@@ -257,8 +257,20 @@ public:
     func = WithAttr(func, tvm::attr::kGlobalSymbol, gvar->name_hint);
 
     const auto &info = device_info_map_.at(gvar.get());
-    if (!TargetIsAscend(
+    if (TargetIsAscend(
             func->GetAttr<Target>(tvm::attr::kTarget).value_or(info.target))) {
+      // Ascend: keep blockIdx extents (grid shape) but drop threadIdx extents
+      // since thread domains are managed per-region by SimtVF.
+      Map<String, PrimExpr> grid_extent;
+      for (const auto &kv : info.thread_extent) {
+        if (kv.first.find("blockIdx") != std::string::npos) {
+          grid_extent.Set(kv.first, kv.second);
+        }
+      }
+      if (grid_extent.size() > 0) {
+        func = WithAttr(std::move(func), "thread_extent", grid_extent);
+      }
+    } else {
       const auto &thread_extent = info.thread_extent;
       func = WithAttr(std::move(func), "thread_extent", thread_extent);
     }

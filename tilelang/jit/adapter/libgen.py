@@ -14,7 +14,7 @@ from tilelang.contrib.nvcc import get_nvcc_compiler, get_target_arch, get_target
 from tilelang.contrib.rocm import find_rocm_path, get_rocm_arch
 from tilelang.env import TILELANG_TEMPLATE_PATH
 
-from .utils import is_cpu_target, is_cuda_target, is_hip_target
+from .utils import is_ascend_target, is_cpu_target, is_cuda_target, is_hip_target
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +107,21 @@ class LibraryGenerator:
             command += [
                 "-I" + COMPOSABLE_KERNEL_INCLUDE_DIR,
             ]
+        elif is_ascend_target(target):
+            from tilelang.contrib.bisheng import find_bisheng_path
+
+            src = tempfile.NamedTemporaryFile(mode="w", suffix=".asc", delete=False)  # noqa: SIM115
+            libpath = src.name.replace(".asc", ".so")
+
+            npu_arch = os.environ.get("ASCEND_NPU_ARCH", None)
+            command = [
+                find_bisheng_path(),
+                "-fPIC",
+                "--shared",
+                src.name,
+            ]
+            if npu_arch:
+                command += [f"--npu-arch={npu_arch}"]
         elif is_cpu_target(target):
             from tilelang.contrib.cc import get_cplus_compiler
 

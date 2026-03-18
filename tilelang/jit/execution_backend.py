@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from tvm.target import Target
-from tilelang.jit.adapter.utils import is_cutedsl_target
+from tilelang.jit.adapter.utils import is_ascend_target, is_cutedsl_target
 
 # Canonical names for execution backends used internally
 _CANONICAL_MAP = {
@@ -33,6 +33,8 @@ def allowed_backends_for_target(target: Target, *, include_unavailable: bool = T
 
     if is_cutedsl_target(target):
         return ["cutedsl"]
+    elif is_ascend_target(target):
+        allowed = ["cython"]
     elif kind == "cuda":
         allowed = ["tvm_ffi", "nvrtc", "cython"]
     elif kind == "hip":
@@ -79,6 +81,8 @@ def resolve_execution_backend(requested: str | None, target: Target) -> str:
     if req in (None, "auto"):
         if is_cutedsl_target(target):
             return "cutedsl"
+        if is_ascend_target(target):
+            return "cython"
         kind = _target_kind(target)
         if kind == "cuda" or kind == "metal":
             choice = "tvm_ffi"
