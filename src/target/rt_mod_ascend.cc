@@ -18,11 +18,7 @@ std::string AscendCodeGen(IRModule mod) {
         << "CodeGenTileLangAscend: Can only take PrimFunc";
     auto f = Downcast<PrimFunc>(kv.second);
     auto calling_conv = f->GetAttr<Integer>(tvm::attr::kCallingConv);
-    // Ascend text-only path may receive PrimFuncs without explicit
-    // calling_conv.
-    if (calling_conv.defined()) {
-      ICHECK(calling_conv == CallingConv::kDeviceKernelLaunch);
-    }
+    ICHECK(calling_conv == CallingConv::kDeviceKernelLaunch);
     cg.AddFunction(f);
   }
 
