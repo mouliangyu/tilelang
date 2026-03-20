@@ -345,7 +345,40 @@ if __name__ == "__main__":
 
 ## 9. 开发工作流
 
-### 9.1 添加新功能
+### 9.1 初次配置
+
+```bash
+# 0. 配置 Ascend 环境变量 (进入开发环境前执行)
+source /usr/local/Ascend/cann-9.0.T530/set_env.sh
+
+# 1. 安装 uv 包管理器
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
+
+# 2. 安装独立 Python (避免系统 Python 头文件缺失问题)
+uv python install 3.11
+
+# 3. 创建虚拟环境
+cd tilelang
+uv venv --python 3.11.15 .venv-ascend
+source .venv-ascend/bin/activate
+
+# 4. 安装 PyTorch 和 torch_npu (使用项目预编译的 wheel)
+uv pip install torch==2.8.0
+uv pip install /path/to/torch_npu-2.8.0.post3.dev20260127-cp311-cp311-manylinux_2_28_aarch64.whl
+
+# 5. 安装构建依赖
+uv pip install scikit-build-core cython z3-solver patchelf cmake ninja
+
+# 6. Editable install (禁用 CUDA，启用 Ascend)
+USE_CUDA=OFF CMAKE_BUILD_PARALLEL_LEVEL=8 uv pip install -e . --no-build-isolation
+
+# 7. 验证安装
+python -c "import tilelang; print(tilelang.__version__)"
+python -c "import torch; import torch_npu; print('torch_npu OK')"
+```
+
+### 9.2 添加新功能
 
 ```bash
 # 1. 修改代码生成
