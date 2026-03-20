@@ -124,7 +124,38 @@ __global__ __vector__ void main_kernel(
 | `__gm__` | Global Memory (HBM) | 输入输出 buffer |
 | `__ubuf__` | Unified Buffer (片上) | 共享内存/临时 buffer |
 
-### 3.2 代码生成中的处理
+### 3.2 Shared Memory (Unified Buffer) 支持
+
+`T.alloc_shared` 用于在片上 Unified Buffer 中分配共享内存，生成的代码使用 `__ubuf__` 指针初始化：
+
+```python
+# alloc_shared 必须在 SimtVF 外部
+temp_ub = T.alloc_shared((256,), "float32")
+
+with T.SimtVF(threads=128):
+    for i in T.Parallel(256):
+        temp_ub[i] = A[i] * B[i]  # 写入 UB
+
+with T.SimtVF(threads=128):
+    for i in T.Parallel(256):
+        D[i] = temp_ub[i] + C[i]  # 从 UB 读取
+```
+
+生成的 Ascend 代码：
+```cpp
+// 单个 alloc_shared
+__ubuf__ float *temp_ub = (__ubuf__ float *)0;
+
+// 多个 alloc_shared 会 merge 为 buf_dyn_shmem
+__ubuf__ uint8_t *buf_dyn_shmem = (__ubuf__ uint8_t *)0;
+```
+
+**重要约束**：
+- `T.alloc_shared` **必须**放在 `T.SimtVF` 外部
+- 所有 `shared.dyn` 分配最终 merge 为单一的 `buf_dyn_shmem`
+- VF 内部通过偏移访问不同 buffer：`(__ubuf__ float*)buf_dyn_shmem + offset`
+
+### 3.3 代码生成中的处理
 
 在 `codegen_ascend.cc` 中，`PrintStorageScope` 负责映射：
 
@@ -134,10 +165,25 @@ void CodeGenTileLangAscend::PrintStorageScope(
 ) {
   if (scope == "global") {
     os << "__gm__ ";
-  } else if (scope == "shared") {
+  } else if (scope == "shared" || scope == "shared.dyn") {
     os << "__ubuf__ ";
   } else if (!scope.empty()) {
     LOG(FATAL) << "Unsupported storage scope: " << scope;
+  }
+}
+```
+
+`VisitStmt_(AllocateNode)` 处理 shared memory 分配：
+
+```cpp
+void CodeGenTileLangAscend::VisitStmt_(const AllocateNode *op) {
+  std::string scope = GetPtrStorageScope(op->buffer_var);
+  if (scope == "shared.dyn") {
+    // 生成指针初始化: __ubuf__ float *buf = (__ubuf__ float *)0;
+    PrintType(op->dtype, stream);
+    stream << " *" << vid << " = (__ubuf__ ";
+    PrintType(op->dtype, stream);
+    stream << " *)0;\n";
   }
 }
 ```
@@ -406,6 +452,8 @@ sudo -E ASCEND_NPU_ARCH=dav-3101 python test.py
 | 修改 kernel 签名 | `codegen_ascend.cc:AddFunction` |
 | 修改 SimtVF 区域 | `codegen_ascend.cc:VisitStmt_(const ForNode*)` |
 | 修改内存限定符 | `codegen_ascend.cc:PrintStorageScope` |
+| 修改 UB 分配 | `codegen_ascend.cc:VisitStmt_(const AllocateNode*)` |
+| 修改 SimtVF captures | `merge_shared_memory_allocations.cc:VisitStmt_(const ForNode*)` |
 | 修改 host wrapper | `wrapper.py:TLAscendSourceWrapper` |
 | 修改设备类型 | `adapter.py:CythonKernelAdapter` |
 | 修改编译参数 | `tilelang/contrib/bisheng.py` |
@@ -417,8 +465,8 @@ sudo -E ASCEND_NPU_ARCH=dav-3101 python test.py
 
 1. **仅支持 SimtVF**: 当前仅实现了 `T.SimtVF` 编程模型
 2. **无 warp 级操作**: 不支持 CUDA 风格的 warp shuffle
-3. **无共享内存分配**: 暂不支持 `T.alloc_shared`
-4. **有限的数据类型**: 主要支持 float32/bfloat16/float16
+3. **有限的 SIMT 功能**: 不支持 barrier、reduce 等高级 SIMT 操作
+4. **有限的数据类型**: 向量类型仅支持 float2/float4/int2/int4，不支持 int8/uint8 等
 5. **需要 sudo**: NPU 操作需要管理员权限
 
 ---
@@ -427,7 +475,8 @@ sudo -E ASCEND_NPU_ARCH=dav-3101 python test.py
 
 | 优先级 | 任务 | 说明 |
 |--------|------|------|
-| 高 | `__ubuf__` 支持 | 调通 `T.alloc_shared` 以及传入 VF 使用 |
+| 高 | 完善 SIMT 功能支持 | barrier 同步、reduce 规约操作 |
+| 高 | 完善数据类型支持 | 支持 int8/uint8/fp16 等更多数据类型 |
 | 高 | `T.copy` MTE 支持 | 实现 MTE (Memory Transfer Engine) 异步访存 |
 | 高 | 连续 `T.Parallel` 打包 | 将连续裸露的 `T.Parallel` 自动打包到 SimtVF |
 | 中 | Fragment 跨 VF 转写 | 将跨越多 VF 的 fragment 转写为 shared，避免寄存器不能跨 VF 的问题 |
