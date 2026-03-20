@@ -51,7 +51,7 @@ PyTorch 调用
 
 ### 2.1 SimtVF 概念
 
-SimtVF (SIMT Vector Fixed) 是昇腾的 SIMT 风格编程模型。与 CUDA 的关键区别：
+SimtVF (SIMT Vector Function) 是昇腾的 SIMT 风格编程模型。与 CUDA 的关键区别：
 
 | 特性 | CUDA | Ascend SimtVF |
 |------|------|---------------|
@@ -60,6 +60,8 @@ SimtVF (SIMT Vector Fixed) 是昇腾的 SIMT 风格编程模型。与 CUDA 的�
 | Block 维度 | `<<<grid, block>>>` | `<<<grid, 0, stream>>>` (无 block 参数) |
 | Kernel 签名 | `__global__ void` | `__global__ __vector__ void` |
 | 内存限定符 | 无 | `__gm__` (global), `__ubuf__` (shared) |
+
+SimtVF 单独抽出的设计允许一个 kernel 中有多个 VF（Vector Function），类似 TMA 的 MTE 访存操作可以在 VF 外部调用。这种分离使得访存和计算可以更好地重叠执行。
 
 ### 2.2 基础 SimtVF Kernel
 
@@ -351,34 +353,36 @@ if __name__ == "__main__":
 # 0. 配置 Ascend 环境变量 (进入开发环境前执行)
 source /usr/local/Ascend/cann-9.0.T530/set_env.sh
 
-# 1. 安装 uv 包管理器
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source $HOME/.local/bin/env
-
-# 2. 安装独立 Python (避免系统 Python 头文件缺失问题)
-uv python install 3.11
-
-# 3. 创建虚拟环境
+# === 检查环境是否已就绪 ===
 cd tilelang
-uv venv --python 3.11.15 .venv-ascend
-source .venv-ascend/bin/activate
-
-# 4. 安装 PyTorch 和 torch_npu (使用项目预编译的 wheel)
-uv pip install torch==2.8.0
-uv pip install /path/to/torch_npu-2.8.0.post3.dev20260127-cp311-cp311-manylinux_2_28_aarch64.whl
-
-# 5. 安装构建依赖
-uv pip install scikit-build-core cython z3-solver patchelf cmake ninja
-
-# 6. 检查 tilelang 是否已安装，跳过重复构建
-if python -c "import tilelang" 2>/dev/null; then
-    echo "tilelang already installed, skipping build"
+if [ -d .venv-ascend ] && python -c "import tilelang; import torch_npu" 2>/dev/null; then
+    echo "Environment already configured, skipping setup"
+    source .venv-ascend/bin/activate
 else
+    # 1. 安装 uv 包管理器
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    source $HOME/.local/bin/env
+
+    # 2. 安装独立 Python (避免系统 Python 头文件缺失问题)
+    uv python install 3.11
+
+    # 3. 创建虚拟环境
+    uv venv --python 3.11.15 .venv-ascend
+    source .venv-ascend/bin/activate
+
+    # 4. 安装 PyTorch 和 torch_npu (使用项目预编译的 wheel)
+    uv pip install torch==2.8.0
+    uv pip install /path/to/torch_npu-2.8.0.post3.dev20260127-cp311-cp311-manylinux_2_28_aarch64.whl
+
+    # 5. 安装构建依赖
+    uv pip install scikit-build-core cython z3-solver patchelf cmake ninja
+
+    # 6. Editable install (禁用 CUDA，启用 Ascend)
     USE_CUDA=OFF CMAKE_BUILD_PARALLEL_LEVEL=8 uv pip install -e . --no-build-isolation
 fi
 
-# 7. 验证安装
-python -c "import tilelang; print(tilelang.__version__)"
+# 验证安装
+python -c "import tilelang; print('tilelang:', tilelang.__version__)"
 python -c "import torch; import torch_npu; print('torch_npu OK')"
 ```
 
@@ -395,7 +399,7 @@ USE_CUDA=OFF uv pip install -e . --no-build-isolation
 sudo -E ASCEND_NPU_ARCH=dav-3101 python test.py
 ```
 
-### 9.2 常见修改点
+### 9.3 常见修改点
 
 | 需求 | 文件 |
 |------|------|
