@@ -181,7 +181,7 @@ bisheng -fPIC --shared source.asc \
 
 | 芯片 | npu-arch |
 |------|----------|
-| Ascend 910B | `dav-3101` |
+| Ascend 950 | `dav-3101` |
 
 ---
 
@@ -423,7 +423,19 @@ sudo -E ASCEND_NPU_ARCH=dav-3101 python test.py
 
 ---
 
-## 11. 相关资源
+## 11. TODO
+
+| 优先级 | 任务 | 说明 |
+|--------|------|------|
+| 高 | `__ubuf__` 支持 | 调通 `T.alloc_shared` 以及传入 VF 使用 |
+| 高 | `T.copy` MTE 支持 | 实现 MTE (Memory Transfer Engine) 异步访存 |
+| 高 | 连续 `T.Parallel` 打包 | 将连续裸露的 `T.Parallel` 自动打包到 SimtVF |
+| 中 | Fragment 跨 VF 转写 | 将跨越多 VF 的 fragment 转写为 shared，避免寄存器不能跨 VF 的问题 |
+| 中 | `T.Pipelined` 支持 | 实现软件流水支持，配合 MTE 做计算访存重叠 |
+
+---
+
+## 12. 相关资源
 
 - **TileLang 主文档**: 参考 `tilelang` skill
 - **示例代码**: `examples/ascend/`
