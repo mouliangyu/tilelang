@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdio.h>
+
 #include "acl/acl.h"
 #include "kernel_operator.h"
 #include "simt_api/asc_simt.h"

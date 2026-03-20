@@ -4,13 +4,113 @@
 
 #include "../transform/common/attr.h"
 #include "../../3rdparty/tvm/src/tir/transforms/ir_utils.h"
+#include <tvm/tir/stmt_functor.h>
 
 namespace tvm {
 namespace codegen {
 
 void CodeGenTileLangAscend::Init(bool output_ssa) {
-  CodeGenTileLangCPP::Init(output_ssa, /*emit_asserts=*/false,
-                           /*emit_fwd_func_decl=*/false, "ascend", {});
+  CodeGenC::Init(output_ssa);
+}
+
+void CodeGenTileLangAscend::PrintFuncPrefix(std::ostream &os) {
+  os << "extern \"C\"\n";
+}
+
+void CodeGenTileLangAscend::PrintType(DataType t, std::ostream &os) {
+  int lanes = t.lanes();
+  if (t.is_handle()) {
+    ICHECK_EQ(lanes, 1) << "does not support vector types for handles";
+    os << "void*";
+    return;
+  }
+  if (t.is_void()) {
+    os << "void";
+    return;
+  }
+  if (t == DataType::Bool()) {
+    if (lanes != 1) {
+      LOG(FATAL) << "Ascend does not support vector bool type: " << t;
+    }
+    os << "bool";
+    return;
+  }
+
+  bool fail = false;
+  if (t.is_float()) {
+    switch (t.bits()) {
+    case 16:
+      if (lanes == 1) {
+        os << "half_t";
+      } else {
+        fail = true;  // half vector not yet supported
+      }
+      break;
+    case 32:
+      if (lanes == 1) {
+        os << "float";
+      } else if (lanes == 2) {
+        os << "float2";
+      } else if (lanes == 4) {
+        os << "float4";
+      } else {
+        fail = true;
+      }
+      break;
+    case 64:
+      if (lanes == 1) {
+        os << "double";
+      } else {
+        fail = true;  // double vector not supported
+      }
+      break;
+    default:
+      fail = true;
+    }
+  } else if (t.is_int() || t.is_uint()) {
+    switch (t.bits()) {
+    case 8:
+      if (lanes == 1) {
+        os << (t.is_int() ? "int8_t" : "uint8_t");
+      } else {
+        fail = true;  // 8-bit vector not yet supported
+      }
+      break;
+    case 16:
+      if (lanes == 1) {
+        os << (t.is_int() ? "int16_t" : "uint16_t");
+      } else {
+        fail = true;  // 16-bit vector not yet supported
+      }
+      break;
+    case 32:
+      if (lanes == 1) {
+        os << (t.is_int() ? "int32_t" : "uint32_t");
+      } else if (lanes == 2) {
+        os << (t.is_int() ? "int2" : "uint2");
+      } else if (lanes == 4) {
+        os << (t.is_int() ? "int4" : "uint4");
+      } else {
+        fail = true;
+      }
+      break;
+    case 64:
+      if (lanes == 1) {
+        os << (t.is_int() ? "int64_t" : "uint64_t");
+      } else {
+        fail = true;  // 64-bit vector not supported
+      }
+      break;
+    default:
+      fail = true;
+    }
+  } else {
+    fail = true;
+  }
+
+  if (fail) {
+    LOG(FATAL) << "Cannot convert type " << t << " (lanes=" << lanes << ") to Ascend type";
+  }
 }
 
 void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
@@ -93,6 +193,17 @@ void CodeGenTileLangAscend::VisitStmt_(const ForNode *op) {
   if (const auto *imm = threads_expr.as<IntImmNode>()) {
     threads = imm->value;
   }
+
+  // Check that no shared buffer allocations exist inside SimtVF region
+  tir::PostOrderVisit(op->body, [](const ObjectRef& n) {
+    if (const auto* alloc = n.as<AllocateNode>()) {
+      auto alloc_scope = GetPtrStorageScope(alloc->buffer_var);
+      ICHECK(alloc_scope != "shared" && alloc_scope != "shared.dyn")
+          << "Shared buffer allocation (T.alloc_shared) must be placed OUTSIDE SimtVF region. "
+          << "Found buffer '" << alloc->buffer_var->name_hint << "' with scope '" << alloc_scope
+          << "' inside SimtVF body.";
+    }
+  });
 
   ffi::Array<Var> captures;
   if (auto opt_captures = op->annotations.Get(tvm::tl::tilelang_simt_vf_captures)) {
@@ -227,6 +338,35 @@ void CodeGenTileLangAscend::VisitStmt_(const AttrStmtNode *op) {
   CodeGenC::VisitStmt_(op);
 }
 
+void CodeGenTileLangAscend::VisitStmt_(const AllocateNode *op) {
+  ICHECK(!is_zero(op->condition));
+  std::string vid = AllocVarID(op->buffer_var.get());
+  std::string scope = GetPtrStorageScope(op->buffer_var);
+
+  if (scope == "shared") {
+    LOG(FATAL) << "Static shared memory (scope='shared') is not supported on Ascend. "
+               << "Use dynamic shared memory (scope='shared.dyn') with T.alloc_shared.";
+  }
+
+  if (scope == "shared.dyn") {
+    // Generate: __ubuf__ <type> *buf = (__ubuf__ <type> *)0;
+    // Use the original dtype from the allocate node
+    DataType dtype = op->dtype;
+    this->PrintIndent();
+    stream << "__ubuf__ ";
+    PrintType(dtype, stream);
+    stream << " *" << vid << " = (__ubuf__ ";
+    PrintType(dtype, stream);
+    stream << " *)0;\n";
+    RegisterHandleType(op->buffer_var.get(), dtype);
+    this->PrintStmt(op->body);
+    return;
+  }
+
+  // For other scopes, use parent class implementation
+  CodeGenC::VisitStmt_(op);
+}
+
 void CodeGenTileLangAscend::PrintStorageSync(const CallNode *op) {
   ICHECK_GE(op->args.size(), 1U);
   PrintIndent();
@@ -236,7 +376,7 @@ void CodeGenTileLangAscend::PrintStorageSync(const CallNode *op) {
 void CodeGenTileLangAscend::PrintStorageScope(const std::string& scope, std::ostream& os) {
   if (scope == "global") {
     os << "__gm__ ";
-  } else if (scope == "shared") {
+  } else if (scope == "shared" || scope == "shared.dyn") {
     os << "__ubuf__ ";
   } else if (!scope.empty()) {
     LOG(FATAL) << "CodeGenTileLangAscend: Unsupported storage scope: " << scope;

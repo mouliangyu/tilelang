@@ -43,6 +43,7 @@
 
 #include "../op/builtin.h"
 #include "../target/utils.h"
+#include "common/attr.h"
 #include "runtime/thread_storage_scope.h"
 #include "tir/transforms/ir_utils.h"
 #include "tvm/tir/function.h"
@@ -492,6 +493,53 @@ private:
       return StmtExprMutator::VisitStmt(op->body);
     }
     return StmtExprMutator::VisitStmt_(op);
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    // Check if this is a SimtVF node
+    auto opt_threads = op->annotations.Get(tilelang_simt_vf_threads);
+    if (!opt_threads) {
+      return StmtExprMutator::VisitStmt_(op);
+    }
+
+    // Get the current captures
+    auto opt_captures = op->annotations.Get(tilelang_simt_vf_captures);
+    if (!opt_captures) {
+      return StmtExprMutator::VisitStmt_(op);
+    }
+
+    auto captures_arr = opt_captures.value().as<Array<Var>>();
+    if (!captures_arr) {
+      return StmtExprMutator::VisitStmt_(op);
+    }
+
+    // Build new captures: remove shared memory buffers, add buf_dyn_shmem
+    Array<Var> new_captures;
+    std::unordered_set<const VarNode *> shared_vars_removed;
+    bool buf_dyn_shmem_added = false;
+
+    for (const Var &v : captures_arr.value()) {
+      if (IsAppropriateSharedMemory(v)) {
+        shared_vars_removed.insert(v.get());
+      } else {
+        new_captures.push_back(v);
+      }
+    }
+
+    // If any shared memory vars were removed, add buf_dyn_shmem
+    if (!shared_vars_removed.empty() && !buf_dyn_shmem_added) {
+      new_captures.push_back(merged_buf_var_);
+      buf_dyn_shmem_added = true;
+    }
+
+    // Visit the body and update the ForNode
+    For new_for = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+    if (!shared_vars_removed.empty()) {
+      auto *ptr = new_for.CopyOnWrite();
+      ptr->annotations.Set(tilelang_simt_vf_captures, new_captures);
+    }
+
+    return std::move(new_for);
   }
 
   Stmt VisitStmt_(const DeclBufferNode *op) final {
