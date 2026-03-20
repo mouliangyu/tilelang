@@ -370,8 +370,12 @@ uv pip install /path/to/torch_npu-2.8.0.post3.dev20260127-cp311-cp311-manylinux_
 # 5. 安装构建依赖
 uv pip install scikit-build-core cython z3-solver patchelf cmake ninja
 
-# 6. Editable install (禁用 CUDA，启用 Ascend)
-USE_CUDA=OFF CMAKE_BUILD_PARALLEL_LEVEL=8 uv pip install -e . --no-build-isolation
+# 6. 检查 tilelang 是否已安装，跳过重复构建
+if python -c "import tilelang" 2>/dev/null; then
+    echo "tilelang already installed, skipping build"
+else
+    USE_CUDA=OFF CMAKE_BUILD_PARALLEL_LEVEL=8 uv pip install -e . --no-build-isolation
+fi
 
 # 7. 验证安装
 python -c "import tilelang; print(tilelang.__version__)"
