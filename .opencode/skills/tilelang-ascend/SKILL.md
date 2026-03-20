@@ -484,7 +484,52 @@ sudo -E ASCEND_NPU_ARCH=dav-3101 python test.py
 
 ---
 
-## 12. 相关资源
+## 12. bisheng 编译器接口参考
+
+> **说明**: bisheng 编译器提供了丰富的内置函数和 API。可用接口位于：
+> ```
+> /usr/local/Ascend/cann-9.0.T530/tools/bisheng_compiler/lib/clang/15.0.5/include/
+> ```
+> 
+> **要求**: 每次找到有用的接口后，请更新到下面的表格中。
+
+### 12.1 向量类型
+
+| 类型 | 说明 | 来源 |
+|------|------|------|
+| `float2`, `float4` | 32位浮点向量 | - |
+| `int2`, `int4`, `uint2`, `uint4` | 32位整数向量 | - |
+| | | |
+
+### 12.2 内存操作
+
+| 接口 | 说明 | 来源 |
+|------|------|------|
+| | | |
+
+### 12.3 同步原语
+
+| 接口 | 说明 | 来源 |
+|------|------|------|
+| `pipe_barrier(pipe_t::PIPE_ALL)` | 流水线全同步 | simt_api/asc_simt.h |
+| | | |
+
+### 12.4 数学运算
+
+| 接口 | 说明 | 来源 |
+|------|------|------|
+| | | |
+
+### 12.5 其他
+
+| 接口 | 说明 | 来源 |
+|------|------|------|
+| `asc_vf_call<name>(dim3, args...)` | 调用 SimtVF helper | simt_api/asc_simt.h |
+| | | |
+
+---
+
+## 13. 相关资源
 
 - **TileLang 主文档**: 参考 `tilelang` skill
 - **示例代码**: `examples/ascend/`
