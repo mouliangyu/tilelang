@@ -3,6 +3,7 @@
 #include <string>
 
 #include "../transform/common/attr.h"
+#include "../../3rdparty/tvm/src/tir/transforms/ir_utils.h"
 
 namespace tvm {
 namespace codegen {
@@ -15,6 +16,14 @@ void CodeGenTileLangAscend::Init(bool output_ssa) {
 void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   this->InitFuncState(f);
   ReserveKeywordsAsUnique();
+
+  // Register function parameters with their storage scope for codegen
+  for (const auto &param : f->params) {
+    if (param->dtype.is_handle()) {
+      auto scope = GetPtrStorageScope(param);
+      alloc_storage_scope_[param.get()] = scope;
+    }
+  }
 
   auto global_symbol = f->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol);
   ICHECK(global_symbol)
@@ -101,6 +110,11 @@ void CodeGenTileLangAscend::VisitStmt_(const ForNode *op) {
   };
 
   // Capture helper body by rendering the region body to a temporary stream.
+  // Register captures with their storage scope so GetBufferRef adds correct qualifier
+  for (const auto &v : captures) {
+    auto scope = GetPtrStorageScope(v);
+    alloc_storage_scope_[v.get()] = scope;
+  }
   std::ostringstream saved_main_stream;
   stream.swap(saved_main_stream);
   CodeGenC::VisitStmt(op->body);
@@ -129,6 +143,9 @@ void CodeGenTileLangAscend::VisitStmt_(const ForNode *op) {
         }
       }
     }
+    // simt_vf helper functions need memory qualifier based on storage scope
+    auto scope = GetPtrStorageScope(v);
+    PrintStorageScope(scope, decl_stream);
     if (it != handle_data_type_.end()) {
       PrintType(it->second, decl_stream);
       decl_stream << "* " << vname;
@@ -149,7 +166,7 @@ void CodeGenTileLangAscend::VisitStmt_(const ForNode *op) {
   PrintIndent();
   stream << "pipe_barrier(pipe_t::PIPE_ALL);\n";
   PrintIndent();
-  stream << "asc_vf_call<" << helper_name << ">(dim3(";
+  stream << "asc_vf_call<" << helper_name << ">(cce::dim3(";
   if (threads >= 0) {
     stream << threads;
   } else {
@@ -214,6 +231,22 @@ void CodeGenTileLangAscend::PrintStorageSync(const CallNode *op) {
   ICHECK_GE(op->args.size(), 1U);
   PrintIndent();
   stream << "pipe_barrier(pipe_t::PIPE_ALL);\n";
+}
+
+void CodeGenTileLangAscend::PrintStorageScope(const std::string& scope, std::ostream& os) {
+  if (scope == "global") {
+    os << "__gm__ ";
+  } else if (scope == "shared") {
+    os << "__ubuf__ ";
+  } else if (!scope.empty()) {
+    LOG(FATAL) << "CodeGenTileLangAscend: Unsupported storage scope: " << scope;
+  }
+  // Empty scope: output nothing
+}
+
+bool CodeGenTileLangAscend::IsScopePartOfType() const {
+  // Ascend requires memory scope qualifiers as part of the pointer type
+  return true;
 }
 
 } // namespace codegen

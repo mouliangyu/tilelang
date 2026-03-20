@@ -263,7 +263,7 @@ public:
       // since thread domains are managed per-region by SimtVF.
       Map<String, PrimExpr> grid_extent;
       for (const auto &kv : info.thread_extent) {
-        if (kv.first.find("blockIdx") != std::string::npos) {
+        if (std::string(kv.first).find("blockIdx") != std::string::npos) {
           grid_extent.Set(kv.first, kv.second);
         }
       }
@@ -308,7 +308,10 @@ private:
 
     bool same_device_type = caller_target->GetTargetDeviceType() ==
                             callee_target->GetTargetDeviceType();
-    if (same_device_type) {
+    // For Ascend target, always use call_packed path to generate consistent
+    // host code that can be properly wrapped by the cython adapter.
+    bool is_ascend_callee = callee_target->HasKey("ascend");
+    if (same_device_type && !is_ascend_callee) {
       // Calls to another target using the same device (e.g. LLVM
       // calling a custom TIRToRuntime target) do not require a kernel
       // launch, but need to be replaced with call_extern.
@@ -321,12 +324,16 @@ private:
       return Call(node->dtype, builtin::call_extern(), args);
     }
 
-    ICHECK(dev_info.launch_params.defined())
-        << "CallNode attempted kernel launch to " << gvar->name_hint
-        << " on target " << dev_info.target << ", but subroutine "
-        << gvar->name_hint
-        << " did not have the tir::attr::kKernelLaunchParams attribute "
-        << "required for cross-target kernel launch";
+    // For Ascend, skip the launch_params check since we handle it differently.
+    // For other cross-target calls, verify launch_params is defined.
+    if (!is_ascend_callee) {
+      ICHECK(dev_info.launch_params.defined())
+          << "CallNode attempted kernel launch to " << gvar->name_hint
+          << " on target " << dev_info.target << ", but subroutine "
+          << gvar->name_hint
+          << " did not have the tir::attr::kKernelLaunchParams attribute "
+          << "required for cross-target kernel launch";
+    }
 
     // Collected kernel information may be in terms of the callee's
     // arguments, but we need expressions for them in terms of the

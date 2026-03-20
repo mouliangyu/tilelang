@@ -198,6 +198,10 @@ private:
     // code.
 
     bool can_propagate_errors = [&]() {
+      // Ascend kernels use void return type
+      if (device_target->HasKey("ascend")) {
+        return false;
+      }
       auto kind = device_target->GetTargetDeviceType();
       return kind == kDLCPU || kind == kDLExtDev || kind == kDLHexagon;
     }();

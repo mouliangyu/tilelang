@@ -13,6 +13,8 @@ public:
   void VisitStmt_(const ForNode *op) final;
   void VisitStmt_(const AttrStmtNode *op) final;
   void PrintStorageSync(const CallNode *op) final;
+  void PrintStorageScope(const std::string& scope, std::ostream& os) final;
+  bool IsScopePartOfType() const final;
 
 private:
   int simtvf_helper_counter_{0};

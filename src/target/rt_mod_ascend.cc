@@ -18,7 +18,13 @@ std::string AscendCodeGen(IRModule mod) {
         << "CodeGenTileLangAscend: Can only take PrimFunc";
     auto f = Downcast<PrimFunc>(kv.second);
     auto calling_conv = f->GetAttr<Integer>(tvm::attr::kCallingConv);
-    ICHECK(calling_conv == CallingConv::kDeviceKernelLaunch);
+    auto is_global_func = f->GetAttr<Bool>(tvm::tir::attr::kIsGlobalFunc).value_or(Bool(false));
+    // For Ascend, we accept functions that are either:
+    // 1. Device kernel launches (calling_conv == kDeviceKernelLaunch), or
+    // 2. Global functions called via call_extern (is_global_func == true)
+    ICHECK(calling_conv == CallingConv::kDeviceKernelLaunch || is_global_func)
+        << "CodeGenTileLangAscend: Function must have calling_conv=kDeviceKernelLaunch "
+        << "or be marked as a global function (tir.is_global_func=True)";
     cg.AddFunction(f);
   }
 

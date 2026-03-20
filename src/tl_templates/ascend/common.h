@@ -1,10 +1,13 @@
 #pragma once
 
-#include <acl/acl.h>
+#include "acl/acl.h"
+#include "kernel_operator.h"
+#include "simt_api/asc_simt.h"
 
-#define uint unsigned int
-#define uchar unsigned char
-#define ushort unsigned short
+// Use standard unsigned types instead of macros to avoid conflicts with system headers
+typedef unsigned int uint;
+typedef unsigned char uchar;
+typedef unsigned short ushort;
 
 #define TILELANG_CHECK(stmt)                                                   \
   do {                                                                         \

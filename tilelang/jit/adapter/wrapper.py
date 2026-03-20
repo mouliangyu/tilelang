@@ -933,7 +933,9 @@ class TLAscendSourceWrapper(TLCUDASourceWrapper):
             if dyn_sym not in [arg["name"] for arg in function_args]:
                 function_args.append({"name": dyn_sym, "type": self._lookup_type(dyn_sym_dtype)})
 
-        function_args.append(self.get_stream_type())
+        stream_type = self.get_stream_type()
+        if stream_type is not None:
+            function_args.append(stream_type)
 
         def_args = ", ".join([f"{arg['type']} {arg['name']}" for arg in function_args])
 
@@ -949,9 +951,6 @@ class TLAscendSourceWrapper(TLCUDASourceWrapper):
             declaration = self.get_declaration(code[func_decl_pos:])
             brace_pos = code.index("{", func_decl_pos)  # noqa: F841
 
-            grid_str = (
-                f"dim3({self._pythonic_expr(grid_info[0])}, {self._pythonic_expr(grid_info[1])}, {self._pythonic_expr(grid_info[2])})"
-            )
             smem_str = 0 if dynamic_smem_buf is None else dynamic_smem_buf
 
             args_list = parse_function_call_args(declaration, function_args, function_params, {}, {})
@@ -960,7 +959,10 @@ class TLAscendSourceWrapper(TLCUDASourceWrapper):
             )
             call_args = ", ".join(args_list)
             # Ascend triple-chevron: <<<grid, smem, stream>>> (no block dim)
-            kernel_launch_code += f"\t{function_name}<<<{grid_str}, {smem_str}, stream>>>({call_args});\n"
+            # Ascend bisheng expects grid as a single unsigned int, not dim3
+            grid_dim = f"({self._pythonic_expr(grid_info[0])} * {self._pythonic_expr(grid_info[1])} * {self._pythonic_expr(grid_info[2])})"
+            stream_arg = "stream" if stream_type else "nullptr"
+            kernel_launch_code += f"\t{function_name}<<<{grid_dim}, {smem_str}, {stream_arg}>>>({call_args});\n"
             kernel_launch_code += f'\tTILELANG_CHECK_LAST_ERROR("{function_name}");\n'
 
         host_func = PREDEF_HOST_FUNC.format(def_args, kernel_launch_code)
@@ -972,12 +974,20 @@ class TLAscendSourceWrapper(TLCUDASourceWrapper):
         return init_funcs
 
     def update_lib_code(self, code: str):
-        # Prepend Ascend common header so TILELANG_CHECK macros are available
-        ascend_header = '#include <tl_templates/ascend/common.h>\n\n'
-        return super().update_lib_code(ascend_header + code)
+        # Prepend Ascend common header so TILELANG_CHECK macros and dim3 are available
+        # for both kernel code and wrapper code
+        ascend_header = '#include <tl_templates/ascend/common.h>\n'
+        lib_code = super().update_lib_code(code)
+        # The parent class combines source + init_func + host_func.
+        # We need the header at the very beginning, so prepend it to the final result.
+        if not lib_code.strip().startswith('#include <tl_templates/ascend/common.h>'):
+            lib_code = ascend_header + lib_code
+        return lib_code
 
     def get_stream_type(self) -> dict[str, str]:
-        return {"name": "stream=nullptr", "type": "aclrtStream"}
+        # Ascend does not need explicit stream parameter in host wrapper
+        # The kernel launch uses default stream (nullptr)
+        return None
 
 
 class TLMetalSourceWrapper:
