@@ -976,18 +976,20 @@ class TLAscendSourceWrapper(TLCUDASourceWrapper):
     def update_lib_code(self, code: str):
         # Prepend Ascend common header so TILELANG_CHECK macros and dim3 are available
         # for both kernel code and wrapper code
-        ascend_header = '#include <tl_templates/ascend/common.h>\n'
+        ascend_header = "#include <tl_templates/ascend/common.h>\n"
         lib_code = super().update_lib_code(code)
         # The parent class combines source + init_func + host_func.
         # We need the header at the very beginning, so prepend it to the final result.
-        if not lib_code.strip().startswith('#include <tl_templates/ascend/common.h>'):
+        if not lib_code.strip().startswith("#include <tl_templates/ascend/common.h>"):
             lib_code = ascend_header + lib_code
         return lib_code
 
     def get_stream_type(self) -> dict[str, str]:
-        # Ascend does not need explicit stream parameter in host wrapper
-        # The kernel launch uses default stream (nullptr)
-        return None
+        # aclrtStream is typedef void* (defined in acl_base_rt.h:46)
+        # Use void* directly to avoid depending on ACL headers in the host wrapper.
+        # The Cython caller will pass the raw handle obtained from
+        # torch.npu.current_stream().npu_stream.
+        return {"name": "stream=nullptr", "type": "void*"}
 
 
 class TLMetalSourceWrapper:

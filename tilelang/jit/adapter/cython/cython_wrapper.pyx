@@ -175,13 +175,15 @@ cdef class CythonKernelWrapper:
                 f"Expected {len(self.params)} inputs, got {len(inputs) + len(self.result_idx)} with {len(inputs)} inputs and {len(self.result_idx)} outputs"
             )
 
-        # Use current CUDA stream if none specified
+        # Use current device stream if none specified
         if stream == -1:
             if torch.cuda.is_available():
                 try:
                     stream = torch._C._cuda_getCurrentRawStream(torch.cuda.current_device())
                 except ImportError:
                     stream = torch.cuda.current_stream().cuda_stream
+            elif hasattr(torch, 'npu') and torch.npu.is_available():
+                stream = torch.npu.current_stream().npu_stream
             else:
                 stream = 0
 
