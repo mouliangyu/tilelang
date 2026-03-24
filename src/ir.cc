@@ -23,6 +23,9 @@ namespace tl {
 
 using namespace script::ir_builder::tir;
 
+class SimtVFFrameNode;
+class SimtVFFrame;
+
 static Var CreateEnvThread(String name, String thread_tag, DataType dtype) {
   using namespace tvm::tir;
   using namespace tvm::script::ir_builder;
@@ -102,40 +105,7 @@ ForFrame ParallelFor(const Array<PrimExpr> &extents,
   return ForFrame(n);
 }
 
-ForFrame SimtVFFor(int threads) {
-  using namespace tvm::tir;
-  ICHECK_GT(threads, 0) << "SimtVF requires threads > 0";
-  ObjectPtr<ForFrameNode> n = tvm::ffi::make_object<ForFrameNode>();
-  DataType dtype = DataType::Int(32);
-  n->vars.push_back(Var("simt_vf", dtype));
-  n->doms.push_back(Range(make_const(dtype, 0), make_const(dtype, 1)));
-  n->f_make_for_loop =
-      [threads](const Array<Var> &vars, const Array<Range> &doms,
-                const Array<Optional<PrimExpr>> &steps, Stmt body) -> Stmt {
-    (void)vars;
-    (void)doms;
-    (void)steps;
-    auto make_thread_extent = [&](const String &name, const String &thread_tag,
-                                  const PrimExpr &extent, Stmt inner) {
-      DataType dtype = extent.dtype();
-      IterVar iv(Range::FromMinExtent(make_zero(dtype), extent),
-                 Var(name, dtype), IterVarType::kThreadIndex, thread_tag);
-      return AttrStmt(iv, tir::attr::thread_extent, extent, inner);
-    };
-
-    DataType dtype = DataType::Int(32);
-    body = make_thread_extent("simtvf_tz", "threadIdx.z", make_const(dtype, 1),
-                              std::move(body));
-    body = make_thread_extent("simtvf_ty", "threadIdx.y", make_const(dtype, 1),
-                              std::move(body));
-    body = make_thread_extent("simtvf_tx", "threadIdx.x",
-                              make_const(dtype, threads), std::move(body));
-
-    return tvm::tir::Block({}, {}, {}, "SIMT_VF", body, std::nullopt, {}, {},
-                           {});
-  };
-  return ForFrame(n);
-}
+SimtVFFrame SimtVF(const Array<PrimExpr> &thread_extents);
 
 ForFrame PipelinedFor(PrimExpr start, const PrimExpr &stop, int num_stages,
                       const Array<PrimExpr> &order,
@@ -366,10 +336,85 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef()
       .def("tl.Parallel", ParallelFor)
-      .def("tl.SimtVF", SimtVFFor)
+      .def("tl.SimtVF", SimtVF)
       .def("tl.Pipelined", PipelinedFor)
       .def("tl.Persistent", PersistentFor)
       .def("tl.KernelLaunch", KernelLaunch);
+}
+
+class SimtVFFrameNode : public TIRFrameNode {
+public:
+  Array<PrimExpr> thread_extents;
+
+  static void RegisterReflection() {
+    namespace refl = tvm::ffi::reflection;
+    refl::ObjectDef<SimtVFFrameNode>().def_ro("thread_extents",
+                                              &SimtVFFrameNode::thread_extents);
+  }
+
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.SimtVFFrame", SimtVFFrameNode,
+                                    TIRFrameNode);
+
+public:
+  TVM_DLL void ExitWithScope() final {
+    using namespace tvm::tir;
+    TIRFrameNode::ExitWithScope();
+
+    auto make_thread_extent = [](const String &name, const String &thread_tag,
+                                 const PrimExpr &extent, Stmt inner) {
+      DataType dtype = extent.dtype();
+      IterVar iv(Range::FromMinExtent(make_zero(dtype), extent),
+                 Var(name, dtype), IterVarType::kThreadIndex, thread_tag);
+      return AttrStmt(iv, tir::attr::thread_extent, extent, inner);
+    };
+
+    ICHECK_EQ(thread_extents.size(), 3)
+        << "SimtVF requires exactly 3 thread extents [tx, ty, tz]";
+
+    Stmt body = tvm::tir::SeqStmt::Flatten(stmts);
+    body = make_thread_extent("simtvf_tz", "threadIdx.z", thread_extents[2],
+                              std::move(body));
+    body = make_thread_extent("simtvf_ty", "threadIdx.y", thread_extents[1],
+                              std::move(body));
+    body = make_thread_extent("simtvf_tx", "threadIdx.x", thread_extents[0],
+                              std::move(body));
+
+    Stmt stmt =
+        tvm::tir::Block({}, {}, {}, "SIMT_VF", body, std::nullopt, {}, {}, {});
+
+    script::ir_builder::IRBuilder builder =
+        script::ir_builder::IRBuilder::Current();
+    if (builder->frames.empty()) {
+      ICHECK(!builder->result.defined())
+          << "ValueError: Builder.result has already been set";
+      builder->result = stmt;
+    } else if (const auto *tir_frame =
+                   builder->frames.back().as<TIRFrameNode>()) {
+      ffi::GetRef<TIRFrame>(tir_frame)->stmts.push_back(stmt);
+    } else {
+      LOG(FATAL) << "TypeError: Unsupported frame type: "
+                 << builder->frames.back();
+    }
+  }
+};
+
+class SimtVFFrame : public TIRFrame {
+public:
+  explicit SimtVFFrame(ObjectPtr<SimtVFFrameNode> data)
+      : TIRFrame(::tvm::ffi::UnsafeInit{}) {
+    ICHECK(data != nullptr);
+    data_ = std::move(data);
+  }
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(SimtVFFrame, TIRFrame,
+                                                SimtVFFrameNode);
+};
+
+SimtVFFrame SimtVF(const Array<PrimExpr> &thread_extents) {
+  ICHECK_EQ(thread_extents.size(), 3)
+      << "SimtVF requires exactly 3 thread extents [tx, ty, tz]";
+  ObjectPtr<SimtVFFrameNode> n = tvm::ffi::make_object<SimtVFFrameNode>();
+  n->thread_extents = thread_extents;
+  return SimtVFFrame(n);
 }
 
 class WarpSpecializeFrameNode : public TIRFrameNode {
@@ -459,6 +504,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def("tl.WarpSpecialize", WarpSpecialize)
       .def("tl.SideEffect", SideEffect);
   KernelLaunchFrameNode::RegisterReflection();
+  SimtVFFrameNode::RegisterReflection();
   WarpSpecializeFrameNode::RegisterReflection();
 }
 

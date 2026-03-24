@@ -17,7 +17,6 @@ from tilelang.layout import Layout, Fragment  # noqa: F401
 from .proxy import ptr, make_tensor, Buffer, Tensor, StridedTensor, FragmentBuffer, SharedBuffer, LocalBuffer  # noqa: F401
 from .loop import (
     Parallel,  # noqa: F401
-    SimtVF,  # noqa: F401
     Persistent,  # noqa: F401
     Pipelined,  # noqa: F401
     serial,  # noqa: F401
@@ -26,6 +25,10 @@ from .loop import (
     Serial,  # noqa: F401
     Unroll,  # noqa: F401
     Vectorized,  # noqa: F401
+)
+from .vf import (
+    SimtVF,  # noqa: F401
+    SimtVFFrame,  # noqa: F401
 )
 from .frame import has_let_value, get_let_value  # noqa: F401
 from .math_intrinsics import *  # noqa: F401

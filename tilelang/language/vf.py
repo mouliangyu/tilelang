@@ -1,0 +1,54 @@
+"""SimtVF (SIMT Vector Fixed) language interface for Ascend NPU."""
+
+from __future__ import annotations
+
+from tvm.ffi import register_object
+from tvm.script.ir_builder.tir.frame import TIRFrame
+from tilelang import _ffi_api
+
+
+@register_object("tl.SimtVFFrame")
+class SimtVFFrame(TIRFrame):
+    """Frame for SimtVF (SIMT Vector Fixed) region.
+
+    This frame wraps the SIMT vector-fragment execution region for Ascend NPU.
+    The C++ side (SimtVFFrameNode) handles scope entry/exit and generates
+    the Block("SIMT_VF") IR node with thread extent bindings.
+    """
+
+    pass
+
+
+def SimtVF(threads: int | list[int] | tuple = 128) -> SimtVFFrame:
+    """Construct a dedicated SIMT vector-fragment region frame.
+
+    Parameters
+    ----------
+    threads : int | list[int] | tuple
+        Thread count for the SimtVF frame.
+        Can be a single int (threadIdx.x only), or a list/tuple of up to 3
+        integers for (threadIdx.x, threadIdx.y, threadIdx.z).
+        Missing dimensions default to 1.
+
+    Returns
+    -------
+    res : SimtVFFrame
+        The SimtVFFrame used to denote a SimtVF region.
+    """
+    if isinstance(threads, int):
+        normalized = [threads, 1, 1]
+    elif isinstance(threads, list):
+        if len(threads) > 3:
+            raise ValueError("SimtVF supports at most 3 thread dimensions")
+        normalized = threads + [1] * (3 - len(threads))
+    elif isinstance(threads, tuple):
+        if len(threads) > 3:
+            raise ValueError("SimtVF supports at most 3 thread dimensions")
+        normalized = list(threads) + [1] * (3 - len(threads))
+    else:
+        raise TypeError(f"threads must be int, list, or tuple, got {type(threads)}")
+
+    if any(t <= 0 for t in normalized):
+        raise ValueError("SimtVF requires all thread dimensions > 0")
+
+    return _ffi_api.SimtVF(normalized)  # type: ignore[attr-defined] # pylint: disable=no-member
