@@ -39,6 +39,11 @@ ffi::Module BuildTileLangAscend(IRModule mod, Target target) {
   std::string code = AscendCodeGen(mod);
 
   if (const auto f =
+          ffi::Function::GetGlobal("tilelang_callback_ascend_postproc")) {
+    code = (*f)(code, target).cast<std::string>();
+  }
+
+  if (const auto f =
           ffi::Function::GetGlobal("tilelang_callback_ascend_compile")) {
     (*f)(code, target);
   }
@@ -51,6 +56,10 @@ ffi::Module BuildTileLangAscend(IRModule mod, Target target) {
 
 ffi::Module BuildTileLangAscendWithoutCompile(IRModule mod, Target target) {
   std::string code = AscendCodeGen(mod);
+  if (const auto f =
+          ffi::Function::GetGlobal("tilelang_callback_ascend_postproc")) {
+    code = (*f)(code, target).cast<std::string>();
+  }
   return CSourceModuleCreate(code, "asc", ffi::Array<ffi::String>());
 }
 
