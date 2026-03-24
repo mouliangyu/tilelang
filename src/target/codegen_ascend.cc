@@ -385,7 +385,7 @@ void CodeGenTileLangAscend::VisitStmt_(const AllocateNode *op) {
 void CodeGenTileLangAscend::PrintStorageSync(const CallNode *op) {
   ICHECK_GE(op->args.size(), 1U);
   PrintIndent();
-  stream << "pipe_barrier(pipe_t::PIPE_ALL);\n";
+  stream << "asc_syncthreads();\n";
 }
 
 void CodeGenTileLangAscend::PrintStorageScope(const std::string &scope,

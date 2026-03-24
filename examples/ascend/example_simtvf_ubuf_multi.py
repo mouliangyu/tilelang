@@ -46,7 +46,7 @@ def ubuf_multi(N):
                     temp2[i] = temp1[i] + C[i]
 
             # VF3: temp2 * D → E
-            with T.SimtVF(threads=128):
+            with T.SimtVF(threads=256):
                 for i in T.Parallel(N):
                     E[i] = temp2[i] * D[i]
 
