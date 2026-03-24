@@ -16,7 +16,22 @@ class SimtVFFrame(TIRFrame):
     the Block("SIMT_VF") IR node with thread extent bindings.
     """
 
-    pass
+    def __enter__(self):
+        super().__enter__()
+        from tilelang.language.kernel import SimtVFContext, push_simtvf_context
+
+        ctx = SimtVFContext(
+            thread_vars=list(self.thread_vars),
+            thread_extents=[int(e) for e in self.thread_extents],
+        )
+        push_simtvf_context(ctx)
+        return self
+
+    def __exit__(self, ptype, value, trace):
+        from tilelang.language.kernel import pop_simtvf_context
+
+        pop_simtvf_context()
+        super().__exit__(ptype, value, trace)
 
 
 def SimtVF(threads: int | list[int] | tuple = 128) -> SimtVFFrame:

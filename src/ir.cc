@@ -273,6 +273,8 @@ KernelLaunchFrame KernelLaunch(const Array<PrimExpr> &grid_size,
   // If the kernel is a CPU kernel, we don't need to launch any threads.
   bool is_cpu_kernel_frame =
       attrs.defined() && attrs.count(tilelang_is_cpu_kernel_frame);
+  bool is_npu_kernel_frame =
+      attrs.defined() && attrs.count(tilelang_is_npu_kernel_frame);
 
   auto block_size = block_size_opt.value_or(Array<PrimExpr>());
 
@@ -286,6 +288,14 @@ KernelLaunchFrame KernelLaunch(const Array<PrimExpr> &grid_size,
       n->frames.push_back(
           MakeIterVarFrame("block_var_" + std::to_string(i), grid_size[i]));
     }
+  } else if (is_npu_kernel_frame) {
+    // Launch NPU Kernel – only 1-D grid, no threadIdx
+    ICHECK_EQ(grid_size.size(), 1) << "NPU kernel only supports 1-D grid";
+    ICHECK(block_size.empty())
+        << "NPU kernel cannot have block size (use T.SimtVF instead)";
+    n->frames.push_back(
+        LaunchThread(CreateEnvThread("bx", "blockIdx.x", grid_size[0].dtype()),
+                     grid_size[0]));
   } else {
     // Launch GPU Kernel
     ICHECK(grid_size.size() <= 3);
@@ -345,11 +355,13 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 class SimtVFFrameNode : public TIRFrameNode {
 public:
   Array<PrimExpr> thread_extents;
+  Array<tvm::tir::Var> thread_vars;
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
-    refl::ObjectDef<SimtVFFrameNode>().def_ro("thread_extents",
-                                              &SimtVFFrameNode::thread_extents);
+    refl::ObjectDef<SimtVFFrameNode>()
+        .def_ro("thread_extents", &SimtVFFrameNode::thread_extents)
+        .def_ro("thread_vars", &SimtVFFrameNode::thread_vars);
   }
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.SimtVFFrame", SimtVFFrameNode,
@@ -360,23 +372,25 @@ public:
     using namespace tvm::tir;
     TIRFrameNode::ExitWithScope();
 
-    auto make_thread_extent = [](const String &name, const String &thread_tag,
+    auto make_thread_extent = [](const Var &var, const String &thread_tag,
                                  const PrimExpr &extent, Stmt inner) {
       DataType dtype = extent.dtype();
-      IterVar iv(Range::FromMinExtent(make_zero(dtype), extent),
-                 Var(name, dtype), IterVarType::kThreadIndex, thread_tag);
+      IterVar iv(Range::FromMinExtent(make_zero(dtype), extent), var,
+                 IterVarType::kThreadIndex, thread_tag);
       return AttrStmt(iv, tir::attr::thread_extent, extent, inner);
     };
 
     ICHECK_EQ(thread_extents.size(), 3)
         << "SimtVF requires exactly 3 thread extents [tx, ty, tz]";
+    ICHECK_EQ(thread_vars.size(), 3)
+        << "SimtVF requires exactly 3 thread vars [tx, ty, tz]";
 
     Stmt body = tvm::tir::SeqStmt::Flatten(stmts);
-    body = make_thread_extent("simtvf_tz", "threadIdx.z", thread_extents[2],
+    body = make_thread_extent(thread_vars[2], "threadIdx.z", thread_extents[2],
                               std::move(body));
-    body = make_thread_extent("simtvf_ty", "threadIdx.y", thread_extents[1],
+    body = make_thread_extent(thread_vars[1], "threadIdx.y", thread_extents[1],
                               std::move(body));
-    body = make_thread_extent("simtvf_tx", "threadIdx.x", thread_extents[0],
+    body = make_thread_extent(thread_vars[0], "threadIdx.x", thread_extents[0],
                               std::move(body));
 
     Stmt stmt =
@@ -414,6 +428,12 @@ SimtVFFrame SimtVF(const Array<PrimExpr> &thread_extents) {
       << "SimtVF requires exactly 3 thread extents [tx, ty, tz]";
   ObjectPtr<SimtVFFrameNode> n = tvm::ffi::make_object<SimtVFFrameNode>();
   n->thread_extents = thread_extents;
+  DataType dtype = DataType::Int(32);
+  n->thread_vars = {
+      tvm::tir::Var("simtvf_tx", dtype),
+      tvm::tir::Var("simtvf_ty", dtype),
+      tvm::tir::Var("simtvf_tz", dtype),
+  };
   return SimtVFFrame(n);
 }
 

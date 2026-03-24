@@ -82,6 +82,38 @@ def _get_current_stack() -> FrameStack:
     return _local.kernel_launch_frame_stack
 
 
+class SimtVFContext:
+    """Stores thread binding info for an active SimtVF scope."""
+
+    __slots__ = ("thread_vars", "thread_extents")
+
+    def __init__(self, thread_vars, thread_extents):
+        self.thread_vars = thread_vars
+        self.thread_extents = thread_extents
+
+
+_simtvf_local = threading.local()
+
+
+def _get_simtvf_stack() -> FrameStack:
+    if not hasattr(_simtvf_local, "simtvf_stack"):
+        _simtvf_local.simtvf_stack = FrameStack()
+    return _simtvf_local.simtvf_stack
+
+
+def _get_current_simtvf() -> SimtVFContext | None:
+    stack = _get_simtvf_stack()
+    return stack.top() if stack else None
+
+
+def push_simtvf_context(ctx: SimtVFContext):
+    _get_simtvf_stack().push(ctx)
+
+
+def pop_simtvf_context():
+    _get_simtvf_stack().pop()
+
+
 def _normalize_bindings(bindings: list[Var]) -> Var | list[Var]:
     """
     Return a bare Var when we only have a single binding so that users may write either
@@ -113,13 +145,13 @@ class KernelLaunchFrame(TIRFrame):
         assert isinstance(last_block_frame, BlockFrame), f"Last frame must be a block frame, got {last_block_frame}"
 
         maybe_cpu = last_block_frame.annotations.get("tilelang.is_cpu_kernel_frame", False)
+        maybe_npu = last_block_frame.annotations.get("tilelang.is_npu_kernel_frame", False)
 
         if maybe_cpu:
-            # CPU kernel frame, return a list of for frame items.
             return _normalize_bindings([frame.vars[0] for frame in self.frames[0:-1]])
+        elif maybe_npu:
+            return _normalize_bindings([frame.iter_var.var for frame in self.frames[0:-1]])
         else:
-            # Otherwise, return a list of iter_var.var objects (excluding the last 4 frames).
-            # As 4 frames for threadIdx.x, threadIdx.y, threadIdx.z and block frame with attributes
             return _normalize_bindings([frame.iter_var.var for frame in self.frames[0:-4]])
 
     def __exit__(self, ptype, value, trace):
@@ -299,6 +331,9 @@ def Kernel(
             raise ValueError(
                 "Ascend backend does not support `threads=` in `T.Kernel(...)`. Use `T.SimtVF(threads=...)` to define thread domains."
             )
+        if len(blocks) != 1:
+            raise ValueError(f"Ascend backend only supports 1-D grid in `T.Kernel(N)`. Got {len(blocks)}-D grid.")
+        attrs["tilelang.is_npu_kernel_frame"] = True
     elif not is_cpu and threads is None:
         # Keep backward compatibility when target is not Ascend (or unknown).
         threads = 128  # default thread number
@@ -326,12 +361,18 @@ def Kernel(
 
 def get_thread_binding(dim: int = 0) -> Var:
     """Returns the thread binding for the given dimension."""
+    simtvf = _get_current_simtvf()
+    if simtvf is not None:
+        return simtvf.thread_vars[dim]
     assert KernelLaunchFrame.Current() is not None, "KernelLaunchFrame is not initialized"
     return KernelLaunchFrame.Current().get_thread_binding(dim)
 
 
 def get_thread_bindings() -> list[Var]:
     """Returns all three thread bindings."""
+    simtvf = _get_current_simtvf()
+    if simtvf is not None:
+        return list(simtvf.thread_vars)
     assert KernelLaunchFrame.Current() is not None, "KernelLaunchFrame is not initialized"
     return KernelLaunchFrame.Current().get_thread_bindings()
 
@@ -350,12 +391,18 @@ def get_block_bindings() -> list[Var]:
 
 def get_thread_extent(dim: int = 0) -> int:
     """Returns the thread extent for the given dimension."""
+    simtvf = _get_current_simtvf()
+    if simtvf is not None:
+        return simtvf.thread_extents[dim]
     assert KernelLaunchFrame.Current() is not None, "KernelLaunchFrame is not initialized"
     return KernelLaunchFrame.Current().get_thread_extent(dim)
 
 
 def get_thread_extents() -> list[int]:
     """Returns all three thread extents."""
+    simtvf = _get_current_simtvf()
+    if simtvf is not None:
+        return list(simtvf.thread_extents)
     assert KernelLaunchFrame.Current() is not None, "KernelLaunchFrame is not initialized"
     return KernelLaunchFrame.Current().get_thread_extents()
 

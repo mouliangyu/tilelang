@@ -188,14 +188,24 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
     return;
   }
 
-  int64_t threads = -1;
-  const auto *attr = op->body.as<AttrStmtNode>();
-  if (attr && attr->attr_key == tir::attr::thread_extent) {
-    const auto *iv = attr->node.as<IterVarNode>();
-    if (iv && iv->thread_tag == "threadIdx.x") {
+  int64_t thread_x = 1, thread_y = 1, thread_z = 1;
+  {
+    const tir::Stmt *cur = &op->body;
+    while (const auto *attr = (*cur).as<AttrStmtNode>()) {
+      if (attr->attr_key != tir::attr::thread_extent)
+        break;
+      const auto *iv = attr->node.as<IterVarNode>();
+      if (!iv)
+        break;
       if (const auto *imm = attr->value.as<IntImmNode>()) {
-        threads = imm->value;
+        if (iv->thread_tag == "threadIdx.x")
+          thread_x = imm->value;
+        else if (iv->thread_tag == "threadIdx.y")
+          thread_y = imm->value;
+        else if (iv->thread_tag == "threadIdx.z")
+          thread_z = imm->value;
       }
+      cur = &attr->body;
     }
   }
 
@@ -237,15 +247,19 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
   }
   std::ostringstream saved_main_stream;
   stream.swap(saved_main_stream);
+  bool old_inside_simtvf_body = inside_simtvf_body_;
+  inside_simtvf_body_ = true;
   CodeGenC::VisitStmt(op->body);
+  inside_simtvf_body_ = old_inside_simtvf_body;
   std::string helper_body = stream.str();
   stream.str("");
   stream.clear();
   stream.swap(saved_main_stream);
 
+  int64_t total_threads = thread_x * thread_y * thread_z;
   decl_stream << "__simt_vf__ ";
-  if (threads >= 0) {
-    decl_stream << "__launch_bounds__(" << threads << ") ";
+  if (total_threads > 0) {
+    decl_stream << "__launch_bounds__(" << total_threads << ") ";
   }
   decl_stream << "inline void " << helper_name << "(";
   for (size_t i = 0; i < captures.size(); ++i) {
@@ -278,19 +292,18 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
   decl_stream << "}\n\n";
 
   PrintIndent();
-  stream << "// __simt_vf__ begin";
-  if (threads >= 0) {
-    stream << " threads=" << threads;
-  }
-  stream << "\n";
+  stream << "// __simt_vf__ begin threads=(" << thread_x << ", " << thread_y
+         << ", " << thread_z << ")\n";
   PrintIndent();
   stream << "pipe_barrier(pipe_t::PIPE_ALL);\n";
   PrintIndent();
   stream << "asc_vf_call<" << helper_name << ">(cce::dim3(";
-  if (threads >= 0) {
-    stream << threads;
-  } else {
-    stream << "1";
+  stream << thread_x;
+  if (thread_y > 1 || thread_z > 1) {
+    stream << ", " << thread_y;
+    if (thread_z > 1) {
+      stream << ", " << thread_z;
+    }
   }
   stream << ")";
   for (size_t i = 0; i < captures.size(); ++i) {
@@ -318,10 +331,9 @@ void CodeGenTileLangAscend::VisitStmt_(const AttrStmtNode *op) {
       // Materialize a placeholder symbol so later uses (e.g. simtvf_tx) are
       // printable in expression codegen.
       std::string var_name = AllocVarID(iv->var.get());
-      bool is_simtvf_thread_var = var_name.rfind("simtvf_", 0) == 0;
       if ((iv->thread_tag == "threadIdx.x" || iv->thread_tag == "threadIdx.y" ||
            iv->thread_tag == "threadIdx.z") &&
-          !is_simtvf_thread_var) {
+          !inside_simtvf_body_) {
         this->VisitStmt(op->body);
         return;
       }

@@ -42,8 +42,11 @@ def ubuf_multi(N):
 
             # VF2: temp1 + C → temp2
             with T.SimtVF(threads=(16, 16)):
+                tx = T.get_thread_binding()
                 for i in T.Parallel(N):
                     temp2[i] = temp1[i] + C[i]
+                if tx == 0:
+                    temp1[tx] = 0.0
 
             # VF3: temp2 * D → E
             with T.SimtVF(threads=256):

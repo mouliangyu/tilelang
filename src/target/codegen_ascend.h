@@ -22,6 +22,7 @@ public:
 
 private:
   int simtvf_helper_counter_{0};
+  bool inside_simtvf_body_{false};
 };
 
 } // namespace codegen
