@@ -251,7 +251,8 @@ private:
   }
 
   Range InferThreadBoundsFromIterVar(const IterVar &iter_var) const {
-    if (iter_var.defined() && analyzer_->const_int_bound.IsBound(iter_var->var)) {
+    if (iter_var.defined() &&
+        analyzer_->const_int_bound.IsBound(iter_var->var)) {
       auto const_int_bound = analyzer_->const_int_bound(iter_var->var);
       auto min_value = const_int_bound->min_value;
       auto max_value = const_int_bound->max_value;
@@ -269,19 +270,20 @@ private:
     return InferThreadBoundsFromIterVar(thread_var_);
   }
 
-  void PushSimtVFThreadContext(const ForNode *op) {
-    IterVar active_thread_var = thread_var_;
-    ICHECK(op->annotations.count(tilelang_simt_vf_threads))
-        << "SimtVF loop must carry " << tilelang_simt_vf_threads
-        << " annotation";
-    PrimExpr threads = Downcast<PrimExpr>(
-        op->annotations.Get(tilelang_simt_vf_threads).value());
+  void PushSimtVFThreadContext(const BlockNode *op) {
+    const auto *attr = op->body.as<AttrStmtNode>();
+    ICHECK(attr && attr->attr_key == tir::attr::thread_extent)
+        << "SIMT_VF block body must start with thread_extent AttrStmt";
+    const auto *iv = attr->node.as<IterVarNode>();
+    ICHECK(iv && iv->thread_tag == "threadIdx.x")
+        << "SIMT_VF block body must bind threadIdx.x first";
+    PrimExpr threads = attr->value;
     DataType dtype = threads.dtype();
-    active_thread_var = IterVar(
-        Range::FromMinExtent(make_zero(dtype), threads), Var("simtvf_tx", dtype),
-        IterVarType::kThreadIndex, "threadIdx.x");
-    Range thread_bounds = active_thread_var->dom;
-    simt_vf_thread_ctx_stack_.push_back({active_thread_var, thread_bounds});
+    IterVar active_thread_var = IterVar(
+        Range::FromMinExtent(make_zero(dtype), threads),
+        Var("simtvf_tx", dtype), IterVarType::kThreadIndex, "threadIdx.x");
+    simt_vf_thread_ctx_stack_.push_back(
+        {active_thread_var, active_thread_var->dom});
   }
 
   void PopSimtVFThreadContext() {
@@ -290,6 +292,11 @@ private:
   }
 
   Stmt VisitStmt_(const BlockNode *op) final {
+    bool is_simt_vf = (op->name_hint == "SIMT_VF");
+    if (is_simt_vf) {
+      PushSimtVFThreadContext(op);
+    }
+
     // Record the mapping from buffer data var to buffer for later lookup
     for (auto buffer : op->alloc_buffers) {
       buffer_map_.insert({buffer->data, buffer});
@@ -329,6 +336,36 @@ private:
       }
       workspace_stack_.pop_back();
     }
+
+    if (is_simt_vf) {
+      Map<Var, PrimExpr> let_var_to_expr;
+      for (const auto &[var, expr] : let_bindings_) {
+        let_var_to_expr.Set(var, expr);
+      }
+
+      Range thread_bounds = GetActiveThreadBounds();
+      IterVar active_thread_var = GetActiveThreadVar();
+
+      AddWorkspaceCallback callback = [this](int num_elem, DataType dtype) {
+        auto workspace =
+            decl_buffer({PrimExpr(num_elem)}, dtype, "workspace", "shared.dyn");
+        if (!workspace_stack_.empty()) {
+          workspace_stack_.back().push_back(workspace);
+        } else {
+          workspace_stack_.emplace_back(Array<Buffer>{workspace});
+        }
+        return workspace.access_ptr(2);
+      };
+
+      auto simt_vf_op = SimtVFOp(block);
+      Stmt lowered = simt_vf_op->Lower(
+          LowerArgs{target_, thread_bounds, active_thread_var->var, callback,
+                    layout_map_, buffer_remap_, let_var_to_expr},
+          analyzer_);
+      PopSimtVFThreadContext();
+      return lowered;
+    }
+
     return block;
   }
 
@@ -1091,11 +1128,6 @@ private:
    * @return Stmt The lowered statement.
    */
   Stmt VisitStmt_(const ForNode *op) final {
-    bool is_simt_vf = op->annotations.count(tilelang_simt_vf_threads);
-    if (is_simt_vf) {
-      PushSimtVFThreadContext(op);
-    }
-
     // Extract reducer info from annotations
     Map<Var, ReducerInfo> reducer_info;
     if (op->annotations.count(attr::kReducerInfo)) {
@@ -1107,42 +1139,8 @@ private:
     // First visit the body
     For for_node = Downcast<For>(arith::IRMutatorWithAnalyzer::VisitStmt_(op));
 
-    if (is_simt_vf) {
-      Map<Var, PrimExpr> let_var_to_expr;
-      for (const auto &[var, expr] : let_bindings_) {
-        let_var_to_expr.Set(var, expr);
-      }
-
-      Range thread_bounds = GetActiveThreadBounds();
-      IterVar active_thread_var = GetActiveThreadVar();
-
-      AddWorkspaceCallback callback = [this](int num_elem, DataType dtype) {
-        auto workspace =
-            decl_buffer({PrimExpr(num_elem)}, dtype, "workspace", "shared.dyn");
-        if (!workspace_stack_.empty()) {
-          workspace_stack_.back().push_back(workspace);
-        } else {
-          workspace_stack_.emplace_back(Array<Buffer>{workspace});
-        }
-        return workspace.access_ptr(2);
-      };
-
-      auto simt_vf_op = SimtVFOp(for_node);
-      Stmt lowered =
-          simt_vf_op->Lower(LowerArgs{target_, thread_bounds,
-                                      active_thread_var->var, callback,
-                                      layout_map_, buffer_remap_,
-                                      let_var_to_expr},
-                            analyzer_);
-      PopSimtVFThreadContext();
-      return lowered;
-    }
-
     // Only process parallel loops
     if (op->kind != ForKind::kParallel) {
-      if (is_simt_vf) {
-        PopSimtVFThreadContext();
-      }
       return for_node;
     }
 
@@ -1153,9 +1151,6 @@ private:
     // loop is the correct place to carry layout so we can rewrite the whole
     // nested region in one place.
     if (!op->annotations.count(attr::kParallelLoopLayout)) {
-      if (is_simt_vf) {
-        PopSimtVFThreadContext();
-      }
       return for_node;
     }
 
@@ -1279,13 +1274,9 @@ private:
     bool should_vectorize =
         (has_non_local || has_cast_operations) && !has_reducer;
     IterVar active_thread_var = GetActiveThreadVar();
-    if (is_simt_vf) {
-      PopSimtVFThreadContext();
-    }
     // Lower the parallel loop using the common function
     return LowerParallelLoop(for_node, loop_layout, active_thread_var->var,
-                             analyzer_,
-                             layout_map_, predicate, parallel_loop,
+                             analyzer_, layout_map_, predicate, parallel_loop,
                              should_vectorize);
   }
 

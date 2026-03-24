@@ -12,8 +12,8 @@ def _is_fragment_layout(layout) -> bool:
     return cls.__name__ == "Fragment" and cls.__module__.startswith("tilelang.layout")
 
 
-def _is_simtvf_loop(op: For) -> bool:
-    return "tl.simt_vf_threads" in op.annotations
+def _is_simtvf_block(op: tir.Block) -> bool:
+    return op.name_hint == "SIMT_VF"
 
 
 @tir.functor.visitor
@@ -68,14 +68,13 @@ class _SimtVFFragmentNarrowVisitor(PyStmtExprVisitor):
         return fragment_buffers
 
     def visit_for_(self, op: For) -> None:
-        is_simtvf = _is_simtvf_loop(op)
-        if is_simtvf:
-            self._simtvf_depth += 1
         self.visit_stmt(op.body)
-        if is_simtvf:
-            self._simtvf_depth -= 1
 
     def visit_block_(self, op: tir.Block) -> None:
+        is_simtvf = _is_simtvf_block(op)
+        if is_simtvf:
+            self._simtvf_depth += 1
+
         fragment_layout_buffers = self._extract_fragment_layout_buffers(op)
         for buf in fragment_layout_buffers:
             self._mark_fragment_buffer(buf.data)
@@ -88,6 +87,9 @@ class _SimtVFFragmentNarrowVisitor(PyStmtExprVisitor):
 
         for buf in reversed(fragment_layout_buffers):
             self._unmark_fragment_buffer(buf.data)
+
+        if is_simtvf:
+            self._simtvf_depth -= 1
 
     def visit_buffer_load_(self, op: BufferLoad) -> None:
         self._check_fragment_in_simtvf(op.buffer, action="accessed")

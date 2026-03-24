@@ -27,8 +27,8 @@
 
 #include "arith/ir_mutator_with_analyzer.h"
 #include "arith/ir_visitor_with_analyzer.h"
-#include "common/loop_fusion_utils.h"
 #include "common/attr.h"
+#include "common/loop_fusion_utils.h"
 #include "common/union_find.h"
 #include "layout_reducer.h"
 #include "parallel_loop_layout_validator.h"
@@ -478,7 +478,8 @@ private:
   }
 
   Range InferThreadBoundsFromIterVar(const IterVar &iter_var) const {
-    if (iter_var.defined() && analyzer_.const_int_bound.IsBound(iter_var->var)) {
+    if (iter_var.defined() &&
+        analyzer_.const_int_bound.IsBound(iter_var->var)) {
       auto const_int_bound = analyzer_.const_int_bound(iter_var->var);
       auto dtype = iter_var->var.dtype();
       auto extent = const_int_bound->max_value - const_int_bound->min_value + 1;
@@ -495,19 +496,20 @@ private:
     return InferThreadBoundsFromIterVar(thread_var_);
   }
 
-  void PushSimtVFThreadContext(const ForNode *op) {
-    IterVar active_thread_var = thread_var_;
-    ICHECK(op->annotations.count(tilelang_simt_vf_threads))
-        << "SimtVF loop must carry " << tilelang_simt_vf_threads
-        << " annotation";
-    PrimExpr threads = Downcast<PrimExpr>(
-        op->annotations.Get(tilelang_simt_vf_threads).value());
+  void PushSimtVFThreadContext(const BlockNode *op) {
+    const auto *attr = op->body.as<AttrStmtNode>();
+    ICHECK(attr && attr->attr_key == tir::attr::thread_extent)
+        << "SIMT_VF block body must start with thread_extent AttrStmt";
+    const auto *iv = attr->node.as<IterVarNode>();
+    ICHECK(iv && iv->thread_tag == "threadIdx.x")
+        << "SIMT_VF block body must bind threadIdx.x first";
+    PrimExpr threads = attr->value;
     DataType dtype = threads.dtype();
-    active_thread_var = IterVar(
-        Range::FromMinExtent(make_zero(dtype), threads), Var("simtvf_tx", dtype),
-        IterVarType::kThreadIndex, "threadIdx.x");
-    Range thread_bounds = active_thread_var->dom;
-    simt_vf_thread_ctx_stack_.push_back({active_thread_var, thread_bounds});
+    IterVar active_thread_var = IterVar(
+        Range::FromMinExtent(make_zero(dtype), threads),
+        Var("simtvf_tx", dtype), IterVarType::kThreadIndex, "threadIdx.x");
+    simt_vf_thread_ctx_stack_.push_back(
+        {active_thread_var, active_thread_var->dom});
   }
 
   void PopSimtVFThreadContext() {
@@ -678,22 +680,6 @@ private:
   }
 
   void VisitStmt_(const ForNode *op) final {
-    if (op->annotations.count(tilelang_simt_vf_threads)) {
-      PushSimtVFThreadContext(op);
-      // SimtVF is a control-style TileOperator wrapper. Visit body first so
-      // nested TileOps (e.g. Parallel) are still collected normally.
-      IRVisitorWithAnalyzer::VisitStmt(op->body);
-      auto infer = SimtVFOp(tvm::ffi::GetRef<For>(op));
-      infer_list_stmt_.push_back(tvm::ffi::GetRef<ObjectRef>(op));
-      infer_list_.push_back(std::move(infer));
-      thread_var_vec_.push_back(GetActiveThreadVar());
-      thread_bounds_vec_.push_back(GetActiveThreadBounds());
-      analyzer_vec_.push_back(analyzer_.Clone());
-      buffer_oob_vec_.push_back(false);
-      PopSimtVFThreadContext();
-      return;
-    }
-
     if (op->kind == ForKind::kParallel) {
       auto infer = ParallelOp(tvm::ffi::GetRef<For>(op));
       for (const auto &[buffer, _] : infer->GetIndiceMap()) {
@@ -776,6 +762,22 @@ private:
   }
 
   void VisitStmt_(const BlockNode *op) final {
+    if (op->name_hint == "SIMT_VF") {
+      PushSimtVFThreadContext(op);
+      // SimtVF is a control-style TileOperator wrapper. Visit body first so
+      // nested TileOps (e.g. Parallel) are still collected normally.
+      IRVisitorWithAnalyzer::VisitStmt(op->body);
+      auto infer = SimtVFOp(tvm::ffi::GetRef<Block>(op));
+      infer_list_stmt_.push_back(tvm::ffi::GetRef<ObjectRef>(op));
+      infer_list_.push_back(std::move(infer));
+      thread_var_vec_.push_back(GetActiveThreadVar());
+      thread_bounds_vec_.push_back(GetActiveThreadBounds());
+      analyzer_vec_.push_back(analyzer_.Clone());
+      buffer_oob_vec_.push_back(false);
+      PopSimtVFThreadContext();
+      return;
+    }
+
     for (auto buffer : op->alloc_buffers) {
       if (buffer_data_to_buffers_.count(buffer->data)) {
         auto buffers = buffer_data_to_buffers_[buffer->data];

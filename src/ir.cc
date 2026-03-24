@@ -14,6 +14,7 @@
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/script/ir_builder/tir/ir.h>
 #include <tvm/tir/analysis.h>
+#include <tvm/tir/stmt.h>
 
 #include <utility>
 
@@ -108,19 +109,17 @@ ForFrame SimtVFFor(int threads) {
   DataType dtype = DataType::Int(32);
   n->vars.push_back(Var("simt_vf", dtype));
   n->doms.push_back(Range(make_const(dtype, 0), make_const(dtype, 1)));
-  n->f_make_for_loop = [threads](const Array<Var> &vars, const Array<Range> &doms,
-                                 const Array<Optional<PrimExpr>> &steps,
-                                 Stmt body) -> Stmt {
-    ICHECK_EQ(vars.size(), 1);
-    ICHECK_EQ(doms.size(), 1);
-    Map<String, tvm::ffi::Any> loop_annotations;
-    loop_annotations.Set(tilelang_simt_vf_threads, Integer(threads));
-
+  n->f_make_for_loop =
+      [threads](const Array<Var> &vars, const Array<Range> &doms,
+                const Array<Optional<PrimExpr>> &steps, Stmt body) -> Stmt {
+    (void)vars;
+    (void)doms;
+    (void)steps;
     auto make_thread_extent = [&](const String &name, const String &thread_tag,
                                   const PrimExpr &extent, Stmt inner) {
       DataType dtype = extent.dtype();
-      IterVar iv(Range::FromMinExtent(make_zero(dtype), extent), Var(name, dtype),
-                 IterVarType::kThreadIndex, thread_tag);
+      IterVar iv(Range::FromMinExtent(make_zero(dtype), extent),
+                 Var(name, dtype), IterVarType::kThreadIndex, thread_tag);
       return AttrStmt(iv, tir::attr::thread_extent, extent, inner);
     };
 
@@ -132,12 +131,8 @@ ForFrame SimtVFFor(int threads) {
     body = make_thread_extent("simtvf_tx", "threadIdx.x",
                               make_const(dtype, threads), std::move(body));
 
-    Optional<PrimExpr> step =
-        !steps.empty() ? steps[0] : Optional<PrimExpr>(std::nullopt);
-    return For(vars[0], doms[0]->min, doms[0]->extent, ForKind::kSerial, body,
-               /*thread_binding=*/std::nullopt,
-               /*annotations=*/loop_annotations,
-               /*step=*/step);
+    return tvm::tir::Block({}, {}, {}, "SIMT_VF", body, std::nullopt, {}, {},
+                           {});
   };
   return ForFrame(n);
 }

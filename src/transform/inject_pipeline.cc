@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <utility>
 
+#include "common/attr.h"
 #include "support/utils.h"
 #include "tir/schedule/utils.h"
 #include "tir/transforms/ir_utils.h"
@@ -1324,6 +1325,11 @@ private:
   }
 
   Stmt VisitStmt_(const BlockNode *op) final {
+    if (op->name_hint == "SIMT_VF") {
+      // TODO: analyze BufferRegion with threadIdx
+      return StmtExprMutator::VisitStmt_(op);
+    }
+
     for (const auto &buffer : op->alloc_buffers) {
       buffer_data_to_buffer_.Set(buffer->data, buffer);
       allocated_buffers_.insert(buffer);

@@ -18,14 +18,14 @@ using namespace tir;
 
 class SimtVFOpNode : public TileOperatorNode {
 public:
-  For root_;
+  Block root_;
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.SimtVFOp", SimtVFOpNode,
                                     TileOperatorNode);
 
   static void RegisterReflection();
 
-  explicit SimtVFOpNode(For root) : root_(std::move(root)) {}
+  explicit SimtVFOpNode(Block root) : root_(std::move(root)) {}
 
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
 
@@ -44,7 +44,7 @@ public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(SimtVFOp, TileOperator,
                                              SimtVFOpNode);
 
-  explicit SimtVFOp(const For &root) {
+  explicit SimtVFOp(const Block &root) {
     auto op = tvm::ffi::make_object<SimtVFOpNode>(root);
     data_ = std::move(op);
   }

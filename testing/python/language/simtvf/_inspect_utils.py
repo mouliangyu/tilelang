@@ -3,30 +3,25 @@ from __future__ import annotations
 from tilelang import tvm
 
 
-def collect_simtvf_loops(func: tvm.tir.PrimFunc) -> list[tvm.tir.For]:
-    loops: list[tvm.tir.For] = []
+def collect_simtvf_blocks(func: tvm.tir.PrimFunc) -> list[tvm.tir.Block]:
+    blocks: list[tvm.tir.Block] = []
 
     def _visit(stmt):
-        if isinstance(stmt, tvm.tir.For):
-            annotations = stmt.annotations
-            if annotations is not None and "tl.simt_vf_threads" in annotations:
-                loops.append(stmt)
+        if isinstance(stmt, tvm.tir.Block) and stmt.name_hint == "SIMT_VF":
+            blocks.append(stmt)
 
     tvm.tir.stmt_functor.post_order_visit(func.body, _visit)
-    return loops
+    return blocks
 
 
 def print_stage(title: str, mod: tvm.IRModule, func_name: str) -> None:
     print(f"\n===== {title} =====")
     print(mod.script())
     func = mod[func_name]
-    loops = collect_simtvf_loops(func)
-    print(f"[check] simtvf(loop has tl.simt_vf_threads) count = {len(loops)}")
-    for idx, loop in enumerate(loops):
-        print(
-            f"  loop[{idx}] annotations: "
-            f"tl.simt_vf_threads={loop.annotations['tl.simt_vf_threads']}"
-        )
+    blocks = collect_simtvf_blocks(func)
+    print(f"[check] simtvf(block has SIMT_VF name_hint) count = {len(blocks)}")
+    for idx, block in enumerate(blocks):
+        print(f"  block[{idx}] name_hint: {block.name_hint}")
 
 
 def collect_thread_extent_tags(stmt: tvm.tir.Stmt) -> list[str]:
@@ -46,19 +41,15 @@ def collect_thread_extent_tags_outside_simtvf(stmt: tvm.tir.Stmt) -> list[str]:
     tags: list[str] = []
 
     def _walk(node: tvm.tir.Stmt, simtvf_depth: int) -> None:
-        if isinstance(node, tvm.tir.For):
-            is_simtvf = (
-                node.annotations is not None
-                and "tl.simt_vf_threads" in node.annotations
-            )
+        if isinstance(node, tvm.tir.Block):
+            is_simtvf = node.name_hint == "SIMT_VF"
             _walk(node.body, simtvf_depth + (1 if is_simtvf else 0))
             return
+        if isinstance(node, tvm.tir.For):
+            _walk(node.body, simtvf_depth)
+            return
         if isinstance(node, tvm.tir.AttrStmt):
-            if (
-                simtvf_depth == 0
-                and node.attr_key == "thread_extent"
-                and isinstance(node.node, tvm.tir.IterVar)
-            ):
+            if simtvf_depth == 0 and node.attr_key == "thread_extent" and isinstance(node.node, tvm.tir.IterVar):
                 tags.append(node.node.thread_tag)
             _walk(node.body, simtvf_depth)
             return
@@ -112,12 +103,12 @@ def find_thread_predicate_hoist_violations(func: tvm.tir.PrimFunc) -> list[tvm.t
         return found
 
     def _walk_stmt(stmt: tvm.tir.Stmt, simtvf_depth: int) -> None:
-        if isinstance(stmt, tvm.tir.For):
-            is_simtvf = (
-                stmt.annotations is not None
-                and "tl.simt_vf_threads" in stmt.annotations
-            )
+        if isinstance(stmt, tvm.tir.Block):
+            is_simtvf = stmt.name_hint == "SIMT_VF"
             _walk_stmt(stmt.body, simtvf_depth + (1 if is_simtvf else 0))
+            return
+        if isinstance(stmt, tvm.tir.For):
+            _walk_stmt(stmt.body, simtvf_depth)
             return
         if isinstance(stmt, tvm.tir.IfThenElse):
             if simtvf_depth == 0 and _is_thread_predicate(stmt.condition):

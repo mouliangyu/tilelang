@@ -9,14 +9,15 @@ namespace codegen {
 class CodeGenTileLangAscend final : public CodeGenC {
 public:
   void Init(bool output_ssa);
-  void AddFunction(const PrimFunc& f);
+  void AddFunction(const PrimFunc &f);
   void PrintFuncPrefix(std::ostream &os) final;
   void PrintType(DataType t, std::ostream &os) final;
+  void VisitStmt_(const tir::BlockNode *op) final;
   void VisitStmt_(const ForNode *op) final;
   void VisitStmt_(const AttrStmtNode *op) final;
   void VisitStmt_(const AllocateNode *op) final;
   void PrintStorageSync(const CallNode *op) final;
-  void PrintStorageScope(const std::string& scope, std::ostream& os) final;
+  void PrintStorageScope(const std::string &scope, std::ostream &os) final;
   bool IsScopePartOfType() const final;
 
 private:

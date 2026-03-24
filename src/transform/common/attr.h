@@ -11,7 +11,6 @@ constexpr const char *MainBlockName = "tilelang_root";
 constexpr const char *tilelang_is_cpu_kernel_frame =
     "tilelang.is_cpu_kernel_frame";
 
-constexpr const char *tilelang_simt_vf_threads = "tl.simt_vf_threads";
 constexpr const char *tilelang_simt_vf_captures = "tl.simt_vf_captures";
 
 namespace attr {

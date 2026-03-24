@@ -21,9 +21,7 @@ void SimtVFOpNode::RegisterReflection() {
   refl::ObjectDef<SimtVFOpNode>().def_ro("root", &SimtVFOpNode::root_);
 }
 
-TileOperator SimtVFOpNode::Clone() const {
-  return SimtVFOp(root_);
-}
+TileOperator SimtVFOpNode::Clone() const { return SimtVFOp(root_); }
 
 bool SimtVFOpNode::IsSupportedCaptureVar(const Var &var) {
   const DataType dtype = var->dtype;
@@ -36,7 +34,6 @@ bool SimtVFOpNode::IsSupportedCaptureVar(const Var &var) {
 
 Array<Var> SimtVFOpNode::CollectCaptures(const LowerArgs &T) const {
   Array<Var> predefined;
-  predefined.push_back(root_->loop_var);
   if (T.thread_var.defined()) {
     predefined.push_back(T.thread_var);
   }
@@ -51,8 +48,8 @@ Array<Var> SimtVFOpNode::CollectCaptures(const LowerArgs &T) const {
     }
     seen.insert(var.get());
     ICHECK(IsSupportedCaptureVar(var))
-        << "SimtVF capture variable `" << var
-        << "` has unsupported dtype `" << var->dtype
+        << "SimtVF capture variable `" << var << "` has unsupported dtype `"
+        << var->dtype
         << "`. Only scalar int/uint/float/bool/handle are currently supported.";
     captures.push_back(var);
   }
@@ -61,14 +58,11 @@ Array<Var> SimtVFOpNode::CollectCaptures(const LowerArgs &T) const {
 
 Stmt SimtVFOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   (void)analyzer;
-  For lowered = root_;
+  Block lowered = root_;
   auto captures = CollectCaptures(T);
 
   auto ptr = lowered.CopyOnWrite();
   ptr->annotations.Set(tilelang_simt_vf_captures, captures);
-  if (!ptr->annotations.count(tilelang_simt_vf_threads)) {
-    ptr->annotations.Set(tilelang_simt_vf_threads, T.thread_bounds->extent);
-  }
   return lowered;
 }
 
@@ -79,9 +73,7 @@ LayoutMap SimtVFOpNode::InferLayout(const LayoutInferArgs &T,
   return {};
 }
 
-TVM_FFI_STATIC_INIT_BLOCK() {
-  SimtVFOpNode::RegisterReflection();
-}
+TVM_FFI_STATIC_INIT_BLOCK() { SimtVFOpNode::RegisterReflection(); }
 
 } // namespace tl
 } // namespace tvm

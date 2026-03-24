@@ -24,7 +24,7 @@ def has_simtvf_region(mod: IRModule) -> bool:
             nonlocal found
             if found:
                 return
-            if isinstance(node, tir.For) and "tl.simt_vf_threads" in node.annotations:
+            if isinstance(node, tir.Block) and node.name_hint == "SIMT_VF":
                 found = True
 
         tir.stmt_functor.post_order_visit(func.body, _visit)

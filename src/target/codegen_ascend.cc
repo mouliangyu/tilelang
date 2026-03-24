@@ -2,8 +2,8 @@
 
 #include <string>
 
-#include "../transform/common/attr.h"
 #include "../../3rdparty/tvm/src/tir/transforms/ir_utils.h"
+#include "../transform/common/attr.h"
 #include <tvm/tir/stmt_functor.h>
 
 namespace tvm {
@@ -43,7 +43,7 @@ void CodeGenTileLangAscend::PrintType(DataType t, std::ostream &os) {
       if (lanes == 1) {
         os << "half_t";
       } else {
-        fail = true;  // half vector not yet supported
+        fail = true; // half vector not yet supported
       }
       break;
     case 32:
@@ -61,7 +61,7 @@ void CodeGenTileLangAscend::PrintType(DataType t, std::ostream &os) {
       if (lanes == 1) {
         os << "double";
       } else {
-        fail = true;  // double vector not supported
+        fail = true; // double vector not supported
       }
       break;
     default:
@@ -73,14 +73,14 @@ void CodeGenTileLangAscend::PrintType(DataType t, std::ostream &os) {
       if (lanes == 1) {
         os << (t.is_int() ? "int8_t" : "uint8_t");
       } else {
-        fail = true;  // 8-bit vector not yet supported
+        fail = true; // 8-bit vector not yet supported
       }
       break;
     case 16:
       if (lanes == 1) {
         os << (t.is_int() ? "int16_t" : "uint16_t");
       } else {
-        fail = true;  // 16-bit vector not yet supported
+        fail = true; // 16-bit vector not yet supported
       }
       break;
     case 32:
@@ -98,7 +98,7 @@ void CodeGenTileLangAscend::PrintType(DataType t, std::ostream &os) {
       if (lanes == 1) {
         os << (t.is_int() ? "int64_t" : "uint64_t");
       } else {
-        fail = true;  // 64-bit vector not supported
+        fail = true; // 64-bit vector not supported
       }
       break;
     default:
@@ -109,7 +109,8 @@ void CodeGenTileLangAscend::PrintType(DataType t, std::ostream &os) {
   }
 
   if (fail) {
-    LOG(FATAL) << "Cannot convert type " << t << " (lanes=" << lanes << ") to Ascend type";
+    LOG(FATAL) << "Cannot convert type " << t << " (lanes=" << lanes
+               << ") to Ascend type";
   }
 }
 
@@ -126,8 +127,8 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   }
 
   auto global_symbol = f->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol);
-  ICHECK(global_symbol)
-      << "CodeGenTileLangAscend: Expect PrimFunc to have the global_symbol attribute";
+  ICHECK(global_symbol) << "CodeGenTileLangAscend: Expect PrimFunc to have the "
+                           "global_symbol attribute";
   bool no_alias = f->HasNonzeroAttr(tir::attr::kNoAlias);
 
   this->PrintFuncPrefix(stream);
@@ -181,37 +182,44 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   this->stream << "}\n\n";
 }
 
-void CodeGenTileLangAscend::VisitStmt_(const ForNode *op) {
-  auto opt_threads = op->annotations.Get(tvm::tl::tilelang_simt_vf_threads);
-  if (!opt_threads) {
-    CodeGenC::VisitStmt_(op);
+void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
+  if (op->name_hint != "SIMT_VF") {
+    PrintStmt(op->body);
     return;
   }
 
   int64_t threads = -1;
-  PrimExpr threads_expr = Downcast<PrimExpr>(opt_threads.value());
-  if (const auto *imm = threads_expr.as<IntImmNode>()) {
-    threads = imm->value;
+  const auto *attr = op->body.as<AttrStmtNode>();
+  if (attr && attr->attr_key == tir::attr::thread_extent) {
+    const auto *iv = attr->node.as<IterVarNode>();
+    if (iv && iv->thread_tag == "threadIdx.x") {
+      if (const auto *imm = attr->value.as<IntImmNode>()) {
+        threads = imm->value;
+      }
+    }
   }
 
   // Check that no shared buffer allocations exist inside SimtVF region
-  tir::PostOrderVisit(op->body, [](const ObjectRef& n) {
-    if (const auto* alloc = n.as<AllocateNode>()) {
+  tir::PostOrderVisit(op->body, [](const ObjectRef &n) {
+    if (const auto *alloc = n.as<AllocateNode>()) {
       auto alloc_scope = GetPtrStorageScope(alloc->buffer_var);
       ICHECK(alloc_scope != "shared" && alloc_scope != "shared.dyn")
-          << "Shared buffer allocation (T.alloc_shared) must be placed OUTSIDE SimtVF region. "
-          << "Found buffer '" << alloc->buffer_var->name_hint << "' with scope '" << alloc_scope
-          << "' inside SimtVF body.";
+          << "Shared buffer allocation (T.alloc_shared) must be placed OUTSIDE "
+             "SimtVF region. "
+          << "Found buffer '" << alloc->buffer_var->name_hint
+          << "' with scope '" << alloc_scope << "' inside SimtVF body.";
     }
   });
 
   ffi::Array<Var> captures;
-  if (auto opt_captures = op->annotations.Get(tvm::tl::tilelang_simt_vf_captures)) {
+  if (auto opt_captures =
+          op->annotations.Get(tvm::tl::tilelang_simt_vf_captures)) {
     if (auto arr = opt_captures.value().as<ffi::Array<Var>>()) {
       captures = arr.value();
     }
   }
-  std::string helper_name = "simt_vf_" + std::to_string(simtvf_helper_counter_++);
+  std::string helper_name =
+      "simt_vf_" + std::to_string(simtvf_helper_counter_++);
   auto resolve_var_name = [this](const Var &v) -> std::string {
     auto it = var_idmap_.find(v.get());
     if (it != var_idmap_.end()) {
@@ -221,7 +229,8 @@ void CodeGenTileLangAscend::VisitStmt_(const ForNode *op) {
   };
 
   // Capture helper body by rendering the region body to a temporary stream.
-  // Register captures with their storage scope so GetBufferRef adds correct qualifier
+  // Register captures with their storage scope so GetBufferRef adds correct
+  // qualifier
   for (const auto &v : captures) {
     auto scope = GetPtrStorageScope(v);
     alloc_storage_scope_[v.get()] = scope;
@@ -295,6 +304,10 @@ void CodeGenTileLangAscend::VisitStmt_(const ForNode *op) {
   stream << "// __simt_vf__ end\n";
 }
 
+void CodeGenTileLangAscend::VisitStmt_(const ForNode *op) {
+  CodeGenC::VisitStmt_(op);
+}
+
 void CodeGenTileLangAscend::VisitStmt_(const AttrStmtNode *op) {
   // Ascend text-only backend currently does not lower thread binding attrs into
   // executable launch semantics. Keep generating the enclosed body instead of
@@ -344,8 +357,10 @@ void CodeGenTileLangAscend::VisitStmt_(const AllocateNode *op) {
   std::string scope = GetPtrStorageScope(op->buffer_var);
 
   if (scope == "shared") {
-    LOG(FATAL) << "Static shared memory (scope='shared') is not supported on Ascend. "
-               << "Use dynamic shared memory (scope='shared.dyn') with T.alloc_shared.";
+    LOG(FATAL)
+        << "Static shared memory (scope='shared') is not supported on Ascend. "
+        << "Use dynamic shared memory (scope='shared.dyn') with "
+           "T.alloc_shared.";
   }
 
   if (scope == "shared.dyn") {
@@ -373,7 +388,8 @@ void CodeGenTileLangAscend::PrintStorageSync(const CallNode *op) {
   stream << "pipe_barrier(pipe_t::PIPE_ALL);\n";
 }
 
-void CodeGenTileLangAscend::PrintStorageScope(const std::string& scope, std::ostream& os) {
+void CodeGenTileLangAscend::PrintStorageScope(const std::string &scope,
+                                              std::ostream &os) {
   if (scope == "global") {
     os << "__gm__ ";
   } else if (scope == "shared" || scope == "shared.dyn") {

@@ -4,7 +4,7 @@ from tilelang.engine.phase import LowerAndLegalize, OptimizeForTarget, PreLowerS
 from tilelang.utils.target import determine_target
 
 from testing.python.language.simtvf._inspect_utils import (
-    collect_simtvf_loops,
+    collect_simtvf_blocks,
     collect_thread_extent_tags,
     collect_thread_extent_tags_outside_simtvf,
     print_stage,
@@ -32,41 +32,34 @@ def main():
     mod = tvm.IRModule({"simtvf_two_threads_demo": simtvf_two_threads_demo})
 
     print_stage("Raw PrimFunc", mod, "simtvf_two_threads_demo")
-    raw_loops = collect_simtvf_loops(mod["simtvf_two_threads_demo"])
-    assert len(raw_loops) == 2, "raw stage should contain exactly two SimtVF loops"
+    raw_blocks = collect_simtvf_blocks(mod["simtvf_two_threads_demo"])
+    assert len(raw_blocks) == 2, "raw stage should contain exactly two SimtVF blocks"
     raw_tags = collect_thread_extent_tags_outside_simtvf(mod["simtvf_two_threads_demo"].body)
     assert "blockIdx.x" in raw_tags, "Raw stage should keep blockIdx launch binding"
-    assert not any(tag.startswith("threadIdx.") for tag in raw_tags), (
-        "Raw stage should not have outer threadIdx launch bindings on ascend"
-    )
+    assert not any(tag.startswith("threadIdx.") for tag in raw_tags), "Raw stage should not have outer threadIdx launch bindings on ascend"
 
     with target:
         PreLowerSemanticCheck(mod)
         lowered = LowerAndLegalize(mod, target)
         print_stage("After LowerAndLegalize", lowered, "simtvf_two_threads_demo")
-        lowered_loops = collect_simtvf_loops(lowered["simtvf_two_threads_demo"])
-        assert len(lowered_loops) == 2, "LowerAndLegalize should keep two SimtVF loops"
+        lowered_blocks = collect_simtvf_blocks(lowered["simtvf_two_threads_demo"])
+        assert len(lowered_blocks) == 2, "LowerAndLegalize should keep two SimtVF blocks"
 
         optimized = OptimizeForTarget(lowered, target)
         print_stage("After OptimizeForTarget", optimized, "simtvf_two_threads_demo")
-        optimized_loops = collect_simtvf_loops(optimized["simtvf_two_threads_demo"])
-        assert len(optimized_loops) == 2, "OptimizeForTarget should keep two SimtVF loops"
+        optimized_blocks = collect_simtvf_blocks(optimized["simtvf_two_threads_demo"])
+        assert len(optimized_blocks) == 2, "OptimizeForTarget should keep two SimtVF blocks"
 
-        threads = [int(loop.annotations["tl.simt_vf_threads"]) for loop in optimized_loops]
-        assert sorted(threads) == [128, 256], (
-            f"expected SimtVF thread annotations [128, 256], got {threads}"
-        )
+        assert all(block.name_hint == "SIMT_VF" for block in optimized_blocks), "OptimizeForTarget should preserve SIMT_VF name_hint"
         opt_func = optimized["simtvf_two_threads_demo"]
         opt_tags = collect_thread_extent_tags_outside_simtvf(opt_func.body)
         assert "blockIdx.x" in opt_tags, "OptimizeForTarget should keep blockIdx launch binding"
-        assert (
-            opt_func.attrs is None or "thread_extent" not in opt_func.attrs
-        ), "OptimizeForTarget should not leave func_attr thread_extent on ascend"
-        for loop in optimized_loops:
-            loop_tags = collect_thread_extent_tags(loop.body)
-            assert "threadIdx.x" in loop_tags, (
-                "Each SimtVF region should contain local threadIdx.x thread_extent"
-            )
+        assert opt_func.attrs is None or "thread_extent" not in opt_func.attrs, (
+            "OptimizeForTarget should not leave func_attr thread_extent on ascend"
+        )
+        for block in optimized_blocks:
+            block_tags = collect_thread_extent_tags(block.body)
+            assert "threadIdx.x" in block_tags, "Each SimtVF region should contain local threadIdx.x thread_extent"
 
     print("\n[ok] Dual-SimtVF (128/256) IR inspection finished.")
 

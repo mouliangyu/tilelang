@@ -495,10 +495,8 @@ private:
     return StmtExprMutator::VisitStmt_(op);
   }
 
-  Stmt VisitStmt_(const ForNode *op) final {
-    // Check if this is a SimtVF node
-    auto opt_threads = op->annotations.Get(tilelang_simt_vf_threads);
-    if (!opt_threads) {
+  Stmt VisitStmt_(const BlockNode *op) final {
+    if (op->name_hint != "SIMT_VF") {
       return StmtExprMutator::VisitStmt_(op);
     }
 
@@ -532,14 +530,14 @@ private:
       buf_dyn_shmem_added = true;
     }
 
-    // Visit the body and update the ForNode
-    For new_for = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+    // Visit the body and update the BlockNode
+    Block new_block = Downcast<Block>(StmtExprMutator::VisitStmt_(op));
     if (!shared_vars_removed.empty()) {
-      auto *ptr = new_for.CopyOnWrite();
+      auto *ptr = new_block.CopyOnWrite();
       ptr->annotations.Set(tilelang_simt_vf_captures, new_captures);
     }
 
-    return std::move(new_for);
+    return std::move(new_block);
   }
 
   Stmt VisitStmt_(const DeclBufferNode *op) final {
