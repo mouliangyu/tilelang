@@ -51,7 +51,6 @@ def ref_program(a, b, c):
 
 if __name__ == "__main__":
     import torch
-    import torch_npu
 
     N = 256
     dtype = torch.float32

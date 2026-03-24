@@ -37,9 +37,7 @@ def find_bisheng_path() -> str:
         return path
 
     raise RuntimeError(
-        "Cannot find the bisheng compiler. "
-        "Please install it and make sure it is in PATH, "
-        "or set the BISHENG_HOME environment variable."
+        "Cannot find the bisheng compiler.Please install it and make sure it is in PATH, or set the BISHENG_HOME environment variable."
     )
 
 
@@ -131,6 +129,3 @@ def compile_ascend(
         if not data:
             raise RuntimeError("Compilation error: empty result is generated")
         return data
-
-
-

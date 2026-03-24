@@ -267,7 +267,7 @@ public:
           grid_extent.Set(kv.first, kv.second);
         }
       }
-      if (grid_extent.size() > 0) {
+      if (!grid_extent.empty()) {
         func = WithAttr(std::move(func), "thread_extent", grid_extent);
       }
     } else {

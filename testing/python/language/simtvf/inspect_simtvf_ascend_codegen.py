@@ -1,5 +1,4 @@
 import tilelang.language as T
-from tilelang import tvm
 from tilelang.engine.lower import lower
 
 
@@ -9,11 +8,10 @@ def main():
         A: T.Buffer((16,), "float32"),
         B: T.Buffer((16,), "float32"),
     ):
-        with T.Kernel(1) as _:
-            with T.SimtVF(threads=128):
-                for i in T.Parallel(16):
-                    B[i] = A[i] + T.float32(1)
-                    T.tvm_storage_sync("shared")
+        with T.Kernel(1) as _, T.SimtVF(threads=128):
+            for i in T.Parallel(16):
+                B[i] = A[i] + T.float32(1)
+                T.tvm_storage_sync("shared")
 
     artifact = lower(simtvf_codegen_demo, target="ascend")
     source = artifact.kernel_source
@@ -24,9 +22,7 @@ def main():
         "Ascend source should use '__global__ __vector__ <ret> <name>' signature order"
     )
     assert "asc_vf_call" in source, "Ascend source should emit asc_vf_call marker"
-    assert "pipe_barrier(pipe_t::PIPE_ALL);" in source, (
-        "Ascend source should map tvm_storage_sync to pipe_barrier(pipe_t::PIPE_ALL)"
-    )
+    assert "pipe_barrier(pipe_t::PIPE_ALL);" in source, "Ascend source should map tvm_storage_sync to pipe_barrier(pipe_t::PIPE_ALL)"
 
     @T.prim_func
     def simtvf_codegen_two_vf(
@@ -49,12 +45,8 @@ def main():
     assert "__global__ __vector__ int32_t simtvf_codegen_two_vf_kernel" in source_two, (
         "Two-VF kernel should keep '__global__ __vector__ <ret> <name>' signature order"
     )
-    assert source_two.count("__simt_vf__ __launch_bounds__(") >= 2, (
-        "Two-VF source should emit two SimtVF helper functions"
-    )
-    assert source_two.count("asc_vf_call<simt_vf_") >= 2, (
-        "Two-VF source should emit two asc_vf_call invocations"
-    )
+    assert source_two.count("__simt_vf__ __launch_bounds__(") >= 2, "Two-VF source should emit two SimtVF helper functions"
+    assert source_two.count("asc_vf_call<simt_vf_") >= 2, "Two-VF source should emit two asc_vf_call invocations"
     assert "__launch_bounds__(64)" in source_two and "__launch_bounds__(128)" in source_two, (
         "Two-VF source should preserve per-region thread bounds"
     )

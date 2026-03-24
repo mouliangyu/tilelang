@@ -6,7 +6,8 @@
 #include "kernel_operator.h"
 #include "simt_api/asc_simt.h"
 
-// Use standard unsigned types instead of macros to avoid conflicts with system headers
+// Use standard unsigned types instead of macros to avoid conflicts with system
+// headers
 typedef unsigned int uint;
 typedef unsigned char uchar;
 typedef unsigned short ushort;

@@ -7,15 +7,14 @@ def main():
 
     with target:
         try:
+
             @T.prim_func
             def _bad_kernel(a: T.Buffer((1,), "float32")):
                 with T.Kernel(1, threads=128):
                     a[0] = T.float32(1)
         except ValueError as err:
             msg = str(err)
-            assert "threads" in msg and "ascend" in msg.lower(), (
-                f"unexpected ValueError message: {msg}"
-            )
+            assert "threads" in msg and "ascend" in msg.lower(), f"unexpected ValueError message: {msg}"
         else:
             raise AssertionError("Ascend should reject explicit threads= in T.Kernel")
 

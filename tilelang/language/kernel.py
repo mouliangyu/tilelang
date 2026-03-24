@@ -292,16 +292,12 @@ def Kernel(
 
     attrs: dict = {}
     current_target = Target.current(allow_none=True)
-    is_ascend_target = bool(
-        current_target is not None
-        and (current_target.kind.name == "ascend" or "ascend" in current_target.keys)
-    )
+    is_ascend_target = bool(current_target is not None and (current_target.kind.name == "ascend" or "ascend" in current_target.keys))
 
     if is_ascend_target and not is_cpu:
         if threads is not None:
             raise ValueError(
-                "Ascend backend does not support `threads=` in `T.Kernel(...)`. "
-                "Use `T.SimtVF(threads=...)` to define thread domains."
+                "Ascend backend does not support `threads=` in `T.Kernel(...)`. Use `T.SimtVF(threads=...)` to define thread domains."
             )
     elif not is_cpu and threads is None:
         # Keep backward compatibility when target is not Ascend (or unknown).

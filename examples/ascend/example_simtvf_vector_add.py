@@ -2,7 +2,6 @@
 
 import tilelang
 import tilelang.language as T
-import tilelang.engine as engine
 
 
 def vector_add(N):
@@ -18,10 +17,9 @@ def vector_add(N):
         B: T.Buffer((N,), "float32"),
         C: T.Buffer((N,), "float32"),
     ):
-        with T.Kernel(1) as _:
-            with T.SimtVF(threads=128):
-                for i in T.Parallel(N):
-                    C[i] = A[i] + B[i]
+        with T.Kernel(1) as _, T.SimtVF(threads=128):
+            for i in T.Parallel(N):
+                C[i] = A[i] + B[i]
 
     return main
 
@@ -33,7 +31,6 @@ def ref_program(a, b):
 
 if __name__ == "__main__":
     import torch
-    import torch_npu
 
     N = 1024
     dtype = torch.float32
