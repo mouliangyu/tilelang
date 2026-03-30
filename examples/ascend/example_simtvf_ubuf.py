@@ -27,7 +27,7 @@ def ubuf_two_vf(N):
         C: T.Buffer((N,), "float32"),
         D: T.Buffer((N,), "float32"),
     ):
-        with T.Kernel(1) as _:
+        with T.Kernel(1, is_ascend=True) as _:
             # alloc_shared OUTSIDE SimtVF regions
             temp_ub = T.alloc_shared((N,), "float32")
 

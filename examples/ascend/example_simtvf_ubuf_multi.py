@@ -30,7 +30,7 @@ def ubuf_multi(N):
         D: T.Buffer((N,), "float32"),
         E: T.Buffer((N,), "float32"),
     ):
-        with T.Kernel(1) as _:
+        with T.Kernel(1, is_ascend=True) as _:
             # Multiple alloc_shared - triggers merge into buf_dyn_shmem
             temp1 = T.alloc_shared((N,), "float32")
             temp2 = T.alloc_shared((N,), "float32")

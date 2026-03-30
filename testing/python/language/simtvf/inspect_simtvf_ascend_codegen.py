@@ -8,7 +8,7 @@ def main():
         A: T.Buffer((16,), "float32"),
         B: T.Buffer((16,), "float32"),
     ):
-        with T.Kernel(1) as _, T.SimtVF(threads=128):
+        with T.Kernel(1, is_ascend=True) as _, T.SimtVF(threads=128):
             for i in T.Parallel(16):
                 B[i] = A[i] + T.float32(1)
                 T.tvm_storage_sync("shared")
@@ -30,7 +30,7 @@ def main():
         B: T.Buffer((16,), "float32"),
         C: T.Buffer((16,), "float32"),
     ):
-        with T.Kernel(1) as _:
+        with T.Kernel(1, is_ascend=True) as _:
             with T.SimtVF(threads=64):
                 for i in T.Parallel(16):
                     B[i] = A[i] + T.float32(1)

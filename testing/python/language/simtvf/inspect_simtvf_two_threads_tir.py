@@ -21,7 +21,7 @@ def main():
             B: T.Buffer((256,), "float32"),
             C: T.Buffer((256,), "float32"),
         ):
-            with T.Kernel(1):
+            with T.Kernel(1, is_ascend=True):
                 with T.SimtVF(threads=128):
                     for i in T.Parallel(256):
                         B[i] = A[i] + T.float32(1)

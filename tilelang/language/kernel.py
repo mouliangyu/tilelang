@@ -4,7 +4,6 @@ from __future__ import annotations
 from collections import deque
 from tvm import tir
 from tvm.tir import Var
-from tvm.target import Target
 from tvm.script.ir_builder.tir.frame import TIRFrame, BlockFrame
 from tvm.ffi import register_object
 from tilelang import _ffi_api
@@ -263,6 +262,7 @@ def Kernel(
     *blocks: int | tir.PrimExpr,
     threads: int | list[int] | tuple | None = None,
     is_cpu: bool = False,
+    is_ascend: bool = False,
     prelude: str | None = None,
 ):
     """Tools to quickly construct a GPU kernel launch frame.
@@ -323,10 +323,10 @@ def Kernel(
         raise JITNoBuilderError("T.Kernel() can only be used inside @tilelang.jit or @T.prim_func context. No Builder is available.")
 
     attrs: dict = {}
-    current_target = Target.current(allow_none=True)
-    is_ascend_target = bool(current_target is not None and (current_target.kind.name == "ascend" or "ascend" in current_target.keys))
+    if is_ascend and is_cpu:
+        raise ValueError("Uncertain backend behavior for `is_cpu=True` and `is_ascend=True`")
 
-    if is_ascend_target and not is_cpu:
+    if is_ascend:
         if threads is not None:
             raise ValueError(
                 "Ascend backend does not support `threads=` in `T.Kernel(...)`. Use `T.SimtVF(threads=...)` to define thread domains."

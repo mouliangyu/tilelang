@@ -22,10 +22,9 @@ def vector_add(N):
         B: T.Buffer((N,), "float32"),
         C: T.Buffer((N,), "float32"),
     ):
-        with T.Kernel(1) as _:
-            with T.SimtVF(threads=128):
-                for i in T.Parallel(N):
-                    C[i] = A[i] + B[i]
+        with T.Kernel(1, is_ascend=True) as _, T.SimtVF(threads=128):
+            for i in T.Parallel(N):
+                C[i] = A[i] + B[i]
 
     return main
 
@@ -52,7 +51,6 @@ if __name__ == "__main__":
     source = kernel.get_kernel_source()
 
     assert CUSTOM_MARKER in source, (
-        f"Expected marker in generated source, but it was not found.\n"
-        f"This means the postproc callback was not invoked."
+        "Expected marker in generated source, but it was not found.\nThis means the postproc callback was not invoked."
     )
     print("\n[ok] Postproc callback verification passed.")
