@@ -22,11 +22,11 @@ class _SimtVFFragmentNarrowVisitor(PyStmtExprVisitor):
 
     def __init__(self) -> None:
         super().__init__()
-        self._simtvf_depth = 0
+        self._simtvf_depth = False
         self._fragment_data_var_depth = defaultdict(int)
 
     def _in_simtvf(self) -> bool:
-        return self._simtvf_depth > 0
+        return self._simtvf_depth
 
     def _mark_fragment_buffer(self, data: Var) -> None:
         self._fragment_data_var_depth[data] += 1
@@ -73,7 +73,7 @@ class _SimtVFFragmentNarrowVisitor(PyStmtExprVisitor):
     def visit_block_(self, op: tir.Block) -> None:
         is_simtvf = _is_simtvf_block(op)
         if is_simtvf:
-            self._simtvf_depth += 1
+            self._simtvf_depth = True
 
         fragment_layout_buffers = self._extract_fragment_layout_buffers(op)
         for buf in fragment_layout_buffers:
@@ -89,7 +89,7 @@ class _SimtVFFragmentNarrowVisitor(PyStmtExprVisitor):
             self._unmark_fragment_buffer(buf.data)
 
         if is_simtvf:
-            self._simtvf_depth -= 1
+            self._simtvf_depth = False
 
     def visit_buffer_load_(self, op: BufferLoad) -> None:
         self._check_fragment_in_simtvf(op.buffer, action="accessed")

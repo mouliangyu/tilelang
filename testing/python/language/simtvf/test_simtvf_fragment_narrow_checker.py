@@ -15,7 +15,7 @@ def _run_to_optimize(func):
         return OptimizeForTarget(lowered, target)
 
 
-def test_fragment_narrow_checker_accepts_narrowed_fragment():
+def test_fragment_narrow_checker_rejects_narrowed_fragment():
     @T.prim_func
     def narrowed(
         A: T.Buffer((16,), "float32"),
@@ -28,7 +28,8 @@ def test_fragment_narrow_checker_accepts_narrowed_fragment():
                     frag[i] = A[i]
                     B[i] = frag[i] + T.float32(1)
 
-    _run_to_optimize(narrowed)
+    with pytest.raises(ValueError, match="outside any T.SimtVF region"):
+        _run_to_optimize(narrowed)
 
 
 def test_fragment_narrow_checker_rejects_fragment_leak():

@@ -184,6 +184,8 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
         IRModule: The transformed module, ready for target-specific optimization passes.
     """
     mod = tir.transform.BindTarget(target)(mod)
+    if is_ascend_target(target):
+        mod = tilelang.analysis.SimtVFFragmentNarrowChecker()(mod)
 
     if should_force_let_inline():
         # Force-let inline whenever the pass config requests it.
@@ -252,8 +254,6 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     else:
         mod = tilelang.transform.IfStmtBinding()(mod)
         mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
-        if is_ascend_target(target):
-            mod = tilelang.analysis.SimtVFFragmentNarrowChecker()(mod)
         mod = tilelang.transform.PipelinePlanning()(mod)
         mod = tilelang.transform.InjectSoftwarePipeline()(mod)
 
