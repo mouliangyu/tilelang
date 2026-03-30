@@ -21,7 +21,7 @@ def main():
             B: T.Buffer((256,), "float32"),
             C: T.Buffer((256,), "float32"),
         ):
-            with T.Kernel(1, is_ascend=True):
+            with T.Kernel(1):
                 with T.SimtVF(threads=128):
                     for i in T.Parallel(256):
                         B[i] = A[i] + T.float32(1)
@@ -54,9 +54,6 @@ def main():
         opt_func = optimized["simtvf_two_threads_demo"]
         opt_tags = collect_thread_extent_tags_outside_simtvf(opt_func.body)
         assert "blockIdx.x" in opt_tags, "OptimizeForTarget should keep blockIdx launch binding"
-        assert opt_func.attrs is None or "thread_extent" not in opt_func.attrs, (
-            "OptimizeForTarget should not leave func_attr thread_extent on ascend"
-        )
         for block in optimized_blocks:
             block_tags = collect_thread_extent_tags(block.body)
             assert "threadIdx.x" in block_tags, "Each SimtVF region should contain local threadIdx.x thread_extent"

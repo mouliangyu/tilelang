@@ -65,6 +65,20 @@ def check_metal_availability() -> bool:
     return arch == "arm64"
 
 
+def check_ascend_availability() -> bool:
+    """
+    Check if Ascend is available on the system by checking torch.npu.
+    Returns:
+        bool: True if Ascend is available, False otherwise.
+    """
+    try:
+        import torch
+
+        return hasattr(torch, "npu") and torch.npu.is_available()
+    except Exception:
+        return False
+
+
 def determine_fp8_type(fp8_format: Literal["e4m3", "e5m2"] = "e4m3") -> str:
     """
     Select the correct FP8 dtype string for the current platform.
@@ -169,6 +183,7 @@ def determine_target(target: str | Target | Literal["auto"] = "auto", return_obj
         # Check for CUDA and HIP availability
         is_cuda_available = check_cuda_availability()
         is_hip_available = check_hip_availability()
+        is_ascend_available = check_ascend_availability()
 
         # Determine the target based on availability
         if is_cuda_available:
@@ -178,6 +193,8 @@ def determine_target(target: str | Target | Literal["auto"] = "auto", return_obj
                 return_var = "cuda"
         elif is_hip_available:
             return_var = "hip"
+        elif is_ascend_available:
+            return_var = "c -keys=ascend"
         elif check_metal_availability():
             return_var = "metal"
         else:

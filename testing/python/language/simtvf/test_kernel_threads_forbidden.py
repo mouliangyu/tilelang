@@ -10,7 +10,7 @@ def main():
 
             @T.prim_func
             def _bad_kernel(a: T.Buffer((1,), "float32")):
-                with T.Kernel(1, is_ascend=True, threads=128):
+                with T.Kernel(1, threads=128):
                     a[0] = T.float32(1)
         except ValueError as err:
             msg = str(err)

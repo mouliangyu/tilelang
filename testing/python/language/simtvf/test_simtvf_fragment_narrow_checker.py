@@ -21,7 +21,7 @@ def test_fragment_narrow_checker_rejects_narrowed_fragment():
         A: T.Buffer((16,), "float32"),
         B: T.Buffer((16,), "float32"),
     ):
-        with T.Kernel(1, is_ascend=True):
+        with T.Kernel(1):
             frag = T.alloc_fragment((16,), "float32")
             with T.SimtVF(threads=128):
                 for i in T.Parallel(16):
@@ -38,7 +38,7 @@ def test_fragment_narrow_checker_rejects_fragment_leak():
         A: T.Buffer((16,), "float32"),
         B: T.Buffer((16,), "float32"),
     ):
-        with T.Kernel(1, is_ascend=True):
+        with T.Kernel(1):
             frag = T.alloc_fragment((16,), "float32")
             with T.SimtVF(threads=128):
                 for i in T.Parallel(16):

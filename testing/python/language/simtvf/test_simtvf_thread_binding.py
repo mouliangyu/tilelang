@@ -46,7 +46,7 @@ def test_get_thread_binding_inside_simtvf():
 
         @T.prim_func
         def fn(A: T.Buffer((16,), "float32"), B: T.Buffer((16,), "float32")):
-            with T.Kernel(1, is_ascend=True) as _, T.SimtVF(threads=128):
+            with T.Kernel(1) as _, T.SimtVF(threads=128):
                 results["tx"] = K.get_thread_binding(0)
                 for i in T.Parallel(16):
                     B[i] = A[i] + T.float32(1)
@@ -64,7 +64,7 @@ def test_get_thread_bindings_inside_simtvf():
 
         @T.prim_func
         def fn(A: T.Buffer((16,), "float32"), B: T.Buffer((16,), "float32")):
-            with T.Kernel(1, is_ascend=True) as _, T.SimtVF(threads=128):
+            with T.Kernel(1) as _, T.SimtVF(threads=128):
                 results["bindings"] = K.get_thread_bindings()
                 for i in T.Parallel(16):
                     B[i] = A[i] + T.float32(1)
@@ -84,7 +84,7 @@ def test_get_thread_extent_inside_simtvf():
 
         @T.prim_func
         def fn(A: T.Buffer((16,), "float32"), B: T.Buffer((16,), "float32")):
-            with T.Kernel(1, is_ascend=True) as _, T.SimtVF(threads=128):
+            with T.Kernel(1) as _, T.SimtVF(threads=128):
                 results["ext0"] = K.get_thread_extent(0)
                 results["ext1"] = K.get_thread_extent(1)
                 results["ext2"] = K.get_thread_extent(2)
@@ -104,7 +104,7 @@ def test_get_thread_extents_inside_simtvf():
 
         @T.prim_func
         def fn(A: T.Buffer((16,), "float32"), B: T.Buffer((16,), "float32")):
-            with T.Kernel(1, is_ascend=True) as _, T.SimtVF(threads=128):
+            with T.Kernel(1) as _, T.SimtVF(threads=128):
                 results["extents"] = K.get_thread_extents()
                 for i in T.Parallel(16):
                     B[i] = A[i] + T.float32(1)
@@ -124,7 +124,7 @@ def test_sequential_simtvf_different_threads():
             B: T.Buffer((256,), "float32"),
             C: T.Buffer((256,), "float32"),
         ):
-            with T.Kernel(1, is_ascend=True) as _:
+            with T.Kernel(1) as _:
                 with T.SimtVF(threads=128):
                     results["tx1"] = K.get_thread_binding(0)
                     results["ext1"] = K.get_thread_extent(0)
@@ -150,7 +150,7 @@ def test_variable_identity():
 
         @T.prim_func
         def fn(A: T.Buffer((16,), "float32"), B: T.Buffer((16,), "float32")):
-            with T.Kernel(1, is_ascend=True) as _, T.SimtVF(threads=128):
+            with T.Kernel(1) as _, T.SimtVF(threads=128):
                 results["tx"] = K.get_thread_binding(0)
                 for i in T.Parallel(16):
                     B[i] = A[i] + T.float32(1)
@@ -189,7 +189,7 @@ def test_multidim_simtvf():
 
         @T.prim_func
         def fn(A: T.Buffer((16,), "float32"), B: T.Buffer((16,), "float32")):
-            with T.Kernel(1, is_ascend=True) as _, T.SimtVF(threads=[64, 2, 1]):
+            with T.Kernel(1) as _, T.SimtVF(threads=[64, 2, 1]):
                 results["extents"] = K.get_thread_extents()
                 results["bindings"] = K.get_thread_bindings()
                 for i in T.Parallel(16):

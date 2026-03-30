@@ -124,6 +124,20 @@ def _normalize_bindings(bindings: list[Var]) -> Var | list[Var]:
     return bindings
 
 
+def check_ascend_availability() -> bool:
+    """
+    Check if Ascend is available on the system by checking torch.npu.
+    Returns:
+        bool: True if Ascend is available, False otherwise.
+    """
+    try:
+        import torch
+
+        return hasattr(torch, "npu") and torch.npu.is_available()
+    except Exception:
+        return False
+
+
 @register_object("tl.KernelLaunchFrame")
 class KernelLaunchFrame(TIRFrame):
     """
@@ -262,7 +276,6 @@ def Kernel(
     *blocks: int | tir.PrimExpr,
     threads: int | list[int] | tuple | None = None,
     is_cpu: bool = False,
-    is_ascend: bool = False,
     prelude: str | None = None,
 ):
     """Tools to quickly construct a GPU kernel launch frame.
@@ -321,22 +334,21 @@ def Kernel(
 
     if Builder.current() is None:
         raise JITNoBuilderError("T.Kernel() can only be used inside @tilelang.jit or @T.prim_func context. No Builder is available.")
+    is_ascend = check_ascend_availability()
 
     attrs: dict = {}
-    if is_ascend and is_cpu:
-        raise ValueError("Uncertain backend behavior for `is_cpu=True` and `is_ascend=True`")
-
-    if is_ascend:
-        if threads is not None:
-            raise ValueError(
-                "Ascend backend does not support `threads=` in `T.Kernel(...)`. Use `T.SimtVF(threads=...)` to define thread domains."
-            )
-        if len(blocks) != 1:
-            raise ValueError(f"Ascend backend only supports 1-D grid in `T.Kernel(N)`. Got {len(blocks)}-D grid.")
-        attrs["tilelang.is_npu_kernel_frame"] = True
-    elif not is_cpu and threads is None:
-        # Keep backward compatibility when target is not Ascend (or unknown).
-        threads = 128  # default thread number
+    if not is_cpu:
+        if is_ascend:
+            if threads is not None:
+                raise ValueError(
+                    "Ascend backend does not support `threads=` in `T.Kernel(...)`. Use `T.SimtVF(threads=...)` to define thread domains."
+                )
+            if len(blocks) != 1:
+                raise ValueError(f"Ascend backend only supports 1-D grid in `T.Kernel(N)`. Got {len(blocks)}-D grid.")
+            attrs["tilelang.is_npu_kernel_frame"] = True
+        elif threads is None:
+            # Keep backward compatibility when target is not Ascend (or unknown).
+            threads = 128  # default thread number
 
     if threads is None:
         normalized_threads = None

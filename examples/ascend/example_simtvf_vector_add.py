@@ -17,7 +17,7 @@ def vector_add(N):
         B: T.Buffer((N,), "float32"),
         C: T.Buffer((N,), "float32"),
     ):
-        with T.Kernel(1, is_ascend=True) as _, T.SimtVF(threads=128):
+        with T.Kernel(1) as _, T.SimtVF(threads=128):
             for i in T.Parallel(N):
                 C[i] = A[i] + B[i]
 

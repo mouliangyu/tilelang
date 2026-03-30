@@ -30,7 +30,7 @@ def ubuf_multi(N):
         D: T.Buffer((N,), "float32"),
         E: T.Buffer((N,), "float32"),
     ):
-        with T.Kernel(1, is_ascend=True) as _:
+        with T.Kernel(1) as _:
             # Multiple alloc_shared - triggers merge into buf_dyn_shmem
             temp1 = T.alloc_shared((N,), "float32")
             temp2 = T.alloc_shared((N,), "float32")
@@ -71,7 +71,7 @@ if __name__ == "__main__":
     # Create and compile kernel
     print(f"Compiling ubuf_multi kernel (N={N})...")
     program = ubuf_multi(N)
-    kernel = tilelang.compile(program, target="ascend", out_idx=-1)
+    kernel = tilelang.compile(program, out_idx=-1)
     print("Compilation succeeded!")
 
     # Create test data
