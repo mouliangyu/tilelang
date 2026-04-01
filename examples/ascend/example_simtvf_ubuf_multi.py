@@ -39,6 +39,7 @@ def ubuf_multi(N):
             with T.SimtVF(threads=128):
                 for i in T.Parallel(N):
                     temp1[i] = A[i] * B[i]
+            T.ascend_pipe_barrier("PIPE_V")
 
             # VF2: temp1 + C → temp2
             with T.SimtVF(threads=(16, 16)):
@@ -47,6 +48,7 @@ def ubuf_multi(N):
                     temp2[i] = temp1[i] + C[i]
                 if tx == 0:
                     temp1[tx] = 0.0
+            T.ascend_pipe_barrier("PIPE_V")
 
             # VF3: temp2 * D → E
             with T.SimtVF(threads=256):

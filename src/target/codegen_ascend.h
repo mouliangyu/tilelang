@@ -17,6 +17,7 @@ public:
   void VisitStmt_(const AttrStmtNode *op) final;
   void VisitStmt_(const AllocateNode *op) final;
   void PrintStorageSync(const CallNode *op) final;
+  void VisitExpr_(const CallNode *op, std::ostream &os) final;
   void PrintStorageScope(const std::string &scope, std::ostream &os) final;
   bool IsScopePartOfType() const final;
 

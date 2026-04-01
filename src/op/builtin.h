@@ -515,6 +515,14 @@ TVM_DLL const Op &sync_grid();
 TVM_DLL const Op &sync_warp();
 
 /*!
+ * \brief Ascend pipeline barrier intrinsic.
+ *
+ * ascend_pipe_barrier(pipe_t_string)
+ *
+ */
+TVM_DLL const Op &ascend_pipe_barrier();
+
+/*!
  * \brief Programmatic dependency trigger.
  *
  * pdl_trigger()

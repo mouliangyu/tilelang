@@ -35,6 +35,7 @@ def ubuf_two_vf(N):
             with T.SimtVF(threads=128):
                 for i in T.Parallel(N):
                     temp_ub[i] = A[i] * B[i]
+            T.ascend_pipe_barrier("PIPE_V")
 
             # VF2: compute temp_ub + C → D
             with T.SimtVF(threads=128):

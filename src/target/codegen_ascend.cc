@@ -1,5 +1,6 @@
 #include "codegen_ascend.h"
 
+#include "../op/builtin.h"
 #include <string>
 
 #include "../../3rdparty/tvm/src/tir/transforms/ir_utils.h"
@@ -292,11 +293,6 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
   decl_stream << "}\n\n";
 
   PrintIndent();
-  stream << "// __simt_vf__ begin threads=(" << thread_x << ", " << thread_y
-         << ", " << thread_z << ")\n";
-  PrintIndent();
-  stream << "pipe_barrier(pipe_t::PIPE_ALL);\n";
-  PrintIndent();
   stream << "asc_vf_call<" << helper_name << ">(cce::dim3(";
   stream << thread_x;
   if (thread_y > 1 || thread_z > 1) {
@@ -310,11 +306,18 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
     stream << ", " << resolve_var_name(captures[i]);
   }
   stream << ");\n";
+}
 
-  PrintIndent();
-  stream << "pipe_barrier(pipe_t::PIPE_ALL);\n";
-  PrintIndent();
-  stream << "// __simt_vf__ end\n";
+void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
+  if (op->op.same_as(tl::ascend_pipe_barrier())) {
+    ICHECK_EQ(op->args.size(), 1)
+        << "tl.ascend_pipe_barrier expects exactly 1 argument (pipe_t string)";
+    std::string pipe_t_str = Downcast<StringImm>(op->args[0])->value;
+    this->PrintIndent();
+    this->stream << "AscendC::PipeBarrier<pipe_t::" << pipe_t_str << ">();\n";
+  } else {
+    CodeGenC::VisitExpr_(op, os);
+  }
 }
 
 void CodeGenTileLangAscend::VisitStmt_(const ForNode *op) {

@@ -18,7 +18,7 @@ def main():
     print(source)
 
     assert "__simt_vf__" in source, "Ascend source should mark SimtVF region"
-    assert "__global__ __vector__ int32_t simtvf_codegen_demo_kernel" in source, (
+    assert "__global__ __vector__ void simtvf_codegen_demo_kernel" in source, (
         "Ascend source should use '__global__ __vector__ <ret> <name>' signature order"
     )
     assert "asc_vf_call" in source, "Ascend source should emit asc_vf_call marker"
@@ -42,7 +42,7 @@ def main():
     source_two = artifact_two.kernel_source
     print(source_two)
 
-    assert "__global__ __vector__ int32_t simtvf_codegen_two_vf_kernel" in source_two, (
+    assert "__global__ __vector__ void simtvf_codegen_two_vf_kernel" in source_two, (
         "Two-VF kernel should keep '__global__ __vector__ <ret> <name>' signature order"
     )
     assert source_two.count("__simt_vf__ __launch_bounds__(") >= 2, "Two-VF source should emit two SimtVF helper functions"
