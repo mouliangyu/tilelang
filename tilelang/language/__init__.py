@@ -95,7 +95,7 @@ from .customize import (
 )
 from .logical import any_of, all_of  # noqa: F401
 from .builtin import *  # noqa: F401
-from .ascend import ascend_pipe_barrier  # noqa: F401
+from .ascend import ascend_pipe_barrier, ascend_set_flag, ascend_wait_flag  # noqa: F401
 from .builtin import __ldg as __ldg  # noqa: F401
 from .builtin import ldg32 as ldg32  # noqa: F401
 from .builtin import ldg64 as ldg64  # noqa: F401

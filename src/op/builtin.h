@@ -523,6 +523,22 @@ TVM_DLL const Op &sync_warp();
 TVM_DLL const Op &ascend_pipe_barrier();
 
 /*!
+ * \brief Ascend SetFlag intrinsic for pipeline synchronization.
+ *
+ * ascend_set_flag(hard_event_string, event_id)
+ *
+ */
+TVM_DLL const Op &ascend_set_flag();
+
+/*!
+ * \brief Ascend WaitFlag intrinsic for pipeline synchronization.
+ *
+ * ascend_wait_flag(hard_event_string, event_id)
+ *
+ */
+TVM_DLL const Op &ascend_wait_flag();
+
+/*!
  * \brief Programmatic dependency trigger.
  *
  * pdl_trigger()

@@ -12,9 +12,7 @@ def test_ascend_pipe_barrier_pipe_all():
     artifact = lower(func, target="ascend")
     source = artifact.kernel_source
     print(source)
-    assert "AscendC::PipeBarrier<pipe_t::PIPE_ALL>();" in source, (
-        f"Expected AscendC::PipeBarrier<pipe_t::PIPE_ALL>(); in:\n{source}"
-    )
+    assert "AscendC::PipeBarrier<pipe_t::PIPE_ALL>();" in source, f"Expected AscendC::PipeBarrier<pipe_t::PIPE_ALL>(); in:\n{source}"
 
 
 def test_ascend_pipe_barrier_pipe_v():
@@ -27,9 +25,7 @@ def test_ascend_pipe_barrier_pipe_v():
     artifact = lower(func, target="ascend")
     source = artifact.kernel_source
     print(source)
-    assert "AscendC::PipeBarrier<pipe_t::PIPE_V>();" in source, (
-        f"Expected AscendC::PipeBarrier<pipe_t::PIPE_V>(); in:\n{source}"
-    )
+    assert "AscendC::PipeBarrier<pipe_t::PIPE_V>();" in source, f"Expected AscendC::PipeBarrier<pipe_t::PIPE_V>(); in:\n{source}"
 
 
 if __name__ == "__main__":

@@ -315,6 +315,24 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::string pipe_t_str = Downcast<StringImm>(op->args[0])->value;
     this->PrintIndent();
     this->stream << "AscendC::PipeBarrier<pipe_t::" << pipe_t_str << ">();\n";
+  } else if (op->op.same_as(tl::ascend_set_flag())) {
+    ICHECK_EQ(op->args.size(), 2) << "tl.ascend_set_flag expects exactly 2 "
+                                     "arguments (hard_event string, event_id)";
+    std::string hard_event_str = Downcast<StringImm>(op->args[0])->value;
+    this->PrintIndent();
+    this->stream << "AscendC::SetFlag<AscendC::HardEvent::" << hard_event_str
+                 << ">(";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_wait_flag())) {
+    ICHECK_EQ(op->args.size(), 2) << "tl.ascend_wait_flag expects exactly 2 "
+                                     "arguments (hard_event string, event_id)";
+    std::string hard_event_str = Downcast<StringImm>(op->args[0])->value;
+    this->PrintIndent();
+    this->stream << "AscendC::WaitFlag<AscendC::HardEvent::" << hard_event_str
+                 << ">(";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ");\n";
   } else {
     CodeGenC::VisitExpr_(op, os);
   }
