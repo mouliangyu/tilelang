@@ -539,6 +539,30 @@ TVM_DLL const Op &ascend_set_flag();
 TVM_DLL const Op &ascend_wait_flag();
 
 /*!
+ * \brief Ascend thread fence intrinsic.
+ *
+ * ascend_threadfence()
+ *
+ */
+TVM_DLL const Op &ascend_threadfence();
+
+/*!
+ * \brief Ascend CrossCoreSetFlag intrinsic for cross-core synchronization.
+ *
+ * ascend_cross_core_set_flag(mode_id_string, pipe_string, flag_id)
+ *
+ */
+TVM_DLL const Op &ascend_cross_core_set_flag();
+
+/*!
+ * \brief Ascend CrossCoreWaitFlag intrinsic for cross-core synchronization.
+ *
+ * ascend_cross_core_wait_flag(flag_id)
+ *
+ */
+TVM_DLL const Op &ascend_cross_core_wait_flag();
+
+/*!
  * \brief Programmatic dependency trigger.
  *
  * pdl_trigger()

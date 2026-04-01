@@ -333,6 +333,33 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
                  << ">(";
     this->PrintExpr(op->args[1], this->stream);
     this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_threadfence())) {
+    ICHECK_EQ(op->args.size(), 0)
+        << "tl.ascend_threadfence expects 0 arguments";
+    this->PrintIndent();
+    this->stream << "asc_threadfence();\n";
+  } else if (op->op.same_as(tl::ascend_cross_core_set_flag())) {
+    ICHECK_EQ(op->args.size(), 3)
+        << "tl.ascend_cross_core_set_flag expects exactly 3 arguments "
+           "(mode_id int, pipe string, flag_id)";
+    int64_t mode_id = Downcast<IntImm>(op->args[0])->value;
+    std::string pipe_str = Downcast<StringImm>(op->args[1])->value;
+    this->PrintIndent();
+    this->stream << "AscendC::CrossCoreSetFlag<" << mode_id << ", " << pipe_str
+                 << ">(";
+    this->PrintExpr(op->args[2], this->stream);
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_cross_core_wait_flag())) {
+    ICHECK_EQ(op->args.size(), 3)
+        << "tl.ascend_cross_core_wait_flag expects exactly 3 arguments "
+           "(mode_id int, pipe string, flag_id)";
+    int64_t mode_id = Downcast<IntImm>(op->args[0])->value;
+    std::string pipe_str = Downcast<StringImm>(op->args[1])->value;
+    this->PrintIndent();
+    this->stream << "AscendC::CrossCoreWaitFlag<" << mode_id << ", " << pipe_str
+                 << ">(";
+    this->PrintExpr(op->args[2], this->stream);
+    this->stream << ");\n";
   } else {
     CodeGenC::VisitExpr_(op, os);
   }
