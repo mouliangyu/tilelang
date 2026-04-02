@@ -232,7 +232,7 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
       PrintStmt(op->body);
       EndScope(scope);
       PrintIndent();
-      stream << "}";
+      stream << "}\n";
     } else {
       PrintStmt(op->body);
     }
@@ -240,7 +240,8 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
   }
   if (op->name_hint == "VECTOR") {
     if (kernel_mode_ == AscendKernelMode::kMix) {
-      stream << " else {\n";
+      PrintIndent();
+      stream << "if ASCEND_IS_AIV {\n";
       int scope = BeginScope();
       PrintStmt(op->body);
       EndScope(scope);
