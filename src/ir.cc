@@ -518,14 +518,135 @@ WarpSpecializeFrame WarpSpecialize(const Array<IntImm> &warp_group_ids,
   return WarpSpecializeFrame(n);
 }
 
+class CubeFrameNode : public TIRFrameNode {
+public:
+  static void RegisterReflection() {
+    namespace refl = tvm::ffi::reflection;
+    refl::ObjectDef<CubeFrameNode>();
+  }
+
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.CubeFrame", CubeFrameNode,
+                                    TIRFrameNode);
+
+public:
+  TVM_DLL void ExitWithScope() final {
+    using namespace tvm::tir;
+    TIRFrameNode::ExitWithScope();
+
+    Stmt body = SeqStmt::Flatten(stmts);
+    Stmt stmt =
+        tvm::tir::Block({}, {}, {}, "CUBE", body, std::nullopt, {}, {}, {});
+
+    script::ir_builder::IRBuilder builder =
+        script::ir_builder::IRBuilder::Current();
+    if (builder->frames.empty()) {
+      ICHECK(!builder->result.defined())
+          << "ValueError: Builder.result has already been set";
+      builder->result = stmt;
+    } else if (const auto *tir_frame =
+                   builder->frames.back().as<TIRFrameNode>()) {
+      ffi::GetRef<TIRFrame>(tir_frame)->stmts.push_back(stmt);
+    } else {
+      LOG(FATAL) << "TypeError: Unsupported frame type: "
+                 << builder->frames.back();
+    }
+  }
+};
+
+class CubeFrame : public TIRFrame {
+public:
+  explicit CubeFrame(ObjectPtr<CubeFrameNode> data)
+      : TIRFrame(::tvm::ffi::UnsafeInit{}) {
+    ICHECK(data != nullptr);
+    data_ = std::move(data);
+  }
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(CubeFrame, TIRFrame,
+                                                CubeFrameNode);
+};
+
+CubeFrame Cube() { return CubeFrame(tvm::ffi::make_object<CubeFrameNode>()); }
+
+class VectorFrameNode : public TIRFrameNode {
+public:
+  int vector_count;
+  tvm::tir::Var sid_var;
+
+  static void RegisterReflection() {
+    namespace refl = tvm::ffi::reflection;
+    refl::ObjectDef<VectorFrameNode>()
+        .def_ro("vector_count", &VectorFrameNode::vector_count)
+        .def_ro("sid_var", &VectorFrameNode::sid_var);
+  }
+
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.VectorFrame", VectorFrameNode,
+                                    TIRFrameNode);
+
+public:
+  TVM_DLL void ExitWithScope() final {
+    using namespace tvm::tir;
+    TIRFrameNode::ExitWithScope();
+
+    Stmt body = SeqStmt::Flatten(stmts);
+
+    DataType dtype = DataType::Int(32);
+    PrimExpr extent = IntImm(dtype, vector_count);
+    IterVar iv(Range::FromMinExtent(make_zero(dtype), extent), sid_var,
+               IterVarType::kThreadIndex, "cthread");
+    body = AttrStmt(iv, tir::attr::thread_extent, extent, body);
+
+    Map<String, ObjectRef> annotations;
+    annotations.Set("vector_count", IntImm(dtype, vector_count));
+    Stmt stmt = tvm::tir::Block({}, {}, {}, "VECTOR", body, std::nullopt, {},
+                                {}, annotations);
+
+    script::ir_builder::IRBuilder builder =
+        script::ir_builder::IRBuilder::Current();
+    if (builder->frames.empty()) {
+      ICHECK(!builder->result.defined())
+          << "ValueError: Builder.result has already been set";
+      builder->result = stmt;
+    } else if (const auto *tir_frame =
+                   builder->frames.back().as<TIRFrameNode>()) {
+      ffi::GetRef<TIRFrame>(tir_frame)->stmts.push_back(stmt);
+    } else {
+      LOG(FATAL) << "TypeError: Unsupported frame type: "
+                 << builder->frames.back();
+    }
+  }
+};
+
+class VectorFrame : public TIRFrame {
+public:
+  explicit VectorFrame(ObjectPtr<VectorFrameNode> data)
+      : TIRFrame(::tvm::ffi::UnsafeInit{}) {
+    ICHECK(data != nullptr);
+    data_ = std::move(data);
+  }
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(VectorFrame, TIRFrame,
+                                                VectorFrameNode);
+};
+
+VectorFrame Vector(int vector_count) {
+  ICHECK(vector_count >= 1 && vector_count <= 2)
+      << "Vector core count must be 1 or 2, got " << vector_count;
+  auto n = tvm::ffi::make_object<VectorFrameNode>();
+  n->vector_count = vector_count;
+  n->sid_var = tvm::tir::Var("sid", DataType::Int(32));
+  return VectorFrame(n);
+}
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef()
       .def("tl.WarpSpecialize", WarpSpecialize)
-      .def("tl.SideEffect", SideEffect);
+      .def("tl.SideEffect", SideEffect)
+      .def("tl.Cube", Cube)
+      .def("tl.Vector", Vector);
   KernelLaunchFrameNode::RegisterReflection();
   SimtVFFrameNode::RegisterReflection();
   WarpSpecializeFrameNode::RegisterReflection();
+  CubeFrameNode::RegisterReflection();
+  VectorFrameNode::RegisterReflection();
 }
 
 } // namespace tl

@@ -127,13 +127,53 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
     }
   }
 
+  // Pre-scan body to determine kernel mode (Mix / Vector / Cube)
+  bool has_cube = false, has_vector = false, has_simtvf = false;
+  int vector_count = 2;
+  tir::PostOrderVisit(f->body, [&](const ObjectRef &n) {
+    if (const auto *block = n.as<tir::BlockNode>()) {
+      if (block->name_hint == "CUBE")
+        has_cube = true;
+      else if (block->name_hint == "VECTOR") {
+        has_vector = true;
+        if (auto opt = block->annotations.Get("vector_count")) {
+          if (const auto *imm = opt.value().as<IntImmNode>()) {
+            vector_count = imm->value;
+          }
+        }
+      } else if (block->name_hint == "SIMT_VF")
+        has_simtvf = true;
+    }
+  });
+
+  if (has_cube && has_vector) {
+    kernel_mode_ = AscendKernelMode::kMix;
+    mix_aiv_count_ = vector_count;
+  } else if (has_cube || has_vector) {
+    LOG(FATAL) << "T.Cube() and T.Vector() must be used together for Mix mode";
+  } else if (has_simtvf) {
+    kernel_mode_ = AscendKernelMode::kVector;
+  } else {
+    kernel_mode_ = AscendKernelMode::kCube;
+  }
+
   auto global_symbol = f->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol);
   ICHECK(global_symbol) << "CodeGenTileLangAscend: Expect PrimFunc to have the "
                            "global_symbol attribute";
   bool no_alias = f->HasNonzeroAttr(tir::attr::kNoAlias);
 
   this->PrintFuncPrefix(stream);
-  this->stream << "__global__ __vector__ ";
+  switch (kernel_mode_) {
+  case AscendKernelMode::kMix:
+    this->stream << "__global__ __mix__(1, " << mix_aiv_count_ << ") ";
+    break;
+  case AscendKernelMode::kVector:
+    this->stream << "__global__ __vector__ ";
+    break;
+  case AscendKernelMode::kCube:
+    this->stream << "__global__ __cube__ ";
+    break;
+  }
   CodeGenC::PrintType(f->ret_type, stream);
   CodeGenC::PrintExtraAttrs(f, stream);
   this->stream << " " << static_cast<std::string>(global_symbol.value()) << "(";
@@ -184,6 +224,33 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
 }
 
 void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
+  if (op->name_hint == "CUBE") {
+    if (kernel_mode_ == AscendKernelMode::kMix) {
+      PrintIndent();
+      stream << "if ASCEND_IS_AIC {\n";
+      int scope = BeginScope();
+      PrintStmt(op->body);
+      EndScope(scope);
+      PrintIndent();
+      stream << "}";
+    } else {
+      PrintStmt(op->body);
+    }
+    return;
+  }
+  if (op->name_hint == "VECTOR") {
+    if (kernel_mode_ == AscendKernelMode::kMix) {
+      stream << " else {\n";
+      int scope = BeginScope();
+      PrintStmt(op->body);
+      EndScope(scope);
+      PrintIndent();
+      stream << "}\n";
+    } else {
+      PrintStmt(op->body);
+    }
+    return;
+  }
   if (op->name_hint != "SIMT_VF") {
     PrintStmt(op->body);
     return;
@@ -600,6 +667,8 @@ void CodeGenTileLangAscend::VisitStmt_(const AttrStmtNode *op) {
         stream << "blockIdx.y";
       } else if (iv->thread_tag == "blockIdx.z") {
         stream << "blockIdx.z";
+      } else if (iv->thread_tag == "cthread") {
+        stream << "get_subblockid()";
       } else {
         stream << "0";
       }

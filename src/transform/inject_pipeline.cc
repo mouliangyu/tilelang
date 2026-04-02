@@ -1325,7 +1325,8 @@ private:
   }
 
   Stmt VisitStmt_(const BlockNode *op) final {
-    if (op->name_hint == "SIMT_VF") {
+    if (op->name_hint == "SIMT_VF" || op->name_hint == "VECTOR" ||
+        op->name_hint == "CUBE") {
       // TODO: analyze BufferRegion with threadIdx
       return StmtExprMutator::VisitStmt_(op);
     }

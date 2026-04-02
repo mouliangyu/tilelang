@@ -30,6 +30,14 @@ from .vf import (
     SimtVF,  # noqa: F401
     SimtVFFrame,  # noqa: F401
 )
+from .cube import (
+    Cube,  # noqa: F401
+    CubeFrame,  # noqa: F401
+)
+from .vector_frame import (
+    Vector,  # noqa: F401
+    VectorFrame,  # noqa: F401
+)
 from .frame import has_let_value, get_let_value  # noqa: F401
 from .math_intrinsics import *  # noqa: F401
 from .kernel import (

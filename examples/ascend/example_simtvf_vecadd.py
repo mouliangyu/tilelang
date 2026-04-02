@@ -17,18 +17,36 @@ def vector_add(N):
         C: T.Buffer((N,), "float32"),
     ):
         with T.Kernel(NUM_BLOCKS) as bx:
-            temp1 = T.alloc_shared((NUM_STAGES, TILE_ELEMS,), "float32")
-            temp2 = T.alloc_shared((NUM_STAGES, TILE_ELEMS,), "float32")
-            temp3 = T.alloc_shared((NUM_STAGES, TILE_ELEMS,), "float32")
+            temp1 = T.alloc_shared(
+                (
+                    NUM_STAGES,
+                    TILE_ELEMS,
+                ),
+                "float32",
+            )
+            temp2 = T.alloc_shared(
+                (
+                    NUM_STAGES,
+                    TILE_ELEMS,
+                ),
+                "float32",
+            )
+            temp3 = T.alloc_shared(
+                (
+                    NUM_STAGES,
+                    TILE_ELEMS,
+                ),
+                "float32",
+            )
 
             for f in range(NUM_STAGES):
                 T.ascend_set_flag("MTE3_V", f)
                 T.ascend_set_flag("V_MTE2", f)
-            
+
             for iter in range(TOTAL_TILES):
-                begin = ((iter * NUM_BLOCKS + bx) * TILE_ELEMS)
-                end = ((iter * NUM_BLOCKS + bx + 1) * TILE_ELEMS)
-                stage = iter%NUM_STAGES
+                begin = (iter * NUM_BLOCKS + bx) * TILE_ELEMS
+                end = (iter * NUM_BLOCKS + bx + 1) * TILE_ELEMS
+                stage = iter % NUM_STAGES
 
                 T.ascend_wait_flag("V_MTE2", stage)
                 T.copy(A[begin:end], temp1[stage, :])
@@ -37,7 +55,7 @@ def vector_add(N):
 
                 T.ascend_wait_flag("MTE2_V", stage)
                 T.ascend_wait_flag("MTE3_V", stage)
-                with T.SimtVF(threads=2048):
+                with T.SimtVF(threads=NUM_THREADS):
                     for i in T.Parallel(TILE_ELEMS):
                         temp3[stage, i] = temp1[stage, i] + temp2[stage, i]
                 T.ascend_set_flag("V_MTE3", stage)
@@ -56,7 +74,8 @@ def vector_add(N):
 
 def ref_program(a, b):
     """Reference implementation: C = A + B"""
-    return (a + b)
+    return a + b
+
 
 NUM_REPEATS = 10
 
@@ -98,12 +117,10 @@ if __name__ == "__main__":
     t1 = torch.npu.Event(enable_timing=True)
     t0.record()
     for _ in range(NUM_REPEATS):
-        kernel(a,b)
+        kernel(a, b)
     t1.record()
     torch.npu.synchronize()
 
     ms = t0.elapsed_time(t1)
     total_gb = N * 4 * 3 * NUM_REPEATS / 1e9
-    print(
-        f"{ms:.1f} ms  |  {ms / NUM_REPEATS:.1f} ms/iter  |  {total_gb / (ms / 1e3):.1f} GB/s"
-    )
+    print(f"{ms:.1f} ms  |  {ms / NUM_REPEATS:.1f} ms/iter  |  {total_gb / (ms / 1e3):.1f} GB/s")
