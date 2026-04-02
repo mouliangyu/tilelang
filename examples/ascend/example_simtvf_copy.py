@@ -1,9 +1,5 @@
 """Example: SimtVF with multiple __ubuf__ buffers on Ascend NPU.
 
-This example demonstrates using multiple T.alloc_shared to allocate multiple
-Unified Buffer (UB) memory regions, which triggers the MergeSharedMemoryAllocations
-pass to merge them into a single buf_dyn_shmem.
-
 The kernel computes: E = (A * B + C) * D
 
 VF1: computes A * B → stores to temp1
@@ -13,16 +9,9 @@ VF3: computes temp2 * D → stores to E
 
 import tilelang
 import tilelang.language as T
-from tilelang.engine.callback import register_ascend_postproc_callback
 
 
 def ubuf_multi(N):
-    """Multi-VF kernel with multiple shared UB buffers.
-
-    Multiple alloc_shared calls trigger the MergeSharedMemoryAllocations pass,
-    which merges all shared.dyn buffers into a single buf_dyn_shmem.
-    """
-
     @T.prim_func
     def main(
         A: T.Buffer((N,), "float32"),
@@ -58,7 +47,7 @@ def ubuf_multi(N):
             with T.SimtVF(threads=256):
                 for i in T.Parallel(N):
                     temp2[i] = temp2[i] * D[i]
-            
+
             T.ascend_set_flag("V_MTE3", 0)
             T.ascend_wait_flag("V_MTE3", 0)
             T.copy(temp2, E[:N])

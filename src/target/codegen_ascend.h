@@ -21,6 +21,8 @@ public:
   void PrintStorageScope(const std::string &scope, std::ostream &os) final;
   bool IsScopePartOfType() const final;
 
+  void VisitExpr_(const BroadcastNode *op, std::ostream &os) final; // NOLINT(*)
+
 private:
   int simtvf_helper_counter_{0};
   bool inside_simtvf_body_{false};

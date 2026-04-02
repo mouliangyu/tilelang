@@ -308,6 +308,159 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
   stream << ");\n";
 }
 
+void CodeGenTileLangAscend::VisitExpr_(const BroadcastNode *op,
+                                       std::ostream &os) { // NOLINT(*)
+  int lanes = static_cast<int>(Downcast<IntImm>(op->lanes)->value);
+  if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 8) {
+    const int64_t *p = as_const_int(op->value);
+    if (p) {
+      if (lanes == 4) {
+        // make_int8x4
+        ICHECK(p);
+        int64_t v = *p & 0xFF;
+        v = (v << 24) | (v << 16) | (v << 8) | v;
+        if (op->dtype.is_uint()) {
+          os << "(uint)" << v;
+        } else {
+          os << "(int)" << v;
+        }
+        return;
+      } else if (lanes == 32) {
+        // make_int8x32
+        const int64_t *p = as_const_int(op->value);
+        ICHECK(p);
+        int64_t v = *p & 0xFF;
+        v = (v << 24) | (v << 16) | (v << 8) | v;
+        if (op->dtype.is_uint()) {
+          os << "make_ulonglong4(" << v << ", " << v << ", " << v << ", " << v
+             << ")";
+        } else {
+          os << "make_longlong4(" << v << ", " << v << ", " << v << ", " << v
+             << ")";
+        }
+        return;
+      }
+    }
+  }
+
+  if (op->dtype.is_float16()) {
+    std::string v = PrintExpr(op->value);
+    os << "make_";
+    PrintType(op->dtype, os);
+    os << '(';
+    if (lanes <= 8) {
+      for (int i = 0; i < lanes / 2; ++i) {
+        if (i != 0)
+          os << ", ";
+        os << "__pack_half2(" << v << ", " << v << ")";
+      }
+    } else {
+      for (int i = 0; i < lanes / 4; ++i) {
+        if (i != 0)
+          os << ", ";
+        os << "tl::pack_float16x4(" << v << ", " << v << ", " << v << ", " << v
+           << ")";
+      }
+    }
+    os << ')';
+    return;
+  }
+
+  if (op->dtype.is_bfloat16()) {
+    std::string v = PrintExpr(op->value);
+    os << "make_";
+    PrintType(op->dtype, os);
+    os << '(';
+    if (lanes <= 8) {
+      for (int i = 0; i < lanes / 2; ++i) {
+        if (i != 0)
+          os << ", ";
+        os << "__pack_nv_bfloat162(" << v << ", " << v << ")";
+      }
+    } else {
+      for (int i = 0; i < lanes / 4; ++i) {
+        if (i != 0)
+          os << ", ";
+        os << "tl::pack_bfloat16x4(" << v << ", " << v << ", " << v << ", " << v
+           << ")";
+      }
+    }
+    os << ')';
+    return;
+  }
+
+  if (op->dtype.is_float() && op->dtype.bits() == 32 &&
+      op->dtype.lanes() == 8) {
+    std::string v = PrintExpr(op->value);
+    os << "make_ulonglong4(";
+    for (int i = 0; i < 4; ++i) {
+      if (i != 0)
+        os << ", ";
+      os << "*(unsigned long long*)&make_float2(" << v << ", " << v << ")";
+    }
+    os << ')';
+    return;
+  }
+
+  if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 4) {
+    bool fail = false;
+    const int64_t *p = as_const_int(op->value);
+    ICHECK(p) << "BroadcastNode " << op << " value: " << op->value
+              << " is not a constant";
+    int64_t v = *p & 0xF;
+
+    if (lanes == 4) {
+      v = (v << 12) | (v << 8) | (v << 4) | v;
+      if (op->dtype.is_uint()) {
+        os << "(uint16_t)" << v;
+      } else {
+        os << "(int16_t)" << v;
+      }
+    } else {
+      v = (v << 28) | (v << 24) | (v << 20) | (v << 16) | (v << 12) | (v << 8) |
+          (v << 4) | v;
+      if (lanes == 8) {
+        if (op->dtype.is_uint()) {
+          os << "(uint)" << v;
+        } else {
+          os << "(int)" << v;
+        }
+      } else if (lanes == 16 || lanes == 32) {
+        os << "make_";
+        PrintType(op->dtype, os);
+        os << '(';
+        for (int i = 0; i < lanes / 8; ++i) {
+          if (i != 0)
+            os << ", ";
+          if (op->dtype.is_uint()) {
+            os << "(uint)" << v;
+          } else {
+            os << "(int)" << v;
+          }
+        }
+        os << ')';
+      } else {
+        fail = true;
+      }
+    }
+
+    if (!fail) {
+      return;
+    }
+  }
+
+  std::string v = PrintExpr(op->value);
+  os << "make_";
+  PrintType(op->dtype, os);
+  os << '(';
+  for (int i = 0; i < lanes; ++i) {
+    if (i != 0)
+      os << ", ";
+    os << v;
+  }
+  os << ')';
+}
+
 void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   if (op->op.same_as(tl::ascend_pipe_barrier())) {
     ICHECK_EQ(op->args.size(), 1)
