@@ -797,12 +797,38 @@ Stmt CopyNode::LowerAscendDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
   Array<Range> gm_range = is_gm_to_ub ? src_range : dst_range;
   Array<Range> ub_range = is_gm_to_ub ? dst_range : src_range;
 
-  PrimExpr total_elems = make_const(DataType::Int(32), 1);
-  for (const auto &r : gm_range) {
-    total_elems = total_elems * r->extent;
+  auto I = [](int64_t v) { return make_const(DataType::Int(32), v); };
+  int elem_bytes = gm_buf->dtype.bytes();
+
+  // Split ranges into outer dims (rows) and the contiguous inner dim.
+  // Inner dim = last dim whose range covers the full buffer extent.
+  // Outer dims = everything before that; their extents multiply to nRows.
+  //
+  // Example: A[M,N] shape, copy A[2:5, :] → inner_elems=N, n_rows=3
+  //          A[M,N] shape, copy A[:, :]   → inner_elems=N, n_rows=M
+  //          (contiguous) A[N]   shape, copy A[:]      → inner_elems=N,
+  //          n_rows=1 (1-D)
+  size_t ndim = gm_range.size();
+  PrimExpr inner_elems = gm_range[ndim - 1]->extent;
+  PrimExpr n_rows = I(1);
+  for (size_t i = 0; i + 1 < ndim; ++i) {
+    n_rows = n_rows * gm_range[i]->extent;
   }
-  PrimExpr len_burst =
-      total_elems * make_const(DataType::Int(32), gm_buf->dtype.bytes());
+
+  PrimExpr row_bytes = inner_elems * I(elem_bytes);
+
+  // GM row stride = product of buffer shape dims after the first (outer) dim,
+  // in bytes. For shape [M, K, N]: stride = K*N*elem_bytes.
+  PrimExpr gm_row_stride_bytes = I(elem_bytes);
+  for (size_t j = 1; j < gm_buf->shape.size(); ++j) {
+    gm_row_stride_bytes = gm_row_stride_bytes * gm_buf->shape[j];
+  }
+
+  // UB row stride = product of UB buffer shape dims after the first, in bytes.
+  PrimExpr ub_row_stride_bytes = I(elem_bytes);
+  for (size_t j = 1; j < ub_buf->shape.size(); ++j) {
+    ub_row_stride_bytes = ub_row_stride_bytes * ub_buf->shape[j];
+  }
 
   auto compute_flat_offset = [](const Buffer &buf,
                                 const Array<Range> &range) -> PrimExpr {
@@ -820,32 +846,80 @@ Stmt CopyNode::LowerAscendDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
   PrimExpr gm_offset = compute_flat_offset(gm_buf, gm_range);
   PrimExpr ub_offset = compute_flat_offset(ub_buf, ub_range);
 
-  // Always use address_of(BufferLoad(...)) for UB pointers so that
-  // MergeSharedMemoryAllocations (which runs later) can rewrite
-  // the BufferLoad to reference the merged buf_dyn_shmem.
-  PrimExpr gm_ptr, ub_ptr;
+  // For address_of(BufferLoad(...)), the buffer must be indexed with matching
+  // dimensionality. Create flat 1D views so we can use a single offset index.
+  auto make_flat_view = [](const Buffer &buf) -> Buffer {
+    PrimExpr total = make_const(DataType::Int(32), 1);
+    for (const auto &s : buf->shape)
+      total = total * s;
+    return Buffer(buf->data, buf->dtype, {total}, {}, buf->elem_offset,
+                  buf->name, buf->data_alignment, 0, buf->buffer_type);
+  };
+  Buffer gm_flat = make_flat_view(gm_buf);
+  Buffer ub_flat = make_flat_view(ub_buf);
 
+  PrimExpr gm_ptr, ub_ptr;
   if (analyzer->CanProve(gm_offset == 0)) {
     gm_ptr = gm_buf->data;
   } else {
     gm_ptr = Call(DataType::Handle(), tir::builtin::address_of(),
-                  {BufferLoad(gm_buf, {gm_offset})});
+                  {BufferLoad(gm_flat, {gm_offset})});
   }
-
+  // Always use address_of(BufferLoad) for UB so MergeSharedMemoryAllocations
+  // can rewrite the reference to buf_dyn_shmem.
   ub_ptr = Call(DataType::Handle(), tir::builtin::address_of(),
-                {BufferLoad(ub_buf, {ub_offset})});
+                {BufferLoad(ub_flat, {ub_offset})});
 
-  PrimExpr sid = make_const(DataType::Int(32), 0);
-  PrimExpr n_burst = make_const(DataType::Int(32), 1);
-  PrimExpr zero = make_const(DataType::Int(32), 0);
+  PrimExpr sid = I(0);
+  PrimExpr zero = I(0);
+
+  bool is_single_row = ndim <= 1;
+  if (!is_single_row) {
+    auto as_int = [&](PrimExpr e) -> int64_t {
+      if (auto *imm = e.as<IntImmNode>())
+        return imm->value;
+      return -1;
+    };
+    int64_t nr = as_int(n_rows);
+    if (nr == 1)
+      is_single_row = true;
+  }
 
   PrimExpr call;
   if (is_gm_to_ub) {
-    call = Call(DataType::Void(), ascend_copy_gm_to_ubuf(),
-                {ub_ptr, gm_ptr, sid, n_burst, len_burst, zero, zero});
+    // copy_gm_to_ubuf(dst, src, sid, nBurst, lenBurst, srcStride, dstStride)
+    //   1D/contiguous: nBurst = total_bytes/32, lenBurst = 1, strides = 0
+    //   2D strided:    nBurst = n_rows, lenBurst = row_bytes/32,
+    //                  srcStride = (gm_stride - row_bytes)/32,
+    //                  dstStride = (ub_stride - row_bytes)/32
+    if (is_single_row) {
+      PrimExpr total_bytes = row_bytes * n_rows;
+      call = Call(DataType::Void(), ascend_copy_gm_to_ubuf(),
+                  {ub_ptr, gm_ptr, sid, total_bytes / I(32), I(1), zero, zero});
+    } else {
+      PrimExpr len_burst = row_bytes / I(32);
+      PrimExpr src_stride = (gm_row_stride_bytes - row_bytes) / I(32);
+      PrimExpr dst_stride = (ub_row_stride_bytes - row_bytes) / I(32);
+      call = Call(
+          DataType::Void(), ascend_copy_gm_to_ubuf(),
+          {ub_ptr, gm_ptr, sid, n_rows, len_burst, src_stride, dst_stride});
+    }
   } else {
-    call = Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
-                {gm_ptr, ub_ptr, sid, n_burst, len_burst, zero, zero, zero});
+    // copy_ubuf_to_gm_align_v2(dst, src, sid,
+    //   burst_num, burst_len, l2_cache_ctl, burst_dst_stride, burst_src_stride)
+    //   1D/contiguous: burst_num=1, burst_len=total, strides=total
+    //   2D strided:    burst_num=n_rows, burst_len=row_bytes,
+    //                  dst/src_stride = gm/ub row stride (bytes)
+    if (is_single_row) {
+      PrimExpr total_bytes = row_bytes * n_rows;
+      call = Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
+                  {gm_ptr, ub_ptr, sid, I(1), total_bytes, zero, total_bytes,
+                   total_bytes});
+    } else {
+      call = Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
+                  {gm_ptr, ub_ptr, sid, n_rows, row_bytes, zero,
+                   gm_row_stride_bytes, ub_row_stride_bytes});
+    }
   }
 
   return Evaluate(call);

@@ -243,8 +243,10 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
   // Register captures with their storage scope so GetBufferRef adds correct
   // qualifier
   for (const auto &v : captures) {
-    auto scope = GetPtrStorageScope(v);
-    alloc_storage_scope_[v.get()] = scope;
+    if (v->type_annotation.as<PointerTypeNode>()) {
+      auto scope = GetPtrStorageScope(v);
+      alloc_storage_scope_[v.get()] = scope;
+    }
   }
   std::ostringstream saved_main_stream;
   stream.swap(saved_main_stream);
@@ -269,23 +271,27 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
     }
     const Var &v = captures[i];
     std::string vname = resolve_var_name(v);
-    auto it = handle_data_type_.find(v.get());
-    if (it == handle_data_type_.end()) {
-      for (const auto &kv : handle_data_type_) {
-        if (kv.first->name_hint == v->name_hint) {
-          it = handle_data_type_.find(kv.first);
-          break;
+    if (!v->type_annotation.as<PointerTypeNode>()) {
+      PrintType(v.dtype(), decl_stream);
+      decl_stream << " " << vname;
+    } else {
+      auto it = handle_data_type_.find(v.get());
+      if (it == handle_data_type_.end()) {
+        for (const auto &kv : handle_data_type_) {
+          if (kv.first->name_hint == v->name_hint) {
+            it = handle_data_type_.find(kv.first);
+            break;
+          }
         }
       }
-    }
-    // simt_vf helper functions need memory qualifier based on storage scope
-    auto scope = GetPtrStorageScope(v);
-    PrintStorageScope(scope, decl_stream);
-    if (it != handle_data_type_.end()) {
-      PrintType(it->second, decl_stream);
-      decl_stream << "* " << vname;
-    } else {
-      decl_stream << "void* " << vname;
+      auto scope = GetPtrStorageScope(v);
+      PrintStorageScope(scope, decl_stream);
+      if (it != handle_data_type_.end()) {
+        PrintType(it->second, decl_stream);
+        decl_stream << "* " << vname;
+      } else {
+        decl_stream << "void* " << vname;
+      }
     }
   }
   decl_stream << ") {\n";

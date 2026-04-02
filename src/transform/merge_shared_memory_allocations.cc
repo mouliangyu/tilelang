@@ -57,6 +57,8 @@ using runtime::StorageRank;
 using runtime::StorageScope;
 
 static bool IsDynamicSharedMemory(Var buffer_var) {
+  if (!buffer_var->type_annotation.as<PointerTypeNode>())
+    return false;
   StorageScope storage_scope =
       runtime::StorageScope::Create(GetPtrStorageScope(std::move(buffer_var)));
   return storage_scope.rank == runtime::StorageRank::kShared &&
@@ -64,6 +66,8 @@ static bool IsDynamicSharedMemory(Var buffer_var) {
 }
 
 static bool IsStaticSharedMemory(Var buffer_var) {
+  if (!buffer_var->type_annotation.as<PointerTypeNode>())
+    return false;
   StorageScope storage_scope =
       runtime::StorageScope::Create(GetPtrStorageScope(std::move(buffer_var)));
   return storage_scope.rank == runtime::StorageRank::kShared &&
@@ -517,7 +521,9 @@ private:
     bool buf_dyn_shmem_added = false;
 
     for (const Var &v : captures_arr.value()) {
-      if (IsAppropriateSharedMemory(v)) {
+      bool is_shmem = v->type_annotation.as<PointerTypeNode>() &&
+                      IsAppropriateSharedMemory(v);
+      if (is_shmem) {
         shared_vars_removed.insert(v.get());
       } else {
         new_captures.push_back(v);
