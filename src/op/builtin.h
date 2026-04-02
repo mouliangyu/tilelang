@@ -563,6 +563,23 @@ TVM_DLL const Op &ascend_cross_core_set_flag();
 TVM_DLL const Op &ascend_cross_core_wait_flag();
 
 /*!
+ * \brief Ascend DMA copy from GM to UBuf.
+ *
+ * ascend_copy_gm_to_ubuf(dst, src, sid, nBurst, lenBurst, srcStride, dstStride)
+ *
+ */
+TVM_DLL const Op &ascend_copy_gm_to_ubuf();
+
+/*!
+ * \brief Ascend DMA copy from UBuf to GM.
+ *
+ * ascend_copy_ubuf_to_gm(dst, src, sid, burst_num, burst_len, l2_cache_ctl,
+ * burst_dst_stride, burst_src_stride)
+ *
+ */
+TVM_DLL const Op &ascend_copy_ubuf_to_gm();
+
+/*!
  * \brief Programmatic dependency trigger.
  *
  * pdl_trigger()

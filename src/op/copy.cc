@@ -295,6 +295,32 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
   auto copy_inst = GetCopyInst(target, disable_tma_lower || GetDisableTMA(),
                                T.layout_map, T.analyzer, T.buffer_oob);
 
+  // For Ascend GM↔UB copies, skip NV-specific layout inference.
+  // DMA copies don't need SIMT thread layout.
+  if (TargetIsAscend(target)) {
+    bool is_gm_ub = (IsGlobalBuffer(src) && IsSharedBuffer(dst)) ||
+                    (IsSharedBuffer(src) && IsGlobalBuffer(dst));
+    if (is_gm_ub) {
+      Map<Buffer, Layout> result_map;
+      PrimExpr thread_extent = T.thread_bounds->extent;
+      for (const auto &range : src_range) {
+        CollectFragmentLayouts(range->min, T.let_var_to_expr, T.layout_map,
+                               thread_extent, T.thread_bounds, result_map);
+        CollectFragmentLayouts(range->extent, T.let_var_to_expr, T.layout_map,
+                               thread_extent, T.thread_bounds, result_map);
+      }
+      for (const auto &range : dst_range) {
+        CollectFragmentLayouts(range->min, T.let_var_to_expr, T.layout_map,
+                               thread_extent, T.thread_bounds, result_map);
+        CollectFragmentLayouts(range->extent, T.let_var_to_expr, T.layout_map,
+                               thread_extent, T.thread_bounds, result_map);
+      }
+      return result_map;
+    }
+    // For other Ascend copy patterns (e.g. inside SimtVF, UB→local):
+    // fall through to kNormal path which creates ParallelOp
+  }
+
   // If user annotated a loop layout on T.copy, enforce SIMT (normal) copy.
   // Parallel-loop layout only applies to SIMT-style loops we generate here;
   // other copy instructions (TMA/LDSM/STSM/TMem) are incompatible.
@@ -712,13 +738,31 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 Stmt CopyNode::LowerNormalCopy(const LowerArgs &T,
                                arith::Analyzer *analyzer) const {
   bool is_cpu_target = T.target->GetTargetDeviceType() == kDLCPU;
+  bool in_simt_vf =
+      T.thread_var.defined() &&
+      std::string(T.thread_var->name_hint).substr(0, 6) == "simtvf";
+
+  // Ascend DMA path: GM↔UB copies outside SimtVF use DMA intrinsics.
+  if (TargetIsAscend(T.target) && !IsLocalBuffer(src) && !IsLocalBuffer(dst) &&
+      !in_simt_vf) {
+    bool is_gm_to_ub = IsGlobalBuffer(src) && IsSharedBuffer(dst);
+    bool is_ub_to_gm = IsSharedBuffer(src) && IsGlobalBuffer(dst);
+    if (is_gm_to_ub || is_ub_to_gm) {
+      return LowerAscendDMACopy(T, analyzer, is_gm_to_ub);
+    }
+  }
+
   auto simt_loop = MakeSIMTLoop(analyzer);
   auto fused_loop = Downcast<For>(ParallelLoopFuser::Fuse(simt_loop));
 
   For vectorized_thread_loop;
   auto par_op = ParallelOp(fused_loop);
 
-  if (is_cpu_target || IsLocalBuffer(src) || IsLocalBuffer(dst)) {
+  bool use_vectorize_only =
+      is_cpu_target || IsLocalBuffer(src) || IsLocalBuffer(dst);
+  if (in_simt_vf)
+    use_vectorize_only = false;
+  if (use_vectorize_only) {
     if (IsLocalBuffer(src) && !IsLocalBuffer(dst)) {
       LOG(WARNING) << "Copy from local buffer `" << src->name << "` to "
                    << dst.scope() << " buffer `" << dst->name
@@ -740,12 +784,71 @@ Stmt CopyNode::LowerNormalCopy(const LowerArgs &T,
                           level);
     }
     auto loop_layout = par_op->GetLoopLayout();
-    // Use LowerParallelLoop to handle partitioning, vectorization, and
-    // predicate
     return LowerParallelLoop(par_op->GetRoot(), loop_layout, T.thread_var,
                              analyzer, T.layout_map,
                              par_op->GetPredicate(T.thread_var));
   }
+}
+
+Stmt CopyNode::LowerAscendDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
+                                  bool is_gm_to_ub) const {
+  Buffer gm_buf = is_gm_to_ub ? src : dst;
+  Buffer ub_buf = is_gm_to_ub ? dst : src;
+  Array<Range> gm_range = is_gm_to_ub ? src_range : dst_range;
+  Array<Range> ub_range = is_gm_to_ub ? dst_range : src_range;
+
+  PrimExpr total_elems = make_const(DataType::Int(32), 1);
+  for (const auto &r : gm_range) {
+    total_elems = total_elems * r->extent;
+  }
+  PrimExpr len_burst =
+      total_elems * make_const(DataType::Int(32), gm_buf->dtype.bytes());
+
+  auto compute_flat_offset = [](const Buffer &buf,
+                                const Array<Range> &range) -> PrimExpr {
+    PrimExpr offset = make_const(DataType::Int(32), 0);
+    for (size_t i = 0; i < range.size(); ++i) {
+      PrimExpr stride = make_const(DataType::Int(32), 1);
+      for (size_t j = i + 1; j < buf->shape.size(); ++j) {
+        stride = stride * buf->shape[j];
+      }
+      offset = offset + range[i]->min * stride;
+    }
+    return offset;
+  };
+
+  PrimExpr gm_offset = compute_flat_offset(gm_buf, gm_range);
+  PrimExpr ub_offset = compute_flat_offset(ub_buf, ub_range);
+
+  // Always use address_of(BufferLoad(...)) for UB pointers so that
+  // MergeSharedMemoryAllocations (which runs later) can rewrite
+  // the BufferLoad to reference the merged buf_dyn_shmem.
+  PrimExpr gm_ptr, ub_ptr;
+
+  if (analyzer->CanProve(gm_offset == 0)) {
+    gm_ptr = gm_buf->data;
+  } else {
+    gm_ptr = Call(DataType::Handle(), tir::builtin::address_of(),
+                  {BufferLoad(gm_buf, {gm_offset})});
+  }
+
+  ub_ptr = Call(DataType::Handle(), tir::builtin::address_of(),
+                {BufferLoad(ub_buf, {ub_offset})});
+
+  PrimExpr sid = make_const(DataType::Int(32), 0);
+  PrimExpr n_burst = make_const(DataType::Int(32), 1);
+  PrimExpr zero = make_const(DataType::Int(32), 0);
+
+  PrimExpr call;
+  if (is_gm_to_ub) {
+    call = Call(DataType::Void(), ascend_copy_gm_to_ubuf(),
+                {ub_ptr, gm_ptr, sid, n_burst, len_burst, zero, zero});
+  } else {
+    call = Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
+                {gm_ptr, ub_ptr, sid, n_burst, len_burst, zero, zero, zero});
+  }
+
+  return Evaluate(call);
 }
 
 // Lowers copy to LDSM/STSM (warp-level 8x8 matrix) instructions.

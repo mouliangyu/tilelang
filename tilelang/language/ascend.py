@@ -135,3 +135,98 @@ def ascend_cross_core_wait_flag(mode_id: int, pipe: str, flag_id) -> None:
     if isinstance(flag_id, int):
         flag_id = tir.IntImm("int32", flag_id)
     return tir.call_intrin("void", tir.op.Op.get("tl.ascend_cross_core_wait_flag"), mode_id, pipe, flag_id)
+
+
+def ascend_copy_gm_to_ubuf(dst, src, sid, n_burst, len_burst, src_stride, dst_stride) -> None:
+    """Insert an Ascend DMA copy from GM to UBuf.
+
+    Generates: copy_gm_to_ubuf(dst, src, sid, nBurst, lenBurst, srcStride, dstStride);
+
+    Parameters
+    ----------
+    dst : PrimExpr
+        Destination UBuf pointer (tvm_access_ptr or similar).
+    src : PrimExpr
+        Source GM pointer (tvm_access_ptr or similar).
+    sid : int or PrimExpr
+        Sub-block ID (usually 0).
+    n_burst : int or PrimExpr
+        Number of bursts.
+    len_burst : int or PrimExpr
+        Length of each burst in bytes.
+    src_stride : int or PrimExpr
+        Source stride between bursts.
+    dst_stride : int or PrimExpr
+        Destination stride between bursts.
+    """
+    if isinstance(sid, int):
+        sid = tir.IntImm("int32", sid)
+    if isinstance(n_burst, int):
+        n_burst = tir.IntImm("int32", n_burst)
+    if isinstance(len_burst, int):
+        len_burst = tir.IntImm("int32", len_burst)
+    if isinstance(src_stride, int):
+        src_stride = tir.IntImm("int32", src_stride)
+    if isinstance(dst_stride, int):
+        dst_stride = tir.IntImm("int32", dst_stride)
+    return tir.call_intrin(
+        "void",
+        tir.op.Op.get("tl.ascend_copy_gm_to_ubuf"),
+        dst,
+        src,
+        sid,
+        n_burst,
+        len_burst,
+        src_stride,
+        dst_stride,
+    )
+
+
+def ascend_copy_ubuf_to_gm(dst, src, sid, burst_num, burst_len, l2_cache_ctl, burst_dst_stride, burst_src_stride) -> None:
+    """Insert an Ascend DMA copy from UBuf to GM.
+
+    Generates: bisheng::cce::copy_ubuf_to_gm_align_v2(dst, src, sid, burst_num, burst_len, l2_cache_ctl, burst_dst_stride, burst_src_stride);
+
+    Parameters
+    ----------
+    dst : PrimExpr
+        Destination GM pointer.
+    src : PrimExpr
+        Source UBuf pointer.
+    sid : int or PrimExpr
+        Sub-block ID (usually 0).
+    burst_num : int or PrimExpr
+        Number of bursts.
+    burst_len : int or PrimExpr
+        Length of each burst in bytes.
+    l2_cache_ctl : int or PrimExpr
+        L2 cache control.
+    burst_dst_stride : int or PrimExpr
+        Destination stride between bursts.
+    burst_src_stride : int or PrimExpr
+        Source stride between bursts.
+    """
+    if isinstance(sid, int):
+        sid = tir.IntImm("int32", sid)
+    if isinstance(burst_num, int):
+        burst_num = tir.IntImm("int32", burst_num)
+    if isinstance(burst_len, int):
+        burst_len = tir.IntImm("int32", burst_len)
+    if isinstance(l2_cache_ctl, int):
+        l2_cache_ctl = tir.IntImm("int32", l2_cache_ctl)
+    if isinstance(burst_dst_stride, int):
+        burst_dst_stride = tir.IntImm("int32", burst_dst_stride)
+    if isinstance(burst_src_stride, int):
+        burst_src_stride = tir.IntImm("int32", burst_src_stride)
+    return tir.call_intrin(
+        "void",
+        tir.op.Op.get("tl.ascend_copy_ubuf_to_gm"),
+        dst,
+        src,
+        sid,
+        burst_num,
+        burst_len,
+        l2_cache_ctl,
+        burst_dst_stride,
+        burst_src_stride,
+    )

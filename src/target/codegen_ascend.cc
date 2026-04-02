@@ -360,6 +360,47 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
                  << ">(";
     this->PrintExpr(op->args[2], this->stream);
     this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_copy_gm_to_ubuf())) {
+    // LOG(FATAL) << op->args[1]->dtype;
+    ICHECK_EQ(op->args.size(), 7)
+        << "tl.ascend_copy_gm_to_ubuf expects exactly 7 arguments";
+    this->PrintIndent();
+    this->stream << "copy_gm_to_ubuf((__ubuf__ void*)(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << "), (__gm__ void*)(";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << "), ";
+    this->PrintExpr(op->args[2], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[3], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[4], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[5], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[6], this->stream);
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_copy_ubuf_to_gm())) {
+    ICHECK_EQ(op->args.size(), 8)
+        << "tl.ascend_copy_ubuf_to_gm expects exactly 8 arguments";
+    this->PrintIndent();
+    this->stream << "bisheng::cce::copy_ubuf_to_gm_align_v2((__gm__ void*)(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << "), (__ubuf__ void*)(";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << "), ";
+    this->PrintExpr(op->args[2], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[3], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[4], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[5], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[6], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[7], this->stream);
+    this->stream << ");\n";
   } else {
     CodeGenC::VisitExpr_(op, os);
   }
@@ -433,6 +474,7 @@ void CodeGenTileLangAscend::VisitStmt_(const AllocateNode *op) {
     stream << " *" << vid << " = (__ubuf__ ";
     PrintType(dtype, stream);
     stream << " *)0;\n";
+    alloc_storage_scope_[op->buffer_var.get()] = scope;
     RegisterHandleType(op->buffer_var.get(), dtype);
     this->PrintStmt(op->body);
     return;

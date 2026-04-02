@@ -293,7 +293,9 @@ private:
 
   Stmt VisitStmt_(const BlockNode *op) final {
     bool is_simt_vf = (op->name_hint == "SIMT_VF");
+    IterVar saved_thread_var;
     if (is_simt_vf) {
+      saved_thread_var = thread_var_;
       PushSimtVFThreadContext(op);
     }
 
@@ -363,6 +365,7 @@ private:
                     layout_map_, buffer_remap_, let_var_to_expr},
           analyzer_);
       PopSimtVFThreadContext();
+      thread_var_ = saved_thread_var;
       return lowered;
     }
 
