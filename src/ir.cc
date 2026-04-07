@@ -352,10 +352,67 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def("tl.KernelLaunch", KernelLaunch);
 }
 
+/**
+ * Record the current number of alloc_buffers on the parent BlockFrame.
+ * Call this during EnterWithScope of SimtVF/Cube/Vector frames so that
+ * ExitWithScope can later steal only the buffers added during this frame's
+ * lifetime (i.e. those hoisted by TVM's AllocBuffer).
+ */
+static size_t RecordParentAllocCount() {
+  script::ir_builder::IRBuilder builder =
+      script::ir_builder::IRBuilder::Current();
+  ffi::Optional<BlockFrame> opt_parent = builder->FindFrame<BlockFrame>();
+  if (!opt_parent.defined()) {
+    return 0;
+  }
+  return opt_parent.value()->alloc_buffers.size();
+}
+
+/**
+ * Steal buffers that were added to the parent BlockFrame during this frame's
+ * lifetime.  TVM's AllocBuffer() hoists buffers to the nearest BlockFrame,
+ * but for SimtVF/Cube/Vector frames we want those buffers inside their own
+ * Block node instead.
+ *
+ * @param parent_alloc_count  The alloc_buffers count recorded at
+ *                            EnterWithScope time via RecordParentAllocCount().
+ */
+static ffi::Array<tvm::tir::Buffer>
+StealAllocBuffers(size_t parent_alloc_count) {
+  using namespace tvm::tir;
+  script::ir_builder::IRBuilder builder =
+      script::ir_builder::IRBuilder::Current();
+
+  ffi::Optional<BlockFrame> opt_parent = builder->FindFrame<BlockFrame>();
+  if (!opt_parent.defined()) {
+    return {};
+  }
+  BlockFrame parent = opt_parent.value();
+
+  size_t total = parent->alloc_buffers.size();
+  if (parent_alloc_count >= total) {
+    return {};
+  }
+
+  ffi::Array<Buffer> stolen;
+  ffi::Array<Buffer> remaining;
+  for (size_t i = 0; i < total; ++i) {
+    if (i < parent_alloc_count) {
+      remaining.push_back(parent->alloc_buffers[i]);
+    } else {
+      stolen.push_back(parent->alloc_buffers[i]);
+    }
+  }
+
+  parent->alloc_buffers = remaining;
+  return stolen;
+}
+
 class SimtVFFrameNode : public TIRFrameNode {
 public:
   Array<PrimExpr> thread_extents;
   Array<tvm::tir::Var> thread_vars;
+  size_t parent_alloc_count_{0};
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
@@ -368,9 +425,15 @@ public:
                                     TIRFrameNode);
 
 public:
+  TVM_DLL void EnterWithScope() final {
+    TIRFrameNode::EnterWithScope();
+    parent_alloc_count_ = RecordParentAllocCount();
+  }
+
   TVM_DLL void ExitWithScope() final {
     using namespace tvm::tir;
     TIRFrameNode::ExitWithScope();
+    auto stolen_bufs = StealAllocBuffers(parent_alloc_count_);
 
     auto make_thread_extent = [](const Var &var, const String &thread_tag,
                                  const PrimExpr &extent, Stmt inner) {
@@ -393,8 +456,8 @@ public:
     body = make_thread_extent(thread_vars[0], "threadIdx.x", thread_extents[0],
                               std::move(body));
 
-    Stmt stmt =
-        tvm::tir::Block({}, {}, {}, "SIMT_VF", body, std::nullopt, {}, {}, {});
+    Stmt stmt = tvm::tir::Block({}, {}, {}, "SIMT_VF", body, std::nullopt,
+                                stolen_bufs, {}, {});
 
     script::ir_builder::IRBuilder builder =
         script::ir_builder::IRBuilder::Current();
@@ -520,6 +583,8 @@ WarpSpecializeFrame WarpSpecialize(const Array<IntImm> &warp_group_ids,
 
 class CubeFrameNode : public TIRFrameNode {
 public:
+  size_t parent_alloc_count_{0};
+
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
     refl::ObjectDef<CubeFrameNode>();
@@ -529,13 +594,19 @@ public:
                                     TIRFrameNode);
 
 public:
+  TVM_DLL void EnterWithScope() final {
+    TIRFrameNode::EnterWithScope();
+    parent_alloc_count_ = RecordParentAllocCount();
+  }
+
   TVM_DLL void ExitWithScope() final {
     using namespace tvm::tir;
     TIRFrameNode::ExitWithScope();
+    auto stolen_bufs = StealAllocBuffers(parent_alloc_count_);
 
     Stmt body = SeqStmt::Flatten(stmts);
-    Stmt stmt =
-        tvm::tir::Block({}, {}, {}, "CUBE", body, std::nullopt, {}, {}, {});
+    Stmt stmt = tvm::tir::Block({}, {}, {}, "CUBE", body, std::nullopt,
+                                stolen_bufs, {}, {});
 
     script::ir_builder::IRBuilder builder =
         script::ir_builder::IRBuilder::Current();
@@ -570,6 +641,7 @@ class VectorFrameNode : public TIRFrameNode {
 public:
   int vector_count;
   tvm::tir::Var sid_var;
+  size_t parent_alloc_count_{0};
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
@@ -582,9 +654,15 @@ public:
                                     TIRFrameNode);
 
 public:
+  TVM_DLL void EnterWithScope() final {
+    TIRFrameNode::EnterWithScope();
+    parent_alloc_count_ = RecordParentAllocCount();
+  }
+
   TVM_DLL void ExitWithScope() final {
     using namespace tvm::tir;
     TIRFrameNode::ExitWithScope();
+    auto stolen_bufs = StealAllocBuffers(parent_alloc_count_);
 
     Stmt body = SeqStmt::Flatten(stmts);
 
@@ -596,8 +674,8 @@ public:
 
     Map<String, ObjectRef> annotations;
     annotations.Set("vector_count", IntImm(dtype, vector_count));
-    Stmt stmt = tvm::tir::Block({}, {}, {}, "VECTOR", body, std::nullopt, {},
-                                {}, annotations);
+    Stmt stmt = tvm::tir::Block({}, {}, {}, "VECTOR", body, std::nullopt,
+                                stolen_bufs, {}, annotations);
 
     script::ir_builder::IRBuilder builder =
         script::ir_builder::IRBuilder::Current();

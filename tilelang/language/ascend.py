@@ -230,3 +230,105 @@ def ascend_copy_ubuf_to_gm(dst, src, sid, burst_num, burst_len, l2_cache_ctl, bu
         burst_dst_stride,
         burst_src_stride,
     )
+
+
+def _to_int32(v):
+    return tir.IntImm("int32", v) if isinstance(v, int) else v
+
+
+def ascend_copy_gm_to_cbuf(dst, src, sid, loop1_src_stride, l2_cache_ctrl, n_value, d_value, loop4_src_stride, smallc0_en) -> None:
+    """Ascend DMA copy from GM to CBuf (L1).
+
+    Generates: bisheng::cce::copy_gm_to_cbuf_multi_nd2nz(dst, src, sid,
+    loop1_src_stride, l2_cache_ctrl, n_value, d_value, loop4_src_stride, smallc0_en);
+    """
+    args = [dst, src] + [_to_int32(a) for a in [sid, loop1_src_stride, l2_cache_ctrl, n_value, d_value, loop4_src_stride, smallc0_en]]
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_copy_gm_to_cbuf"), *args)
+
+
+def ascend_load_cbuf_to_ca(dst, src, m_start, k_start, m_step, k_step, src_stride, dst_stride, transpose) -> None:
+    """Ascend load from CBuf (L1) to CA (L0A).
+
+    Generates: bisheng::cce::load_cbuf_to_ca(dst, src, mStartPosition,
+    kStartPosition, mStep, kStep, srcStride, dstStride, transpose);
+    """
+    args = [dst, src] + [_to_int32(a) for a in [m_start, k_start, m_step, k_step, src_stride, dst_stride, transpose]]
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_load_cbuf_to_ca"), *args)
+
+
+def ascend_load_cbuf_to_cb(dst, src, m_start, k_start, m_step, k_step, src_stride, dst_stride, transpose) -> None:
+    """Ascend load from CBuf (L1) to CB (L0B).
+
+    Generates: bisheng::cce::load_cbuf_to_cb(dst, src, mStartPosition,
+    kStartPosition, mStep, kStep, srcStride, dstStride, transpose);
+    """
+    args = [dst, src] + [_to_int32(a) for a in [m_start, k_start, m_step, k_step, src_stride, dst_stride, transpose]]
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_load_cbuf_to_cb"), *args)
+
+
+def ascend_copy_matrix_cc_to_ub(
+    dst,
+    src,
+    sid,
+    n_size,
+    m_size,
+    loop_dst_stride,
+    loop_src_stride,
+    l2,
+    clip_relu_pre,
+    unit_flag_ctl,
+    quant_pre,
+    relu_pre,
+    split_en,
+    NZ2ND_en,
+    quant_post,
+    relu_post,
+    clip_relu_post,
+    loop_enhance_en,
+    eltwise_op,
+    eltwise_antq_en,
+    loop_enhance_merge_en,
+) -> None:
+    """Ascend copy matrix from CC (L0C) to UBuf.
+
+    Generates: copy_matrix_cc_to_ub(dst, src, sid, n_size, m_size,
+    loop_dst_stride, loop_src_stride, l2, clip_relu_pre, unit_flag_ctl,
+    quant_pre, relu_pre, split_en, NZ2ND_en, quant_post, relu_post,
+    clip_relu_post, loop_enhance_en, eltwise_op, eltwise_antq_en,
+    loop_enhance_merge_en);
+    """
+    args = [dst, src] + [
+        _to_int32(a)
+        for a in [
+            sid,
+            n_size,
+            m_size,
+            loop_dst_stride,
+            loop_src_stride,
+            l2,
+            clip_relu_pre,
+            unit_flag_ctl,
+            quant_pre,
+            relu_pre,
+            split_en,
+            NZ2ND_en,
+            quant_post,
+            relu_post,
+            clip_relu_post,
+            loop_enhance_en,
+            eltwise_op,
+            eltwise_antq_en,
+            loop_enhance_merge_en,
+        ]
+    ]
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_copy_matrix_cc_to_ub"), *args)
+
+
+def ascend_copy_ubuf_to_cbuf(dst, src, sub_blockid, burst_num, burst_len, src_gap, dst_gap) -> None:
+    """Ascend DMA copy from UBuf to CBuf (L1).
+
+    Generates: copy_ubuf_to_cbuf(dst, src, sub_blockid, burst_num,
+    burst_len, src_gap, dst_gap);
+    """
+    args = [dst, src] + [_to_int32(a) for a in [sub_blockid, burst_num, burst_len, src_gap, dst_gap]]
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_copy_ubuf_to_cbuf"), *args)

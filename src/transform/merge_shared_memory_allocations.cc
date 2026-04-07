@@ -74,6 +74,13 @@ static bool IsStaticSharedMemory(Var buffer_var) {
          storage_scope.tag.empty();
 }
 
+static bool IsScopeMemory(Var buffer_var, const std::string &target_scope) {
+  if (!buffer_var->type_annotation.as<PointerTypeNode>())
+    return false;
+  auto scope = GetPtrStorageScope(std::move(buffer_var));
+  return scope == target_scope;
+}
+
 /*!
  * \brief collect the mapping from the buffer var to its allocate
  */
@@ -84,6 +91,16 @@ public:
       dyn_shmem_allocs_[op->buffer_var.get()] = op;
     } else if (IsStaticSharedMemory(op->buffer_var)) {
       static_shmem_allocs_[op->buffer_var.get()] = op;
+    } else {
+      // Check for Ascend on-chip scopes
+      auto scope = GetPtrStorageScope(op->buffer_var);
+      for (const auto &s :
+           {"shared.l0a", "shared.l0b", "shared.l0c", "shared.l1"}) {
+        if (scope == s) {
+          ascend_scope_allocs_[s][op->buffer_var.get()] = op;
+          break;
+        }
+      }
     }
     StmtExprVisitor::VisitStmt_(op);
   }
@@ -92,6 +109,10 @@ public:
   // The static mapping from the original buffer var to its allocate
   std::unordered_map<const VarNode *, const AllocateNode *>
       static_shmem_allocs_;
+  // Ascend: scope_string -> {var -> alloc}
+  std::unordered_map<std::string,
+                     std::unordered_map<const VarNode *, const AllocateNode *>>
+      ascend_scope_allocs_;
 };
 
 // Find a linear pattern of storage access
@@ -111,9 +132,10 @@ class SharedMemLinearAccessPatternFinder final : public StmtExprVisitor {
 public:
   explicit SharedMemLinearAccessPatternFinder(
       bool is_dynamic = true, bool enable_aggressive_merge = false,
-      bool verbose = false)
+      bool verbose = false, const std::string &target_scope = "")
       : is_dynamic_(is_dynamic),
-        enable_aggressive_merge_(enable_aggressive_merge), verbose_(verbose) {}
+        enable_aggressive_merge_(enable_aggressive_merge), verbose_(verbose),
+        target_scope_(target_scope) {}
   /*! \brief record the touch list of statement. */
   struct StmtEntry {
     // The statement
@@ -335,6 +357,9 @@ private:
   // Wrapper function to determine if the shared memory allocation for a
   // variable is appropriate.
   bool IsAppropriateSharedMemory(const Var &var) {
+    if (!target_scope_.empty()) {
+      return IsScopeMemory(var, target_scope_);
+    }
     return is_dynamic_ ? IsDynamicSharedMemory(var) : IsStaticSharedMemory(var);
   }
   // Whether do dynamic analysis.
@@ -348,6 +373,7 @@ private:
   // The scope stack.
   std::vector<StmtEntry> scope_;
   // The size of the scope.
+  std::string target_scope_;
   size_t scope_level_{0};
 };
 
@@ -422,10 +448,15 @@ public:
   explicit SharedMemoryRewriter(
       const std::unordered_map<const VarNode *, const AllocateNode *>
           &shmem_allocs,
-      bool is_dynamic = true, bool verbose = false, int align_bytes = 0)
+      bool is_dynamic = true, bool verbose = false, int align_bytes = 0,
+      const std::string &merged_name = "", const std::string &merged_scope = "",
+      const std::string &target_scope = "")
       : is_dynamic_{is_dynamic}, shmem_allocs_{shmem_allocs}, verbose_{verbose},
-        align_bytes_{align_bytes} {
-    if (!is_dynamic) {
+        align_bytes_{align_bytes}, target_scope_{target_scope} {
+    if (!merged_name.empty() && !merged_scope.empty()) {
+      merged_buf_var_ = Var(
+          merged_name, PointerType(PrimType(DataType::UInt(8)), merged_scope));
+    } else if (!is_dynamic) {
       merged_buf_var_ =
           Var("buf_shmem", PointerType(PrimType(DataType::UInt(8)), "shared"));
     }
@@ -437,8 +468,8 @@ public:
    */
   void PlanReuse(const Stmt &stmt, bool is_dynamic = true,
                  bool enable_aggressive_merge = false, bool verbose = false) {
-    SharedMemLinearAccessPatternFinder finder(is_dynamic,
-                                              enable_aggressive_merge, verbose);
+    SharedMemLinearAccessPatternFinder finder(
+        is_dynamic, enable_aggressive_merge, verbose, target_scope_);
     finder(stmt);
     shmem_alignment_map_ = SharedMemoryAlignmentPlanner::Plan(stmt);
     // First compute liveness over the flattened schedule, then feed it into the
@@ -674,6 +705,9 @@ private:
   // Wrapper function to determine if the shared memory allocation for a
   // variable is appropriate.
   bool IsAppropriateSharedMemory(const Var &var) {
+    if (!target_scope_.empty()) {
+      return IsScopeMemory(var, target_scope_);
+    }
     return is_dynamic_ ? IsDynamicSharedMemory(var) : IsStaticSharedMemory(var);
   }
 
@@ -1384,6 +1418,8 @@ private:
   // The var for the merged buffer
   Var merged_buf_var_{"buf_dyn_shmem",
                       PointerType(PrimType(DataType::UInt(8)), "shared.dyn")};
+  // For Ascend per-scope merging: the exact scope string to match
+  std::string target_scope_;
   // The mapping from the original buffer var to its allocate
   std::unordered_map<const VarNode *, const AllocateNode *> shmem_allocs_;
   // The size of the merged buffer
@@ -1417,6 +1453,18 @@ Stmt MergeSharedMemoryAllocations(Stmt stmt, bool merge_static_smem,
                                   verbose, align_bytes);
     rewriter.PlanReuse(stmt, false, enable_aggressive_merge);
     stmt = rewriter(std::move(stmt));
+  }
+  for (const auto &kv : collector.ascend_scope_allocs_) {
+    if (kv.second.size() > 1) {
+      const std::string &scope = kv.first;
+      std::string suffix = scope.substr(7);
+      std::string merged_name = "buf_dyn_" + suffix;
+      std::string merged_scope = scope + ".dyn";
+      SharedMemoryRewriter rewriter(kv.second, true, verbose, align_bytes,
+                                    merged_name, merged_scope, scope);
+      rewriter.PlanReuse(stmt, true, enable_aggressive_merge);
+      stmt = rewriter(std::move(stmt));
+    }
   }
   return stmt;
 }

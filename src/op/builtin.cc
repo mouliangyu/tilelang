@@ -354,6 +354,41 @@ TIR_DEFINE_TL_BUILTIN(ascend_copy_ubuf_to_gm)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(ascend_copy_gm_to_cbuf)
+    .set_num_inputs(9)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(ascend_load_cbuf_to_ca)
+    .set_num_inputs(9)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(ascend_load_cbuf_to_cb)
+    .set_num_inputs(9)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(ascend_copy_matrix_cc_to_ub)
+    .set_num_inputs(25)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(ascend_copy_ubuf_to_cbuf)
+    .set_num_inputs(7)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(ascend_copy_matrix_cc_to_gm)
+    .set_num_inputs(25)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(ascend_mad)
+    .set_num_inputs(10)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(pdl_trigger)
     .set_num_inputs(0)
     .set_attr<TCallEffectKind>("TCallEffectKind",

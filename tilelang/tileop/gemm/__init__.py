@@ -11,6 +11,7 @@ from .gemm_mma_sm70 import GemmMMASm70
 from .gemm_wgmma import GemmWGMMA
 from .gemm_tcgen05 import GemmTCGEN5
 from .gemm_mfma import GemmMFMA
+from .gemm_mad import GemmMAD
 from .gemm_cutedsl import GemmCuTeDSL
 from tilelang import _ffi_api
 from tilelang.utils.target import target_is_volta
@@ -170,6 +171,8 @@ class GemmPy(Node, Scriptable):
             return GemmTCGEN5
         elif gemm_inst.is_mfma():
             return GemmMFMA
+        elif gemm_inst.is_mad():
+            return GemmMAD
         elif gemm_inst.is_tcgen5mma():
             raise NotImplementedError("TCGEN5MMA is not implemented")
         else:

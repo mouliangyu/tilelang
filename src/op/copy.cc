@@ -298,9 +298,38 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
   // For Ascend GM↔UB copies, skip NV-specific layout inference.
   // DMA copies don't need SIMT thread layout.
   if (TargetIsAscend(target)) {
-    bool is_gm_ub = (IsGlobalBuffer(src) && IsSharedBuffer(dst)) ||
-                    (IsSharedBuffer(src) && IsGlobalBuffer(dst));
-    if (is_gm_ub) {
+    auto is_ascend_dma_pair = [&]() -> bool {
+      // GM <-> UB (existing)
+      if ((IsGlobalBuffer(src) && IsSharedBuffer(dst)) ||
+          (IsSharedBuffer(src) && IsGlobalBuffer(dst)))
+        return true;
+      // GM <-> L1
+      if ((IsGlobalBuffer(src) && IsL1Buffer(dst)) ||
+          (IsL1Buffer(src) && IsGlobalBuffer(dst)))
+        return true;
+      // L1 <-> L0A
+      if ((IsL1Buffer(src) && IsL0ABuffer(dst)) ||
+          (IsL0ABuffer(src) && IsL1Buffer(dst)))
+        return true;
+      // L1 <-> L0B
+      if ((IsL1Buffer(src) && IsL0BBuffer(dst)) ||
+          (IsL0BBuffer(src) && IsL1Buffer(dst)))
+        return true;
+      // L0C <-> UB
+      if ((IsL0CBuffer(src) && IsSharedBuffer(dst)) ||
+          (IsSharedBuffer(src) && IsL0CBuffer(dst)))
+        return true;
+      // UB <-> L1
+      if ((IsSharedBuffer(src) && IsL1Buffer(dst)) ||
+          (IsL1Buffer(src) && IsSharedBuffer(dst)))
+        return true;
+      // L0C <-> GM
+      if ((IsL0CBuffer(src) && IsGlobalBuffer(dst)) ||
+          (IsGlobalBuffer(src) && IsL0CBuffer(dst)))
+        return true;
+      return false;
+    };
+    if (is_ascend_dma_pair()) {
       Map<Buffer, Layout> result_map;
       PrimExpr thread_extent = T.thread_bounds->extent;
       for (const auto &range : src_range) {
@@ -734,7 +763,26 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   }
 }
 
-// Lowers the copy using standard load/store with loop transformations.
+static int GetAscendDMAPath(const Buffer &src, const Buffer &dst) {
+  if (IsGlobalBuffer(src) && IsSharedBuffer(dst))
+    return 0;
+  if (IsSharedBuffer(src) && IsGlobalBuffer(dst))
+    return 1;
+  if (IsGlobalBuffer(src) && IsL1Buffer(dst))
+    return 2;
+  if (IsL1Buffer(src) && IsL0ABuffer(dst))
+    return 3;
+  if (IsL1Buffer(src) && IsL0BBuffer(dst))
+    return 4;
+  if (IsL0CBuffer(src) && IsSharedBuffer(dst))
+    return 5;
+  if (IsSharedBuffer(src) && IsL1Buffer(dst))
+    return 6;
+  if (IsL0CBuffer(src) && IsGlobalBuffer(dst))
+    return 7;
+  return -1;
+}
+
 Stmt CopyNode::LowerNormalCopy(const LowerArgs &T,
                                arith::Analyzer *analyzer) const {
   bool is_cpu_target = T.target->GetTargetDeviceType() == kDLCPU;
@@ -742,13 +790,11 @@ Stmt CopyNode::LowerNormalCopy(const LowerArgs &T,
       T.thread_var.defined() &&
       std::string(T.thread_var->name_hint).substr(0, 6) == "simtvf";
 
-  // Ascend DMA path: GM↔UB copies outside SimtVF use DMA intrinsics.
   if (TargetIsAscend(T.target) && !IsLocalBuffer(src) && !IsLocalBuffer(dst) &&
       !in_simt_vf) {
-    bool is_gm_to_ub = IsGlobalBuffer(src) && IsSharedBuffer(dst);
-    bool is_ub_to_gm = IsSharedBuffer(src) && IsGlobalBuffer(dst);
-    if (is_gm_to_ub || is_ub_to_gm) {
-      return LowerAscendDMACopy(T, analyzer, is_gm_to_ub);
+    int dma_path = GetAscendDMAPath(src, dst);
+    if (dma_path >= 0) {
+      return LowerAscendDMACopy(T, analyzer, dma_path);
     }
   }
 
@@ -791,43 +837,27 @@ Stmt CopyNode::LowerNormalCopy(const LowerArgs &T,
 }
 
 Stmt CopyNode::LowerAscendDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
-                                  bool is_gm_to_ub) const {
-  Buffer gm_buf = is_gm_to_ub ? src : dst;
-  Buffer ub_buf = is_gm_to_ub ? dst : src;
-  Array<Range> gm_range = is_gm_to_ub ? src_range : dst_range;
-  Array<Range> ub_range = is_gm_to_ub ? dst_range : src_range;
-
+                                  int dma_path) const {
   auto I = [](int64_t v) { return make_const(DataType::Int(32), v); };
-  int elem_bytes = gm_buf->dtype.bytes();
+  int elem_bytes = src->dtype.bytes();
 
-  // Split ranges into outer dims (rows) and the contiguous inner dim.
-  // Inner dim = last dim whose range covers the full buffer extent.
-  // Outer dims = everything before that; their extents multiply to nRows.
-  //
-  // Example: A[M,N] shape, copy A[2:5, :] → inner_elems=N, n_rows=3
-  //          A[M,N] shape, copy A[:, :]   → inner_elems=N, n_rows=M
-  //          (contiguous) A[N]   shape, copy A[:]      → inner_elems=N,
-  //          n_rows=1 (1-D)
-  size_t ndim = gm_range.size();
-  PrimExpr inner_elems = gm_range[ndim - 1]->extent;
+  size_t ndim = src_range.size();
+  PrimExpr inner_elems = src_range[ndim - 1]->extent;
   PrimExpr n_rows = I(1);
   for (size_t i = 0; i + 1 < ndim; ++i) {
-    n_rows = n_rows * gm_range[i]->extent;
+    n_rows = n_rows * src_range[i]->extent;
   }
 
   PrimExpr row_bytes = inner_elems * I(elem_bytes);
 
-  // GM row stride = product of buffer shape dims after the first (outer) dim,
-  // in bytes. For shape [M, K, N]: stride = K*N*elem_bytes.
-  PrimExpr gm_row_stride_bytes = I(elem_bytes);
-  for (size_t j = 1; j < gm_buf->shape.size(); ++j) {
-    gm_row_stride_bytes = gm_row_stride_bytes * gm_buf->shape[j];
+  PrimExpr src_row_stride_bytes = I(elem_bytes);
+  for (size_t j = 1; j < src->shape.size(); ++j) {
+    src_row_stride_bytes = src_row_stride_bytes * src->shape[j];
   }
 
-  // UB row stride = product of UB buffer shape dims after the first, in bytes.
-  PrimExpr ub_row_stride_bytes = I(elem_bytes);
-  for (size_t j = 1; j < ub_buf->shape.size(); ++j) {
-    ub_row_stride_bytes = ub_row_stride_bytes * ub_buf->shape[j];
+  PrimExpr dst_row_stride_bytes = I(elem_bytes);
+  for (size_t j = 1; j < dst->shape.size(); ++j) {
+    dst_row_stride_bytes = dst_row_stride_bytes * dst->shape[j];
   }
 
   auto compute_flat_offset = [](const Buffer &buf,
@@ -843,32 +873,21 @@ Stmt CopyNode::LowerAscendDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
     return offset;
   };
 
-  PrimExpr gm_offset = compute_flat_offset(gm_buf, gm_range);
-  PrimExpr ub_offset = compute_flat_offset(ub_buf, ub_range);
+  PrimExpr src_offset = compute_flat_offset(src, src_range);
+  PrimExpr dst_offset = compute_flat_offset(dst, dst_range);
 
-  // For address_of(BufferLoad(...)), the buffer must be indexed with matching
-  // dimensionality. Create flat 1D views so we can use a single offset index.
-  auto make_flat_view = [](const Buffer &buf) -> Buffer {
-    PrimExpr total = make_const(DataType::Int(32), 1);
-    for (const auto &s : buf->shape)
-      total = total * s;
-    return Buffer(buf->data, buf->dtype, {total}, {}, buf->elem_offset,
-                  buf->name, buf->data_alignment, 0, buf->buffer_type);
+  auto make_access_ptr = [&](const Buffer &buf, PrimExpr offset,
+                             PrimExpr extent, int rw_mask) -> PrimExpr {
+    PrimExpr ptype = tir::TypeAnnotation(buf->dtype);
+    return Call(
+        DataType::Handle(), tir::builtin::tvm_access_ptr(),
+        {ptype, buf->data, offset, extent, IntImm(DataType::Int(32), rw_mask)});
   };
-  Buffer gm_flat = make_flat_view(gm_buf);
-  Buffer ub_flat = make_flat_view(ub_buf);
 
-  PrimExpr gm_ptr, ub_ptr;
-  if (analyzer->CanProve(gm_offset == 0)) {
-    gm_ptr = gm_buf->data;
-  } else {
-    gm_ptr = Call(DataType::Handle(), tir::builtin::address_of(),
-                  {BufferLoad(gm_flat, {gm_offset})});
-  }
-  // Always use address_of(BufferLoad) for UB so MergeSharedMemoryAllocations
-  // can rewrite the reference to buf_dyn_shmem.
-  ub_ptr = Call(DataType::Handle(), tir::builtin::address_of(),
-                {BufferLoad(ub_flat, {ub_offset})});
+  PrimExpr total_elems_expr = inner_elems * n_rows;
+  // rw_mask: 1 = read, 2 = write
+  PrimExpr src_ptr = make_access_ptr(src, src_offset, total_elems_expr, 1);
+  PrimExpr dst_ptr = make_access_ptr(dst, dst_offset, total_elems_expr, 2);
 
   PrimExpr sid = I(0);
   PrimExpr zero = I(0);
@@ -885,41 +904,84 @@ Stmt CopyNode::LowerAscendDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
       is_single_row = true;
   }
 
+  PrimExpr total_bytes = row_bytes * n_rows;
+
   PrimExpr call;
-  if (is_gm_to_ub) {
-    // copy_gm_to_ubuf(dst, src, sid, nBurst, lenBurst, srcStride, dstStride)
-    //   1D/contiguous: nBurst = total_bytes/32, lenBurst = 1, strides = 0
-    //   2D strided:    nBurst = n_rows, lenBurst = row_bytes/32,
-    //                  srcStride = (gm_stride - row_bytes)/32,
-    //                  dstStride = (ub_stride - row_bytes)/32
+  if (dma_path == 0) {
     if (is_single_row) {
-      PrimExpr total_bytes = row_bytes * n_rows;
-      call = Call(DataType::Void(), ascend_copy_gm_to_ubuf(),
-                  {ub_ptr, gm_ptr, sid, total_bytes / I(32), I(1), zero, zero});
+      call =
+          Call(DataType::Void(), ascend_copy_gm_to_ubuf(),
+               {dst_ptr, src_ptr, sid, total_bytes / I(32), I(1), zero, zero});
     } else {
       PrimExpr len_burst = row_bytes / I(32);
-      PrimExpr src_stride = (gm_row_stride_bytes - row_bytes) / I(32);
-      PrimExpr dst_stride = (ub_row_stride_bytes - row_bytes) / I(32);
+      PrimExpr src_stride = (src_row_stride_bytes - row_bytes) / I(32);
+      PrimExpr dst_stride = (dst_row_stride_bytes - row_bytes) / I(32);
       call = Call(
           DataType::Void(), ascend_copy_gm_to_ubuf(),
-          {ub_ptr, gm_ptr, sid, n_rows, len_burst, src_stride, dst_stride});
+          {dst_ptr, src_ptr, sid, n_rows, len_burst, src_stride, dst_stride});
     }
-  } else {
-    // copy_ubuf_to_gm_align_v2(dst, src, sid,
-    //   burst_num, burst_len, l2_cache_ctl, burst_dst_stride, burst_src_stride)
-    //   1D/contiguous: burst_num=1, burst_len=total, strides=total
-    //   2D strided:    burst_num=n_rows, burst_len=row_bytes,
-    //                  dst/src_stride = gm/ub row stride (bytes)
+  } else if (dma_path == 1) {
     if (is_single_row) {
-      PrimExpr total_bytes = row_bytes * n_rows;
       call = Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
-                  {gm_ptr, ub_ptr, sid, I(1), total_bytes, zero, total_bytes,
+                  {dst_ptr, src_ptr, sid, I(1), total_bytes, zero, total_bytes,
                    total_bytes});
     } else {
       call = Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
-                  {gm_ptr, ub_ptr, sid, n_rows, row_bytes, zero,
-                   gm_row_stride_bytes, ub_row_stride_bytes});
+                  {dst_ptr, src_ptr, sid, n_rows, row_bytes, zero,
+                   dst_row_stride_bytes, src_row_stride_bytes});
     }
+  } else if (dma_path == 2) {
+    call = Call(DataType::Void(), ascend_copy_gm_to_cbuf(),
+                {dst_ptr, src_ptr, sid, src_row_stride_bytes, zero, n_rows,
+                 inner_elems, zero, zero});
+  } else if (dma_path == 3 || dma_path == 4) {
+    // L1 -> L0A/L0B: fractal-addressed load
+    // K offset handled by kStartPosition param, not in src pointer.
+    // Recompute src_ptr excluding last-dim offset.
+    PrimExpr src_base_offset = I(0);
+    for (size_t i = 0; i + 1 < src_range.size(); ++i) {
+      PrimExpr stride = I(1);
+      for (size_t j = i + 1; j < src->shape.size(); ++j) {
+        stride = stride * src->shape[j];
+      }
+      src_base_offset = src_base_offset + src_range[i]->min * stride;
+    }
+    PrimExpr src_base_ptr =
+        make_access_ptr(src, src_base_offset, total_elems_expr, 1);
+
+    PrimExpr C0 = I(16);
+    size_t dst_ndim = dst_range.size();
+    PrimExpr m_dim = dst_ndim >= 2 ? dst_range[dst_ndim - 2]->extent : I(1);
+    PrimExpr k_dim = dst_range[dst_ndim - 1]->extent;
+    PrimExpr k_start = src_range[src_range.size() - 1]->min;
+    PrimExpr mStep = m_dim / C0;
+    PrimExpr kStep = k_dim / C0;
+    auto intrinsic =
+        (dma_path == 3) ? ascend_load_cbuf_to_ca() : ascend_load_cbuf_to_cb();
+    call = Call(DataType::Void(), intrinsic,
+                {dst_ptr, src_base_ptr, zero, k_start / C0, mStep, kStep, mStep,
+                 mStep, zero});
+  } else if (dma_path == 5) {
+    call =
+        Call(DataType::Void(), ascend_copy_matrix_cc_to_ub(),
+             {dst_ptr, src_ptr, sid,  inner_elems, n_rows, inner_elems, n_rows,
+              zero,    zero,    zero, zero,        zero,   zero,        I(1),
+              zero,    zero,    zero, zero,        zero,   zero,        zero,
+              zero,    zero,    zero, zero});
+  } else if (dma_path == 6) {
+    PrimExpr n_burst_val = total_bytes / I(32);
+    call = Call(DataType::Void(), ascend_copy_ubuf_to_cbuf(),
+                {dst_ptr, src_ptr, zero, n_burst_val, I(1), zero, zero});
+  } else if (dma_path == 7) {
+    PrimExpr dst_last_dim = dst->shape[dst->shape.size() - 1];
+    call =
+        Call(DataType::Void(), ascend_copy_matrix_cc_to_gm(),
+             {dst_ptr, src_ptr, sid,  inner_elems, n_rows, dst_last_dim, n_rows,
+              zero,    zero,    zero, zero,        zero,   zero,         I(1),
+              zero,    zero,    zero, zero,        zero,   zero,         zero,
+              zero,    zero,    zero, zero});
+  } else {
+    LOG(FATAL) << "Unknown Ascend DMA path: " << dma_path;
   }
 
   return Evaluate(call);

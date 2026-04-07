@@ -78,6 +78,31 @@ inline bool IsLocalVarBuffer(const Buffer &buffer) {
   return buffer.defined() && buffer.scope() == "local.var";
 }
 
+inline bool IsL1Buffer(const Buffer &buffer) {
+  return buffer.defined() &&
+         (buffer.scope() == "shared.l1" || buffer.scope() == "shared.l1.dyn");
+}
+
+inline bool IsL0ABuffer(const Buffer &buffer) {
+  return buffer.defined() &&
+         (buffer.scope() == "shared.l0a" || buffer.scope() == "shared.l0a.dyn");
+}
+
+inline bool IsL0BBuffer(const Buffer &buffer) {
+  return buffer.defined() &&
+         (buffer.scope() == "shared.l0b" || buffer.scope() == "shared.l0b.dyn");
+}
+
+inline bool IsL0CBuffer(const Buffer &buffer) {
+  return buffer.defined() &&
+         (buffer.scope() == "shared.l0c" || buffer.scope() == "shared.l0c.dyn");
+}
+
+inline bool IsAscendOnChipBuffer(const Buffer &buffer) {
+  return IsSharedBuffer(buffer) || IsL1Buffer(buffer) || IsL0ABuffer(buffer) ||
+         IsL0BBuffer(buffer) || IsL0CBuffer(buffer);
+}
+
 } // namespace tl
 } // namespace tvm
 

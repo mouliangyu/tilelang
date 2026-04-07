@@ -580,6 +580,65 @@ TVM_DLL const Op &ascend_copy_gm_to_ubuf();
 TVM_DLL const Op &ascend_copy_ubuf_to_gm();
 
 /*!
+ * \brief Ascend DMA copy from GM to CBuf (L1).
+ *
+ * ascend_copy_gm_to_cbuf(dst, src, sid, loop1_src_stride, l2_cache_ctrl,
+ * n_value, d_value, loop4_src_stride, smallc0_en)
+ *
+ */
+TVM_DLL const Op &ascend_copy_gm_to_cbuf();
+
+/*!
+ * \brief Ascend load from CBuf (L1) to CA (L0A).
+ *
+ * ascend_load_cbuf_to_ca(dst, src, mStartPosition, kStartPosition,
+ * mStep, kStep, srcStride, dstStride, transpose)
+ *
+ */
+TVM_DLL const Op &ascend_load_cbuf_to_ca();
+
+/*!
+ * \brief Ascend load from CBuf (L1) to CB (L0B).
+ *
+ * ascend_load_cbuf_to_cb(dst, src, mStartPosition, kStartPosition,
+ * mStep, kStep, srcStride, dstStride, transpose)
+ *
+ */
+TVM_DLL const Op &ascend_load_cbuf_to_cb();
+
+/*!
+ * \brief Ascend copy matrix from CC (L0C) to UBuf.
+ *
+ * ascend_copy_matrix_cc_to_ub(dst, src, sid, n_size, m_size,
+ * loop_dst_stride, loop_src_stride, l2, clip_relu_pre, unit_flag_ctl,
+ * quant_pre, relu_pre, split_en, NZ2ND_en, quant_post, relu_post,
+ * clip_relu_post, loop_enhance_en, eltwise_op, eltwise_antq_en,
+ * loop_enhance_merge_en)
+ *
+ */
+TVM_DLL const Op &ascend_copy_matrix_cc_to_ub();
+
+/*!
+ * \brief Ascend DMA copy from UBuf to CBuf (L1).
+ *
+ * ascend_copy_ubuf_to_cbuf(dst, src, sub_blockid, burst_num, burst_len,
+ * src_gap, dst_gap)
+ *
+ */
+TVM_DLL const Op &ascend_copy_ubuf_to_cbuf();
+
+TVM_DLL const Op &ascend_copy_matrix_cc_to_gm();
+
+/*!
+ * \brief Ascend Cube MAD (matrix multiply-add) instruction.
+ *
+ * ascend_mad(dst, src_a, src_b, M, K, N, bias_addr, transpose_a, transpose_b,
+ * init_flag)
+ *
+ */
+TVM_DLL const Op &ascend_mad();
+
+/*!
  * \brief Programmatic dependency trigger.
  *
  * pdl_trigger()

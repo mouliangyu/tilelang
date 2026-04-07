@@ -76,6 +76,50 @@ def alloc_fragment(shape: ShapeType, dtype: DType, scope="local.fragment") -> Bu
     return T.alloc_buffer(shape, dtype, scope=scope)
 
 
+def alloc_l1(shape: ShapeType, dtype: DType, scope="shared.l1") -> Buffer:
+    """Allocate an L1 buffer (__cbuf__) on Ascend NPU.
+
+    Args:
+        shape: Buffer shape
+        dtype: Data type
+        scope: Memory scope. Defaults to "shared.l1"
+    """
+    return T.alloc_buffer(shape, dtype, scope=scope)
+
+
+def alloc_l0a(shape: ShapeType, dtype: DType, scope="shared.l0a") -> Buffer:
+    """Allocate an L0A buffer (__ca__) on Ascend NPU.
+
+    Args:
+        shape: Buffer shape
+        dtype: Data type
+        scope: Memory scope. Defaults to "shared.l0a"
+    """
+    return T.alloc_buffer(shape, dtype, scope=scope)
+
+
+def alloc_l0b(shape: ShapeType, dtype: DType, scope="shared.l0b") -> Buffer:
+    """Allocate an L0B buffer (__cb__) on Ascend NPU.
+
+    Args:
+        shape: Buffer shape
+        dtype: Data type
+        scope: Memory scope. Defaults to "shared.l0b"
+    """
+    return T.alloc_buffer(shape, dtype, scope=scope)
+
+
+def alloc_l0c(shape: ShapeType, dtype: DType, scope="shared.l0c") -> Buffer:
+    """Allocate an L0C buffer (__cc__) on Ascend NPU.
+
+    Args:
+        shape: Buffer shape
+        dtype: Data type
+        scope: Memory scope. Defaults to "shared.l0c"
+    """
+    return T.alloc_buffer(shape, dtype, scope=scope)
+
+
 @overload
 def alloc_var(dtype: DType, init: PrimExpr | int | float, scope: str = "local.var") -> Buffer: ...
 

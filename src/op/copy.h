@@ -264,10 +264,12 @@ protected:
   Stmt LowerNormalCopy(const LowerArgs &T, arith::Analyzer *analyzer) const;
 
   /*!
-   * \brief Generate lowering for Ascend DMA copy (GM↔UB).
+   * \brief Generate lowering for Ascend DMA copy.
+   * \param dma_path  0=GM→UB, 1=UB→GM, 2=GM→L1, 3=L1→L0A,
+   *                  4=L1→L0B, 5=L0C→UB, 6=UB→L1
    */
   Stmt LowerAscendDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
-                          bool is_gm_to_ub) const;
+                          int dma_path) const;
 
   /*!
    * \brief Generate SIMT (thread-level) loop for copying.

@@ -54,6 +54,10 @@ from .allocate import (
     alloc_local,  # noqa: F401
     alloc_shared,  # noqa: F401
     alloc_fragment,  # noqa: F401
+    alloc_l1,  # noqa: F401
+    alloc_l0a,  # noqa: F401
+    alloc_l0b,  # noqa: F401
+    alloc_l0c,  # noqa: F401
     alloc_barrier,  # noqa: F401
     alloc_tmem,  # noqa: F401
     alloc_reducer,  # noqa: F401

@@ -68,6 +68,12 @@ void CodeGenTileLangAscend::PrintType(DataType t, std::ostream &os) {
     default:
       fail = true;
     }
+  } else if (t.is_bfloat16()) {
+    if (lanes == 1) {
+      os << "bfloat16_t";
+    } else {
+      fail = true;
+    }
   } else if (t.is_int() || t.is_uint()) {
     switch (t.bits()) {
     case 8:
@@ -588,7 +594,6 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[2], this->stream);
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_gm_to_ubuf())) {
-    // LOG(FATAL) << op->args[1]->dtype;
     ICHECK_EQ(op->args.size(), 7)
         << "tl.ascend_copy_gm_to_ubuf expects exactly 7 arguments";
     this->PrintIndent();
@@ -628,6 +633,140 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << ", ";
     this->PrintExpr(op->args[7], this->stream);
     this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_copy_gm_to_cbuf())) {
+    ICHECK_EQ(op->args.size(), 9)
+        << "tl.ascend_copy_gm_to_cbuf expects exactly 9 arguments";
+    this->PrintIndent();
+    this->stream << "bisheng::cce::copy_gm_to_cbuf_multi_nd2nz(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", ";
+    for (int i = 2; i < 9; ++i) {
+      if (i > 2)
+        this->stream << ", ";
+      this->PrintExpr(op->args[i], this->stream);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_load_cbuf_to_ca())) {
+    ICHECK_EQ(op->args.size(), 9)
+        << "tl.ascend_load_cbuf_to_ca expects exactly 9 arguments";
+    this->PrintIndent();
+    this->stream << "bisheng::cce::load_cbuf_to_ca(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", ";
+    for (int i = 2; i < 9; ++i) {
+      if (i > 2)
+        this->stream << ", ";
+      this->PrintExpr(op->args[i], this->stream);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_load_cbuf_to_cb())) {
+    ICHECK_EQ(op->args.size(), 9)
+        << "tl.ascend_load_cbuf_to_cb expects exactly 9 arguments";
+    this->PrintIndent();
+    this->stream << "bisheng::cce::load_cbuf_to_cb(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", ";
+    for (int i = 2; i < 9; ++i) {
+      if (i > 2)
+        this->stream << ", ";
+      this->PrintExpr(op->args[i], this->stream);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_copy_matrix_cc_to_ub())) {
+    ICHECK_EQ(op->args.size(), 25)
+        << "tl.ascend_copy_matrix_cc_to_ub expects exactly 25 arguments";
+    this->PrintIndent();
+    this->stream << "copy_matrix_cc_to_ub((__ubuf__ void*)(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << "), (__cc__ void*)(";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << "), ";
+    for (int i = 2; i < 25; ++i) {
+      if (i > 2)
+        this->stream << ", ";
+      this->PrintExpr(op->args[i], this->stream);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_copy_matrix_cc_to_gm())) {
+    ICHECK_EQ(op->args.size(), 25)
+        << "tl.ascend_copy_matrix_cc_to_gm expects exactly 25 arguments";
+    this->PrintIndent();
+    this->stream << "bisheng::cce::copy_matrix_cc_to_gm(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", ";
+    for (int i = 2; i < 25; ++i) {
+      if (i > 2)
+        this->stream << ", ";
+      this->PrintExpr(op->args[i], this->stream);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_copy_ubuf_to_cbuf())) {
+    ICHECK_EQ(op->args.size(), 7)
+        << "tl.ascend_copy_ubuf_to_cbuf expects exactly 7 arguments";
+    this->PrintIndent();
+    this->stream << "copy_ubuf_to_cbuf((__cbuf__ void*)(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << "), (__ubuf__ void*)(";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << "), ";
+    for (int i = 2; i < 7; ++i) {
+      if (i > 2)
+        this->stream << ", ";
+      this->PrintExpr(op->args[i], this->stream);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_mad())) {
+    ICHECK_EQ(op->args.size(), 10)
+        << "tl.ascend_mad expects exactly 10 arguments";
+    this->PrintIndent();
+    this->stream << "bisheng::cce::mad(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[2], this->stream);
+    this->stream << ", ";
+    for (int i = 3; i < 10; ++i) {
+      if (i > 3)
+        this->stream << ", ";
+      this->PrintExpr(op->args[i], this->stream);
+    }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tir::builtin::address_of())) {
+    const auto *load = op->args[0].as<tir::BufferLoadNode>();
+    ICHECK(op->args.size() == 1 && load);
+    const auto *buf_var = load->buffer->data.get();
+    std::string scope;
+    if (alloc_storage_scope_.count(buf_var)) {
+      scope = alloc_storage_scope_.at(buf_var);
+    }
+    bool needs_ptr_arith = (scope.find("l0") != std::string::npos ||
+                            scope.find("l1") != std::string::npos);
+    if (needs_ptr_arith) {
+      os << "(";
+      PrintStorageScope(scope, os);
+      PrintType(load->dtype, os);
+      os << "*)(";
+      os << GetVarID(buf_var);
+      if (load->indices.size() == 1) {
+        PrimExpr idx = load->indices[0];
+        if (!is_zero(idx)) {
+          os << " + ";
+          PrintExpr(idx, os);
+        }
+      }
+      os << ")";
+    } else {
+      CodeGenC::VisitExpr_(op, os);
+    }
   } else {
     CodeGenC::VisitExpr_(op, os);
   }
@@ -681,9 +820,22 @@ void CodeGenTileLangAscend::VisitStmt_(const AttrStmtNode *op) {
   CodeGenC::VisitStmt_(op);
 }
 
+static std::string GetAscendScopeQualifier(const std::string &scope) {
+  if (scope == "shared" || scope == "shared.dyn")
+    return "__ubuf__";
+  if (scope == "shared.l0a" || scope == "shared.l0a.dyn")
+    return "__ca__";
+  if (scope == "shared.l0b" || scope == "shared.l0b.dyn")
+    return "__cb__";
+  if (scope == "shared.l0c" || scope == "shared.l0c.dyn")
+    return "__cc__";
+  if (scope == "shared.l1" || scope == "shared.l1.dyn")
+    return "__cbuf__";
+  return "";
+}
+
 void CodeGenTileLangAscend::VisitStmt_(const AllocateNode *op) {
   ICHECK(!is_zero(op->condition));
-  std::string vid = AllocVarID(op->buffer_var.get());
   std::string scope = GetPtrStorageScope(op->buffer_var);
 
   if (scope == "shared") {
@@ -693,14 +845,15 @@ void CodeGenTileLangAscend::VisitStmt_(const AllocateNode *op) {
            "T.alloc_shared.";
   }
 
-  if (scope == "shared.dyn") {
-    // Generate: __ubuf__ <type> *buf = (__ubuf__ <type> *)0;
-    // Use the original dtype from the allocate node
+  std::string qualifier = GetAscendScopeQualifier(scope);
+  if (!qualifier.empty()) {
+    // Generate: __qualifier__ <type> *buf = (__qualifier__ <type> *)0;
+    std::string vid = AllocVarID(op->buffer_var.get());
     DataType dtype = op->dtype;
     this->PrintIndent();
-    stream << "__ubuf__ ";
+    stream << qualifier << " ";
     PrintType(dtype, stream);
-    stream << " *" << vid << " = (__ubuf__ ";
+    stream << " *" << vid << " = (" << qualifier << " ";
     PrintType(dtype, stream);
     stream << " *)0;\n";
     alloc_storage_scope_[op->buffer_var.get()] = scope;
@@ -723,12 +876,12 @@ void CodeGenTileLangAscend::PrintStorageScope(const std::string &scope,
                                               std::ostream &os) {
   if (scope == "global") {
     os << "__gm__ ";
-  } else if (scope == "shared" || scope == "shared.dyn") {
-    os << "__ubuf__ ";
-  } else if (!scope.empty()) {
-    LOG(FATAL) << "CodeGenTileLangAscend: Unsupported storage scope: " << scope;
+  } else {
+    std::string qualifier = GetAscendScopeQualifier(scope);
+    if (!qualifier.empty()) {
+      os << qualifier << " ";
+    }
   }
-  // Empty scope: output nothing
 }
 
 bool CodeGenTileLangAscend::IsScopePartOfType() const {
