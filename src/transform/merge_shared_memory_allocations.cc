@@ -85,37 +85,37 @@ static bool IsScopeMemory(Var buffer_var, const std::string &target_scope) {
  * \brief collect the mapping from the buffer var to its allocate
  */
 namespace {
-  class AllocateCollector : public StmtExprVisitor {
-  public:
-    void VisitStmt_(const AllocateNode *op) final {
-      if (IsDynamicSharedMemory(op->buffer_var)) {
-        dyn_shmem_allocs_[op->buffer_var.get()] = op;
-      } else if (IsStaticSharedMemory(op->buffer_var)) {
-        static_shmem_allocs_[op->buffer_var.get()] = op;
-      } else {
-        // Check for Ascend on-chip scopes
-        auto scope = GetPtrStorageScope(op->buffer_var);
-        for (const auto &s :
-            {"shared.l0a", "shared.l0b", "shared.l0c", "shared.l1"}) {
-          if (scope == s) {
-            ascend_scope_allocs_[s][op->buffer_var.get()] = op;
-            break;
-          }
+class AllocateCollector : public StmtExprVisitor {
+public:
+  void VisitStmt_(const AllocateNode *op) final {
+    if (IsDynamicSharedMemory(op->buffer_var)) {
+      dyn_shmem_allocs_[op->buffer_var.get()] = op;
+    } else if (IsStaticSharedMemory(op->buffer_var)) {
+      static_shmem_allocs_[op->buffer_var.get()] = op;
+    } else {
+      // Check for Ascend on-chip scopes
+      auto scope = GetPtrStorageScope(op->buffer_var);
+      for (const auto &s :
+           {"shared.l0a", "shared.l0b", "shared.l0c", "shared.l1"}) {
+        if (scope == s) {
+          ascend_scope_allocs_[s][op->buffer_var.get()] = op;
+          break;
         }
       }
-      StmtExprVisitor::VisitStmt_(op);
     }
-    // The dynamic mapping from the original buffer var to its allocate
-    std::unordered_map<const VarNode *, const AllocateNode *> dyn_shmem_allocs_;
-    // The static mapping from the original buffer var to its allocate
-    std::unordered_map<const VarNode *, const AllocateNode *>
-        static_shmem_allocs_;
-    // Ascend: scope_string -> {var -> alloc}
-    std::unordered_map<std::string,
-                      std::unordered_map<const VarNode *, const AllocateNode *>>
-        ascend_scope_allocs_;
-  };
-}
+    StmtExprVisitor::VisitStmt_(op);
+  }
+  // The dynamic mapping from the original buffer var to its allocate
+  std::unordered_map<const VarNode *, const AllocateNode *> dyn_shmem_allocs_;
+  // The static mapping from the original buffer var to its allocate
+  std::unordered_map<const VarNode *, const AllocateNode *>
+      static_shmem_allocs_;
+  // Ascend: scope_string -> {var -> alloc}
+  std::unordered_map<std::string,
+                     std::unordered_map<const VarNode *, const AllocateNode *>>
+      ascend_scope_allocs_;
+};
+} // namespace
 
 // Find a linear pattern of storage access
 // Used for liveness analysis.

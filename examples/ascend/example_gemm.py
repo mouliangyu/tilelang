@@ -17,7 +17,7 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
     WINDOW = min(4, M_TILES)
     NUM_STAGES = 2
     MAIN_ROW = M_TILES // WINDOW - 1
-    TAIL_WIN   = M_TILES - MAIN_ROW * WINDOW
+    TAIL_WIN = M_TILES - MAIN_ROW * WINDOW
 
     @T.macro
     def aswt_swizzle(tile_idx):
@@ -53,8 +53,8 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
                 T.ascend_set_flag("M_MTE1", f + NUM_STAGES)
                 T.ascend_set_flag("MTE1_MTE2", f)
             T.ascend_set_flag("FIX_M", 0)
-            for ot in range(TILES_PER_CORE):
-                tile_idx = ot * NUM_BLOCKS + bx
+            for out_tile in range(TILES_PER_CORE):
+                tile_idx = out_tile * NUM_BLOCKS + bx
                 m_tile, n_tile = aswt_swizzle(tile_idx)
 
                 for kt in range(K_TILES):
@@ -109,7 +109,7 @@ if __name__ == "__main__":
     device = torch.device("npu")
 
     # Create and compile kernel
-    print(f"Compiling gemm kernel...")
+    print("Compiling gemm kernel...")
     program = gemm(M_DIM, K_DIM, N_DIM)
     kernel = tilelang.compile(program, out_idx=-1)
     print("Compilation succeeded!")
