@@ -610,10 +610,10 @@ TVM_DLL const Op &ascend_load_cbuf_to_cb();
  * \brief Ascend copy matrix from CC (L0C) to UBuf.
  *
  * ascend_copy_matrix_cc_to_ub(dst, src, sid, n_size, m_size,
- * loop_dst_stride, loop_src_stride, l2, clip_relu_pre, unit_flag_ctl,
- * quant_pre, relu_pre, split_en, NZ2ND_en, quant_post, relu_post,
- * clip_relu_post, loop_enhance_en, eltwise_op, eltwise_antq_en,
- * loop_enhance_merge_en)
+ * loop_dst_stride, loop_src_stride, dual_dst_ctl, sub_blockid, clip_relu_pre,
+ * unit_flag_ctl, quant_pre, relu_pre, split_en, NZ2ND_en, quant_post,
+ * relu_post, clip_relu_post, loop_enhance_en, eltwise_op, eltwise_antq_en,
+ * loop_enhance_merge_en, C0_pad_en, wino_post_en, broadcast_en, NZ2DN_en)
  *
  */
 TVM_DLL const Op &ascend_copy_matrix_cc_to_ub();
@@ -632,8 +632,8 @@ TVM_DLL const Op &ascend_copy_matrix_cc_to_gm();
 /*!
  * \brief Ascend Cube MAD (matrix multiply-add) instruction.
  *
- * ascend_mad(dst, src_a, src_b, M, K, N, bias_addr, transpose_a, transpose_b,
- * init_flag)
+ * ascend_mad(dst, src_a, src_b, M, K, N, unit_flag_ctrl, gemv_ctrl, BTbuf_ctrl,
+ * zero_Cmatrix)
  *
  */
 TVM_DLL const Op &ascend_mad();

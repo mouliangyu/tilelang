@@ -101,6 +101,92 @@ def copy(
     return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.copy"), src, dst, annotations=ann if ann else None)
 
 
+def _get_shape(buf):
+    """Extract shape list from Buffer, BufferLoad, or BufferRegion."""
+    if isinstance(buf, tir.Buffer):
+        return list(buf.shape)
+    elif isinstance(buf, tir.BufferLoad):
+        return list(buf.buffer.shape)
+    elif isinstance(buf, tir.BufferRegion):
+        return [r.extent for r in buf.region]
+    else:
+        raise TypeError(f"Cannot get shape from {type(buf)}")
+
+
+def _is_half(full_dim, half_dim):
+    """Check if half_dim == full_dim // 2."""
+    if isinstance(full_dim, (int, tir.IntImm)) and isinstance(half_dim, (int, tir.IntImm)):
+        full_val = full_dim if isinstance(full_dim, int) else full_dim.value
+        half_val = half_dim if isinstance(half_dim, int) else half_dim.value
+        return half_val == full_val // 2
+    try:
+        from tvm.ir import structural_equal
+
+        return structural_equal(half_dim * 2, full_dim)
+    except Exception:
+        return False
+
+
+def dual_copy(
+    src: BufferLikeType,
+    dst: BufferLikeType,
+    *,
+    unit_flag_ctl: int = 0,
+) -> tir.PrimExpr | tir.Stmt:
+    """Copy data from L0C to UB with dualDst (M-split or N-split across 2 AIVs).
+
+    Generates a ``copy_matrix_cc_to_ub`` instruction with ``dual_dst_ctl`` enabled.
+    The split direction is auto-inferred from the shape mismatch between src and dst:
+
+    - ``src[M, N]`` → ``dst[M/2, N]``: M-split (``dual_dst_ctl=0b01``)
+      AIV0 receives rows ``[0, M/2)``, AIV1 receives rows ``[M/2, M)``
+    - ``src[M, N]`` → ``dst[M, N/2]``: N-split (``dual_dst_ctl=0b10``)
+      AIV0 receives cols ``[0, N/2)``, AIV1 receives cols ``[N/2, N)``
+
+    Args:
+        src: Source buffer in L0C (``__cc__``), shape ``[M, N]``
+        dst: Destination buffer in UB (``__ubuf__``), shape ``[M/2, N]`` or ``[M, N/2]``
+        unit_flag_ctl: Unit flag control (0=manual sync, 3=pipelined with mad)
+
+    Raises:
+        ValueError: If the split direction cannot be inferred from shapes.
+    """
+    src_shape = _get_shape(src)
+    dst_shape = _get_shape(dst)
+
+    if len(src_shape) < 2 or len(dst_shape) < 2:
+        raise ValueError("dual_copy requires at least 2D buffers")
+
+    src_m, src_n = src_shape[-2], src_shape[-1]
+    dst_m, dst_n = dst_shape[-2], dst_shape[-1]
+
+    m_halved = _is_half(src_m, dst_m)
+    n_halved = _is_half(src_n, dst_n)
+
+    if m_halved and not n_halved:
+        dual_dst_ctl = 1  # M-split (0b01)
+    elif n_halved and not m_halved:
+        dual_dst_ctl = 2  # N-split (0b10)
+    else:
+        raise ValueError(
+            f"Cannot infer dual_copy split direction: src shape {src_shape} vs dst shape {dst_shape}. Exactly one dimension must be halved."
+        )
+
+    # Convert both to buffer regions to bypass the shape equality check in copy()
+    # This allows src[M,N] to be copied to dst[M/2,N] or dst[M,N/2]
+    src_region = to_buffer_region(src)
+    dst_region = to_buffer_region(dst)
+
+    return copy(
+        src_region,
+        dst_region,
+        annotations={
+            "dual_dst_ctl": dual_dst_ctl,
+            "unit_flag_ctl": unit_flag_ctl,
+        },
+    )
+
+
 def c2d_im2col(
     img: BufferLikeType,
     col: BufferLikeType,

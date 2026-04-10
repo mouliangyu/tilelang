@@ -62,9 +62,9 @@ class GemmMAD(GemmBase):
                 _to_int32(self.M),
                 _to_int32(self.K),
                 _to_int32(self.N),
-                _to_int32(0),
-                tir.IntImm("int32", 1 if self.trans_A else 0),
-                tir.IntImm("int32", 1 if self.trans_B else 0),
+                _to_int32(0),  # unit_flag_ctrl
+                _to_int32(0),  # gemv_ctrl (false)
+                _to_int32(0),  # BTbuf_ctrl (false)
                 self.clear_accum,
             ],
         )

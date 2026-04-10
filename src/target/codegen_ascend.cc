@@ -679,15 +679,15 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_matrix_cc_to_ub())) {
-    ICHECK_EQ(op->args.size(), 25)
-        << "tl.ascend_copy_matrix_cc_to_ub expects exactly 25 arguments";
+    ICHECK_EQ(op->args.size(), 26)
+        << "tl.ascend_copy_matrix_cc_to_ub expects exactly 26 arguments";
     this->PrintIndent();
-    this->stream << "copy_matrix_cc_to_ub((__ubuf__ void*)(";
+    this->stream << "copy_matrix_cc_to_ub(";
     this->PrintExpr(op->args[0], this->stream);
-    this->stream << "), (__cc__ void*)(";
+    this->stream << ", ";
     this->PrintExpr(op->args[1], this->stream);
-    this->stream << "), ";
-    for (int i = 2; i < 25; ++i) {
+    this->stream << ", ";
+    for (int i = 2; i < 26; ++i) {
       if (i > 2)
         this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);

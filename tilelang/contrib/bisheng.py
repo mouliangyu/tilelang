@@ -62,7 +62,7 @@ def compile_ascend(
 
     npu_arch : str, optional
         NPU architecture string passed via ``--npu-arch=<arch>`` (e.g.
-        ``"dav-3101"``).  If *None*, ``ASCEND_NPU_ARCH`` env-var is used.
+        ``"dav-3510"``).  If *None*, ``ASCEND_NPU_ARCH`` env-var is used.
 
     options : str or list of str, optional
         Extra flags forwarded to bisheng.

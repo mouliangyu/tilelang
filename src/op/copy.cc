@@ -962,12 +962,38 @@ Stmt CopyNode::LowerAscendDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
                 {dst_ptr, src_base_ptr, zero, k_start / C0, mStep, kStep, mStep,
                  mStep, zero});
   } else if (dma_path == 5) {
-    call =
-        Call(DataType::Void(), ascend_copy_matrix_cc_to_ub(),
-             {dst_ptr, src_ptr, sid,  inner_elems, n_rows, inner_elems, n_rows,
-              zero,    zero,    zero, zero,        zero,   zero,        I(1),
-              zero,    zero,    zero, zero,        zero,   zero,        zero,
-              zero,    zero,    zero, zero});
+    // arg7 = hardware dual_dst_ctl (0=off, 1=M-split, 2=N-split)
+    // arg8 = hardware sub_blockid (always 0 for our use case)
+    // arg10 = hardware unit_flag_ctl (0=manual, 3=pipelined with mad)
+    PrimExpr dual_dst_ctl_val = I(this->GetDualDstCtl());
+    PrimExpr unit_flag_ctl_val = I(this->GetUnitFlagCtl());
+    call = Call(DataType::Void(), ascend_copy_matrix_cc_to_ub(),
+                {dst_ptr,
+                 src_ptr,
+                 sid,
+                 inner_elems,
+                 n_rows,
+                 inner_elems,
+                 n_rows,
+                 dual_dst_ctl_val,
+                 zero,              // [8] sub_blockid
+                 zero,              // [9] clip_relu_pre
+                 unit_flag_ctl_val, // [10] unit_flag_ctl
+                 zero,              // [11] quant_pre
+                 zero,              // [12] relu_pre
+                 zero,              // [13] split_en
+                 I(1),              // [14] NZ2ND_en
+                 zero,              // [15] quant_post
+                 zero,              // [16] relu_post
+                 zero,              // [17] clip_relu_post
+                 zero,              // [18] loop_enhance_en
+                 zero,              // [19] eltwise_op
+                 zero,              // [20] eltwise_antq_en
+                 zero,              // [21] loop_enhance_merge_en
+                 zero,              // [22] C0_pad_en
+                 zero,              // [23] wino_post_en
+                 zero,              // [24] broadcast_en
+                 zero});            // [25] NZ2DN_en
   } else if (dma_path == 6) {
     PrimExpr n_burst_val = total_bytes / I(32);
     call = Call(DataType::Void(), ascend_copy_ubuf_to_cbuf(),

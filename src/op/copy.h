@@ -158,6 +158,24 @@ public:
     return 0; // default: evict_normal
   }
 
+  int GetDualDstCtl() const {
+    if (auto val = annotations.Get("dual_dst_ctl")) {
+      if (auto int_val = val->as<IntImmNode>()) {
+        return int_val->value;
+      }
+    }
+    return 0;
+  }
+
+  int GetUnitFlagCtl() const {
+    if (auto val = annotations.Get("unit_flag_ctl")) {
+      if (auto int_val = val->as<IntImmNode>()) {
+        return int_val->value;
+      }
+    }
+    return 0;
+  }
+
   /*!
    * \brief Lower the copy operator to a TIR statement.
    * \param T        Arguments for lowering.

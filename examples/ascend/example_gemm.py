@@ -47,8 +47,6 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
             res = T.alloc_l0c((TILE_M, TILE_N), "float32")
             x_l1 = T.alloc_l1((NUM_STAGES, TILE_M, TILE_K), "bfloat16")
             w_l1 = T.alloc_l1((NUM_STAGES, TILE_N, TILE_K), "bfloat16")
-            m_tile = T.alloc_var("int32")
-            n_tile = T.alloc_var("int32")
             for f in range(NUM_STAGES):
                 T.ascend_set_flag("M_MTE1", f + NUM_STAGES)
                 T.ascend_set_flag("MTE1_MTE2", f)
@@ -69,13 +67,13 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
                     for sk in range(SUB_K):
                         sf = sk % NUM_STAGES
                         T.ascend_wait_flag("M_MTE1", sf + NUM_STAGES)
-                        T.copy(x_l1[sf, :, sk * TILE_K_SUB : (sk + 1) * TILE_K_SUB], x_l0[sf, :, :])
-                        T.copy(w_l1[sf, :, sk * TILE_K_SUB : (sk + 1) * TILE_K_SUB], w_l0[sf, :, :])
+                        T.copy(x_l1[f, :, sk * TILE_K_SUB : (sk + 1) * TILE_K_SUB], x_l0[sf, :, :])
+                        T.copy(w_l1[f, :, sk * TILE_K_SUB : (sk + 1) * TILE_K_SUB], w_l0[sf, :, :])
                         T.ascend_set_flag("MTE1_M", sf + 2)
                         T.ascend_wait_flag("MTE1_M", sf + 2)
                         if kt == 0 and sk == 0:
                             T.ascend_wait_flag("FIX_M", 0)
-                        T.gemm(x_l0[sf, :, :], w_l0[sf, :, :], res, transpose_B=True)
+                        T.gemm(x_l0[sf, :, :], w_l0[sf, :, :], res, transpose_B=True, clear_accum=(kt == 0 and sk == 0))
                         T.ascend_set_flag("M_MTE1", sf + 2)
 
                     T.ascend_set_flag("MTE1_MTE2", f)
@@ -131,7 +129,8 @@ if __name__ == "__main__":
     # Verify
     expected = ref_program(x, w)
     max_diff = torch.max(torch.abs(c - expected)).item()
-    if max_diff > 1e-2:
+    print(f"  {'PASS' if max_diff < 1e-2 else 'FAIL'}  rel={max_diff:.2e}")
+    if not max_diff < 1e-2:
         raise AssertionError(f"Results mismatch! Max diff: {max_diff}")
     print("\nVerification passed!")
 
