@@ -382,7 +382,10 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         std::stringstream ss;
 
         auto thread_offset = T.thread_bounds->min;
-        if (TargetHasSMVersionGE(T.target, 90)) {
+        if (T.target->HasKey("ascend")) {
+          ss << "tl::AscendAllReduce<" << this->MakeCodegenReducer() << ", "
+             << reducing_threads << ">::run";
+        } else if (TargetHasSMVersionGE(T.target, 90)) {
           auto all_threads = T.thread_bounds->extent;
           ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
              << reducing_threads << ", " << (*scale) << ", " << thread_offset
@@ -397,8 +400,14 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         // The butterfly reduce path needs one shared-memory slot per
         // thread in the block.
         if (reducing_threads > 32) {
-          int workspace_size =
-              static_cast<int>(*as_const_int(T.thread_bounds->extent));
+          int workspace_size;
+          if (T.target->HasKey("ascend")) {
+            workspace_size = reducing_threads / 32;
+          } else {
+            workspace_size =
+                static_cast<int>(*as_const_int(T.thread_bounds->extent));
+          }
+
           PrimExpr workspace =
               T.AddWorkspace(workspace_size, clear_buffer->dtype);
           thread_reduce_args.push_back(workspace);

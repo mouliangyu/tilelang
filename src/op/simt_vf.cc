@@ -38,6 +38,15 @@ Array<Var> SimtVFOpNode::CollectCaptures(const LowerArgs &T) const {
     predefined.push_back(T.thread_var);
   }
 
+  // Exclude Block-owned alloc_buffers from capture analysis.
+  // These are fragment buffers that will be placed inside the VF
+  // function by StorageRewrite (via tl.simtvf_scope). Without this
+  // exclusion, LCA analysis sees them as external references and
+  // places their Allocate outside the SIMT_VF region.
+  for (const tir::Buffer &buf : root_->alloc_buffers) {
+    predefined.push_back(buf->data);
+  }
+
   Array<Var> undefined = UndefinedVars(root_->body, predefined);
 
   Array<Var> captures;

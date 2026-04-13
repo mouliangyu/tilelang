@@ -83,6 +83,43 @@ def ascend_threadfence() -> None:
     return tir.call_intrin("void", tir.op.Op.get("tl.ascend_threadfence"))
 
 
+def ascend_reduce_add(val):
+    """Ascend SIMT warp-level reduce sum.
+
+    Reduces a scalar value across all 32 threads in a warp using
+    hardware tree reduction. Returns the sum on all threads.
+
+    Generates: asc_reduce_add(val)
+
+    Parameters
+    ----------
+    val : PrimExpr
+        Scalar float value to reduce.
+
+    Returns
+    -------
+    PrimExpr
+        The reduced sum (same value on all threads in the warp).
+    """
+    return tir.call_intrin("float32", tir.op.Op.get("tl.ascend_reduce_add"), val)
+
+
+def ascend_reduce_max(val):
+    """Ascend SIMT warp-level reduce max.
+
+    Generates: asc_reduce_max(val)
+    """
+    return tir.call_intrin("float32", tir.op.Op.get("tl.ascend_reduce_max"), val)
+
+
+def ascend_reduce_min(val):
+    """Ascend SIMT warp-level reduce min.
+
+    Generates: asc_reduce_min(val)
+    """
+    return tir.call_intrin("float32", tir.op.Op.get("tl.ascend_reduce_min"), val)
+
+
 def ascend_cross_core_set_flag(mode_id: int, pipe: str, flag_id) -> None:
     """Insert an AscendC CrossCoreSetFlag for cross-core synchronization.
 

@@ -449,6 +449,13 @@ public:
         << "SimtVF requires exactly 3 thread vars [tx, ty, tz]";
 
     Stmt body = tvm::tir::SeqStmt::Flatten(stmts);
+
+    // SimtVF scope marker: placed inside thread extents (innermost),
+    // so that StorageRewrite attaches local.fragment allocations here.
+    // This keeps fragments inside the VF function as local variables.
+    body = AttrStmt(StringImm("simtvf"), "tl.simtvf_scope",
+                    IntImm(DataType::Int(32), 1), std::move(body));
+
     body = make_thread_extent(thread_vars[2], "threadIdx.z", thread_extents[2],
                               std::move(body));
     body = make_thread_extent(thread_vars[1], "threadIdx.y", thread_extents[1],

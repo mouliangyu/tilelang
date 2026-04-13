@@ -521,6 +521,9 @@ TVM_DLL const Op &sync_warp();
  *
  */
 TVM_DLL const Op &ascend_pipe_barrier();
+TVM_DLL const Op &ascend_reduce_add();
+TVM_DLL const Op &ascend_reduce_max();
+TVM_DLL const Op &ascend_reduce_min();
 
 /*!
  * \brief Ascend SetFlag intrinsic for pipeline synchronization.
