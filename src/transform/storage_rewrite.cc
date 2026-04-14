@@ -285,6 +285,8 @@ public:
       VisitNewScope(op);
     } else if (op->attr_key == tir::attr::virtual_thread) {
       VisitNewScope(op);
+    } else if (op->attr_key == "tl.simtvf_scope") {
+      VisitNewScope(op);
     } else {
       StmtExprVisitor::VisitStmt_(op);
     }
@@ -575,6 +577,7 @@ public:
   Stmt VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key == tir::attr::thread_extent ||
         op->attr_key == tir::attr::virtual_thread ||
+        op->attr_key == "tl.simtvf_scope" ||
         tir::attr::IsPragmaKey(op->attr_key)) {
       // remake all the allocation at the attach scope.
       if (attach_map_.count(op)) {
@@ -963,6 +966,18 @@ private:
 
     for (size_t i = 0; i < seq.size(); ++i) {
       const StmtEntry &s = seq[i];
+
+      // Ascend SimtVF: if this is the begin of a simtvf_scope, override
+      // thread_scope_ BEFORE processing gen events so that local
+      // allocations first touched inside the scope attach to it.
+      if (seq[i].scope_pair_offset > 0 && s.stmt->IsInstance<AttrStmtNode>()) {
+        const auto *attr = static_cast<const AttrStmtNode *>(s.stmt);
+        if (attr->attr_key == "tl.simtvf_scope") {
+          saved_thread_scope_ = thread_scope_;
+          thread_scope_ = attr;
+        }
+      }
+
       auto it = event_map_.find(seq[i].stmt);
 
       // scope_pair_offset >= 0 means it is either
@@ -1022,6 +1037,14 @@ private:
             op->attr_key == tir::attr::virtual_thread ||
             tir::attr::IsPragmaKey(op->attr_key)) {
           PlanNewScope(op);
+        } else if (op->attr_key == "tl.simtvf_scope") {
+          // Ascend SimtVF: the scope enter (save/restore) is handled
+          // BEFORE gen event processing (see above). Here we only
+          // handle the exit: restore thread_scope_.
+          if (seq[i].scope_pair_offset <= 0) {
+            thread_scope_ = saved_thread_scope_;
+            saved_thread_scope_ = nullptr;
+          }
         } else {
           ICHECK(op->attr_key == tir::attr::extern_scope);
         }
@@ -1179,6 +1202,7 @@ private:
   }
   // thread scope.
   const Object *thread_scope_{nullptr};
+  const Object *saved_thread_scope_{nullptr};
   // whether enable inplace detection.
   bool detect_inplace_{false};
   // Locations of free ops.

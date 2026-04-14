@@ -116,6 +116,9 @@ from .ascend import (
     ascend_cross_core_wait_flag,  # noqa: F401
     ascend_copy_gm_to_ubuf,  # noqa: F401
     ascend_copy_ubuf_to_gm,  # noqa: F401
+    ascend_reduce_add,  # noqa: F401
+    ascend_reduce_max,  # noqa: F401
+    ascend_reduce_min,  # noqa: F401
 )
 from .builtin import __ldg as __ldg  # noqa: F401
 from .builtin import ldg32 as ldg32  # noqa: F401

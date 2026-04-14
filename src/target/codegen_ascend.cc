@@ -582,6 +582,12 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         << "tl.ascend_threadfence expects 0 arguments";
     this->PrintIndent();
     this->stream << "asc_threadfence();\n";
+  } else if (op->op.same_as(tl::ascend_reduce_add())) {
+    os << "asc_reduce_add(" << PrintExpr(op->args[0]) << ")";
+  } else if (op->op.same_as(tl::ascend_reduce_max())) {
+    os << "asc_reduce_max(" << PrintExpr(op->args[0]) << ")";
+  } else if (op->op.same_as(tl::ascend_reduce_min())) {
+    os << "asc_reduce_min(" << PrintExpr(op->args[0]) << ")";
   } else if (op->op.same_as(tl::ascend_cross_core_set_flag())) {
     ICHECK_EQ(op->args.size(), 3)
         << "tl.ascend_cross_core_set_flag expects exactly 3 arguments "

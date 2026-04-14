@@ -5,6 +5,7 @@
 #include "acl/acl.h"
 #include "kernel_operator.h"
 #include "simt_api/asc_simt.h"
+#include "tl_templates/ascend/reduce.h"
 
 // Use standard unsigned types instead of macros to avoid conflicts with system
 // headers
