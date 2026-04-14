@@ -931,9 +931,10 @@ Stmt CopyNode::LowerAscendDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
                    dst_row_stride_bytes, src_row_stride_bytes});
     }
   } else if (dma_path == 2) {
+    PrimExpr transpose_flag = I(this->GetTranspose());
     call = Call(DataType::Void(), ascend_copy_gm_to_cbuf(),
                 {dst_ptr, src_ptr, sid, src_row_stride_bytes, zero, n_rows,
-                 inner_elems, zero, zero});
+                 inner_elems, zero, zero, transpose_flag});
   } else if (dma_path == 3 || dma_path == 4) {
     // L1 -> L0A/L0B: fractal-addressed load
     // K offset handled by kStartPosition param, not in src pointer.

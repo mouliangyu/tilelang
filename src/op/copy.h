@@ -176,6 +176,15 @@ public:
     return 0;
   }
 
+  int GetTranspose() const {
+    if (auto val = annotations.Get("transpose")) {
+      if (auto int_val = val->as<IntImmNode>()) {
+        return int_val->value;
+      }
+    }
+    return 0;
+  }
+
   /*!
    * \brief Lower the copy operator to a TIR statement.
    * \param T        Arguments for lowering.

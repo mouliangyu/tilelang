@@ -583,8 +583,11 @@ TVM_DLL const Op &ascend_copy_ubuf_to_gm();
  * \brief Ascend DMA copy from GM to CBuf (L1).
  *
  * ascend_copy_gm_to_cbuf(dst, src, sid, loop1_src_stride, l2_cache_ctrl,
- * n_value, d_value, loop4_src_stride, smallc0_en)
+ * n_value, d_value, loop4_src_stride, smallc0_en, transpose)
  *
+ * When transpose=0 emits copy_gm_to_cbuf_multi_nd2nz (row-major → NZ).
+ * When transpose!=0 emits copy_gm_to_cbuf_multi_dn2nz (col-major → NZ),
+ * which transposes the N/D mapping — useful for NN matmul on Ascend.
  */
 TVM_DLL const Op &ascend_copy_gm_to_cbuf();
 
@@ -637,6 +640,15 @@ TVM_DLL const Op &ascend_copy_matrix_cc_to_gm();
  *
  */
 TVM_DLL const Op &ascend_mad();
+
+/*!
+ * \brief Ascend GEMM with L1-scoped inputs (auto sub-K pipeline).
+ *
+ * ascend_gemm_l1(cc_ptr, cbuf_a_ptr, cbuf_b_ptr, M, K, N, tile_k_sub,
+ * trans_b, clear_accum, dtype_str)
+ *
+ */
+TVM_DLL const Op &ascend_gemm_l1();
 
 /*!
  * \brief Programmatic dependency trigger.

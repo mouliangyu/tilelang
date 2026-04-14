@@ -63,6 +63,10 @@ if __name__ == "__main__":
     kernel = tilelang.compile(program, target="ascend", out_idx=-1)
     print("Compilation succeeded!")
 
+    # Print generated source code
+    print("\n--- Generated Ascend Source ---")
+    print(kernel.get_kernel_source())
+
     # Create test data
     a = torch.randn(N, dtype=dtype, device=device)
     b = torch.randn(N, dtype=dtype, device=device)
@@ -72,10 +76,6 @@ if __name__ == "__main__":
     print("Running kernel on NPU...")
     d = kernel(a, b, c)
     torch.npu.synchronize()
-
-    # Print generated source code
-    print("\n--- Generated Ascend Source ---")
-    print(kernel.get_kernel_source())
 
     # Verify
     expected = ref_program(a, b, c)

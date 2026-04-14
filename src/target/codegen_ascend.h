@@ -26,6 +26,8 @@ public:
 private:
   int simtvf_helper_counter_{0};
   bool inside_simtvf_body_{false};
+  bool has_gemm_l1_{false};
+  bool has_gemm_l1_included_{false};
 
   enum class AscendKernelMode { kVector, kCube, kMix };
   AscendKernelMode kernel_mode_{AscendKernelMode::kVector};

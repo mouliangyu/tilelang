@@ -1,13 +1,12 @@
 import tilelang
 import tilelang.language as T
 
+
 def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
     NUM_BLOCKS = 32
     TILE_M = 256
     TILE_N = 256
     TILE_K = 256
-    TILE_K_SUB = 64
-    SUB_K = TILE_K // TILE_K_SUB
     M_TILES = M_DIM // TILE_M
     N_TILES = N_DIM // TILE_N
     K_TILES = K_DIM // TILE_K
@@ -16,7 +15,7 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
     WINDOW = min(4, M_TILES)
     NUM_STAGES = 2
     MAIN_ROW = M_TILES // WINDOW - 1
-    TAIL_WIN   = M_TILES - MAIN_ROW * WINDOW
+    TAIL_WIN = M_TILES - MAIN_ROW * WINDOW
 
     @T.macro
     def aswt_swizzle(tile_idx):
@@ -41,25 +40,23 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
         C: T.Buffer((M_DIM, N_DIM), "float32"),
     ):
         with T.Kernel(NUM_BLOCKS) as bx:
-            x_l0 = T.alloc_l0a((NUM_STAGES, TILE_M, TILE_K_SUB), "bfloat16")
-            w_l0 = T.alloc_l0b((NUM_STAGES, TILE_N, TILE_K_SUB), "bfloat16")
             res = T.alloc_l0c((TILE_M, TILE_N), "float32")
             x_l1 = T.alloc_l1((NUM_STAGES, TILE_M, TILE_K), "bfloat16")
             w_l1 = T.alloc_l1((NUM_STAGES, TILE_N, TILE_K), "bfloat16")
-            temp = T.alloc_shared((TILE_M//2, TILE_N), "float32")
+            temp = T.alloc_shared((TILE_M // 2, TILE_N), "float32")
             with T.Cube():
-                for f in range(NUM_STAGES):
-                    T.ascend_set_flag("M_MTE1", f + NUM_STAGES)
+                for f in T.Serial(NUM_STAGES):
+                    T.ascend_set_flag("M_MTE1", f)
                     T.ascend_set_flag("MTE1_MTE2", f)
                 T.ascend_set_flag("FIX_M", 0)
-                for ot in range(TILES_PER_CORE):
-                    tile_idx = ot * NUM_BLOCKS + bx
+                for out_tile in T.Serial(TILES_PER_CORE):
+                    tile_idx = out_tile * NUM_BLOCKS + bx
                     m_tile, n_tile = aswt_swizzle(tile_idx)
-                    if ot > 0:
+                    if out_tile > 0:
                         T.ascend_cross_core_wait_flag(4, "PIPE_FIX", 4)
                         T.ascend_cross_core_wait_flag(4, "PIPE_FIX", 20)
 
-                    for kt in range(K_TILES):
+                    for kt in T.Serial(K_TILES):
                         f = kt % NUM_STAGES
                         T.ascend_wait_flag("MTE1_MTE2", f)
 
@@ -68,28 +65,20 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
                         T.ascend_set_flag("MTE2_MTE1", f)
 
                         T.ascend_wait_flag("MTE2_MTE1", f)
-                        for sk in range(SUB_K):
-                            sf = sk % NUM_STAGES
-                            T.ascend_wait_flag("M_MTE1", sf + NUM_STAGES)
-                            T.copy(x_l1[f, :, sk * TILE_K_SUB : (sk + 1) * TILE_K_SUB], x_l0[sf, :, :])
-                            T.copy(w_l1[f, :, sk * TILE_K_SUB : (sk + 1) * TILE_K_SUB], w_l0[sf, :, :])
-                            T.ascend_set_flag("MTE1_M", sf + 2)
-                            T.ascend_wait_flag("MTE1_M", sf + 2)
-                            if kt == 0 and sk == 0:
-                                T.ascend_wait_flag("FIX_M", 0)
-                            T.gemm(x_l0[sf, :, :], w_l0[sf, :, :], res, transpose_B=True, clear_accum=(kt==0 and sk ==0))
-                            T.ascend_set_flag("M_MTE1", sf + 2)
+                        if kt == 0:
+                            T.ascend_wait_flag("FIX_M", 0)
+                        T.gemm(x_l1[f, :, :], w_l1[f, :, :], res, transpose_B=True, clear_accum=(kt == 0))
 
                         T.ascend_set_flag("MTE1_MTE2", f)
-                    
+
                     T.ascend_set_flag("M_FIX", 0)
                     T.ascend_wait_flag("M_FIX", 0)
                     T.dual_copy(res, temp)
                     T.ascend_cross_core_set_flag(4, "PIPE_FIX", 6)
                     T.ascend_cross_core_set_flag(4, "PIPE_FIX", 22)
                     T.ascend_set_flag("FIX_M", 0)
-                for f in range(NUM_STAGES):
-                    T.ascend_wait_flag("M_MTE1", f + NUM_STAGES)
+                for f in T.Serial(NUM_STAGES):
+                    T.ascend_wait_flag("M_MTE1", f)
                     T.ascend_wait_flag("MTE1_MTE2", f)
                 T.ascend_wait_flag("FIX_M", 0)
                 T.ascend_cross_core_wait_flag(4, "PIPE_FIX", 4)
@@ -97,13 +86,12 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
             with T.Vector() as sid:
                 my_aic_flag = 6 + sid * 16
                 my_aiv_flag = 4 + sid * 16
-                for ot in range(TILES_PER_CORE):
-                    tile_idx = ot * NUM_BLOCKS + bx
+                for out_tile in T.Serial(TILES_PER_CORE):
+                    tile_idx = out_tile * NUM_BLOCKS + bx
                     m_tile, n_tile = aswt_swizzle(tile_idx)
                     T.ascend_cross_core_wait_flag(4, "PIPE_MTE3", my_aic_flag)
-                    T.copy(temp, C[m_tile * TILE_M + sid * (TILE_M//2), n_tile * TILE_N])
+                    T.copy(temp, C[m_tile * TILE_M + sid * (TILE_M // 2), n_tile * TILE_N])
                     T.ascend_cross_core_set_flag(4, "PIPE_MTE3", my_aiv_flag)
-                
 
     return main
 
@@ -125,7 +113,7 @@ if __name__ == "__main__":
     device = torch.device("npu")
 
     # Create and compile kernel
-    print(f"Compiling gemm kernel...")
+    print("Compiling gemm kernel...")
     program = gemm(M_DIM, K_DIM, N_DIM)
     kernel = tilelang.compile(program, out_idx=-1)
     print("Compilation succeeded!")

@@ -7,8 +7,6 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
     TILE_M = 256
     TILE_N = 256
     TILE_K = 256
-    TILE_K_SUB = 64
-    SUB_K = TILE_K // TILE_K_SUB
     M_TILES = M_DIM // TILE_M
     N_TILES = N_DIM // TILE_N
     K_TILES = K_DIM // TILE_K
@@ -38,17 +36,15 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
     @T.prim_func
     def main(
         X: T.Buffer((M_DIM, K_DIM), "bfloat16"),
-        W: T.Buffer((N_DIM, K_DIM), "bfloat16"),
+        W: T.Buffer((K_DIM, N_DIM), "bfloat16"),
         C: T.Buffer((M_DIM, N_DIM), "float32"),
     ):
         with T.Kernel(NUM_BLOCKS) as bx:
-            x_l0 = T.alloc_l0a((NUM_STAGES, TILE_M, TILE_K_SUB), "bfloat16")
-            w_l0 = T.alloc_l0b((NUM_STAGES, TILE_N, TILE_K_SUB), "bfloat16")
             res = T.alloc_l0c((TILE_M, TILE_N), "float32")
             x_l1 = T.alloc_l1((NUM_STAGES, TILE_M, TILE_K), "bfloat16")
-            w_l1 = T.alloc_l1((NUM_STAGES, TILE_N, TILE_K), "bfloat16")
+            w_l1 = T.alloc_l1((NUM_STAGES, TILE_K, TILE_N), "bfloat16")
             for f in range(NUM_STAGES):
-                T.ascend_set_flag("M_MTE1", f + NUM_STAGES)
+                T.ascend_set_flag("M_MTE1", f)
                 T.ascend_set_flag("MTE1_MTE2", f)
             T.ascend_set_flag("FIX_M", 0)
             for out_tile in range(TILES_PER_CORE):
@@ -60,22 +56,13 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
                     T.ascend_wait_flag("MTE1_MTE2", f)
 
                     T.copy(X[m_tile * TILE_M : (m_tile + 1) * TILE_M, kt * TILE_K : (kt + 1) * TILE_K], x_l1[f, :, :])
-                    T.copy(W[n_tile * TILE_N : (n_tile + 1) * TILE_N, kt * TILE_K : (kt + 1) * TILE_K], w_l1[f, :, :])
+                    T.copy(W[kt * TILE_K : (kt + 1) * TILE_K, n_tile * TILE_N : (n_tile + 1) * TILE_N], w_l1[f, :, :], transpose=True)
                     T.ascend_set_flag("MTE2_MTE1", f)
 
                     T.ascend_wait_flag("MTE2_MTE1", f)
-                    for sk in range(SUB_K):
-                        sf = sk % NUM_STAGES
-                        T.ascend_wait_flag("M_MTE1", sf + NUM_STAGES)
-                        T.copy(x_l1[f, :, sk * TILE_K_SUB : (sk + 1) * TILE_K_SUB], x_l0[sf, :, :])
-                        T.copy(w_l1[f, :, sk * TILE_K_SUB : (sk + 1) * TILE_K_SUB], w_l0[sf, :, :])
-                        T.ascend_set_flag("MTE1_M", sf + 2)
-                        T.ascend_wait_flag("MTE1_M", sf + 2)
-                        if kt == 0 and sk == 0:
-                            T.ascend_wait_flag("FIX_M", 0)
-                        T.gemm(x_l0[sf, :, :], w_l0[sf, :, :], res, transpose_B=True, clear_accum=(kt == 0 and sk == 0))
-                        T.ascend_set_flag("M_MTE1", sf + 2)
-
+                    if kt == 0:
+                        T.ascend_wait_flag("FIX_M", 0)
+                    T.gemm(x_l1[f, :, :], w_l1[f, :, :], res, transpose_B=True, clear_accum=(kt == 0))
                     T.ascend_set_flag("MTE1_MTE2", f)
 
                 T.ascend_set_flag("M_FIX", 0)
@@ -83,7 +70,7 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
                 T.copy(res, C[m_tile * TILE_M, n_tile * TILE_N])
                 T.ascend_set_flag("FIX_M", 0)
             for f in range(NUM_STAGES):
-                T.ascend_wait_flag("M_MTE1", f + NUM_STAGES)
+                T.ascend_wait_flag("M_MTE1", f)
                 T.ascend_wait_flag("MTE1_MTE2", f)
             T.ascend_wait_flag("FIX_M", 0)
 
@@ -92,7 +79,7 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
 
 def ref_program(x, w):
     """Reference implementation: C = A @ B"""
-    return x.float() @ w.float().T
+    return x.float() @ w.float()
 
 
 NUM_REPEATS = 500
@@ -118,7 +105,7 @@ if __name__ == "__main__":
 
     # Create test data
     x = torch.randn(M_DIM, K_DIM, dtype=torch.bfloat16, device=device)
-    w = torch.randn(N_DIM, K_DIM, dtype=torch.bfloat16, device=device)
+    w = torch.randn(K_DIM, N_DIM, dtype=torch.bfloat16, device=device)
 
     # Run kernel
     print("Running kernel on NPU...")

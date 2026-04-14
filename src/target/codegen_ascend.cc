@@ -150,7 +150,18 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
       } else if (block->name_hint == "SIMT_VF")
         has_simtvf = true;
     }
+    if (const auto *call = n.as<tir::CallNode>()) {
+      if (call->op.same_as(tl::ascend_gemm_l1())) {
+        has_gemm_l1_ = true;
+      }
+    }
   });
+
+  // Conditionally include gemm.h when ascend_gemm_l1 is used
+  if (has_gemm_l1_ && !has_gemm_l1_included_) {
+    decl_stream << "#include <tl_templates/ascend/gemm.h>\n";
+    has_gemm_l1_included_ = true;
+  }
 
   if (has_cube && has_vector) {
     kernel_mode_ = AscendKernelMode::kMix;
@@ -634,10 +645,22 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[7], this->stream);
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_gm_to_cbuf())) {
-    ICHECK_EQ(op->args.size(), 9)
-        << "tl.ascend_copy_gm_to_cbuf expects exactly 9 arguments";
+    ICHECK_EQ(op->args.size(), 10)
+        << "tl.ascend_copy_gm_to_cbuf expects exactly 10 arguments";
+    // arg[9] is the transpose flag: 0 → nd2nz, nonzero → dn2nz
+    const IntImmNode *transpose_node = op->args[9].as<IntImmNode>();
+    bool use_dn2nz = transpose_node && transpose_node->value != 0;
+    // Emit set_mte2_nz_para: configure MTE2 NZ layout for GM→L1 copy
+    // ndNum=1, dstNzNStride=1, dstNzC0Stride = n_value (nd2nz) or d_value
+    // (dn2nz)
     this->PrintIndent();
-    this->stream << "bisheng::cce::copy_gm_to_cbuf_multi_nd2nz(";
+    this->stream << "bisheng::cce::set_mte2_nz_para("
+                 << "uint64_t(1) | (uint64_t(1) << 16) | (uint64_t(";
+    this->PrintExpr(use_dn2nz ? op->args[6] : op->args[5], this->stream);
+    this->stream << ") << 32));\n";
+    this->PrintIndent();
+    this->stream << (use_dn2nz ? "bisheng::cce::copy_gm_to_cbuf_multi_dn2nz("
+                               : "bisheng::cce::copy_gm_to_cbuf_multi_nd2nz(");
     this->PrintExpr(op->args[0], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[1], this->stream);
@@ -696,6 +719,10 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::ascend_copy_matrix_cc_to_gm())) {
     ICHECK_EQ(op->args.size(), 25)
         << "tl.ascend_copy_matrix_cc_to_gm expects exactly 25 arguments";
+    // Emit set_loop3_para: configure LOOP3_PARA for L0C→GM NZ-to-ND conversion
+    // ndNum=1, srcNdStride=0, dstNdStride=0 (single ND block)
+    this->PrintIndent();
+    this->stream << "bisheng::cce::set_loop3_para(uint64_t(1));\n";
     this->PrintIndent();
     this->stream << "bisheng::cce::copy_matrix_cc_to_gm(";
     this->PrintExpr(op->args[0], this->stream);
@@ -739,6 +766,30 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_gemm_l1())) {
+    // ascend_gemm_l1(cc_ptr, cbuf_a_ptr, cbuf_b_ptr, M, K, N, tile_k_sub,
+    //                trans_b, clear_accum, dtype_str)
+    ICHECK_EQ(op->args.size(), 10)
+        << "tl.ascend_gemm_l1 expects exactly 10 arguments";
+    int M = op->args[3].as<IntImmNode>()->value;
+    int K = op->args[4].as<IntImmNode>()->value;
+    int N = op->args[5].as<IntImmNode>()->value;
+    int tile_k_sub = op->args[6].as<IntImmNode>()->value;
+    int trans_b = op->args[7].as<IntImmNode>()->value;
+    std::string dtype_str = op->args[9].as<StringImmNode>()->value;
+
+    this->PrintIndent();
+    this->stream << "ascend_gemm_l1<" << M << ", " << K << ", " << N << ", "
+                 << tile_k_sub << ", " << (trans_b ? "true" : "false") << ", "
+                 << dtype_str << ">(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[2], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[8], this->stream);
     this->stream << ");\n";
   } else if (op->op.same_as(tir::builtin::address_of())) {
     const auto *load = op->args[0].as<tir::BufferLoadNode>();
