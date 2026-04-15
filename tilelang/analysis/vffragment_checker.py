@@ -108,4 +108,3 @@ def VFFragmentNarrowChecker():
         return func
 
     return prim_func_pass(pass_fn, opt_level=0)
-

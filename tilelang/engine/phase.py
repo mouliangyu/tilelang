@@ -220,6 +220,9 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.InjectAssumes()(mod)
     # Simplify the IR expressions
     mod = tilelang.transform.Simplify()(mod)
+    # Lower T.Parallel inside SimdVF to MicroAPI vector ops (before layout passes)
+    if is_ascend_target(target) and has_simdvf_region(mod):
+        mod = tilelang.transform.AscendSimdVFLowerParallel()(mod)
     # Set layouts for reducers
     mod = tilelang.transform.LayoutReducer()(mod)
     # Infer memory layouts for fragments and shared memory

@@ -5,9 +5,9 @@ import tilelang.language as T
 def vector_add(N):
     NUM_BLOCKS = 64  # AI cores
     NUM_THREADS = 2048  # SIMT threads per core
-    TILE = NUM_THREADS * 4  # 8192 floats = 32 KB per tile
+    TILE_ELEMS = NUM_THREADS * 4  # 8192 floats = 32 KB per tile
 
-    TOTAL_TILES = N // (TILE * NUM_BLOCKS)  # tiles per core
+    TOTAL_TILES = N // (TILE_ELEMS * NUM_BLOCKS)  # tiles per core
     NUM_STAGES = 2
 
     @T.prim_func
@@ -20,21 +20,21 @@ def vector_add(N):
             temp1 = T.alloc_shared(
                 (
                     NUM_STAGES,
-                    TILE,
+                    TILE_ELEMS,
                 ),
                 "float32",
             )
             temp2 = T.alloc_shared(
                 (
                     NUM_STAGES,
-                    TILE,
+                    TILE_ELEMS,
                 ),
                 "float32",
             )
             temp3 = T.alloc_shared(
                 (
                     NUM_STAGES,
-                    TILE,
+                    TILE_ELEMS,
                 ),
                 "float32",
             )
@@ -44,8 +44,8 @@ def vector_add(N):
                 T.ascend_set_flag("V_MTE2", f)
 
             for iter in range(TOTAL_TILES):
-                begin = (iter * NUM_BLOCKS + bx) * TILE
-                end = (iter * NUM_BLOCKS + bx + 1) * TILE
+                begin = (iter * NUM_BLOCKS + bx) * TILE_ELEMS
+                end = (iter * NUM_BLOCKS + bx + 1) * TILE_ELEMS
                 stage = iter % NUM_STAGES
 
                 T.ascend_wait_flag("V_MTE2", stage)
@@ -56,15 +56,8 @@ def vector_add(N):
                 T.ascend_wait_flag("MTE2_V", stage)
                 T.ascend_wait_flag("MTE3_V", stage)
                 with T.SimdVF():
-                    r0 = T.alloc_fragment((64), "float32")
-                    r1 = T.alloc_fragment((64), "float32")
-                    mask_cnt = T.ascend_init_mask(TILE)
-                    for i in range(TILE//64):
-                        mask = T.ascend_simd_update_mask(mask_cnt)
-                        T.ascend_simd_load(r0.data, T.address_of(temp1[stage, i*64]))
-                        T.ascend_simd_load(r1.data, T.address_of(temp2[stage, i*64]))
-                        T.ascend_simd_add(r0.data, r0.data, r1.data, mask)
-                        T.ascend_simd_store(T.address_of(temp3[stage, i*64]), r0.data, mask)
+                    for i in T.Parallel(TILE_ELEMS):
+                        temp3[stage, i] = temp1[stage, i] + temp2[stage, i]
                 T.ascend_set_flag("V_MTE3", stage)
                 T.ascend_set_flag("V_MTE2", stage)
 

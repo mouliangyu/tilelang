@@ -523,6 +523,11 @@ def LowerSharedTmem():
     return _ffi_api.LowerSharedTmem()  # type: ignore
 
 
+def AscendSimdVFLowerParallel():
+    """Lower T.Parallel inside SIMD_VF blocks to MicroAPI register-level vector ops."""
+    return _ffi_api.AscendSimdVFLowerParallel()  # type: ignore
+
+
 def LayoutReducer():
     """
     Return a TVM transform pass that performs layout reduction/normalization.
