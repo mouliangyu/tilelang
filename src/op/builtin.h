@@ -526,6 +526,21 @@ TVM_DLL const Op &ascend_reduce_max();
 TVM_DLL const Op &ascend_reduce_min();
 
 /*!
+ * \brief Ascend SimdVF MicroAPI binary arithmetic ops.
+ *
+ * ascend_simd_add(dst, src0, src1, mask) → MicroAPI::Add(dst, src0, src1, mask)
+ * ascend_simd_sub(dst, src0, src1, mask) → MicroAPI::Sub(dst, src0, src1, mask)
+ * ascend_simd_mul(dst, src0, src1, mask) → MicroAPI::Mul(dst, src0, src1, mask)
+ */
+TVM_DLL const Op &ascend_simd_add();
+TVM_DLL const Op &ascend_simd_sub();
+TVM_DLL const Op &ascend_simd_mul();
+TVM_DLL const Op &ascend_simd_load();
+TVM_DLL const Op &ascend_simd_store();
+TVM_DLL const Op &ascend_simd_update_mask();
+TVM_DLL const Op &ascend_init_mask();
+
+/*!
  * \brief Ascend SetFlag intrinsic for pipeline synchronization.
  *
  * ascend_set_flag(hard_event_string, event_id)

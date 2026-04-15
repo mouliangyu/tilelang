@@ -287,6 +287,8 @@ public:
       VisitNewScope(op);
     } else if (op->attr_key == "tl.simtvf_scope") {
       VisitNewScope(op);
+    } else if (op->attr_key == "tl.simdvf_scope") {
+      VisitNewScope(op);
     } else {
       StmtExprVisitor::VisitStmt_(op);
     }
@@ -578,6 +580,7 @@ public:
     if (op->attr_key == tir::attr::thread_extent ||
         op->attr_key == tir::attr::virtual_thread ||
         op->attr_key == "tl.simtvf_scope" ||
+        op->attr_key == "tl.simdvf_scope" ||
         tir::attr::IsPragmaKey(op->attr_key)) {
       // remake all the allocation at the attach scope.
       if (attach_map_.count(op)) {
@@ -685,6 +688,16 @@ private:
            scope.tag.find(".descriptor") != 0;
   }
 
+  static bool IsSimdVFScope(const Object *scope) {
+    if (scope == nullptr)
+      return false;
+    if (scope->IsInstance<AttrStmtNode>()) {
+      return static_cast<const AttrStmtNode *>(scope)->attr_key ==
+             "tl.simdvf_scope";
+    }
+    return false;
+  }
+
   // Allocate entry of node.
   // Event entry in liveness analysis
   struct EventEntry {
@@ -735,6 +748,8 @@ private:
         if (IsSpecialTaggedMemory(e->scope)) {
           ICHECK_NE(e->const_nbits, 0U)
               << "Special tagged memory must be const size";
+          if (IsSimdVFScope(e->attach_scope_))
+            continue;
           for (size_t j = 0; j < i; ++j) {
             if (e->scope == vec[j]->scope) {
               vec[j]->merged_children.push_back(e);
@@ -972,7 +987,8 @@ private:
       // allocations first touched inside the scope attach to it.
       if (seq[i].scope_pair_offset > 0 && s.stmt->IsInstance<AttrStmtNode>()) {
         const auto *attr = static_cast<const AttrStmtNode *>(s.stmt);
-        if (attr->attr_key == "tl.simtvf_scope") {
+        if (attr->attr_key == "tl.simtvf_scope" ||
+            attr->attr_key == "tl.simdvf_scope") {
           saved_thread_scope_ = thread_scope_;
           thread_scope_ = attr;
         }
@@ -1037,7 +1053,8 @@ private:
             op->attr_key == tir::attr::virtual_thread ||
             tir::attr::IsPragmaKey(op->attr_key)) {
           PlanNewScope(op);
-        } else if (op->attr_key == "tl.simtvf_scope") {
+        } else if (op->attr_key == "tl.simtvf_scope" ||
+                   op->attr_key == "tl.simdvf_scope") {
           // Ascend SimtVF: the scope enter (save/restore) is handled
           // BEFORE gen event processing (see above). Here we only
           // handle the exit: restore thread_scope_.

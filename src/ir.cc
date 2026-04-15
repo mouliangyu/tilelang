@@ -507,6 +507,74 @@ SimtVFFrame SimtVF(const Array<PrimExpr> &thread_extents) {
   return SimtVFFrame(n);
 }
 
+class SimdVFFrameNode : public TIRFrameNode {
+public:
+  size_t parent_alloc_count_{0};
+
+  static void RegisterReflection() {
+    namespace refl = tvm::ffi::reflection;
+    refl::ObjectDef<SimdVFFrameNode>();
+  }
+
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.SimdVFFrame", SimdVFFrameNode,
+                                    TIRFrameNode);
+
+public:
+  TVM_DLL void EnterWithScope() final {
+    TIRFrameNode::EnterWithScope();
+    parent_alloc_count_ = RecordParentAllocCount();
+  }
+
+  TVM_DLL void ExitWithScope() final {
+    using namespace tvm::tir;
+    TIRFrameNode::ExitWithScope();
+    auto stolen_bufs = StealAllocBuffers(parent_alloc_count_);
+
+    Stmt body = tvm::tir::SeqStmt::Flatten(stmts);
+
+    // SimdVF scope marker: placed inside the Block body so that
+    // fragment allocations (stolen into alloc_buffers) stay inside
+    // the helper function during codegen.
+    body = AttrStmt(StringImm("simdvf"), "tl.simdvf_scope",
+                    IntImm(DataType::Int(32), 1), std::move(body));
+
+    // No thread extent AttrStmts — SimdVF has no thread dimensions.
+
+    Stmt stmt = tvm::tir::Block({}, {}, {}, "SIMD_VF", body, std::nullopt,
+                                stolen_bufs, {}, {});
+
+    script::ir_builder::IRBuilder builder =
+        script::ir_builder::IRBuilder::Current();
+    if (builder->frames.empty()) {
+      ICHECK(!builder->result.defined())
+          << "ValueError: Builder.result has already been set";
+      builder->result = stmt;
+    } else if (const auto *tir_frame =
+                   builder->frames.back().as<TIRFrameNode>()) {
+      ffi::GetRef<TIRFrame>(tir_frame)->stmts.push_back(stmt);
+    } else {
+      LOG(FATAL) << "TypeError: Unsupported frame type: "
+                 << builder->frames.back();
+    }
+  }
+};
+
+class SimdVFFrame : public TIRFrame {
+public:
+  explicit SimdVFFrame(ObjectPtr<SimdVFFrameNode> data)
+      : TIRFrame(::tvm::ffi::UnsafeInit{}) {
+    ICHECK(data != nullptr);
+    data_ = std::move(data);
+  }
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(SimdVFFrame, TIRFrame,
+                                                SimdVFFrameNode);
+};
+
+SimdVFFrame SimdVF() {
+  ObjectPtr<SimdVFFrameNode> n = tvm::ffi::make_object<SimdVFFrameNode>();
+  return SimdVFFrame(n);
+}
+
 class WarpSpecializeFrameNode : public TIRFrameNode {
 public:
   Array<TIRFrame> frames;
@@ -726,9 +794,11 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def("tl.WarpSpecialize", WarpSpecialize)
       .def("tl.SideEffect", SideEffect)
       .def("tl.Cube", Cube)
-      .def("tl.Vector", Vector);
+      .def("tl.Vector", Vector)
+      .def("tl.SimdVF", SimdVF);
   KernelLaunchFrameNode::RegisterReflection();
   SimtVFFrameNode::RegisterReflection();
+  SimdVFFrameNode::RegisterReflection();
   WarpSpecializeFrameNode::RegisterReflection();
   CubeFrameNode::RegisterReflection();
   VectorFrameNode::RegisterReflection();

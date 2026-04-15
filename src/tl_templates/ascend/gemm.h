@@ -39,10 +39,9 @@
  */
 template <int M, int K, int N, int TILE_K_SUB, bool TRANS_B, typename InT,
           typename AccumT>
-__aicore__ inline void ascend_gemm_l1(__cc__ AccumT *cc_ptr,
-                                      __cbuf__ InT *cbuf_a_ptr,
-                                      __cbuf__ InT *cbuf_b_ptr,
-                                      int clear_accum) {
+__aicore__ inline void
+ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
+               __cbuf__ InT *cbuf_b_ptr, int clear_accum) {
   static_assert(K % TILE_K_SUB == 0, "K must be divisible by TILE_K_SUB");
   static_assert(TILE_K_SUB % 16 == 0, "TILE_K_SUB must be a multiple of 16");
   static_assert(M % 16 == 0, "M must be a multiple of 16");
@@ -56,14 +55,14 @@ __aicore__ inline void ascend_gemm_l1(__cc__ AccumT *cc_ptr,
   constexpr int L0A_STAGE = M * TILE_K_SUB;
   constexpr int L0B_STAGE = N * TILE_K_SUB;
 
-  __ca__ InT* l0a = (__ca__ InT *) 0;
-  __cb__ InT* l0b = (__cb__ InT *) 0;
-  
+  __ca__ InT *l0a = (__ca__ InT *)0;
+  __cb__ InT *l0b = (__cb__ InT *)0;
+
   for (int sk = 0; sk < SUB_K; ++sk) {
     AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>((sk & 1));
-    bisheng::cce::load_cbuf_to_ca(
-        (__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)), cbuf_a_ptr, 0,
-        (sk * kStep), mStepA, kStep, mStepA, mStepA, 0);
+    bisheng::cce::load_cbuf_to_ca((__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)),
+                                  cbuf_a_ptr, 0, (sk * kStep), mStepA, kStep,
+                                  mStepA, mStepA, 0);
     if constexpr (TRANS_B) {
       // NT case: W[N,K] in L1, transpose=false (ZZ)
       // rows=N, cols=K → sub-K along cols (kStart)
@@ -73,21 +72,20 @@ __aicore__ inline void ascend_gemm_l1(__cc__ AccumT *cc_ptr,
     } else {
       // NN case: B[K,N] in L1, transpose=true (ZN)
       // rows=K, cols=N → sub-K along rows (mStart)
-      constexpr int srcStrideNN = K / C0;   // nBlk = K/16
+      constexpr int srcStrideNN = K / C0; // nBlk = K/16
       bisheng::cce::load_cbuf_to_cb(
           (__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), cbuf_b_ptr,
-          (sk * kStep),   // mStartPosition: sub-K row offset
-          0,              // kStartPosition: start from col 0
-          kStep,          // mStep: TILE_K_SUB/16 K-row fractals
-          mStepB,        // kStep: N/16 N-col fractals
-          srcStrideNN,    // srcStride: K/16 (nBlk in L1)
-          kStep,          // dstStride: mStep
+          (sk * kStep), // mStartPosition: sub-K row offset
+          0,            // kStartPosition: start from col 0
+          kStep,        // mStep: TILE_K_SUB/16 K-row fractals
+          mStepB,       // kStep: N/16 N-col fractals
+          srcStrideNN,  // srcStride: K/16 (nBlk in L1)
+          kStep,        // dstStride: mStep
           1);
     }
     AscendC::SetFlag<AscendC::HardEvent::MTE1_M>((sk & 1));
     AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>((sk & 1));
-    bisheng::cce::mad(cc_ptr,
-                      (__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)),
+    bisheng::cce::mad(cc_ptr, (__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)),
                       (__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), M,
                       TILE_K_SUB, N, 0, 0, 0, clear_accum && (sk == 0));
     AscendC::SetFlag<AscendC::HardEvent::M_MTE1>((sk & 1));

@@ -533,12 +533,15 @@ private:
   }
 
   Stmt VisitStmt_(const BlockNode *op) final {
-    if (op->name_hint != "SIMT_VF") {
+    if (op->name_hint != "SIMT_VF" && op->name_hint != "SIMD_VF") {
       return StmtExprMutator::VisitStmt_(op);
     }
 
     // Get the current captures
-    auto opt_captures = op->annotations.Get(tilelang_simt_vf_captures);
+    const char *captures_key = (op->name_hint == "SIMT_VF")
+                                   ? tilelang_simt_vf_captures
+                                   : tilelang_simd_vf_captures;
+    auto opt_captures = op->annotations.Get(captures_key);
     if (!opt_captures) {
       return StmtExprMutator::VisitStmt_(op);
     }
@@ -573,7 +576,7 @@ private:
     Block new_block = Downcast<Block>(StmtExprMutator::VisitStmt_(op));
     if (!shared_vars_removed.empty()) {
       auto *ptr = new_block.CopyOnWrite();
-      ptr->annotations.Set(tilelang_simt_vf_captures, new_captures);
+      ptr->annotations.Set(captures_key, new_captures);
     }
 
     return std::move(new_block);

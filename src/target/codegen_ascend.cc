@@ -134,7 +134,8 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   }
 
   // Pre-scan body to determine kernel mode (Mix / Vector / Cube)
-  bool has_cube = false, has_vector = false, has_simtvf = false;
+  bool has_cube = false, has_vector = false, has_simtvf = false,
+       has_simdvf = false;
   int vector_count = 2;
   tir::PostOrderVisit(f->body, [&](const ObjectRef &n) {
     if (const auto *block = n.as<tir::BlockNode>()) {
@@ -149,6 +150,8 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
         }
       } else if (block->name_hint == "SIMT_VF")
         has_simtvf = true;
+      else if (block->name_hint == "SIMD_VF")
+        has_simdvf = true;
     }
     if (const auto *call = n.as<tir::CallNode>()) {
       if (call->op.same_as(tl::ascend_gemm_l1())) {
@@ -163,12 +166,18 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
     has_gemm_l1_included_ = true;
   }
 
+  // Conditionally include micro_api header when SimdVF is used
+  if (has_simdvf && !has_simdvf_included_) {
+    decl_stream << "#include <micro_api/kernel_micro_intf.h>\n";
+    has_simdvf_included_ = true;
+  }
+
   if (has_cube && has_vector) {
     kernel_mode_ = AscendKernelMode::kMix;
     mix_aiv_count_ = vector_count;
   } else if (has_cube || has_vector) {
     LOG(FATAL) << "T.Cube() and T.Vector() must be used together for Mix mode";
-  } else if (has_simtvf) {
+  } else if (has_simtvf || has_simdvf) {
     kernel_mode_ = AscendKernelMode::kVector;
   } else {
     kernel_mode_ = AscendKernelMode::kCube;
@@ -267,6 +276,90 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
     } else {
       PrintStmt(op->body);
     }
+    return;
+  }
+  if (op->name_hint == "SIMD_VF") {
+    ffi::Array<Var> captures;
+    if (auto opt_captures =
+            op->annotations.Get(tvm::tl::tilelang_simd_vf_captures)) {
+      if (auto arr = opt_captures.value().as<ffi::Array<Var>>()) {
+        captures = arr.value();
+      }
+    }
+    std::string helper_name =
+        "simd_vf_" + std::to_string(simdvf_helper_counter_++);
+    auto resolve_var_name = [this](const Var &v) -> std::string {
+      auto it = var_idmap_.find(v.get());
+      if (it != var_idmap_.end()) {
+        return it->second;
+      }
+      return v->name_hint;
+    };
+
+    // Register captures with their storage scope
+    for (const auto &v : captures) {
+      if (v->type_annotation.as<PointerTypeNode>()) {
+        auto scope = GetPtrStorageScope(v);
+        alloc_storage_scope_[v.get()] = scope;
+      }
+    }
+    // Render body to temporary stream
+    std::ostringstream saved_main_stream;
+    stream.swap(saved_main_stream);
+    bool old_inside_simdvf_body = inside_simdvf_body_;
+    inside_simdvf_body_ = true;
+    CodeGenC::VisitStmt(op->body);
+    inside_simdvf_body_ = old_inside_simdvf_body;
+    std::string helper_body = stream.str();
+    stream.str("");
+    stream.clear();
+    stream.swap(saved_main_stream);
+
+    // Emit __simd_vf__ helper function to decl_stream
+    decl_stream << "__simd_vf__ inline void " << helper_name << "(";
+    for (size_t i = 0; i < captures.size(); ++i) {
+      if (i != 0) {
+        decl_stream << ", ";
+      }
+      const Var &v = captures[i];
+      std::string vname = resolve_var_name(v);
+      if (!v->type_annotation.as<PointerTypeNode>()) {
+        PrintType(v.dtype(), decl_stream);
+        decl_stream << " " << vname;
+      } else {
+        auto it = handle_data_type_.find(v.get());
+        if (it == handle_data_type_.end()) {
+          for (const auto &kv : handle_data_type_) {
+            if (kv.first->name_hint == v->name_hint) {
+              it = handle_data_type_.find(kv.first);
+              break;
+            }
+          }
+        }
+        auto scope = GetPtrStorageScope(v);
+        PrintStorageScope(scope, decl_stream);
+        if (it != handle_data_type_.end()) {
+          PrintType(it->second, decl_stream);
+          decl_stream << "* " << vname;
+        } else {
+          decl_stream << "void* " << vname;
+        }
+      }
+    }
+    decl_stream << ") {\n";
+    decl_stream << helper_body;
+    decl_stream << "}\n\n";
+
+    // Emit direct inline call (no asc_vf_call)
+    PrintIndent();
+    stream << helper_name << "(";
+    for (size_t i = 0; i < captures.size(); ++i) {
+      if (i != 0) {
+        stream << ", ";
+      }
+      stream << resolve_var_name(captures[i]);
+    }
+    stream << ");\n";
     return;
   }
   if (op->name_hint != "SIMT_VF") {
@@ -824,6 +917,74 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     } else {
       CodeGenC::VisitExpr_(op, os);
     }
+  } else if (op->op.same_as(tl::ascend_simd_add())) {
+    ICHECK_EQ(op->args.size(), 4) << "tl.ascend_simd_add expects exactly 4 "
+                                     "arguments (dst, src0, src1, mask)";
+    this->PrintIndent();
+    this->stream << "AscendC::MicroAPI::Add(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[2], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[3], this->stream);
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_simd_sub())) {
+    ICHECK_EQ(op->args.size(), 4) << "tl.ascend_simd_sub expects exactly 4 "
+                                     "arguments (dst, src0, src1, mask)";
+    this->PrintIndent();
+    this->stream << "AscendC::MicroAPI::Sub(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[2], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[3], this->stream);
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_simd_mul())) {
+    ICHECK_EQ(op->args.size(), 4) << "tl.ascend_simd_mul expects exactly 4 "
+                                     "arguments (dst, src0, src1, mask)";
+    this->PrintIndent();
+    this->stream << "AscendC::MicroAPI::Mul(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[2], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[3], this->stream);
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_simd_load())) {
+    ICHECK_EQ(op->args.size(), 3) << "tl.ascend_simd_load expects 3 arguments "
+                                     "(dtype_str, dst_frag, src_ptr)";
+    std::string dtype_str = Downcast<StringImm>(op->args[0])->value;
+    this->PrintIndent();
+    this->stream << "AscendC::MicroAPI::LoadAlign<" << dtype_str << ">(";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[2], this->stream);
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_simd_store())) {
+    ICHECK_EQ(op->args.size(), 4) << "tl.ascend_simd_store expects 4 arguments "
+                                     "(dtype_str, dst_ptr, src_frag, mask)";
+    std::string dtype_str = Downcast<StringImm>(op->args[0])->value;
+    this->PrintIndent();
+    this->stream << "AscendC::MicroAPI::StoreAlign<" << dtype_str << ">(";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[2], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[3], this->stream);
+    this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_simd_update_mask())) {
+    ICHECK_EQ(op->args.size(), 2)
+        << "tl.ascend_simd_update_mask expects 2 arguments (dtype_str, count)";
+    std::string dtype_str = Downcast<StringImm>(op->args[0])->value;
+    os << "AscendC::MicroAPI::UpdateMask<" << dtype_str << ">((uint32_t)";
+    this->PrintExpr(op->args[1], os);
+    os << ")";
   } else {
     CodeGenC::VisitExpr_(op, os);
   }
@@ -845,7 +1006,7 @@ void CodeGenTileLangAscend::VisitStmt_(const AttrStmtNode *op) {
       std::string var_name = AllocVarID(iv->var.get());
       if ((iv->thread_tag == "threadIdx.x" || iv->thread_tag == "threadIdx.y" ||
            iv->thread_tag == "threadIdx.z") &&
-          !inside_simtvf_body_) {
+          !inside_simtvf_body_ && !inside_simdvf_body_) {
         this->VisitStmt(op->body);
         return;
       }
@@ -871,6 +1032,11 @@ void CodeGenTileLangAscend::VisitStmt_(const AttrStmtNode *op) {
       }
       stream << ";\n";
     }
+    this->VisitStmt(op->body);
+    return;
+  }
+  // SimdVF scope marker: transparent in codegen, just visit body
+  if (op->attr_key == "tl.simdvf_scope") {
     this->VisitStmt(op->body);
     return;
   }
@@ -902,6 +1068,19 @@ void CodeGenTileLangAscend::VisitStmt_(const AllocateNode *op) {
            "T.alloc_shared.";
   }
 
+  // SimdVF: emit MicroAPI::RegTensor<T> for fragment buffers
+  if (inside_simdvf_body_ && scope == "local.fragment") {
+    std::string vid = AllocVarID(op->buffer_var.get());
+    this->PrintIndent();
+    stream << "AscendC::MicroAPI::RegTensor<";
+    PrintType(op->dtype, stream);
+    stream << "> " << vid << ";\n";
+    alloc_storage_scope_[op->buffer_var.get()] = scope;
+    RegisterHandleType(op->buffer_var.get(), op->dtype);
+    this->PrintStmt(op->body);
+    return;
+  }
+
   std::string qualifier = GetAscendScopeQualifier(scope);
   if (!qualifier.empty()) {
     // Generate: __qualifier__ <type> *buf = (__qualifier__ <type> *)0;
@@ -920,6 +1099,55 @@ void CodeGenTileLangAscend::VisitStmt_(const AllocateNode *op) {
   }
 
   // For other scopes, use parent class implementation
+  CodeGenC::VisitStmt_(op);
+}
+
+void CodeGenTileLangAscend::VisitStmt_(const tir::LetStmtNode *op) {
+  // Inside SimdVF body, handle-typed let-bindings (e.g. MaskReg from
+  // UpdateMask) should use 'auto' instead of 'void*'.
+  if (inside_simdvf_body_ && op->var.dtype().is_handle()) {
+    std::string vid = AllocVarID(op->var.get());
+    if (const auto *call = op->value.as<CallNode>()) {
+      // ascend_init_mask(count) → uint32_t vid = count;
+      if (call->op.same_as(tl::ascend_init_mask())) {
+        PrintIndent();
+        stream << "uint32_t " << vid << " = ";
+        PrintExpr(call->args[0], stream);
+        stream << ";\n";
+        PrintStmt(op->body);
+        return;
+      }
+      // ascend_simd_update_mask(dtype, count) → auto vid =
+      // UpdateMask<dtype>(count); When count is a Var (from ascend_init_mask),
+      // use it directly as lvalue.
+      if (call->op.same_as(tl::ascend_simd_update_mask())) {
+        std::string dtype_str = Downcast<StringImm>(call->args[0])->value;
+        if (call->args[1].as<VarNode>()) {
+          PrintIndent();
+          stream << "auto " << vid << " = AscendC::MicroAPI::UpdateMask<"
+                 << dtype_str << ">(";
+          PrintExpr(call->args[1], stream);
+          stream << ");\n";
+        } else {
+          PrintIndent();
+          stream << "uint32_t " << vid << "_cnt = ";
+          PrintExpr(call->args[1], stream);
+          stream << ";\n";
+          PrintIndent();
+          stream << "auto " << vid << " = AscendC::MicroAPI::UpdateMask<"
+                 << dtype_str << ">(" << vid << "_cnt);\n";
+        }
+        PrintStmt(op->body);
+        return;
+      }
+    }
+    PrintIndent();
+    stream << "auto " << vid << " = ";
+    PrintExpr(op->value, stream);
+    stream << ";\n";
+    PrintStmt(op->body);
+    return;
+  }
   CodeGenC::VisitStmt_(op);
 }
 

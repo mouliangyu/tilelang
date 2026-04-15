@@ -16,6 +16,7 @@ public:
   void VisitStmt_(const ForNode *op) final;
   void VisitStmt_(const AttrStmtNode *op) final;
   void VisitStmt_(const AllocateNode *op) final;
+  void VisitStmt_(const tir::LetStmtNode *op) final;
   void PrintStorageSync(const CallNode *op) final;
   void VisitExpr_(const CallNode *op, std::ostream &os) final;
   void PrintStorageScope(const std::string &scope, std::ostream &os) final;
@@ -26,8 +27,11 @@ public:
 private:
   int simtvf_helper_counter_{0};
   bool inside_simtvf_body_{false};
+  int simdvf_helper_counter_{0};
+  bool inside_simdvf_body_{false};
   bool has_gemm_l1_{false};
   bool has_gemm_l1_included_{false};
+  bool has_simdvf_included_{false};
 
   enum class AscendKernelMode { kVector, kCube, kMix };
   AscendKernelMode kernel_mode_{AscendKernelMode::kVector};

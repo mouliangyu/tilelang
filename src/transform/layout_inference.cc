@@ -21,6 +21,7 @@
 #include "../op/copy.h"
 #include "../op/parallel.h"
 #include "../op/region.h"
+#include "../op/simd_vf.h"
 #include "../op/simt_vf.h"
 #include "../op/utils.h"
 #include "../target/utils.h"
@@ -775,6 +776,19 @@ private:
       analyzer_vec_.push_back(analyzer_.Clone());
       buffer_oob_vec_.push_back(false);
       PopSimtVFThreadContext();
+      return;
+    }
+
+    if (op->name_hint == "SIMD_VF") {
+      // SimdVF has no thread context — just visit body to collect nested ops
+      IRVisitorWithAnalyzer::VisitStmt(op->body);
+      auto infer = SimdVFOp(tvm::ffi::GetRef<Block>(op));
+      infer_list_stmt_.push_back(tvm::ffi::GetRef<ObjectRef>(op));
+      infer_list_.push_back(std::move(infer));
+      thread_var_vec_.push_back(GetActiveThreadVar());
+      thread_bounds_vec_.push_back(GetActiveThreadBounds());
+      analyzer_vec_.push_back(analyzer_.Clone());
+      buffer_oob_vec_.push_back(false);
       return;
     }
 

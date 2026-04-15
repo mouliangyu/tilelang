@@ -369,3 +369,110 @@ def ascend_copy_ubuf_to_cbuf(dst, src, sub_blockid, burst_num, burst_len, src_ga
     """
     args = [dst, src] + [_to_int32(a) for a in [sub_blockid, burst_num, burst_len, src_gap, dst_gap]]
     return tir.call_intrin("void", tir.op.Op.get("tl.ascend_copy_ubuf_to_cbuf"), *args)
+
+
+def ascend_simd_add(dst, src0, src1, mask) -> None:
+    """Ascend SimdVF MicroAPI element-wise addition.
+
+    Low-level op emitted by AscendLowerParallelToVector pass.
+    Generates: MicroAPI::Add(dst, src0, src1, mask)
+    """
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_add"), dst, src0, src1, mask)
+
+
+def ascend_simd_sub(dst, src0, src1, mask) -> None:
+    """Ascend SimdVF MicroAPI element-wise subtraction.
+
+    Low-level op emitted by AscendLowerParallelToVector pass.
+    Generates: MicroAPI::Sub(dst, src0, src1, mask)
+    """
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_sub"), dst, src0, src1, mask)
+
+
+def ascend_simd_mul(dst, src0, src1, mask) -> None:
+    """Ascend SimdVF MicroAPI element-wise multiplication.
+
+    Low-level op emitted by AscendLowerParallelToVector pass.
+    Generates: MicroAPI::Mul(dst, src0, src1, mask)
+    """
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_mul"), dst, src0, src1, mask)
+
+
+def ascend_simd_load(dst_frag, src_ptr, dtype="float") -> None:
+    """Ascend SimdVF MicroAPI LoadAlign: UB memory → RegTensor.
+
+    Generates: AscendC::MicroAPI::LoadAlign<dtype>(dst, src)
+
+    Parameters
+    ----------
+    dst_frag : Var
+        Fragment buffer data var (becomes MicroAPI::RegTensor<T>).
+    src_ptr : PrimExpr
+        Source UB pointer (address_of).
+    dtype : str
+        C++ type name for template parameter (e.g. "float", "half_t").
+    """
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_load"), dtype, dst_frag, src_ptr)
+
+
+def ascend_simd_store(dst_ptr, src_frag, mask, dtype="float") -> None:
+    """Ascend SimdVF MicroAPI StoreAlign: RegTensor → UB memory.
+
+    Generates: AscendC::MicroAPI::StoreAlign<dtype>(dst, src, mask)
+
+    Parameters
+    ----------
+    dst_ptr : PrimExpr
+        Destination UB pointer (address_of).
+    src_frag : Var
+        Fragment buffer data var (becomes MicroAPI::RegTensor<T>).
+    mask : PrimExpr
+        Mask value (from ascend_simd_update_mask).
+    dtype : str
+        C++ type name for template parameter (e.g. "float", "half_t").
+    """
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_store"), dtype, dst_ptr, src_frag, mask)
+
+
+def ascend_simd_update_mask(count, dtype="float"):
+    """Ascend SimdVF MicroAPI UpdateMask: create mask from element count.
+
+    Generates: AscendC::MicroAPI::UpdateMask<dtype>(count)
+
+    Parameters
+    ----------
+    count : int or PrimExpr
+        A handle returned by ascend_init_mask.
+    dtype : str
+        C++ type name for template parameter (e.g. "float", "half_t").
+
+    Returns
+    -------
+    PrimExpr
+        Opaque mask value (MaskReg).
+    """
+    return tir.call_intrin("handle", tir.op.Op.get("tl.ascend_simd_update_mask"), dtype, count)
+
+
+def ascend_init_mask(count):
+    """Declare a uint32_t mask count variable (should be placed outside loops).
+
+    Generates: uint32_t var = count;
+
+    The returned handle can be passed as the count argument to
+    ascend_simd_update_mask so that the count variable is not
+    redeclared inside a loop body.
+
+    Parameters
+    ----------
+    count : int or PrimExpr
+        Number of active elements.
+
+    Returns
+    -------
+    PrimExpr
+        Opaque handle representing the uint32_t count variable.
+    """
+    if isinstance(count, int):
+        count = tir.IntImm("int32", count)
+    return tir.call_intrin("handle", tir.op.Op.get("tl.ascend_init_mask"), count)

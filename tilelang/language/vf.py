@@ -67,3 +67,35 @@ def SimtVF(threads: int | list[int] | tuple = 128) -> SimtVFFrame:
         raise ValueError("SimtVF requires all thread dimensions > 0")
 
     return _ffi_api.SimtVF(normalized)  # type: ignore[attr-defined] # pylint: disable=no-member
+
+
+@register_object("tl.SimdVFFrame")
+class SimdVFFrame(TIRFrame):
+    """Frame for SimdVF (SIMD Vector Fragment) region on Ascend NPU.
+
+    No thread dimensions — purely register-level SIMD model using MicroAPI.
+    The C++ side (SimdVFFrameNode) handles scope entry/exit and generates
+    the Block("SIMD_VF") IR node with tl.simdvf_scope marker.
+    """
+
+    def __enter__(self):
+        super().__enter__()
+        return self
+
+    def __exit__(self, ptype, value, trace):
+        super().__exit__(ptype, value, trace)
+
+
+def SimdVF() -> SimdVFFrame:
+    """Construct a SimdVF region for Ascend NPU MicroAPI operations.
+
+    Inside this region, the AscendLowerParallelToVector pass will lower
+    T.Parallel loops into MicroAPI register-level SIMD operations.
+    The region is emitted as a __simd_vf__ helper function and called inline.
+
+    Returns
+    -------
+    res : SimdVFFrame
+        The SimdVFFrame used to denote a SimdVF region.
+    """
+    return _ffi_api.SimdVF()  # type: ignore[attr-defined] # pylint: disable=no-member

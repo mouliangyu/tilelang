@@ -33,6 +33,25 @@ def has_simtvf_region(mod: IRModule) -> bool:
     return False
 
 
+def has_simdvf_region(mod: IRModule) -> bool:
+    for _, func in mod.functions.items():
+        if not isinstance(func, tir.PrimFunc):
+            continue
+        found = False
+
+        def _visit(node):
+            nonlocal found
+            if found:
+                return
+            if isinstance(node, tir.Block) and node.name_hint == "SIMD_VF":
+                found = True
+
+        tir.stmt_functor.post_order_visit(func.body, _visit)
+        if found:
+            return True
+    return False
+
+
 def allow_warp_specialized(pass_ctx: PassContext | None = None, target: Target | None = None) -> bool:
     # avoid circular import
     from tilelang.jit.adapter.utils import is_cuda_target
@@ -185,7 +204,7 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     """
     mod = tir.transform.BindTarget(target)(mod)
     if is_ascend_target(target):
-        mod = tilelang.analysis.SimtVFFragmentNarrowChecker()(mod)
+        mod = tilelang.analysis.VFFragmentNarrowChecker()(mod)
 
     if should_force_let_inline():
         # Force-let inline whenever the pass config requests it.
@@ -270,14 +289,14 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # SimtVF defines a control boundary for region-local SIMT predicates.
     # On Ascend path, skip hoisting-related passes to avoid leaking thread
     # predicates across SimtVF regions.
-    allow_if_hoist_across_simtvf = not (is_ascend_target(target) and has_simtvf_region(mod))
-    if allow_if_hoist_across_simtvf:
+    allow_if_hoist_across_vf = not (is_ascend_target(target) and (has_simtvf_region(mod) or has_simdvf_region(mod)))
+    if allow_if_hoist_across_vf:
         mod = tilelang.transform.LoopUnswitching()(mod)
     mod = tilelang.transform.UnrollLoop()(mod)
     mod = tir.transform.RenormalizeSplitPattern()(mod)
     mod = tir.transform.Simplify()(mod)
     mod = tir.transform.RemoveNoOp()(mod)
-    if allow_if_hoist_across_simtvf:
+    if allow_if_hoist_across_vf:
         mod = tir.transform.HoistIfThenElse()(mod)
 
     mod = tir.transform.VerifyMemory()(mod)

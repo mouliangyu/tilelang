@@ -18,6 +18,7 @@
 #include "../op/gemm.h"
 #include "../op/gemm_sp.h"
 #include "../op/operator.h"
+#include "../op/simd_vf.h"
 #include "../op/simt_vf.h"
 #include "../op/utils.h"
 #include "../target/utils.h"
@@ -366,6 +367,32 @@ private:
           analyzer_);
       PopSimtVFThreadContext();
       thread_var_ = saved_thread_var;
+      return lowered;
+    }
+
+    if (op->name_hint == "SIMD_VF") {
+      Map<Var, PrimExpr> let_var_to_expr;
+      for (const auto &[var, expr] : let_bindings_) {
+        let_var_to_expr.Set(var, expr);
+      }
+
+      AddWorkspaceCallback callback = [this](int num_elem, DataType dtype) {
+        auto workspace =
+            decl_buffer({PrimExpr(num_elem)}, dtype, "workspace", "shared.dyn");
+        if (!workspace_stack_.empty()) {
+          workspace_stack_.back().push_back(workspace);
+        } else {
+          workspace_stack_.emplace_back(Array<Buffer>{workspace});
+        }
+        return workspace.access_ptr(2);
+      };
+
+      auto simd_vf_op = SimdVFOp(block);
+      Stmt lowered = simd_vf_op->Lower(
+          LowerArgs{target_, Range::FromMinExtent(0, 1),
+                    Var("simdvf_dummy", DataType::Int(32)), callback,
+                    layout_map_, buffer_remap_, let_var_to_expr},
+          analyzer_);
       return lowered;
     }
 

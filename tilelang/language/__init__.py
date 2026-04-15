@@ -29,6 +29,8 @@ from .loop import (
 from .vf import (
     SimtVF,  # noqa: F401
     SimtVFFrame,  # noqa: F401
+    SimdVF,  # noqa: F401
+    SimdVFFrame,  # noqa: F401
 )
 from .cube import (
     Cube,  # noqa: F401
@@ -119,6 +121,13 @@ from .ascend import (
     ascend_reduce_add,  # noqa: F401
     ascend_reduce_max,  # noqa: F401
     ascend_reduce_min,  # noqa: F401
+    ascend_simd_add,  # noqa: F401
+    ascend_simd_sub,  # noqa: F401
+    ascend_simd_mul,  # noqa: F401
+    ascend_simd_load,  # noqa: F401
+    ascend_simd_store,  # noqa: F401
+    ascend_simd_update_mask,  # noqa: F401
+    ascend_init_mask,  # noqa: F401
 )
 from .builtin import __ldg as __ldg  # noqa: F401
 from .builtin import ldg32 as ldg32  # noqa: F401

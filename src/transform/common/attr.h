@@ -16,6 +16,8 @@ constexpr const char *tilelang_is_npu_kernel_frame =
 
 constexpr const char *tilelang_simt_vf_captures = "tl.simt_vf_captures";
 
+constexpr const char *tilelang_simd_vf_captures = "tl.simd_vf_captures";
+
 namespace attr {
 // Attributes to mark CUDA sync calls
 constexpr const char *kHasTriggerLaunch = "has_cuda_pdl_trigger";

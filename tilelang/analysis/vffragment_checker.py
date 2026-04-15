@@ -12,21 +12,21 @@ def _is_fragment_layout(layout) -> bool:
     return cls.__name__ == "Fragment" and cls.__module__.startswith("tilelang.layout")
 
 
-def _is_simtvf_block(op: tir.Block) -> bool:
-    return op.name_hint == "SIMT_VF"
+def _is_vf_block(op: tir.Block) -> bool:
+    return op.name_hint == "SIMT_VF" or op.name_hint == "SIMD_VF"
 
 
 @tir.functor.visitor
-class _SimtVFFragmentNarrowVisitor(PyStmtExprVisitor):
-    """Check all local.fragment buffers are defined and accessed inside SimtVF."""
+class _VFFragmentNarrowVisitor(PyStmtExprVisitor):
+    """Check all local.fragment buffers are defined and accessed inside VF (SimtVF or SimdVF)."""
 
     def __init__(self) -> None:
         super().__init__()
-        self._simtvf_depth = False
+        self._vf_depth = False
         self._fragment_data_var_depth = defaultdict(int)
 
     def _in_simtvf(self) -> bool:
-        return self._simtvf_depth
+        return self._vf_depth
 
     def _mark_fragment_buffer(self, data: Var) -> None:
         self._fragment_data_var_depth[data] += 1
@@ -53,8 +53,8 @@ class _SimtVFFragmentNarrowVisitor(PyStmtExprVisitor):
             return
         raise ValueError(
             "[Tilelang Semantic Check] "
-            f"Buffer {buf.name} in scope {buf.scope()} is {action} outside any T.SimtVF region. "
-            "On Ascend path, all local.fragment buffers must be narrowed and defined inside T.SimtVF."
+            f"Buffer {buf.name} in scope {buf.scope()} is {action} outside any VF region. "
+            "On Ascend path, all local.fragment buffers must be defined inside T.SimtVF or T.SimdVF."
         )
 
     def _extract_fragment_layout_buffers(self, op: tir.Block) -> list[Buffer]:
@@ -71,9 +71,9 @@ class _SimtVFFragmentNarrowVisitor(PyStmtExprVisitor):
         self.visit_stmt(op.body)
 
     def visit_block_(self, op: tir.Block) -> None:
-        is_simtvf = _is_simtvf_block(op)
+        is_simtvf = _is_vf_block(op)
         if is_simtvf:
-            self._simtvf_depth = True
+            self._vf_depth = True
 
         fragment_layout_buffers = self._extract_fragment_layout_buffers(op)
         for buf in fragment_layout_buffers:
@@ -89,7 +89,7 @@ class _SimtVFFragmentNarrowVisitor(PyStmtExprVisitor):
             self._unmark_fragment_buffer(buf.data)
 
         if is_simtvf:
-            self._simtvf_depth = False
+            self._vf_depth = False
 
     def visit_buffer_load_(self, op: BufferLoad) -> None:
         self._check_fragment_in_simtvf(op.buffer, action="accessed")
@@ -100,11 +100,12 @@ class _SimtVFFragmentNarrowVisitor(PyStmtExprVisitor):
         super().visit_buffer_store_(op)
 
 
-def SimtVFFragmentNarrowChecker():
-    """Validate local.fragment buffers are narrowed into SimtVF region."""
+def VFFragmentNarrowChecker():
+    """Validate local.fragment buffers are narrowed into VF region (SimtVF or SimdVF)."""
 
     def pass_fn(func: PrimFunc, mod, ctx):
-        _SimtVFFragmentNarrowVisitor().visit_stmt(func.body)
+        _VFFragmentNarrowVisitor().visit_stmt(func.body)
         return func
 
     return prim_func_pass(pass_fn, opt_level=0)
+
