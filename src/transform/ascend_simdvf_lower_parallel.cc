@@ -8,6 +8,9 @@
  *
  * VReg size: 8 VLanes × 32 Bytes / sizeof(dtype)
  *   float32 → 64, float16 → 128, int8 → 256
+ *
+ * For 2D parallel, the dimension with stride=1 (contiguous access) is
+ * chosen as the VReg dimension; the other becomes serial.
  */
 
 #include <tvm/tir/builtin.h>
@@ -28,25 +31,6 @@ namespace tl {
 
 using namespace tir;
 
-/*!
- * \brief Lower parallel loops inside SIMD_VF blocks to MicroAPI vector ops.
- *
- * Transforms:
- *   for i in T.Parallel(N):
- *       C[i] = A[i] + B[i]
- *
- * Into:
- *   r0 = alloc_fragment((VL,), dtype)
- *   r1 = alloc_fragment((VL,), dtype)
- *   rd = alloc_fragment((VL,), dtype)
- *   mask_cnt = ascend_init_mask(N)
- *   for chunk in serial(N / VL):
- *       mask = ascend_simd_update_mask(mask_cnt)
- *       ascend_simd_load(r0, &A[chunk*VL])
- *       ascend_simd_load(r1, &B[chunk*VL])
- *       ascend_simd_add(rd, r0, r1, mask)
- *       ascend_simd_store(&C[chunk*VL], rd, mask)
- */
 class AscendSimdVFLowerParallel : public StmtExprMutator {
 public:
   static PrimFunc Substitute(PrimFunc f) {
@@ -57,328 +41,443 @@ public:
   }
 
 private:
-  // Whether we are inside a SIMD_VF block
   bool inside_simdvf_{false};
 
-  // Parallel loop variable and extent being lowered
+  // VReg (inner/contiguous) dimension
   const VarNode *parallel_var_{nullptr};
   int64_t parallel_extent_{0};
 
-  // VReg size (number of elements per register), determined by dtype
+  // Outer (serial) dimension for 2D parallel
+  const VarNode *outer_parallel_var_{nullptr};
+  Var outer_serial_var_;
+
   int64_t vreg_size_{0};
-
-  // The chunk loop variable: iterates over VReg-sized chunks
   Var chunk_var_;
-
-  // Mask variables for the current lowering
   Var mask_cnt_var_;
   Var mask_var_;
 
-  // Fragment registers allocated during expression decomposition
   std::vector<Buffer> new_fragments_;
   int frag_counter_{0};
-
-  // The dtype string for MicroAPI template parameters (e.g. "float")
   std::string dtype_str_;
 
   //-----------------------------------------------------------------------
-  // VReg size computation
+  // VReg / type helpers
   //-----------------------------------------------------------------------
   static int64_t ComputeVRegSize(DataType dtype) {
-    // 8 VLanes × 32 Bytes per VLane / sizeof(element)
-    int64_t elem_bytes = dtype.bits() / 8;
-    return 8 * 32 / elem_bytes;
+    return 8 * 32 / (dtype.bits() / 8);
   }
 
   static std::string DTypeToAscendStr(DataType dtype) {
-    if (dtype.is_float()) {
-      if (dtype.bits() == 16)
-        return "half_t";
-      if (dtype.bits() == 32)
-        return "float";
-    } else if (dtype.is_int()) {
+    if (dtype.is_float())
+      return (dtype.bits() == 16) ? "half_t" : "float";
+    if (dtype.is_int())
       return "int" + std::to_string(dtype.bits()) + "_t";
-    } else if (dtype.is_uint()) {
+    if (dtype.is_uint())
       return "uint" + std::to_string(dtype.bits()) + "_t";
-    }
     return "float";
   }
 
   //-----------------------------------------------------------------------
-  // Fragment register allocation
+  // Fragment allocation
   //-----------------------------------------------------------------------
   Buffer AllocFragmentReg(DataType dtype) {
-    std::string name =
-        "vreg_" + std::to_string(frag_counter_++);
+    std::string name = "vreg_" + std::to_string(frag_counter_++);
     Var data(name, PointerType(PrimType(dtype), "local.fragment"));
     Array<PrimExpr> shape = {IntImm(DataType::Int(32), vreg_size_)};
-    Buffer buf(data, dtype, shape,
-               /*strides=*/{},
-               /*elem_offset=*/PrimExpr(0),
-               /*name=*/name,
-               /*data_alignment=*/0,
-               /*offset_factor=*/0,
-               /*buffer_type=*/kDefault);
+    Buffer buf(data, dtype, shape, {}, PrimExpr(0), name, 0, 0, kDefault);
     new_fragments_.push_back(buf);
     return buf;
   }
 
   //-----------------------------------------------------------------------
-  // Index substitution: replace parallel_var with chunk_var_ * vreg_size_
+  // Stride analysis: coefficient of `var` in linear expression
+  // Returns 0 if not found, -1 if non-linear, >0 = stride
   //-----------------------------------------------------------------------
-  PrimExpr SubstituteIndex(const PrimExpr &index) {
-    if (parallel_var_ == nullptr)
-      return index;
-
-    class IndexReplacer : public ExprMutator {
-    public:
-      const VarNode *from_;
-      PrimExpr to_;
-      IndexReplacer(const VarNode *from, PrimExpr to)
-          : from_(from), to_(std::move(to)) {}
-      PrimExpr VisitExpr_(const VarNode *op) override {
-        if (op == from_)
-          return to_;
-        return ffi::GetRef<PrimExpr>(op);
+  static int64_t GetVarStride(const PrimExpr &expr, const VarNode *var) {
+    if (const auto *v = expr.as<VarNode>())
+      return (v == var) ? 1 : 0;
+    if (expr.as<IntImmNode>() || expr.as<FloatImmNode>())
+      return 0;
+    if (const auto *add = expr.as<AddNode>()) {
+      int64_t sa = GetVarStride(add->a, var);
+      int64_t sb = GetVarStride(add->b, var);
+      return (sa < 0 || sb < 0) ? -1 : sa + sb;
+    }
+    if (const auto *sub = expr.as<SubNode>()) {
+      int64_t sa = GetVarStride(sub->a, var);
+      int64_t sb = GetVarStride(sub->b, var);
+      return (sa < 0 || sb < 0) ? -1 : sa - sb;
+    }
+    if (const auto *mul = expr.as<MulNode>()) {
+      if (const auto *imm = mul->b.as<IntImmNode>()) {
+        int64_t sa = GetVarStride(mul->a, var);
+        return sa < 0 ? -1 : sa * imm->value;
       }
-    };
-
-    PrimExpr replacement =
-        chunk_var_ * IntImm(DataType::Int(32), vreg_size_);
-    IndexReplacer replacer(parallel_var_, replacement);
-    return replacer(index);
+      if (const auto *imm = mul->a.as<IntImmNode>()) {
+        int64_t sb = GetVarStride(mul->b, var);
+        return sb < 0 ? -1 : sb * imm->value;
+      }
+      int64_t sa = GetVarStride(mul->a, var);
+      int64_t sb = GetVarStride(mul->b, var);
+      return (sa != 0 && sb != 0) ? -1 : ((sa == 0) ? sb : sa);
+    }
+    if (const auto *fd = expr.as<FloorDivNode>()) {
+      int64_t sa = GetVarStride(fd->a, var);
+      if (sa == 0)
+        return 0;
+      if (const auto *imm = fd->b.as<IntImmNode>())
+        return (sa > 0 && sa % imm->value == 0) ? sa / imm->value : -1;
+      return -1;
+    }
+    if (expr.as<FloorModNode>()) {
+      return GetVarStride(expr.as<FloorModNode>()->a, var) == 0 ? 0 : -1;
+    }
+    if (const auto *cast = expr.as<CastNode>())
+      return GetVarStride(cast->value, var);
+    return -1;
   }
 
   //-----------------------------------------------------------------------
-  // Make address_of(buffer[substituted_indices])
+  // Strip AttrStmt wrappers to get to the real body
   //-----------------------------------------------------------------------
+  static Stmt StripAttr(const Stmt &body) {
+    Stmt cur = body;
+    while (const auto *attr = cur.as<AttrStmtNode>())
+      cur = attr->body;
+    return cur;
+  }
+
+  //-----------------------------------------------------------------------
+  // Get flattened stride of a given var in the first store's indices
+  //-----------------------------------------------------------------------
+  int64_t GetStrideInStore(const Stmt &body, const VarNode *var) {
+    auto get = [&](const BufferStoreNode *store) -> int64_t {
+      PrimExpr flat = store->indices[0];
+      for (size_t d = 1; d < store->indices.size(); ++d)
+        flat = flat * store->buffer->shape[d] + store->indices[d];
+      return GetVarStride(flat, var);
+    };
+    Stmt b = StripAttr(body);
+    if (const auto *store = b.as<BufferStoreNode>())
+      return get(store);
+    if (const auto *seq = b.as<SeqStmtNode>()) {
+      for (const Stmt &s : seq->seq) {
+        if (const auto *store = s.as<BufferStoreNode>())
+          return get(store);
+      }
+    }
+    return -1;
+  }
+
+  //-----------------------------------------------------------------------
+  // Index substitution: replace both parallel vars with their new values
+  // VReg var → chunk * VL,  outer var → serial loop var
+  //-----------------------------------------------------------------------
+  PrimExpr SubstituteIndex(const PrimExpr &index) {
+    class Replacer : public ExprMutator {
+      const VarNode *pv_;
+      PrimExpr pr_;
+      const VarNode *ov_;
+      PrimExpr or_;
+
+    public:
+      Replacer(const VarNode *pv, PrimExpr pr, const VarNode *ov, PrimExpr or_)
+          : pv_(pv), pr_(pr), ov_(ov), or_(or_) {}
+      PrimExpr VisitExpr_(const VarNode *op) override {
+        if (pv_ && op == pv_)
+          return pr_;
+        if (ov_ && op == ov_)
+          return or_;
+        return ffi::GetRef<PrimExpr>(op);
+      }
+    };
+    PrimExpr par_repl = chunk_var_ * IntImm(DataType::Int(32), vreg_size_);
+    PrimExpr outer_repl = outer_parallel_var_
+                              ? PrimExpr(outer_serial_var_)
+                              : PrimExpr(IntImm(DataType::Int(32), 0));
+    return Replacer(parallel_var_, par_repl, outer_parallel_var_,
+                    outer_repl)(index);
+  }
+
   PrimExpr MakeAddressOf(const Buffer &buffer,
                          const Array<PrimExpr> &orig_indices) {
-    Array<PrimExpr> new_indices;
-    for (const auto &idx : orig_indices) {
-      new_indices.push_back(SubstituteIndex(idx));
-    }
-    PrimExpr load = BufferLoad(buffer, new_indices);
-    return Call(DataType::Handle(), builtin::address_of(), {load});
+    Array<PrimExpr> idx;
+    for (const auto &i : orig_indices)
+      idx.push_back(SubstituteIndex(i));
+    return Call(DataType::Handle(), builtin::address_of(),
+                {BufferLoad(buffer, idx)});
   }
 
   //-----------------------------------------------------------------------
   // Expression decomposition (recursive)
-  // Returns the fragment data Var holding the result
   //-----------------------------------------------------------------------
-  Var DecomposeExpr(const PrimExpr &expr, DataType dtype,
-                    Array<Stmt> *stmts) {
-    // Leaf: BufferLoad → alloc fragment + ascend_simd_load
+  Var DecomposeExpr(const PrimExpr &expr, DataType dtype, Array<Stmt> *stmts) {
     if (const auto *load = expr.as<BufferLoadNode>()) {
       Buffer reg = AllocFragmentReg(dtype);
-      PrimExpr addr = MakeAddressOf(load->buffer, load->indices);
-      PrimExpr call = Call(DataType::Void(), ascend_simd_load(),
-                           {StringImm(dtype_str_), reg->data, addr});
-      stmts->push_back(Evaluate(call));
+      stmts->push_back(
+          Evaluate(Call(DataType::Void(), ascend_simd_load(),
+                        {StringImm(dtype_str_), reg->data,
+                         MakeAddressOf(load->buffer, load->indices)})));
       return reg->data;
     }
 
-    // Binary: Add
-    if (const auto *add = expr.as<AddNode>()) {
-      Var lhs = DecomposeExpr(add->a, dtype, stmts);
-      Var rhs = DecomposeExpr(add->b, dtype, stmts);
+    auto EmitBinary = [&](const PrimExpr &a, const PrimExpr &b,
+                          const Op &op) -> Var {
+      Var lhs = DecomposeExpr(a, dtype, stmts);
+      Var rhs = DecomposeExpr(b, dtype, stmts);
       Buffer dst = AllocFragmentReg(dtype);
-      PrimExpr call = Call(DataType::Void(), ascend_simd_add(),
-                           {dst->data, lhs, rhs, mask_var_});
-      stmts->push_back(Evaluate(call));
+      stmts->push_back(Evaluate(
+          Call(DataType::Void(), op, {dst->data, lhs, rhs, mask_var_})));
       return dst->data;
-    }
+    };
+    if (auto *n = expr.as<AddNode>())
+      return EmitBinary(n->a, n->b, ascend_simd_add());
+    if (auto *n = expr.as<SubNode>())
+      return EmitBinary(n->a, n->b, ascend_simd_sub());
+    if (auto *n = expr.as<MulNode>())
+      return EmitBinary(n->a, n->b, ascend_simd_mul());
+    if (auto *n = expr.as<DivNode>())
+      return EmitBinary(n->a, n->b, ascend_simd_div());
 
-    // Binary: Sub
-    if (const auto *sub = expr.as<SubNode>()) {
-      Var lhs = DecomposeExpr(sub->a, dtype, stmts);
-      Var rhs = DecomposeExpr(sub->b, dtype, stmts);
+    auto EmitUnary = [&](const PrimExpr &a, const Op &op) -> Var {
+      Var src = DecomposeExpr(a, dtype, stmts);
       Buffer dst = AllocFragmentReg(dtype);
-      PrimExpr call = Call(DataType::Void(), ascend_simd_sub(),
-                           {dst->data, lhs, rhs, mask_var_});
-      stmts->push_back(Evaluate(call));
+      stmts->push_back(
+          Evaluate(Call(DataType::Void(), op, {dst->data, src, mask_var_})));
       return dst->data;
+    };
+    if (const auto *call = expr.as<CallNode>()) {
+      if (const auto *opn = call->op.as<OpNode>()) {
+        std::string n = opn->name;
+        if (n == "tir.exp" && call->args.size() == 1)
+          return EmitUnary(call->args[0], ascend_simd_exp());
+        if ((n == "tir.log" || n == "tir.ln") && call->args.size() == 1)
+          return EmitUnary(call->args[0], ascend_simd_ln());
+        if (n == "tir.sqrt" && call->args.size() == 1)
+          return EmitUnary(call->args[0], ascend_simd_sqrt());
+        if (n == "tir.rsqrt" && call->args.size() == 1)
+          return EmitUnary(call->args[0], ascend_simd_rsqrt());
+        if (n == "tir.fabs" && call->args.size() == 1)
+          return EmitUnary(call->args[0], ascend_simd_abs());
+      }
     }
+    if (const auto *sub = expr.as<SubNode>())
+      if (is_zero(sub->a))
+        return EmitUnary(sub->b, ascend_simd_neg());
 
-    // Binary: Mul
-    if (const auto *mul = expr.as<MulNode>()) {
-      Var lhs = DecomposeExpr(mul->a, dtype, stmts);
-      Var rhs = DecomposeExpr(mul->b, dtype, stmts);
-      Buffer dst = AllocFragmentReg(dtype);
-      PrimExpr call = Call(DataType::Void(), ascend_simd_mul(),
-                           {dst->data, lhs, rhs, mask_var_});
-      stmts->push_back(Evaluate(call));
-      return dst->data;
-    }
-
-    LOG(FATAL) << "AscendSimdVFLowerParallel: unsupported expression type: "
-               << expr->GetTypeKey();
+    LOG(FATAL) << "AscendSimdVFLowerParallel: unsupported expr: " << expr;
     return Var();
   }
 
   //-----------------------------------------------------------------------
-  // Lower a single BufferStore inside a parallel loop
+  // Store lowering
   //-----------------------------------------------------------------------
   Stmt LowerBufferStore(const BufferStoreNode *store, DataType dtype) {
     Array<Stmt> stmts;
-
-    // Decompose the value expression into MicroAPI ops
-    Var result_reg = DecomposeExpr(store->value, dtype, &stmts);
-
-    // Store: ascend_simd_store(&dst[chunk*VL], result_reg, mask)
-    PrimExpr addr = MakeAddressOf(store->buffer, store->indices);
-    PrimExpr store_call =
-        Call(DataType::Void(), ascend_simd_store(),
-             {StringImm(dtype_str_), addr, result_reg, mask_var_});
-    stmts.push_back(Evaluate(store_call));
-
-    if (stmts.size() == 1)
-      return stmts[0];
-    return SeqStmt(stmts);
+    Var result = DecomposeExpr(store->value, dtype, &stmts);
+    stmts.push_back(Evaluate(Call(DataType::Void(), ascend_simd_store(),
+                                  {StringImm(dtype_str_),
+                                   MakeAddressOf(store->buffer, store->indices),
+                                   result, mask_var_})));
+    return stmts.size() == 1 ? stmts[0] : SeqStmt(stmts);
   }
 
-  //-----------------------------------------------------------------------
-  // Lower an entire parallel body (single store or seq of stores)
-  //-----------------------------------------------------------------------
-  Stmt LowerParallelBody(const Stmt &body, DataType dtype) {
-    if (const auto *store = body.as<BufferStoreNode>()) {
-      return LowerBufferStore(store, dtype);
+  bool CanLowerBody(const Stmt &body) {
+    Stmt b = StripAttr(body);
+    if (b.as<BufferStoreNode>())
+      return true;
+    if (auto *s = b.as<SeqStmtNode>()) {
+      for (const Stmt &st : s->seq)
+        if (!st.as<BufferStoreNode>())
+          return false;
+      return true;
     }
+    return false;
+  }
 
-    if (const auto *seq = body.as<SeqStmtNode>()) {
+  Stmt LowerParallelBody(const Stmt &body, DataType dtype) {
+    Stmt b = StripAttr(body);
+    if (auto *s = b.as<BufferStoreNode>())
+      return LowerBufferStore(s, dtype);
+    if (auto *s = b.as<SeqStmtNode>()) {
       Array<Stmt> lowered;
-      for (const Stmt &s : seq->seq) {
-        if (const auto *store = s.as<BufferStoreNode>()) {
-          lowered.push_back(LowerBufferStore(store, dtype));
-        } else {
-          LOG(FATAL) << "AscendSimdVFLowerParallel: expected BufferStore in "
-                        "parallel seq, got "
-                     << s->GetTypeKey();
-        }
-      }
+      for (const Stmt &st : s->seq)
+        lowered.push_back(LowerBufferStore(st.as<BufferStoreNode>(), dtype));
       return SeqStmt(lowered);
     }
-
-    LOG(FATAL)
-        << "AscendSimdVFLowerParallel: unsupported parallel body type: "
-        << body->GetTypeKey();
+    LOG(FATAL) << "AscendSimdVFLowerParallel: bad parallel body: "
+               << b->GetTypeKey();
     return Stmt();
+  }
+
+  DataType InferDType(const Stmt &body) {
+    Stmt b = StripAttr(body);
+    if (auto *s = b.as<BufferStoreNode>())
+      return s->buffer->dtype;
+    if (auto *s = b.as<SeqStmtNode>()) {
+      for (const Stmt &st : s->seq)
+        if (auto *bs = st.as<BufferStoreNode>())
+          return bs->buffer->dtype;
+    }
+    return DataType::Float(32);
   }
 
   //-----------------------------------------------------------------------
   // VisitStmt overrides
   //-----------------------------------------------------------------------
   Stmt VisitStmt_(const BlockNode *op) override {
-    if (op->name_hint != "SIMD_VF") {
+    if (op->name_hint != "SIMD_VF")
       return StmtExprMutator::VisitStmt_(op);
-    }
 
-    // Enter SIMD_VF scope
     bool saved = inside_simdvf_;
     inside_simdvf_ = true;
-    auto saved_fragments = std::move(new_fragments_);
-    int saved_counter = frag_counter_;
+    auto saved_frags = std::move(new_fragments_);
+    int saved_cnt = frag_counter_;
     new_fragments_.clear();
     frag_counter_ = 0;
 
-    // Visit body — parallel loops will be lowered here
     Stmt new_body = VisitStmt(op->body);
 
-    // Collect new fragment allocations into alloc_buffers
-    Array<Buffer> alloc_buffers = op->alloc_buffers;
-    for (const Buffer &buf : new_fragments_) {
-      alloc_buffers.push_back(buf);
-    }
+    Array<Buffer> alloc_bufs = op->alloc_buffers;
+    for (const Buffer &b : new_fragments_)
+      alloc_bufs.push_back(b);
 
-    // Restore state
     inside_simdvf_ = saved;
-    new_fragments_ = std::move(saved_fragments);
-    frag_counter_ = saved_counter;
+    new_fragments_ = std::move(saved_frags);
+    frag_counter_ = saved_cnt;
 
-    if (alloc_buffers.same_as(op->alloc_buffers) &&
-        new_body.same_as(op->body)) {
+    if (alloc_bufs.same_as(op->alloc_buffers) && new_body.same_as(op->body))
       return ffi::GetRef<Stmt>(op);
-    }
 
-    return Block(op->iter_vars, op->reads, op->writes, op->name_hint,
-                 new_body, op->init, alloc_buffers, op->match_buffers,
-                 op->annotations);
+    return Block(op->iter_vars, op->reads, op->writes, op->name_hint, new_body,
+                 op->init, alloc_bufs, op->match_buffers, op->annotations);
   }
 
   Stmt VisitStmt_(const ForNode *op) override {
-    if (!inside_simdvf_ || op->kind != ForKind::kParallel) {
+    if (!inside_simdvf_ || op->kind != ForKind::kParallel)
       return StmtExprMutator::VisitStmt_(op);
+
+    // 2D parallel: parallel → [attrs...] → parallel → body
+    Stmt stripped = StripAttr(op->body);
+    const auto *inner = stripped.as<ForNode>();
+    if (inner && inner->kind == ForKind::kParallel) {
+      if (auto *t = inner->body.as<ForNode>())
+        if (t->kind == ForKind::kParallel)
+          LOG(FATAL) << "3D+ parallel not supported";
+      return Lower2DParallel(op, inner);
     }
 
-    // Extract extent
-    const auto *extent_imm = op->extent.as<IntImmNode>();
-    ICHECK(extent_imm)
-        << "AscendSimdVFLowerParallel: parallel extent must be constant, got "
-        << op->extent;
-    int64_t extent = extent_imm->value;
+    if (!CanLowerBody(op->body))
+      return StmtExprMutator::VisitStmt_(op);
+    return Lower1DParallel(op);
+  }
 
-    // Determine dtype from the first BufferStore in the body
-    DataType dtype = DataType::Float(32); // default
-    if (const auto *store = op->body.as<BufferStoreNode>()) {
-      dtype = store->buffer->dtype;
-    } else if (const auto *seq = op->body.as<SeqStmtNode>()) {
-      for (const Stmt &s : seq->seq) {
-        if (const auto *store = s.as<BufferStoreNode>()) {
-          dtype = store->buffer->dtype;
-          break;
-        }
-      }
-    }
+  //-----------------------------------------------------------------------
+  // 1D Parallel
+  //-----------------------------------------------------------------------
+  Stmt Lower1DParallel(const ForNode *op) {
+    int64_t extent = Downcast<IntImm>(op->extent)->value;
+    DataType dtype = InferDType(op->body);
+    vreg_size_ = ComputeVRegSize(dtype);
+    dtype_str_ = DTypeToAscendStr(dtype);
+    ICHECK_EQ(extent % vreg_size_, 0)
+        << "Extent " << extent << " not divisible by VReg size " << vreg_size_;
+    int64_t nchunks = extent / vreg_size_;
 
-    // Compute VReg size
+    auto saved_pv = parallel_var_, saved_ov = outer_parallel_var_;
+    parallel_var_ = op->loop_var.get();
+    outer_parallel_var_ = nullptr;
+
+    chunk_var_ = Var("vchunk", DataType::Int(32));
+    mask_cnt_var_ = Var("mask_cnt", DataType::Handle());
+    mask_var_ = Var("mask", DataType::Handle());
+
+    PrimExpr im = Call(DataType::Handle(), ascend_init_mask(),
+                       {IntImm(DataType::Int(32), extent)});
+    PrimExpr um = Call(DataType::Handle(), ascend_simd_update_mask(),
+                       {StringImm(dtype_str_), mask_cnt_var_});
+
+    Stmt body = LowerParallelBody(op->body, dtype);
+    Stmt ml = LetStmt(mask_var_, um, body);
+    Stmt loop = For(chunk_var_, IntImm(DataType::Int(32), 0),
+                    IntImm(DataType::Int(32), nchunks), ForKind::kSerial, ml);
+    Stmt result = LetStmt(mask_cnt_var_, im, loop);
+
+    parallel_var_ = saved_pv;
+    outer_parallel_var_ = saved_ov;
+    return result;
+  }
+
+  //-----------------------------------------------------------------------
+  // 2D Parallel: pick stride=1 var as VReg, other as serial
+  //-----------------------------------------------------------------------
+  Stmt Lower2DParallel(const ForNode *outer, const ForNode *inner) {
+    if (!CanLowerBody(inner->body))
+      return StmtExprMutator::VisitStmt_(outer);
+
+    int64_t outer_ext = Downcast<IntImm>(outer->extent)->value;
+    int64_t inner_ext = Downcast<IntImm>(inner->extent)->value;
+
+    DataType dtype = InferDType(inner->body);
     vreg_size_ = ComputeVRegSize(dtype);
     dtype_str_ = DTypeToAscendStr(dtype);
 
-    ICHECK_EQ(extent % vreg_size_, 0)
-        << "Parallel extent " << extent << " must be divisible by VReg size "
-        << vreg_size_;
-    int64_t num_chunks = extent / vreg_size_;
+    // Determine which var has stride=1 → that's the VReg dimension
+    int64_t outer_stride = GetStrideInStore(inner->body, outer->loop_var.get());
+    int64_t inner_stride = GetStrideInStore(inner->body, inner->loop_var.get());
 
-    // Save/set parallel variable
-    const VarNode *saved_pvar = parallel_var_;
-    int64_t saved_extent = parallel_extent_;
-    parallel_var_ = op->loop_var.get();
-    parallel_extent_ = extent;
+    const ForNode *vreg_for;
+    const ForNode *serial_for;
+    int64_t vreg_extent, serial_extent;
 
-    // Create chunk loop variable
-    chunk_var_ = Var("simdvf_chunk", DataType::Int(32));
+    if (inner_stride == 1) {
+      vreg_for = inner;
+      serial_for = outer;
+      vreg_extent = inner_ext;
+      serial_extent = outer_ext;
+    } else if (outer_stride == 1) {
+      vreg_for = outer;
+      serial_for = inner;
+      vreg_extent = outer_ext;
+      serial_extent = inner_ext;
+    } else {
+      LOG(FATAL) << "2D parallel requires one dimension with stride=1, got "
+                 << "outer stride=" << outer_stride
+                 << " inner stride=" << inner_stride;
+    }
 
-    // Create mask variables
-    // mask_cnt = ascend_init_mask(extent)
+    ICHECK_EQ(vreg_extent % vreg_size_, 0)
+        << "VReg extent " << vreg_extent << " not divisible by " << vreg_size_;
+    int64_t nchunks = vreg_extent / vreg_size_;
+
+    auto saved_pv = parallel_var_, saved_ov = outer_parallel_var_;
+    parallel_var_ = vreg_for->loop_var.get();
+    parallel_extent_ = vreg_extent;
+    outer_parallel_var_ = serial_for->loop_var.get();
+    outer_serial_var_ = Var("vserial", DataType::Int(32));
+
+    chunk_var_ = Var("vchunk", DataType::Int(32));
     mask_cnt_var_ = Var("mask_cnt", DataType::Handle());
-    PrimExpr init_mask_call =
-        Call(DataType::Handle(), ascend_init_mask(),
-             {IntImm(DataType::Int(32), extent)});
-
-    // mask = ascend_simd_update_mask(mask_cnt)
     mask_var_ = Var("mask", DataType::Handle());
-    PrimExpr update_mask_call =
-        Call(DataType::Handle(), ascend_simd_update_mask(),
-             {StringImm(dtype_str_), mask_cnt_var_});
 
-    // Lower the parallel body
-    Stmt chunk_body = LowerParallelBody(op->body, dtype);
+    PrimExpr im =
+        Call(DataType::Handle(), ascend_init_mask(),
+             {IntImm(DataType::Int(32), vreg_extent * serial_extent)});
+    PrimExpr um = Call(DataType::Handle(), ascend_simd_update_mask(),
+                       {StringImm(dtype_str_), mask_cnt_var_});
 
-    // Wrap: let mask = update_mask(mask_cnt) { chunk_body }
-    Stmt mask_let = LetStmt(mask_var_, update_mask_call, chunk_body);
-
-    // Wrap in chunk loop: for chunk_var in serial(num_chunks) { mask_let }
-    Stmt chunk_loop =
+    Stmt body = LowerParallelBody(inner->body, dtype);
+    Stmt ml = LetStmt(mask_var_, um, body);
+    Stmt inner_loop =
         For(chunk_var_, IntImm(DataType::Int(32), 0),
-            IntImm(DataType::Int(32), num_chunks), ForKind::kSerial, mask_let);
+            IntImm(DataType::Int(32), nchunks), ForKind::kSerial, ml);
+    Stmt outer_loop = For(outer_serial_var_, IntImm(DataType::Int(32), 0),
+                          IntImm(DataType::Int(32), serial_extent),
+                          ForKind::kSerial, inner_loop);
+    Stmt result = LetStmt(mask_cnt_var_, im, outer_loop);
 
-    // Wrap: let mask_cnt = init_mask(extent) { chunk_loop }
-    Stmt result = LetStmt(mask_cnt_var_, init_mask_call, chunk_loop);
-
-    // Restore state
-    parallel_var_ = saved_pvar;
-    parallel_extent_ = saved_extent;
-
+    parallel_var_ = saved_pv;
+    outer_parallel_var_ = saved_ov;
     return result;
   }
 };
@@ -389,8 +488,7 @@ tvm::transform::Pass AscendSimdVFLowerParallel() {
   auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {
     return AscendSimdVFLowerParallel::Substitute(std::move(f));
   };
-  return CreatePrimFuncPass(pass_func, 0,
-                            "tl.AscendSimdVFLowerParallel", {});
+  return CreatePrimFuncPass(pass_func, 0, "tl.AscendSimdVFLowerParallel", {});
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {

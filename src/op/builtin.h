@@ -532,11 +532,24 @@ TVM_DLL const Op &ascend_reduce_min();
  * ascend_simd_sub(dst, src0, src1, mask) → MicroAPI::Sub(dst, src0, src1, mask)
  * ascend_simd_mul(dst, src0, src1, mask) → MicroAPI::Mul(dst, src0, src1, mask)
  */
+// SimdVF binary: (dst_reg, src0_reg, src1_reg, mask)
 TVM_DLL const Op &ascend_simd_add();
 TVM_DLL const Op &ascend_simd_sub();
 TVM_DLL const Op &ascend_simd_mul();
+TVM_DLL const Op &ascend_simd_div();
+// SimdVF unary: (dst_reg, src_reg, mask)
+TVM_DLL const Op &ascend_simd_exp();
+TVM_DLL const Op &ascend_simd_ln();
+TVM_DLL const Op &ascend_simd_sqrt();
+TVM_DLL const Op &ascend_simd_rsqrt();
+TVM_DLL const Op &ascend_simd_abs();
+TVM_DLL const Op &ascend_simd_neg();
+// SimdVF memory: (dtype_str, dst, src [, addr_reg] [, mask])
 TVM_DLL const Op &ascend_simd_load();
 TVM_DLL const Op &ascend_simd_store();
+// SimdVF addr: (dtype_str, idx0, stride0, ...) → AddrReg handle
+TVM_DLL const Op &ascend_simd_create_addr_reg();
+// SimdVF mask
 TVM_DLL const Op &ascend_simd_update_mask();
 TVM_DLL const Op &ascend_init_mask();
 

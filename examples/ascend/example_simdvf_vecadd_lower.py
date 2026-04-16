@@ -59,12 +59,12 @@ def vector_add(N):
                     r0 = T.alloc_fragment((64), "float32")
                     r1 = T.alloc_fragment((64), "float32")
                     mask_cnt = T.ascend_init_mask(TILE)
-                    for i in range(TILE//64):
+                    for i in range(TILE // 64):
                         mask = T.ascend_simd_update_mask(mask_cnt)
-                        T.ascend_simd_load(r0.data, T.address_of(temp1[stage, i*64]))
-                        T.ascend_simd_load(r1.data, T.address_of(temp2[stage, i*64]))
+                        T.ascend_simd_load(r0.data, T.address_of(temp1[stage, i * 64]))
+                        T.ascend_simd_load(r1.data, T.address_of(temp2[stage, i * 64]))
                         T.ascend_simd_add(r0.data, r0.data, r1.data, mask)
-                        T.ascend_simd_store(T.address_of(temp3[stage, i*64]), r0.data, mask)
+                        T.ascend_simd_store(T.address_of(temp3[stage, i * 64]), r0.data, mask)
                 T.ascend_set_flag("V_MTE3", stage)
                 T.ascend_set_flag("V_MTE2", stage)
 

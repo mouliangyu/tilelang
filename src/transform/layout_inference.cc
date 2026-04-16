@@ -1282,6 +1282,8 @@ private:
    * annotation set.
    */
   Stmt VisitStmt_(const BlockNode *op) final {
+    if (op->name_hint == "SIMD_VF")
+      return Downcast<Block>(op);
     Block block = Downcast<Block>(IRMutatorWithAnalyzer::VisitStmt_(op));
 
     for (auto buffer : block->alloc_buffers) {

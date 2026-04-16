@@ -124,8 +124,16 @@ from .ascend import (
     ascend_simd_add,  # noqa: F401
     ascend_simd_sub,  # noqa: F401
     ascend_simd_mul,  # noqa: F401
+    ascend_simd_div,  # noqa: F401
+    ascend_simd_exp,  # noqa: F401
+    ascend_simd_ln,  # noqa: F401
+    ascend_simd_sqrt,  # noqa: F401
+    ascend_simd_rsqrt,  # noqa: F401
+    ascend_simd_abs,  # noqa: F401
+    ascend_simd_neg,  # noqa: F401
     ascend_simd_load,  # noqa: F401
     ascend_simd_store,  # noqa: F401
+    ascend_simd_create_addr_reg,  # noqa: F401
     ascend_simd_update_mask,  # noqa: F401
     ascend_init_mask,  # noqa: F401
 )

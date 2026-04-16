@@ -917,70 +917,105 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     } else {
       CodeGenC::VisitExpr_(op, os);
     }
-  } else if (op->op.same_as(tl::ascend_simd_add())) {
-    ICHECK_EQ(op->args.size(), 4) << "tl.ascend_simd_add expects exactly 4 "
-                                     "arguments (dst, src0, src1, mask)";
+  }
+  // --- SimdVF binary ops: (dst, src0, src1, mask) ---
+  else if (op->op.same_as(tl::ascend_simd_add()) ||
+           op->op.same_as(tl::ascend_simd_sub()) ||
+           op->op.same_as(tl::ascend_simd_mul()) ||
+           op->op.same_as(tl::ascend_simd_div())) {
+    ICHECK_EQ(op->args.size(), 4);
+    const char *name = nullptr;
+    if (op->op.same_as(tl::ascend_simd_add()))
+      name = "Add";
+    else if (op->op.same_as(tl::ascend_simd_sub()))
+      name = "Sub";
+    else if (op->op.same_as(tl::ascend_simd_mul()))
+      name = "Mul";
+    else
+      name = "Div";
     this->PrintIndent();
-    this->stream << "AscendC::MicroAPI::Add(";
+    this->stream << "AscendC::MicroAPI::" << name << "(";
+    this->PrintExpr(op->args[0], this->stream);
+    for (int i = 1; i < 4; ++i) {
+      this->stream << ", ";
+      this->PrintExpr(op->args[i], this->stream);
+    }
+    this->stream << ");\n";
+  }
+  // --- SimdVF unary ops: (dst, src, mask) ---
+  else if (op->op.same_as(tl::ascend_simd_exp()) ||
+           op->op.same_as(tl::ascend_simd_ln()) ||
+           op->op.same_as(tl::ascend_simd_sqrt()) ||
+           op->op.same_as(tl::ascend_simd_rsqrt()) ||
+           op->op.same_as(tl::ascend_simd_abs()) ||
+           op->op.same_as(tl::ascend_simd_neg())) {
+    ICHECK_EQ(op->args.size(), 3);
+    const char *name = nullptr;
+    if (op->op.same_as(tl::ascend_simd_exp()))
+      name = "Exp";
+    else if (op->op.same_as(tl::ascend_simd_ln()))
+      name = "Ln";
+    else if (op->op.same_as(tl::ascend_simd_sqrt()))
+      name = "Sqrt";
+    else if (op->op.same_as(tl::ascend_simd_rsqrt()))
+      name = "Rsqrt";
+    else if (op->op.same_as(tl::ascend_simd_abs()))
+      name = "Abs";
+    else
+      name = "Neg";
+    this->PrintIndent();
+    this->stream << "AscendC::MicroAPI::" << name << "(";
     this->PrintExpr(op->args[0], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[1], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[2], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[3], this->stream);
     this->stream << ");\n";
-  } else if (op->op.same_as(tl::ascend_simd_sub())) {
-    ICHECK_EQ(op->args.size(), 4) << "tl.ascend_simd_sub expects exactly 4 "
-                                     "arguments (dst, src0, src1, mask)";
-    this->PrintIndent();
-    this->stream << "AscendC::MicroAPI::Sub(";
-    this->PrintExpr(op->args[0], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[1], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[2], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[3], this->stream);
-    this->stream << ");\n";
-  } else if (op->op.same_as(tl::ascend_simd_mul())) {
-    ICHECK_EQ(op->args.size(), 4) << "tl.ascend_simd_mul expects exactly 4 "
-                                     "arguments (dst, src0, src1, mask)";
-    this->PrintIndent();
-    this->stream << "AscendC::MicroAPI::Mul(";
-    this->PrintExpr(op->args[0], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[1], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[2], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[3], this->stream);
-    this->stream << ");\n";
-  } else if (op->op.same_as(tl::ascend_simd_load())) {
-    ICHECK_EQ(op->args.size(), 3) << "tl.ascend_simd_load expects 3 arguments "
-                                     "(dtype_str, dst_frag, src_ptr)";
+  }
+  // --- SimdVF load: 3 args (simple) or 4 args (with AddrReg) ---
+  else if (op->op.same_as(tl::ascend_simd_load())) {
+    ICHECK(op->args.size() == 3 || op->args.size() == 4);
     std::string dtype_str = Downcast<StringImm>(op->args[0])->value;
     this->PrintIndent();
     this->stream << "AscendC::MicroAPI::LoadAlign<" << dtype_str << ">(";
     this->PrintExpr(op->args[1], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[2], this->stream);
+    if (op->args.size() == 4) {
+      this->stream << ", ";
+      this->PrintExpr(op->args[3], this->stream);
+    }
     this->stream << ");\n";
-  } else if (op->op.same_as(tl::ascend_simd_store())) {
-    ICHECK_EQ(op->args.size(), 4) << "tl.ascend_simd_store expects 4 arguments "
-                                     "(dtype_str, dst_ptr, src_frag, mask)";
+  }
+  // --- SimdVF store: 4 args (simple) or 5 args (with AddrReg) ---
+  else if (op->op.same_as(tl::ascend_simd_store())) {
+    ICHECK(op->args.size() == 4 || op->args.size() == 5);
     std::string dtype_str = Downcast<StringImm>(op->args[0])->value;
     this->PrintIndent();
     this->stream << "AscendC::MicroAPI::StoreAlign<" << dtype_str << ">(";
     this->PrintExpr(op->args[1], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[2], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[3], this->stream);
+    for (size_t i = 2; i < op->args.size(); ++i) {
+      this->stream << ", ";
+      this->PrintExpr(op->args[i], this->stream);
+    }
     this->stream << ");\n";
-  } else if (op->op.same_as(tl::ascend_simd_update_mask())) {
-    ICHECK_EQ(op->args.size(), 2)
-        << "tl.ascend_simd_update_mask expects 2 arguments (dtype_str, count)";
+  }
+  // --- SimdVF create_addr_reg: (dtype_str, idx0, stride0, ...) → expression
+  // ---
+  else if (op->op.same_as(tl::ascend_simd_create_addr_reg())) {
+    ICHECK_GE(op->args.size(), 3);
+    std::string dtype_str = Downcast<StringImm>(op->args[0])->value;
+    os << "AscendC::MicroAPI::CreateAddrReg<" << dtype_str << ">(";
+    for (size_t i = 1; i < op->args.size(); ++i) {
+      if (i > 1)
+        os << ", ";
+      this->PrintExpr(op->args[i], os);
+    }
+    os << ")";
+  }
+  // --- SimdVF update_mask: (dtype_str, count) → expression ---
+  else if (op->op.same_as(tl::ascend_simd_update_mask())) {
+    ICHECK_EQ(op->args.size(), 2);
     std::string dtype_str = Downcast<StringImm>(op->args[0])->value;
     os << "AscendC::MicroAPI::UpdateMask<" << dtype_str << ">((uint32_t)";
     this->PrintExpr(op->args[1], os);

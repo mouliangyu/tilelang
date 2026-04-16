@@ -56,8 +56,8 @@ def vector_add(N):
                 T.ascend_wait_flag("MTE2_V", stage)
                 T.ascend_wait_flag("MTE3_V", stage)
                 with T.SimdVF():
-                    for i in T.Parallel(TILE_ELEMS):
-                        temp3[stage, i] = temp1[stage, i] + temp2[stage, i]
+                    for j, i in T.Parallel(64, TILE_ELEMS // 64):
+                        temp3[stage, i * 64 + j] = temp1[stage, i * 64 + j] * (temp1[stage, i * 64 + j] + temp2[stage, i * 64 + j])
                 T.ascend_set_flag("V_MTE3", stage)
                 T.ascend_set_flag("V_MTE2", stage)
 
@@ -74,7 +74,7 @@ def vector_add(N):
 
 def ref_program(a, b):
     """Reference implementation: C = A + B"""
-    return a + b
+    return a * (a + b)
 
 
 NUM_REPEATS = 10

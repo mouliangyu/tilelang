@@ -398,39 +398,76 @@ def ascend_simd_mul(dst, src0, src1, mask) -> None:
     return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_mul"), dst, src0, src1, mask)
 
 
-def ascend_simd_load(dst_frag, src_ptr, dtype="float") -> None:
+def ascend_simd_div(dst, src0, src1, mask) -> None:
+    """MicroAPI::Div(dst, src0, src1, mask)"""
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_div"), dst, src0, src1, mask)
+
+
+def ascend_simd_exp(dst, src, mask) -> None:
+    """MicroAPI::Exp(dst, src, mask)"""
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_exp"), dst, src, mask)
+
+
+def ascend_simd_ln(dst, src, mask) -> None:
+    """MicroAPI::Ln(dst, src, mask)"""
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_ln"), dst, src, mask)
+
+
+def ascend_simd_sqrt(dst, src, mask) -> None:
+    """MicroAPI::Sqrt(dst, src, mask)"""
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_sqrt"), dst, src, mask)
+
+
+def ascend_simd_rsqrt(dst, src, mask) -> None:
+    """MicroAPI::Rsqrt(dst, src, mask)"""
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_rsqrt"), dst, src, mask)
+
+
+def ascend_simd_abs(dst, src, mask) -> None:
+    """MicroAPI::Abs(dst, src, mask)"""
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_abs"), dst, src, mask)
+
+
+def ascend_simd_neg(dst, src, mask) -> None:
+    """MicroAPI::Neg(dst, src, mask)"""
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_neg"), dst, src, mask)
+
+
+def ascend_simd_create_addr_reg(*args, dtype="float"):
+    """MicroAPI::CreateAddrReg<dtype>(idx0, stride0, idx1, stride1, ...)
+
+    Returns an opaque AddrReg handle for multi-dimensional addressing.
+    """
+    int_args = []
+    for a in args:
+        if isinstance(a, int):
+            int_args.append(tir.IntImm("int32", a))
+        else:
+            int_args.append(a)
+    return tir.call_intrin("handle", tir.op.Op.get("tl.ascend_simd_create_addr_reg"), dtype, *int_args)
+
+
+def ascend_simd_load(dst_frag, src_ptr, addr_reg=None, dtype="float") -> None:
     """Ascend SimdVF MicroAPI LoadAlign: UB memory → RegTensor.
 
-    Generates: AscendC::MicroAPI::LoadAlign<dtype>(dst, src)
-
-    Parameters
-    ----------
-    dst_frag : Var
-        Fragment buffer data var (becomes MicroAPI::RegTensor<T>).
-    src_ptr : PrimExpr
-        Source UB pointer (address_of).
-    dtype : str
-        C++ type name for template parameter (e.g. "float", "half_t").
+    Generates:
+        3-arg: AscendC::MicroAPI::LoadAlign<dtype>(dst, src)
+        4-arg: AscendC::MicroAPI::LoadAlign<dtype>(dst, src, addr_reg)
     """
+    if addr_reg is not None:
+        return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_load"), dtype, dst_frag, src_ptr, addr_reg)
     return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_load"), dtype, dst_frag, src_ptr)
 
 
-def ascend_simd_store(dst_ptr, src_frag, mask, dtype="float") -> None:
+def ascend_simd_store(dst_ptr, src_frag, mask, addr_reg=None, dtype="float") -> None:
     """Ascend SimdVF MicroAPI StoreAlign: RegTensor → UB memory.
 
-    Generates: AscendC::MicroAPI::StoreAlign<dtype>(dst, src, mask)
-
-    Parameters
-    ----------
-    dst_ptr : PrimExpr
-        Destination UB pointer (address_of).
-    src_frag : Var
-        Fragment buffer data var (becomes MicroAPI::RegTensor<T>).
-    mask : PrimExpr
-        Mask value (from ascend_simd_update_mask).
-    dtype : str
-        C++ type name for template parameter (e.g. "float", "half_t").
+    Generates:
+        4-arg: AscendC::MicroAPI::StoreAlign<dtype>(dst, src, mask)
+        5-arg: AscendC::MicroAPI::StoreAlign<dtype>(dst, src, addr_reg, mask)
     """
+    if addr_reg is not None:
+        return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_store"), dtype, dst_ptr, src_frag, addr_reg, mask)
     return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_store"), dtype, dst_ptr, src_frag, mask)
 
 
