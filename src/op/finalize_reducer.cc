@@ -99,7 +99,10 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
   int reducing_threads = extent;
   std::stringstream ss;
   auto thread_offset = T.thread_bounds->min;
-  if (TargetHasSMVersionGE(T.target, 90)) {
+  if (T.target->HasKey("ascend")) {
+    ss << "tl::AscendAllReduce<" << op_str << ", " << reducing_threads
+       << ">::run";
+  } else if (TargetHasSMVersionGE(T.target, 90)) {
     auto all_threads = T.thread_bounds->extent;
     ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1
        << ", " << thread_offset << ", tl::NamedBarrier<" << all_threads
@@ -110,9 +113,14 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
   }
   Array<PrimExpr> thread_reduce_args = {StringImm(ss.str()),
                                         BufferLoad(buffer, indices_0)};
-  if (reducing_threads >= 32) {
-    PrimExpr workspace =
-        T.AddWorkspace(*as_const_int(T.thread_bounds->extent), buffer->dtype);
+  if (reducing_threads > 32) {
+    int workspace_size;
+    if (T.target->HasKey("ascend")) {
+      workspace_size = reducing_threads / 32;
+    } else {
+      workspace_size = *as_const_int(T.thread_bounds->extent);
+    }
+    PrimExpr workspace = T.AddWorkspace(workspace_size, buffer->dtype);
     thread_reduce_args.push_back(workspace);
   }
   auto call = Call(buffer->dtype, builtin::call_extern(), thread_reduce_args);

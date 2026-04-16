@@ -12,7 +12,7 @@ from tvm.script.ir_builder import IRBuilder
 
 def _legalize_dim(buffer: tir.Buffer, dim: int):
     if dim < 0:
-        dim = len(buffer.shape) + dim
+        dim = len(retrieve_shape(buffer)) + dim
     return dim
 
 
@@ -33,23 +33,34 @@ def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: ReduceKind, dim: in
         clear (bool): Whether to initialize the output buffer before reduction
     """
     # input shape: [X, d, Y], expected output shape: [X, Y] or [X, 1, Y]
-    expected_shapes = [buffer.shape[:dim] + buffer.shape[dim + 1 :], buffer.shape[:dim] + [1] + buffer.shape[dim + 1 :]]
-    if list(out.shape) not in expected_shapes:
+    buf_shape = retrieve_shape(buffer)
+    out_shape = retrieve_shape(out)
+    expected_shapes = [buf_shape[:dim] + buf_shape[dim + 1 :], buf_shape[:dim] + [1] + buf_shape[dim + 1 :]]
+    if list(out_shape) not in expected_shapes:
         expected_shapes_str = " or ".join(map(str, expected_shapes))
         raise ValueError(
-            f"Invalid reduce output shape, buffer shape is {buffer.shape}, dim is {dim}, "
-            f"output shape is {out.shape}, expected shapes are {expected_shapes_str}"
+            f"Invalid reduce output shape, buffer shape is {buf_shape}, dim is {dim}, "
+            f"output shape is {out_shape}, expected shapes are {expected_shapes_str}"
         )
 
     @macro
     def reduce_macro(buffer: tir.Buffer, out: tir.Buffer, reduce_type: str, dim: int, clear: bool) -> None:
+        buf_shape = retrieve_shape(buffer)
+        out_shape = retrieve_shape(out)
+        buf_dtype = _get_buffer(buffer).dtype
+        out_dtype = _get_buffer(out).dtype
+        buf_name = _get_buffer(buffer).name
+        out_name = _get_buffer(out).name
+        buf_scope = _get_buffer(buffer).scope()
+        out_scope = _get_buffer(out).scope()
+
         if is_shared(buffer) and is_shared(out):
-            red_frag_in = alloc_fragment(buffer.shape, buffer.dtype)
-            red_frag_out = alloc_fragment(out.shape, out.dtype)
+            red_frag_in = alloc_fragment(buf_shape, buf_dtype)
+            red_frag_out = alloc_fragment(out_shape, out_dtype)
 
             # rename buffers
-            IRBuilder.name(buffer.name + "_frag", red_frag_in)
-            IRBuilder.name(out.name + "_frag", red_frag_out)
+            IRBuilder.name(buf_name + "_frag", red_frag_in)
+            IRBuilder.name(out_name + "_frag", red_frag_out)
 
             if not clear:
                 copy(out, red_frag_out)
@@ -66,8 +77,8 @@ def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: ReduceKind, dim: in
             )
             copy(red_frag_out, out)
         elif is_shared(buffer) and is_fragment(out):
-            red_frag_in = alloc_fragment(buffer.shape, buffer.dtype)
-            IRBuilder.name(buffer.name + "_frag", red_frag_in)
+            red_frag_in = alloc_fragment(buf_shape, buf_dtype)
+            IRBuilder.name(buf_name + "_frag", red_frag_in)
 
             copy(buffer, red_frag_in)
             tir.call_intrin(
@@ -80,8 +91,8 @@ def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: ReduceKind, dim: in
                 clear,
             )
         elif is_fragment(buffer) and is_shared(out):
-            red_frag_out = alloc_fragment(out.shape, out.dtype)
-            IRBuilder.name(out.name + "_frag", red_frag_out)
+            red_frag_out = alloc_fragment(out_shape, out_dtype)
+            IRBuilder.name(out_name + "_frag", red_frag_out)
 
             if not clear:
                 copy(out, red_frag_out)
@@ -107,7 +118,7 @@ def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: ReduceKind, dim: in
                 clear,
             )
         else:
-            raise ValueError(f"Invalid buffer scopes: {buffer.scope()} and {out.scope()}")
+            raise ValueError(f"Invalid buffer scopes: {buf_scope} and {out_scope}")
 
     reduce_macro(buffer, out, reduce_type, dim, clear)
 
