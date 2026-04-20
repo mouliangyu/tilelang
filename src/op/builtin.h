@@ -664,6 +664,15 @@ TVM_DLL const Op &ascend_copy_matrix_cc_to_ub();
  */
 TVM_DLL const Op &ascend_copy_ubuf_to_cbuf();
 
+/*!
+ * \brief Ascend fused ND→NZ copy from UBuf to CBuf (L1).
+ *
+ * ascend_nd2nz_copy(dst_l1, src_ub, tmp_nz_ub, rows, cols, fuse_cast,
+ *                   dst_dtype_str, src_dtype_str)
+ *
+ */
+TVM_DLL const Op &ascend_nd2nz_copy();
+
 TVM_DLL const Op &ascend_copy_matrix_cc_to_gm();
 
 /*!

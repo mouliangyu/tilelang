@@ -21,6 +21,7 @@ def copy(
     annotations: dict | None = None,
     loop_layout: Any | None = None,
     transpose: bool = False,
+    nd2nz: bool = False,
 ) -> tir.PrimExpr | tir.Stmt:
     """Copy data between memory regions.
 
@@ -102,6 +103,10 @@ def copy(
     # Ascend GM→L1: use dn2nz (transpose N/D mapping) instead of nd2nz
     if transpose and "transpose" not in ann:
         ann["transpose"] = 1
+
+    # Ascend UB→L1: fused ND→NZ scatter (+ optional cast) before raw DMA
+    if nd2nz and "nd2nz" not in ann:
+        ann["nd2nz"] = 1
 
     return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.copy"), src, dst, annotations=ann if ann else None)
 

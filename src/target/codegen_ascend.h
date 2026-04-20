@@ -31,6 +31,8 @@ private:
   bool inside_simdvf_body_{false};
   bool has_gemm_l1_{false};
   bool has_gemm_l1_included_{false};
+  bool has_nd2nz_copy_{false};
+  bool has_nd2nz_copy_included_{false};
   bool has_simdvf_included_{false};
 
   enum class AscendKernelMode { kVector, kCube, kMix };

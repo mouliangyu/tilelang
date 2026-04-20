@@ -932,9 +932,14 @@ Stmt CopyNode::LowerAscendDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
     }
   } else if (dma_path == 2) {
     PrimExpr transpose_flag = I(this->GetTranspose());
+    // For dn2nz (transpose): SDK expects nValue=width(cols),
+    // dValue=height(rows) which is the reverse of nd2nz where
+    // nValue=height(rows), dValue=width(cols).
+    PrimExpr n_value = (this->GetTranspose()) ? inner_elems : n_rows;
+    PrimExpr d_value = (this->GetTranspose()) ? n_rows : inner_elems;
     call = Call(DataType::Void(), ascend_copy_gm_to_cbuf(),
-                {dst_ptr, src_ptr, sid, src_row_stride_bytes, zero, n_rows,
-                 inner_elems, zero, zero, transpose_flag});
+                {dst_ptr, src_ptr, sid, src_row_stride_bytes, zero, n_value,
+                 d_value, zero, zero, transpose_flag});
   } else if (dma_path == 3 || dma_path == 4) {
     // L1 -> L0A/L0B: fractal-addressed load
     // K offset handled by kStartPosition param, not in src pointer.
@@ -996,9 +1001,43 @@ Stmt CopyNode::LowerAscendDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
                  zero,              // [24] broadcast_en
                  zero});            // [25] NZ2DN_en
   } else if (dma_path == 6) {
-    PrimExpr n_burst_val = total_bytes / I(32);
-    call = Call(DataType::Void(), ascend_copy_ubuf_to_cbuf(),
-                {dst_ptr, src_ptr, zero, n_burst_val, I(1), zero, zero});
+    if (this->GetNd2Nz()) {
+      // Fused ND→NZ scatter + copy: ascend_nd2nz_copy template
+      // Determine if cast is needed (src and dst have different dtypes)
+      int fuse_cast = (src->dtype != dst->dtype) ? 1 : 0;
+      // Build dtype strings for template instantiation
+      std::string dst_dtype_str, src_dtype_str;
+      if (dst->dtype.is_bfloat16())
+        dst_dtype_str = "bfloat16_t";
+      else if (dst->dtype.is_float16())
+        dst_dtype_str = "half";
+      else if (dst->dtype.is_float())
+        dst_dtype_str = "float";
+      else
+        dst_dtype_str = "bfloat16_t";
+      if (src->dtype.is_bfloat16())
+        src_dtype_str = "bfloat16_t";
+      else if (src->dtype.is_float16())
+        src_dtype_str = "half";
+      else if (src->dtype.is_float())
+        src_dtype_str = "float";
+      else
+        src_dtype_str = "bfloat16_t";
+      // Compute full_rows: the M dimension of the complete dst buffer in L1
+      // (dst may be a sub-region of a larger buffer after M-split)
+      PrimExpr full_rows =
+          dst->shape.size() >= 2 ? dst->shape[dst->shape.size() - 2] : n_rows;
+      // args: dst_l1, src_ub, rows, cols, fuse_cast, dst_dtype_str,
+      // src_dtype_str, full_rows
+      call =
+          Call(DataType::Void(), ascend_nd2nz_copy(),
+               {dst_ptr, src_ptr, n_rows, inner_elems, I(fuse_cast),
+                StringImm(dst_dtype_str), StringImm(src_dtype_str), full_rows});
+    } else {
+      PrimExpr n_burst_val = total_bytes / I(32);
+      call = Call(DataType::Void(), ascend_copy_ubuf_to_cbuf(),
+                  {dst_ptr, src_ptr, zero, n_burst_val, I(1), zero, zero});
+    }
   } else if (dma_path == 7) {
     PrimExpr dst_last_dim = dst->shape[dst->shape.size() - 1];
     call =

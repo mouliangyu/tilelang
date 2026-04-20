@@ -87,7 +87,7 @@ def allow_vectorize(pass_ctx: PassContext | None = None) -> bool:
 def allow_autoschedule(pass_ctx: PassContext | None = None) -> bool:
     if pass_ctx is None:
         pass_ctx = tilelang.transform.get_pass_context()
-    enable_autoschedule = pass_ctx.config.get("tl.enable_auto_schedule", True)
+    enable_autoschedule = pass_ctx.config.get("tl.enable_auto_schedule", False)
     return enable_autoschedule
 
 

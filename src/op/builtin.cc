@@ -470,6 +470,11 @@ TIR_DEFINE_TL_BUILTIN(ascend_copy_ubuf_to_cbuf)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(ascend_nd2nz_copy)
+    .set_num_inputs(9)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(ascend_copy_matrix_cc_to_gm)
     .set_num_inputs(25)
     .set_attr<TCallEffectKind>("TCallEffectKind",
