@@ -491,6 +491,54 @@ def ascend_simd_update_mask(count, dtype="float"):
     return tir.call_intrin("handle", tir.op.Op.get("tl.ascend_simd_update_mask"), dtype, count)
 
 
+def ascend_get_buf(pipe, buf_id, mode=False):
+    """Acquire a pipe buffer for double-buffer management.
+
+    Generates: get_buf(pipe, buf_id, mode);
+
+    Parameters
+    ----------
+    pipe : str
+        Pipeline type, e.g., "PIPE_MTE1", "PIPE_M".
+    buf_id : int or PrimExpr
+        Buffer slot index, typically (sk & 1) for double-buffering.
+    mode : bool
+        Optional mode flag (default False).
+
+    Example
+    -------
+    >>> T.ascend_get_buf("PIPE_MTE1", sk & 1)
+    """
+    if isinstance(buf_id, int):
+        buf_id = tir.IntImm("int32", buf_id)
+    mode_val = tir.IntImm("int32", 1 if mode else 0)
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_get_buf"), pipe, buf_id, mode_val)
+
+
+def ascend_rls_buf(pipe, buf_id, mode=False):
+    """Release a pipe buffer for double-buffer management.
+
+    Generates: rls_buf(pipe, buf_id, mode);
+
+    Parameters
+    ----------
+    pipe : str
+        Pipeline type, e.g., "PIPE_MTE1", "PIPE_M".
+    buf_id : int or PrimExpr
+        Buffer slot index, typically (sk & 1) for double-buffering.
+    mode : bool
+        Optional mode flag (default False).
+
+    Example
+    -------
+    >>> T.ascend_rls_buf("PIPE_M", sk & 1)
+    """
+    if isinstance(buf_id, int):
+        buf_id = tir.IntImm("int32", buf_id)
+    mode_val = tir.IntImm("int32", 1 if mode else 0)
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_rls_buf"), pipe, buf_id, mode_val)
+
+
 def ascend_init_mask(count):
     """Declare a uint32_t mask count variable (should be placed outside loops).
 

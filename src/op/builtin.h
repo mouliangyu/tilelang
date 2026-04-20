@@ -682,6 +682,22 @@ TVM_DLL const Op &ascend_mad();
 TVM_DLL const Op &ascend_gemm_l1();
 
 /*!
+ * \brief Ascend get_buf for pipe buffer acquisition.
+ *
+ * ascend_get_buf(pipe_string, buf_id, mode)
+ *
+ */
+TVM_DLL const Op &ascend_get_buf();
+
+/*!
+ * \brief Ascend rls_buf for pipe buffer release.
+ *
+ * ascend_rls_buf(pipe_string, buf_id, mode)
+ *
+ */
+TVM_DLL const Op &ascend_rls_buf();
+
+/*!
  * \brief Programmatic dependency trigger.
  *
  * pdl_trigger()

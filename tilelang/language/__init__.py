@@ -136,6 +136,8 @@ from .ascend import (
     ascend_simd_create_addr_reg,  # noqa: F401
     ascend_simd_update_mask,  # noqa: F401
     ascend_init_mask,  # noqa: F401
+    ascend_get_buf,  # noqa: F401
+    ascend_rls_buf,  # noqa: F401
 )
 from .builtin import __ldg as __ldg  # noqa: F401
 from .builtin import ldg32 as ldg32  # noqa: F401

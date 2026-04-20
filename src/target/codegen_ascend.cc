@@ -675,6 +675,26 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         << "tl.ascend_threadfence expects 0 arguments";
     this->PrintIndent();
     this->stream << "asc_threadfence();\n";
+  } else if (op->op.same_as(tl::ascend_get_buf())) {
+    ICHECK_EQ(op->args.size(), 3)
+        << "tl.ascend_get_buf expects exactly 3 arguments "
+           "(pipe string, buf_id, mode)";
+    std::string pipe_str = Downcast<StringImm>(op->args[0])->value;
+    int64_t mode = Downcast<IntImm>(op->args[2])->value;
+    this->PrintIndent();
+    this->stream << "get_buf(" << pipe_str << ", ";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", " << (mode ? "true" : "false") << ");\n";
+  } else if (op->op.same_as(tl::ascend_rls_buf())) {
+    ICHECK_EQ(op->args.size(), 3)
+        << "tl.ascend_rls_buf expects exactly 3 arguments "
+           "(pipe string, buf_id, mode)";
+    std::string pipe_str = Downcast<StringImm>(op->args[0])->value;
+    int64_t mode = Downcast<IntImm>(op->args[2])->value;
+    this->PrintIndent();
+    this->stream << "rls_buf(" << pipe_str << ", ";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", " << (mode ? "true" : "false") << ");\n";
   } else if (op->op.same_as(tl::ascend_reduce_add())) {
     os << "asc_reduce_add(" << PrintExpr(op->args[0]) << ")";
   } else if (op->op.same_as(tl::ascend_reduce_max())) {
