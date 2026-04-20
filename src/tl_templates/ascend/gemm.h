@@ -41,7 +41,7 @@ template <int M, int K, int N, int TILE_K_SUB, bool TRANS_B, typename InT,
           typename AccumT>
 __aicore__ inline void
 ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
-               __cbuf__ InT *cbuf_b_ptr, int clear_accum) {
+               __cbuf__ InT *cbuf_b_ptr, int clear_accum, int buf_offset = 0) {
   static_assert(K % TILE_K_SUB == 0, "K must be divisible by TILE_K_SUB");
   static_assert(TILE_K_SUB % 16 == 0, "TILE_K_SUB must be a multiple of 16");
   static_assert(M % 16 == 0, "M must be a multiple of 16");
@@ -59,11 +59,11 @@ ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
   __cb__ InT *l0b = (__cb__ InT *)0;
 
   for (int sk = 0; sk < SUB_K; ++sk) {
-    get_buf(PIPE_MTE1, sk & 1, false);
+    get_buf(PIPE_MTE1, buf_offset + (sk & 1), false);
     bisheng::cce::load_cbuf_to_ca((__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)),
                                   cbuf_a_ptr, 0, (sk * kStep), mStepA, kStep,
                                   mStepA, mStepA, 0);
-    rls_buf(PIPE_MTE1, sk & 1, false);
+    rls_buf(PIPE_MTE1, buf_offset + (sk & 1), false);
     if constexpr (TRANS_B) {
       // NT case: W[N,K] in L1, transpose=false (ZZ)
       // rows=N, cols=K → sub-K along cols (kStart)
@@ -86,10 +86,10 @@ ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
     }
     AscendC::SetFlag<AscendC::HardEvent::MTE1_M>((sk & 1));
     AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>((sk & 1));
-    get_buf(PIPE_M, sk & 1, false);
+    get_buf(PIPE_M, buf_offset + (sk & 1), false);
     bisheng::cce::mad(cc_ptr, (__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)),
                       (__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), M,
                       TILE_K_SUB, N, 0, 0, 0, clear_accum && (sk == 0));
-    rls_buf(PIPE_M, sk & 1, false);
+    rls_buf(PIPE_M, buf_offset + (sk & 1), false);
   }
 }

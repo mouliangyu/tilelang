@@ -888,9 +888,9 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_gemm_l1())) {
     // ascend_gemm_l1(cc_ptr, cbuf_a_ptr, cbuf_b_ptr, M, K, N, tile_k_sub,
-    //                trans_b, clear_accum, dtype_str)
-    ICHECK_EQ(op->args.size(), 10)
-        << "tl.ascend_gemm_l1 expects exactly 10 arguments";
+    //                trans_b, clear_accum, dtype_str, buf_offset)
+    ICHECK_EQ(op->args.size(), 11)
+        << "tl.ascend_gemm_l1 expects exactly 11 arguments";
     int M = op->args[3].as<IntImmNode>()->value;
     int K = op->args[4].as<IntImmNode>()->value;
     int N = op->args[5].as<IntImmNode>()->value;
@@ -909,6 +909,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[2], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[8], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[10], this->stream);
     this->stream << ");\n";
   } else if (op->op.same_as(tir::builtin::address_of())) {
     const auto *load = op->args[0].as<tir::BufferLoadNode>();

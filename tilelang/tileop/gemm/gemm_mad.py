@@ -181,6 +181,7 @@ class GemmMAD(GemmBase):
                 _to_int32(1 if self.trans_B else 0),
                 self.clear_accum,
                 tir.StringImm(dtype_str),
+                _to_int32(0),  # buf_offset
             ],
         )
 
