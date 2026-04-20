@@ -59,7 +59,6 @@ ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
   __cb__ InT *l0b = (__cb__ InT *)0;
 
   for (int sk = 0; sk < SUB_K; ++sk) {
-    // AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>((sk & 1));
     get_buf(PIPE_MTE1, sk & 1, false);
     bisheng::cce::load_cbuf_to_ca((__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)),
                                   cbuf_a_ptr, 0, (sk * kStep), mStepA, kStep,
@@ -92,6 +91,5 @@ ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
                       (__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), M,
                       TILE_K_SUB, N, 0, 0, 0, clear_accum && (sk == 0));
     rls_buf(PIPE_M, sk & 1, false);
-    // AscendC::SetFlag<AscendC::HardEvent::M_MTE1>((sk & 1));
   }
 }
