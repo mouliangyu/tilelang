@@ -46,7 +46,6 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
             temp = T.alloc_shared((TILE_M // 2, TILE_N), "float32")
             with T.Cube():
                 for f in T.Serial(NUM_STAGES):
-                    T.ascend_set_flag("M_MTE1", f)
                     T.ascend_set_flag("MTE1_MTE2", f)
                 T.ascend_set_flag("FIX_M", 0)
                 for out_tile in T.Serial(TILES_PER_CORE):
@@ -78,7 +77,6 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
                     T.ascend_cross_core_set_flag(4, "PIPE_FIX", 22)
                     T.ascend_set_flag("FIX_M", 0)
                 for f in T.Serial(NUM_STAGES):
-                    T.ascend_wait_flag("M_MTE1", f)
                     T.ascend_wait_flag("MTE1_MTE2", f)
                 T.ascend_wait_flag("FIX_M", 0)
                 T.ascend_cross_core_wait_flag(4, "PIPE_FIX", 4)

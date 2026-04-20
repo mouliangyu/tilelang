@@ -44,7 +44,6 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
             x_l1 = T.alloc_l1((NUM_STAGES, TILE_M, TILE_K), "bfloat16")
             w_l1 = T.alloc_l1((NUM_STAGES, TILE_K, TILE_N), "bfloat16")
             for f in range(NUM_STAGES):
-                T.ascend_set_flag("M_MTE1", f)
                 T.ascend_set_flag("MTE1_MTE2", f)
             T.ascend_set_flag("FIX_M", 0)
             for out_tile in range(TILES_PER_CORE):
@@ -70,7 +69,6 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
                 T.copy(res, C[m_tile * TILE_M, n_tile * TILE_N])
                 T.ascend_set_flag("FIX_M", 0)
             for f in range(NUM_STAGES):
-                T.ascend_wait_flag("M_MTE1", f)
                 T.ascend_wait_flag("MTE1_MTE2", f)
             T.ascend_wait_flag("FIX_M", 0)
 
