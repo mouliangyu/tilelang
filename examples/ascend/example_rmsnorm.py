@@ -132,7 +132,7 @@ if __name__ == "__main__":
         print(f"\n--- d={d}, batch={batch} ---")
         program = rms_norm_fwd(batch, d, str(dtype)[len("torch.") :])
         # Y (idx 1) and RSTD (idx 3) are outputs; X, W, eps are inputs
-        kernel = tilelang.compile(program, out_idx=[1, 3])
+        kernel = tilelang.compile(program, out_idx=[1, 3], pass_configs={tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False})
 
         x_flat = x.view(-1).contiguous()
 

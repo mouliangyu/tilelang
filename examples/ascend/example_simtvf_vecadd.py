@@ -89,7 +89,7 @@ if __name__ == "__main__":
     # Create and compile kernel
     print(f"Compiling vector_add kernel (N={N})...")
     program = vector_add(N)
-    kernel = tilelang.compile(program, out_idx=-1)
+    kernel = tilelang.compile(program, out_idx=-1, pass_configs={tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False})
     print("Compilation succeeded!")
 
     # Print generated source code

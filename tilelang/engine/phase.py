@@ -84,6 +84,13 @@ def allow_vectorize(pass_ctx: PassContext | None = None) -> bool:
     return not disable_vectorize
 
 
+def allow_autoschedule(pass_ctx: PassContext | None = None) -> bool:
+    if pass_ctx is None:
+        pass_ctx = tilelang.transform.get_pass_context()
+    enable_autoschedule = pass_ctx.config.get("tl.enable_auto_schedule", True)
+    return enable_autoschedule
+
+
 def allow_global_thread_synchronization(pass_ctx: PassContext | None = None) -> bool:
     if pass_ctx is None:
         pass_ctx = tilelang.transform.get_pass_context()
@@ -220,6 +227,10 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.InjectAssumes()(mod)
     # Simplify the IR expressions
     mod = tilelang.transform.Simplify()(mod)
+    if allow_autoschedule():
+        mod = tilelang.transform.IfConditionExtract()(mod)
+        mod = tilelang.transform.AutoSchedule()(mod)
+        mod = tilelang.transform.Simplify()(mod)
     # Lower T.Parallel inside SimdVF to MicroAPI vector ops (before layout passes)
     if is_ascend_target(target) and has_simdvf_region(mod):
         mod = tilelang.transform.AscendSimdVFLowerParallel()(mod)
