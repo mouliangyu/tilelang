@@ -411,26 +411,14 @@ public:
             .value()(num_stages, tvm_latencies, tvm_iis, tvm_resource_flags,
                      tvm_data_deps, tvm_resource_deps, tvm_buffer_sizes,
                      memory_limit)
-            .cast<ffi::Tuple<ffi::Array<int64_t>, ffi::Array<int>, int64_t>>();
+            .cast<ffi::Tuple<ffi::Array<int64_t>, int64_t>>();
 
     ffi::Array<int64_t> start_times = return_val.get<0>();
-    ffi::Array<int> stages = return_val.get<1>();
-    ii = return_val.get<2>();
+    ii = return_val.get<1>();
 
     // Apply start times and promote flags to nodes
-    std::map<IRStructure *, int> stage_map;
-    size_t num_promoted = 0;
-    int min_stage = ii * 2;
     for (size_t i = 0; i < n; ++i) {
       nodes[i]->SetStartTime(start_times[i]);
-      min_stage = std::min(min_stage, stages[i]);
-    }
-    // Force all stages to start from 0
-    for (size_t i = 0; i < n; ++i) {
-      stage_map[nodes[i]] = stages[i] - min_stage;
-      if (stages[i] != min_stage) {
-        num_promoted++;
-      }
     }
     std::vector<std::pair<int64_t, size_t>> start_time_with_idx;
     start_time_with_idx.reserve(n);
@@ -495,72 +483,11 @@ public:
       }
       return false;
     };
-    auto SolveConflictVar = [&]() -> bool {
-      for (int i = 0; i < n; ++i)
-        if (IsVarDecl(seq_body->children[i].get())) {
-          for (int j = 0; j < n; ++j) {
-            if (i == j)
-              continue;
-
-            auto node_i = seq_body->children[i].get();
-            auto node_j = seq_body->children[j].get();
-            int rem_stage_j = stage_map[node_j];
-
-            if (!HasDependency(node_i, node_j))
-              continue;
-
-            if (stage_map[node_j] == stage_map[node_i])
-              continue;
-
-            auto node_i_task = static_cast<TaskNode *>(node_i);
-            auto node_i_let_stmt = node_i_task->stmts[0].as<LetStmtNode>();
-
-            auto iter = ctrl->control->loop_var;
-            auto step = ctrl->control->step.has_value()
-                            ? ctrl->control->step.value()
-                            : 1;
-            auto cloned_value = node_i_let_stmt->value;
-            auto cloned_let_stmt =
-                LetStmt(node_i_let_stmt->var.copy_with_suffix(""), cloned_value,
-                        Evaluate(0));
-            auto cloned_task = std::make_shared<TaskNode>();
-            cloned_task->stmts.push_back(cloned_let_stmt);
-            stage_map[cloned_task.get()] = rem_stage_j;
-
-            for (int k = j; k < n; ++k) {
-              auto node_k = seq_body->children[k].get();
-              if (rem_stage_j != stage_map[node_k])
-                continue;
-              if (HasDependency(node_i, node_k)) {
-                node_k->SubstituteVar(node_i_let_stmt->var,
-                                      cloned_let_stmt->var);
-                stage_map[node_k] = rem_stage_j;
-              }
-            }
-
-            seq_body->children.insert(seq_body->children.begin() + j,
-                                      std::move(cloned_task));
-            n += 1;
-            return true; // Conflict resolved, restart the loop
-          }
-        }
-      return false;
-    };
-    // Resolve conflicts until no more conflicts exist or max iterations reached
-    // (to avoid infinite loop)
-    int conflict_count = 0;
-    while (SolveConflictVar() && ++conflict_count < 100)
-      ;
 
     for (auto &node : seq_body->children) {
       auto unit = std::make_shared<ScheduleUnit>();
-      unit->stage = stage_map[node.get()];
       unit->child = std::move(node);
       node = std::move(unit);
-    }
-
-    if (num_promoted > 0) {
-      ctrl->SetPromote(true);
     }
 
     // Estimate overall latency: II * tripcount

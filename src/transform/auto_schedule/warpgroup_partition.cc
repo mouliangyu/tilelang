@@ -261,7 +261,6 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
       }
       new_ctrl->task = std::move(cloned_task);
     }
-    new_ctrl->SetPromote(ctrl->hasPromote());
     new_ctrl->child = CloneIRStructureWithWarpgroupFilter(
         ctrl->child.get(), warpgroup_id, var_remap);
     return new_ctrl;
@@ -288,7 +287,6 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
       return nullptr;
 
     auto new_unit = std::make_shared<ScheduleUnit>();
-    new_unit->stage = unit->stage;
     new_unit->child = CloneIRStructureWithWarpgroupFilter(
         unit->child.get(), warpgroup_id, var_remap);
 
@@ -488,7 +486,6 @@ RemoveUnusedLetDecls(std::shared_ptr<IRStructure> root) {
       auto new_ctrl = std::make_shared<ControlNode>();
       new_ctrl->control = ctrl->control;
       new_ctrl->task = ctrl->task;
-      new_ctrl->SetPromote(ctrl->hasPromote());
       new_ctrl->child = filter_tree(ctrl->child);
       if (!new_ctrl->child)
         return nullptr;
@@ -503,7 +500,6 @@ RemoveUnusedLetDecls(std::shared_ptr<IRStructure> root) {
     } else if (node->IsScheduleUnit()) {
       auto unit = static_cast<const ScheduleUnit *>(node.get());
       auto new_unit = std::make_shared<ScheduleUnit>();
-      new_unit->stage = unit->stage;
       new_unit->before = unit->before;
       new_unit->after = unit->after;
       new_unit->child = filter_tree(unit->child);
@@ -623,20 +619,25 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure, Var sid) {
     PrimExpr loop_step = ctrl->control->step.has_value()
                              ? ctrl->control->step.value()
                              : IntImm(DataType::Int(32), 1);
-    int min_stages = 100, max_stages = -1;
-    if (ctrl->child->IsSequence()) {
+    std::vector<Stmt> stmts;
+    if (ctrl->child->IsScheduleUnit()) {
+      auto unit = static_cast<ScheduleUnit *>(ctrl->child.get());
+      for (auto &[_, before] : unit->before) {
+        for (auto &stmt : before) {
+          stmts.push_back(stmt);
+        }
+      }
+      stmts.push_back(ConvertIRStructureToStmt(unit->child.get(), sid));
+      for (auto &[_, after] : unit->after) {
+        for (auto &stmt : after) {
+          stmts.push_back(stmt);
+        }
+      }
+    } else if (ctrl->child->IsSequence()) {
       auto seq = static_cast<SequenceNode *>(ctrl->child.get());
       for (auto &child : seq->children) {
+        ICHECK(child->IsScheduleUnit());
         auto unit = static_cast<ScheduleUnit *>(child.get());
-        min_stages = std::min(min_stages, unit->stage);
-        max_stages = std::max(max_stages, unit->stage);
-      }
-    }
-    if (!ctrl->hasPromote() || !ctrl->child->IsSequence() ||
-        min_stages == max_stages || true) {
-      std::vector<Stmt> stmts;
-      if (ctrl->child->IsScheduleUnit()) {
-        auto unit = static_cast<ScheduleUnit *>(ctrl->child.get());
         for (auto &[_, before] : unit->before) {
           for (auto &stmt : before) {
             stmts.push_back(stmt);
@@ -648,37 +649,19 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure, Var sid) {
             stmts.push_back(stmt);
           }
         }
-      } else if (ctrl->child->IsSequence()) {
-        auto seq = static_cast<SequenceNode *>(ctrl->child.get());
-        for (auto &child : seq->children) {
-          ICHECK(child->IsScheduleUnit());
-          auto unit = static_cast<ScheduleUnit *>(child.get());
-          for (auto &[_, before] : unit->before) {
-            for (auto &stmt : before) {
-              stmts.push_back(stmt);
-            }
-          }
-          stmts.push_back(ConvertIRStructureToStmt(unit->child.get(), sid));
-          for (auto &[_, after] : unit->after) {
-            for (auto &stmt : after) {
-              stmts.push_back(stmt);
-            }
-          }
-        }
-      } else if (ctrl->child->IsTask()) {
-        auto task = static_cast<TaskNode *>(ctrl->child.get());
-        stmts.push_back(ConvertIRStructureToStmt(task, sid));
-      } else {
-        LOG(FATAL);
       }
-      Stmt body = SeqStmt::Flatten(stmts);
-      // Filter out "num_stages" annotation
-      Map<String, Any> filtered_annotations = ctrl->control->annotations;
-      filtered_annotations.erase("num_stages");
-      return For(loop_var, loop_start, loop_extent, ctrl->control->kind, body,
-                 ctrl->control->thread_binding, filtered_annotations);
+    } else if (ctrl->child->IsTask()) {
+      auto task = static_cast<TaskNode *>(ctrl->child.get());
+      stmts.push_back(ConvertIRStructureToStmt(task, sid));
+    } else {
+      LOG(FATAL);
     }
-    LOG(FATAL) << "Has Promote in control";
+    Stmt body = SeqStmt::Flatten(stmts);
+    // Filter out "num_stages" annotation
+    Map<String, Any> filtered_annotations = ctrl->control->annotations;
+    filtered_annotations.erase("num_stages");
+    return For(loop_var, loop_start, loop_extent, ctrl->control->kind, body,
+               ctrl->control->thread_binding, filtered_annotations);
   } else if (structure->IsWrapper()) {
     auto wrapper = static_cast<const WrapperNode *>(structure);
     Stmt body = Evaluate(0);

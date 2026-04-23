@@ -260,7 +260,6 @@ void ScheduleUnitBuilder::ScheduleRecursive(
     }
     for (auto &node : origin_children) {
       auto unit = std::make_shared<ScheduleUnit>();
-      unit->stage = -1;
       unit->child = std::shared_ptr<IRStructure>(node);
       node = unit;
     }

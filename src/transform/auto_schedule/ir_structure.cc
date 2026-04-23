@@ -288,7 +288,6 @@ std::shared_ptr<IRStructure> ControlNode::Clone() const {
   // Copy latency and II
   new_ctrl->SetLatency(GetLatency());
   new_ctrl->SetII(GetII());
-  new_ctrl->SetPromote(hasPromote());
   return new_ctrl;
 }
 
@@ -309,7 +308,6 @@ std::shared_ptr<IRStructure> WrapperNode::Clone() const {
 std::shared_ptr<IRStructure> ScheduleUnit::Clone() const {
   auto new_unit = std::make_shared<ScheduleUnit>();
   // Copy var and value (TVM objects with reference counting)
-  new_unit->stage = stage;
   // Clone child if exists
   if (child) {
     new_unit->child = child->Clone();

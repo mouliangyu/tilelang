@@ -302,8 +302,6 @@ def z3_schedule_loop_python(
             k_vars = [z3.Int(f"k_{i}") for i in range(n)]
             r_vars = [z3.Int(f"r_{i}") for i in range(n)]
             start_vars = [k_vars[i] * ii_mid + r_vars[i] for i in range(n)]
-        stage_vars = [z3.Int(f"pro_{i}") for i in range(n)]
-        begin = z3.Int("begin")
 
         for i in range(n):
             if num_stages == 1:
@@ -312,11 +310,7 @@ def z3_schedule_loop_python(
                 solver.add(k_vars[i] >= 0)
                 solver.add(r_vars[i] >= 0)
                 solver.add(r_vars[i] < ii_mid)
-            solver.add(stage_vars[i] >= 0)
-            solver.add(stage_vars[i] < num_stages * 2)
-            solver.add(begin <= start_vars[i] + stage_vars[i] * ii_mid)
             ii_i = iis[i]
-            # solver.add(start_vars[i] + ii_i + stage_vars[i] * ii_mid - begin <= ii_mid)
 
         buffer_vars = [z3.Int(f"buf_{i}") for i in range(len(buffer_sizes))]
         for i in range(len(buffer_sizes)):
@@ -378,7 +372,6 @@ def z3_schedule_loop_python(
             if num_stages != 1:
                 best_k_vars = k_vars
                 best_r_vars = r_vars
-            best_stage_vars = stage_vars
             best_buffer_vars = buffer_vars
             # Try smaller II
             ii_upper = ii_mid
@@ -396,8 +389,6 @@ def z3_schedule_loop_python(
 
     # Extract start times from best model
     start_times = []
-    stages = []
-    begin = best_model.eval(begin).as_long()
     offset = 0
     if num_stages != 1:
         k_vars = []
@@ -408,12 +399,9 @@ def z3_schedule_loop_python(
             k_vars.append(k_var)
             r_vars.append(r_var)
         offset = min(k_vars)
-    begin = begin - offset * best_ii
     for i in range(n):
         start_time = best_model.eval(best_start_vars[i]).as_long() - offset * best_ii
-        stage = best_model.eval(best_stage_vars[i]).as_long()
         start_times.append(start_time)
-        stages.append(stage)
     buffer_vars = []
     for i in range(len(buffer_sizes)):
         buffer_var = best_model.eval(best_buffer_vars[i]).as_long()
@@ -421,16 +409,16 @@ def z3_schedule_loop_python(
 
     # Sort tasks by start time (and by index as tie-breaker)
     task_indices = list(range(n))
-    task_indices.sort(key=lambda idx: (start_times[idx] + stages[idx] * best_ii, idx))
+    task_indices.sort(key=lambda idx: (start_times[idx], idx))
 
     if verbose:
-        print(f"[Python Z3 Loop] Scheduling completed. Minimal II = {best_ii}. Begin = {begin}")
+        print(f"[Python Z3 Loop] Scheduling completed. Minimal II = {best_ii}.")
     for i in range(n):
         idx = task_indices[i]
         if verbose:
             print(
                 f"[Python Z3 Loop]   Task {idx}: start_time={start_times[idx]}, "
-                f"latency={latencies[idx]}, II={iis[idx]}, stage={stages[idx]}, "
+                f"latency={latencies[idx]}, II={iis[idx]}, "
                 f"resource_flags={resource_flags[idx]:03b}"
             )
     if verbose:
@@ -456,7 +444,6 @@ def z3_schedule_loop_python(
                 "data_dependencies": data_deps,
                 "resource_dependencies": resource_deps,
                 "start_times": start_times,
-                "stages": stages,
                 "sorted_indices": task_indices,
                 "timestamp": time.time(),
             }
@@ -497,8 +484,7 @@ def z3_schedule_loop_python(
                 # Plot each task as a horizontal bar with two phases
                 for i in range(n):
                     color = _get_pipe_color(resource_flags[i])
-                    # Calculate actual start time: start_times[i] + best_ii * stages[i]
-                    start = start_times[i] + best_ii * stages[i]
+                    start = start_times[i]
                     latency = latencies[i]
                     ii = iis[i]
 
@@ -545,7 +531,7 @@ def z3_schedule_loop_python(
                     ax.text(
                         start + latency / 2,
                         i,
-                        f"T{i}\nS{stages[i]}\nII={ii}",
+                        f"T{i}\nII={ii}",
                         ha="center",
                         va="center",
                         fontsize=8,
@@ -558,8 +544,9 @@ def z3_schedule_loop_python(
                         ax.axvline(x=ii_boundary, color="white", linestyle="-", alpha=0.8, linewidth=1)
 
                 # Set limits and labels
-                max_time = max(start_times[i] + best_ii * stages[i] + latencies[i] for i in range(n))
-                ax.set_xlim(begin - 5, max_time + 5)
+                max_time = max(start_times[i] + latencies[i] for i in range(n))
+                min_time = min(start_times[i] for i in range(n))
+                ax.set_xlim(min_time - 5, max_time + 5)
                 ax.set_ylim(-1, n)
                 ax.set_xlabel("Time (cycles)")
                 ax.set_ylabel("Task Index")
@@ -593,38 +580,6 @@ def z3_schedule_loop_python(
                 for t in range(0, max_time + 10, 10):
                     ax.axvline(x=t, color="gray", linestyle="--", alpha=0.3, linewidth=0.5)
 
-                # Add two vertical lines for loop boundaries (begin, begin+best_ii)
-                # Find the earliest start time as begin
-                loop_end = begin + best_ii
-
-                # Add thick red line for loop begin
-                ax.axvline(x=begin, color="red", linestyle="-", alpha=0.8, linewidth=2, label="Loop Begin")
-                # Add thick blue line for loop end (begin + best_ii)
-                ax.axvline(x=loop_end, color="blue", linestyle="-", alpha=0.8, linewidth=2, label=f"Loop End (Begin+II={loop_end})")
-
-                # Shade the loop region
-                ax.axvspan(begin, loop_end, alpha=0.1, color="yellow", label="Loop Region")
-
-                # Add text annotation for loop boundaries
-                ax.text(
-                    begin,
-                    n - 0.5,
-                    f"Begin\n{begin}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=8,
-                    bbox=dict(boxstyle="round", facecolor="red", alpha=0.3, edgecolor="red"),
-                )
-                ax.text(
-                    loop_end,
-                    n - 0.5,
-                    f"Begin+II\n{loop_end}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=8,
-                    bbox=dict(boxstyle="round", facecolor="blue", alpha=0.3, edgecolor="blue"),
-                )
-
                 # Save PNG and PDF files
                 png_file = schedule_dir / "schedule_timeline.png"
                 pdf_file = schedule_dir / "schedule_timeline.pdf"
@@ -645,7 +600,7 @@ def z3_schedule_loop_python(
         except Exception as e:
             print(f"[Python Z3 Loop] Warning: Failed to save schedule visualization: {e}")
 
-    return start_times, stages, best_ii
+    return start_times, best_ii
 
 
 # FFI-exposed function for loop scheduling
@@ -678,10 +633,10 @@ def z3_schedule_loop_ffi(num_stages, latencies, iis, resource_flags, data_deps, 
 
     # Call the actual scheduler (Z3 is not thread-safe, serialize access)
     with _z3_lock:
-        start_times, stages, best_ii = z3_schedule_loop_python(
+        start_times, best_ii = z3_schedule_loop_python(
             num_stages, latencies_list, iis_list, resource_flags_list, data_deps_list, resource_deps_list, buffer_sizes_list, memory_limit
         )
 
     # Return start_times and promotes as separate arrays for easier FFI handling
     # C++ side expects a tuple of (start_times_array, promotes_array)
-    return (start_times, stages, best_ii)
+    return (start_times, best_ii)

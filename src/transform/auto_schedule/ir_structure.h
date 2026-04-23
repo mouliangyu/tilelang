@@ -417,10 +417,6 @@ public:
   CollectBufferAccessInfo(int num_wgs,
                           std::set<BufferAccessInfo> &result) const override;
 
-  bool hasPromote() const { return has_promote_; }
-
-  void SetPromote(bool promote) { has_promote_ = promote; }
-
   void SetIIperIter(int64_t ii) { ii_per_iter_ = ii; }
 
   int64_t GetIIperIter() const { return ii_per_iter_; }
@@ -440,7 +436,6 @@ private:
   // Latency estimation
   int64_t latency_{0}; // Estimated latency in cycles
   int64_t ii_{0};      // Initiation interval in cycles
-  bool has_promote_{false};
   int64_t ii_per_iter_{0};
 
 public:
@@ -694,7 +689,6 @@ private:
 
 class ScheduleUnit : public IRStructure {
 public:
-  int stage;
   std::map<int, std::vector<Stmt>> before, after;
   std::shared_ptr<IRStructure> child;
 
@@ -762,7 +756,6 @@ public:
   CollectBufferAccessInfo(int num_wgs,
                           std::set<BufferAccessInfo> &result) const override;
 
-  int GetStage() const { return stage; }
   bool isInnerTask() const { return child->IsTask(); }
   int GetWarpgroupId() const override {
     ICHECK(isInnerTask());
@@ -1110,7 +1103,6 @@ inline void PrintAllStmts(const IRStructure *node, int indent = 0) {
   } else if (node->IsScheduleUnit()) {
     const ScheduleUnit *promote = static_cast<const ScheduleUnit *>(node);
     LOG(INFO) << indent_str << "ScheduleUnit:";
-    LOG(INFO) << indent_str << "  Promote: " << promote->stage;
     for (const auto &[idx, stmts] : promote->before) {
       for (const auto &stmt : stmts) {
         LOG(INFO) << indent_str << "  Before " << idx << " : " << stmt;
@@ -1217,7 +1209,6 @@ inline void PrintIRStructure(const IRStructure *node, int indent = 0) {
   } else if (node->IsScheduleUnit()) {
     const ScheduleUnit *promote = static_cast<const ScheduleUnit *>(node);
     LOG(INFO) << indent_str << "ScheduleUnit:";
-    LOG(INFO) << indent_str << "  Promote: " << promote->stage;
     for (const auto &[idx, stmts] : promote->before) {
       for (const auto &stmt : stmts) {
         LOG(INFO) << indent_str << "  Before " << idx << " : " << stmt;
