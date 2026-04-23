@@ -51,9 +51,6 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
                 for out_tile in T.Serial(TILES_PER_CORE):
                     tile_idx = out_tile * NUM_BLOCKS + bx
                     m_tile, n_tile = aswt_swizzle(tile_idx)
-                    if out_tile > 0:
-                        T.ascend_cross_core_wait_flag(4, "PIPE_FIX", 4)
-                        T.ascend_cross_core_wait_flag(4, "PIPE_FIX", 20)
 
                     for kt in T.Serial(K_TILES):
                         f = kt % NUM_STAGES
@@ -72,6 +69,10 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
 
                     T.ascend_set_flag("M_FIX", 0)
                     T.ascend_wait_flag("M_FIX", 0)
+                    # if out_tile > 0
+                    T.ascend_cross_core_wait_flag(4, "PIPE_FIX", 4)
+                    T.ascend_cross_core_wait_flag(4, "PIPE_FIX", 20)
+
                     T.dual_copy(res, temp)
                     T.ascend_cross_core_set_flag(4, "PIPE_FIX", 6)
                     T.ascend_cross_core_set_flag(4, "PIPE_FIX", 22)
@@ -84,6 +85,7 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
             with T.Vector() as sid:
                 my_aic_flag = 6 + sid * 16
                 my_aiv_flag = 4 + sid * 16
+                T.ascend_cross_core_set_flag(4, "PIPE_MTE3", my_aiv_flag)
                 for out_tile in T.Serial(TILES_PER_CORE):
                     tile_idx = out_tile * NUM_BLOCKS + bx
                     m_tile, n_tile = aswt_swizzle(tile_idx)

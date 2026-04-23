@@ -143,7 +143,8 @@ ForFrame PipelinedFor(PrimExpr start, const PrimExpr &stop, int num_stages,
 }
 
 ForFrame PersistentFor(const Array<PrimExpr> &domain, const PrimExpr &wave_size,
-                       const PrimExpr &index, PrimExpr group_size) {
+                       const PrimExpr &index, PrimExpr group_size,
+                       int num_stages) {
   using namespace tvm::tir;
   ICHECK(!domain.empty());
   ObjectPtr<ForFrameNode> n = tvm::ffi::make_object<ForFrameNode>();
@@ -179,6 +180,9 @@ ForFrame PersistentFor(const Array<PrimExpr> &domain, const PrimExpr &wave_size,
                            Stmt body) -> Stmt {
     ICHECK_EQ(vars.size(), doms.size());
     Map<String, tvm::ffi::Any> anno;
+    if (num_stages > 0) {
+      anno.Set("num_stages", PrimExpr(num_stages));
+    }
     Array<PrimExpr> idxs(grouped_domain.size(), PrimExpr());
     PrimExpr rem = loop_var * wave_size + index;
 
@@ -196,7 +200,7 @@ ForFrame PersistentFor(const Array<PrimExpr> &domain, const PrimExpr &wave_size,
 
     arith::Analyzer analyzer;
     Stmt new_body = body;
-    if (analyzer.CanProveGreaterEqual(waves, 2)) {
+    if (analyzer.CanProveGreaterEqual(waves, 2) && num_stages == 0) {
       new_body = SeqStmt({out_if, body});
     }
     Optional<PrimExpr> step =

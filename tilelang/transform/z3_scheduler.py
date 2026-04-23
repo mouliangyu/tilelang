@@ -56,7 +56,7 @@ def z3_schedule_python(
     resource_flags: list[int],
     data_deps: list[tuple[int, int]],
     resource_deps: list[tuple[int, int]],
-    verbose: bool = False,
+    verbose: bool = True,
 ) -> tuple[list[int], list[int]]:
     """Z3-based scheduler implemented in Python.
 
@@ -225,7 +225,7 @@ def z3_schedule_loop_python(
     resource_deps: list[tuple[int, int]],
     buffer_sizes: list[int],
     memory_limit: int,
-    verbose: bool = False,
+    verbose: bool = True,
 ) -> tuple[list[int], list[int], int]:
     """Z3-based scheduler for loops with distance-aware dependencies.
 
@@ -316,7 +316,7 @@ def z3_schedule_loop_python(
             solver.add(stage_vars[i] < num_stages * 2)
             solver.add(begin <= start_vars[i] + stage_vars[i] * ii_mid)
             ii_i = iis[i]
-            solver.add(start_vars[i] + ii_i + stage_vars[i] * ii_mid - begin <= ii_mid)
+            # solver.add(start_vars[i] + ii_i + stage_vars[i] * ii_mid - begin <= ii_mid)
 
         buffer_vars = [z3.Int(f"buf_{i}") for i in range(len(buffer_sizes))]
         for i in range(len(buffer_sizes)):

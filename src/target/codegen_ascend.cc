@@ -1235,6 +1235,9 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     os << "AscendC::MicroAPI::UpdateMask<" << dtype_str << ">((uint32_t)";
     this->PrintExpr(op->args[1], os);
     os << ")";
+  } else if (op->op.same_as(tl::loop_break())) {
+    this->PrintIndent();
+    this->stream << "break;\n";
   } else {
     CodeGenC::VisitExpr_(op, os);
   }

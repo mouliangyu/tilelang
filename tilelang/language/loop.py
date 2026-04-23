@@ -77,6 +77,7 @@ def Persistent(
     wave_size: tir.PrimExpr,
     index: tir.PrimExpr,
     group_size: tir.PrimExpr | int | None = 8,
+    num_stages: int = 0,
 ) -> frame.ForFrame:
     """Tools to construct persistent for loop.
 
@@ -90,8 +91,11 @@ def Persistent(
         The tile index in one wave.
     group_size : tir.PrimExpr
         The group size.
+    num_stages : int
+        The number of pipeline stages for double buffering.
+        If 0, pipeline is disabled.
     """
-    return _ffi_api.Persistent(domain, wave_size, index, group_size)
+    return _ffi_api.Persistent(domain, wave_size, index, group_size, num_stages)
 
 
 def Pipelined(
