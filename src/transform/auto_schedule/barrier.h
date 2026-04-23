@@ -637,6 +637,14 @@ static void InsertSynchronization(
       for (const auto &[waiting_unit_info, distance] : wait_map) {
         auto [waiting_unit, waiting_wg_id] = waiting_unit_info;
 
+        int prod_wg =
+            static_cast<TaskNode *>(unit->child.get())->GetWarpgroupId();
+        int cons_wg = static_cast<TaskNode *>(waiting_unit->child.get())
+                          ->GetWarpgroupId();
+
+        uint16_t producer_mask = unit->GetPipeMask();
+        uint16_t consumer_mask = waiting_unit->GetPipeMask();
+
         if (!unit->isInnerTask() || !waiting_unit->isInnerTask()) {
           Stmt barrier = makeAscendPipeBarrier("PIPE_ALL");
           InsertStatementIntoScheduleUnit(unit, barrier, false, wg_id);
@@ -645,16 +653,11 @@ static void InsertSynchronization(
           continue;
         }
 
-        int prod_wg =
-            static_cast<TaskNode *>(unit->child.get())->GetWarpgroupId();
-        int cons_wg = static_cast<TaskNode *>(waiting_unit->child.get())
-                          ->GetWarpgroupId();
-
-        uint16_t producer_mask = unit->GetPipeMask();
-        uint16_t consumer_mask = waiting_unit->GetPipeMask();
         std::string hard_event = GetHardEvent(producer_mask, consumer_mask);
         int prod_idx = unit_index[unit];
         int cons_idx = unit_index[waiting_unit];
+
+
 
         if (prod_wg != cons_wg) {
           // Cross-core sync: use ascend_cross_core_set_flag / wait_flag
