@@ -116,17 +116,20 @@ bool HasDependency(const IRStructure *a, const IRStructure *b) {
     return true;
   for (const auto &write_region_a : a->GetWriteRegions()) {
     for (const auto &read_region_b : b->GetReadRegions()) {
-      if (SameBuffer(write_region_a, read_region_b))
+      if (SameBuffer(write_region_a, read_region_b) &&
+          !IsGlobalBuffer(write_region_a->buffer))
         return true;
     }
     for (const auto &write_region_b : b->GetWriteRegions()) {
-      if (SameBuffer(write_region_a, write_region_b))
+      if (SameBuffer(write_region_a, write_region_b) &&
+          !IsGlobalBuffer(write_region_a->buffer))
         return true;
     }
   }
   for (const auto &read_region_a : a->GetReadRegions()) {
     for (const auto &write_region_b : b->GetWriteRegions()) {
-      if (SameBuffer(read_region_a, write_region_b))
+      if (SameBuffer(read_region_a, write_region_b) &&
+          !IsGlobalBuffer(write_region_b->buffer))
         return true;
     }
   }
@@ -145,8 +148,9 @@ bool HasRegisterDependency(const IRStructure *a, const IRStructure *b) {
   if (b->ContainsLoopBreak())
     return true;
   for (const auto &write_region_a : a->GetWriteRegions()) {
-    if (IsSharedBuffer(write_region_a.get()->buffer) ||
-        IsL1Buffer(write_region_a.get()->buffer))
+    if (IsSharedBuffer(write_region_a->buffer) ||
+        IsL1Buffer(write_region_a->buffer) ||
+        IsGlobalBuffer(write_region_a->buffer))
       continue;
     for (const auto &read_region_b : b->GetReadRegions()) {
       if (SameBuffer(write_region_a, read_region_b))
@@ -158,8 +162,9 @@ bool HasRegisterDependency(const IRStructure *a, const IRStructure *b) {
     }
   }
   for (const auto &read_region_a : a->GetReadRegions()) {
-    if (IsSharedBuffer(read_region_a.get()->buffer) ||
-        IsL1Buffer(read_region_a.get()->buffer))
+    if (IsSharedBuffer(read_region_a->buffer) ||
+        IsL1Buffer(read_region_a->buffer) ||
+        IsGlobalBuffer(read_region_a->buffer))
       continue;
     for (const auto &write_region_b : b->GetWriteRegions()) {
       if (SameBuffer(read_region_a, write_region_b))
