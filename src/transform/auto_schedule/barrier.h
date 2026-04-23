@@ -141,6 +141,35 @@ struct MultiVersionBufferInfo {
       : buffer(buffer), num_versions(num_versions), new_buffer(new_buffer) {}
 };
 
+// Synchronization point types
+enum class SyncType { PipeBarrier, CrossCore, IntraCore };
+
+// Describes a synchronization point between two ScheduleUnits.
+// Collected during analysis and inserted in a separate pass so that
+// future optimizations can inspect, deduplicate, or eliminate sync points.
+struct SyncPoint {
+  SyncType type;
+  ScheduleUnit *prod_unit;
+  int prod_wg_id;
+  ScheduleUnit *cons_unit;
+  int cons_wg_id;
+  // CrossCore-specific
+  std::string prod_pipe;
+  std::string cons_pipe;
+  int mode_id;
+  int cc_base_id;
+  // Shared
+  int num_versions;
+  int prod_idx;
+  int cons_idx;
+  int prod_wg;
+  // IntraCore-specific
+  std::string hard_event;
+  int base_id;
+  int distance;
+  PrimExpr event_id;
+};
+
 // Barrier dependency analysis function declarations
 // Event ID map: per-hard_event counter for independent event ID allocation
 using EventIdMap = std::unordered_map<std::string, int>;
@@ -169,6 +198,18 @@ static void AnalyzeControlNodeBarriers(
     Var sid, std::vector<Buffer> &barrier_buffers,
     Map<ObjectRef, ObjectRef> &barrier_map, LoopNestingInfo &loop_info,
     std::vector<MultiVersionBufferInfo> &buffer_infos);
+static std::vector<SyncPoint> CollectSyncPoints(
+    const std::vector<ScheduleUnit *> &units,
+    const std::map<
+        std::pair<ScheduleUnit *, int>,
+        std::pair<int, std::map<std::pair<ScheduleUnit *, int>, int>>>
+        &sync_infos);
+static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
+                             FlagInfoList &flag_infos, Var sid,
+                             EventIdMap &event_id_map,
+                             LoopNestingInfo &loop_info);
+static std::vector<SyncPoint>
+OptimizeSyncPoints(const std::vector<SyncPoint> &sync_points);
 
 static bool IsRegularSharedScope(const String &scope) {
   return scope == "shared" || scope == "shared.dyn";
@@ -339,60 +380,6 @@ static void RewriteTaskNodeBuffers(
     if (if_node->else_child)
       RewriteTaskNodeBuffers(if_node->else_child.get(), multi_buffer,
                              iteration);
-  }
-}
-
-// Rewrite the gemm call's mbar argument (arg[16]) in a TaskNode to use the
-// allocated barrier expression from BarrierManager.
-// This is used for TCGEN05MMA where the gemm needs to reference the correct
-// mbarrier for synchronization.
-static void RewriteGemmMbar(TaskNode *task, PrimExpr mbar_expr) {
-  static const auto gemm_py_op = Op::Get("tl.tileop.gemm_py");
-  static const auto gemm_op = Op::Get("tl.tileop.gemm");
-  static const auto wgmma_gemm_py_op = Op::Get("tl.tileop.wgmma_gemm_py");
-  static const auto wgmma_gemm_op = Op::Get("tl.tileop.wgmma_gemm");
-  static const auto tcgen05_gemm_py_op = Op::Get("tl.tileop.tcgen05_gemm_py");
-  static const auto tcgen05_gemm_op = Op::Get("tl.tileop.tcgen05_gemm");
-
-  class GemmMbarRewriter : public StmtExprMutator {
-  public:
-    GemmMbarRewriter(PrimExpr mbar_expr) : mbar_expr_(std::move(mbar_expr)) {}
-
-  private:
-    PrimExpr VisitExpr_(const CallNode *op) override {
-      static const auto gemm_py_op = Op::Get("tl.tileop.gemm_py");
-      static const auto gemm_op = Op::Get("tl.tileop.gemm");
-      static const auto wgmma_gemm_py_op = Op::Get("tl.tileop.wgmma_gemm_py");
-      static const auto wgmma_gemm_op = Op::Get("tl.tileop.wgmma_gemm");
-      static const auto tcgen05_gemm_py_op =
-          Op::Get("tl.tileop.tcgen05_gemm_py");
-      static const auto tcgen05_gemm_op = Op::Get("tl.tileop.tcgen05_gemm");
-
-      if ((op->op.same_as(gemm_py_op) || op->op.same_as(gemm_op) ||
-           op->op.same_as(wgmma_gemm_py_op) || op->op.same_as(wgmma_gemm_op) ||
-           op->op.same_as(tcgen05_gemm_py_op) ||
-           op->op.same_as(tcgen05_gemm_op)) &&
-          op->args.size() > 16) {
-        Array<PrimExpr> new_args;
-        for (size_t i = 0; i < op->args.size(); ++i) {
-          if (i == 16) {
-            // Replace mbar argument with the barrier expression
-            new_args.push_back(mbar_expr_);
-          } else {
-            new_args.push_back(VisitExpr(op->args[i]));
-          }
-        }
-        return Call(op->dtype, op->op, new_args, op->annotations, op->span);
-      }
-      return StmtExprMutator::VisitExpr_(op);
-    }
-
-    PrimExpr mbar_expr_;
-  };
-
-  GemmMbarRewriter rewriter(mbar_expr);
-  for (auto &stmt : task->stmts) {
-    stmt = rewriter(stmt);
   }
 }
 
@@ -612,19 +599,18 @@ static std::string GetHardEvent(uint16_t producer_mask,
   return event;
 }
 
-static void InsertSynchronization(
+static std::vector<SyncPoint> CollectSyncPoints(
     const std::vector<ScheduleUnit *> &units,
     const std::map<
         std::pair<ScheduleUnit *, int>,
         std::pair<int, std::map<std::pair<ScheduleUnit *, int>, int>>>
-        &sync_infos,
-    EventIdMap &event_id_map, FlagInfoList &flag_infos, Var sid,
-    std::vector<Buffer> &barrier_buffers,
-    Map<ObjectRef, ObjectRef> &barrier_map, LoopNestingInfo &loop_info) {
+        &sync_infos) {
   // Build unit→index map for order comparison
   std::unordered_map<ScheduleUnit *, int> unit_index;
   for (size_t i = 0; i < units.size(); ++i)
     unit_index[units[i]] = static_cast<int>(i);
+
+  std::vector<SyncPoint> sync_points;
 
   for (auto unit : units) {
     for (int wg_id = 0; wg_id < 2; ++wg_id) {
@@ -646,10 +632,8 @@ static void InsertSynchronization(
         uint16_t consumer_mask = waiting_unit->GetPipeMask();
 
         if (!unit->isInnerTask() || !waiting_unit->isInnerTask()) {
-          Stmt barrier = makeAscendPipeBarrier("PIPE_ALL");
-          InsertStatementIntoScheduleUnit(unit, barrier, false, wg_id);
-          InsertStatementIntoScheduleUnit(waiting_unit, barrier, true,
-                                          waiting_wg_id);
+          sync_points.push_back({SyncType::PipeBarrier, unit, wg_id,
+                                 waiting_unit, waiting_wg_id});
           continue;
         }
 
@@ -657,105 +641,192 @@ static void InsertSynchronization(
         int prod_idx = unit_index[unit];
         int cons_idx = unit_index[waiting_unit];
 
-
-
         if (prod_wg != cons_wg) {
           // Cross-core sync: use ascend_cross_core_set_flag / wait_flag
-          // flag_id = base + sid * 16 (sid=0,1 for two AIV cores)
           std::string prod_pipe = "PIPE_" + GetPipeName(producer_mask);
           std::string cons_pipe = "PIPE_" + GetPipeName(consumer_mask);
           int mode_id = 4;
-          auto cc_id = event_id_map.find("Cube-Vector");
-          if (cc_id == event_id_map.end()) {
-            event_id_map["Cube-Vector"] = 0;
-            cc_id = event_id_map.find("Cube-Vector");
-          }
-          PrimExpr cc_event_id = cc_id->second + sid * 16;
 
-          if (cons_idx < prod_idx) {
-            if (!prod_wg) {
-              for (int base = 0; base < num_versions; ++base) {
-                flag_infos.push_back(
-                    FlagInfo{0, cc_event_id + base, prod_pipe, 1});
-              }
-              for (unsigned sid = 0; sid != 2; ++sid) {
-                for (int base = 0; base < num_versions; ++base) {
-                  flag_infos.push_back(
-                      FlagInfo{1, Integer(cc_id->second + sid * 16 + base),
-                               prod_pipe, 2});
-                }
-              }
-            } else {
-              for (unsigned sid = 0; sid != 2; ++sid) {
-                for (int base = 0; base < num_versions; ++base) {
-                  flag_infos.push_back(
-                      FlagInfo{1, Integer(cc_id->second + sid * 16 + base),
-                               prod_pipe, 1});
-                }
-              }
-              for (int base = 0; base < num_versions; ++base) {
-                flag_infos.push_back(
-                    FlagInfo{0, cc_event_id + base, prod_pipe, 2});
-              }
-            }
-          }
-          if (!prod_wg) {
-            Stmt set_stmt =
-                makeAscendCrossCoreSetFlag(mode_id, prod_pipe, cc_event_id);
-            InsertStatementIntoScheduleUnit(unit, set_stmt, false, wg_id);
-            for (unsigned sid = 0; sid != 2; ++sid) {
-              Stmt wait_stmt = makeAscendCrossCoreWaitFlag(
-                  mode_id, cons_pipe,
-                  IntImm(DataType::Int(64), cc_id->second + 16 * sid));
-              InsertStatementIntoScheduleUnit(waiting_unit, wait_stmt, true,
-                                              waiting_wg_id);
-            }
-          } else {
-            for (unsigned sid = 0; sid != 2; ++sid) {
-              Stmt set_stmt = makeAscendCrossCoreSetFlag(
-                  mode_id, prod_pipe,
-                  IntImm(DataType::Int(64), cc_id->second + 16 * sid));
-              InsertStatementIntoScheduleUnit(unit, set_stmt, false, wg_id);
-            }
-            Stmt wait_stmt =
-                makeAscendCrossCoreWaitFlag(mode_id, cons_pipe, cc_event_id);
-            InsertStatementIntoScheduleUnit(waiting_unit, wait_stmt, true,
-                                            waiting_wg_id);
-          }
-          cc_id->second += num_versions;
+          sync_points.push_back({SyncType::CrossCore, unit, wg_id, waiting_unit,
+                                 waiting_wg_id, prod_pipe, cons_pipe, mode_id,
+                                 0, num_versions, prod_idx, cons_idx, prod_wg});
           continue;
         }
 
         // Intra-core sync: use ascend_set_flag / wait_flag
-        // Record hard_event info for prologue/epilogue
-        // Need prologue when consumer (wait_flag) appears before producer
-        // (set_flag) in the loop body execution order.
-        auto base_id = event_id_map.find(hard_event);
-        if (base_id == event_id_map.end()) {
-          event_id_map[hard_event] = 0;
-          base_id = event_id_map.find(hard_event);
-        }
+        sync_points.push_back({SyncType::IntraCore,
+                               unit,
+                               wg_id,
+                               waiting_unit,
+                               waiting_wg_id,
+                               {},
+                               {},
+                               0,
+                               0,
+                               num_versions,
+                               prod_idx,
+                               cons_idx,
+                               prod_wg,
+                               hard_event,
+                               0,
+                               distance,
+                               PrimExpr()});
+      }
+    }
+  }
+  return sync_points;
+}
 
-        if (cons_idx < prod_idx) {
-          for (int base = 0; base < num_versions; ++base) {
-            flag_infos.push_back(FlagInfo{
-                prod_wg, Integer(base_id->second + base), hard_event, 0});
+static std::vector<SyncPoint>
+OptimizeSyncPoints(const std::vector<SyncPoint> &sync_points) {
+  std::vector<bool> keep(sync_points.size(), true);
+
+  for (size_t i = 0; i < sync_points.size(); ++i) {
+    if (!keep[i])
+      continue;
+    for (size_t j = i + 1; j < sync_points.size(); ++j) {
+      if (!keep[j])
+        continue;
+      const auto &a = sync_points[i];
+      const auto &b = sync_points[j];
+
+      if (a.type != b.type)
+        continue;
+
+      bool same_group = false;
+      if (a.type == SyncType::CrossCore) {
+        same_group =
+            (a.prod_pipe == b.prod_pipe && a.cons_pipe == b.cons_pipe &&
+             a.num_versions == b.num_versions &&
+             (a.cons_idx < a.prod_idx) == (b.cons_idx < b.prod_idx));
+      } else if (a.type == SyncType::IntraCore) {
+        same_group =
+            (a.hard_event == b.hard_event && a.num_versions == b.num_versions &&
+             (a.cons_idx < a.prod_idx) == (b.cons_idx < b.prod_idx));
+      } else {
+        continue;
+      }
+
+      if (!same_group)
+        continue;
+
+      if (a.prod_idx >= b.prod_idx && a.cons_idx <= b.cons_idx) {
+        keep[j] = false;
+      } else if (b.prod_idx >= a.prod_idx && b.cons_idx <= a.cons_idx) {
+        keep[i] = false;
+        break;
+      }
+    }
+  }
+
+  std::vector<SyncPoint> result;
+  for (size_t i = 0; i < sync_points.size(); ++i) {
+    if (keep[i])
+      result.push_back(sync_points[i]);
+  }
+  return result;
+}
+
+static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
+                             FlagInfoList &flag_infos, Var sid,
+                             EventIdMap &event_id_map,
+                             LoopNestingInfo &loop_info) {
+  for (const auto &sp : sync_points) {
+    if (sp.type == SyncType::PipeBarrier) {
+      Stmt barrier = makeAscendPipeBarrier("PIPE_ALL");
+      InsertStatementIntoScheduleUnit(sp.prod_unit, barrier, false,
+                                      sp.prod_wg_id);
+      InsertStatementIntoScheduleUnit(sp.cons_unit, barrier, true,
+                                      sp.cons_wg_id);
+    } else if (sp.type == SyncType::CrossCore) {
+      auto cc_id = event_id_map.find("Cube-Vector");
+      if (cc_id == event_id_map.end()) {
+        event_id_map["Cube-Vector"] = 0;
+        cc_id = event_id_map.find("Cube-Vector");
+      }
+      int cc_base_id = cc_id->second;
+      cc_id->second += sp.num_versions;
+
+      PrimExpr cc_event_id = cc_base_id + sid * 16;
+
+      if (sp.cons_idx < sp.prod_idx) {
+        if (!sp.prod_wg) {
+          for (int base = 0; base < sp.num_versions; ++base) {
+            flag_infos.push_back(
+                FlagInfo{0, cc_event_id + base, sp.prod_pipe, 1});
+          }
+          for (unsigned s = 0; s != 2; ++s) {
+            for (int base = 0; base < sp.num_versions; ++base) {
+              flag_infos.push_back(FlagInfo{
+                  1, Integer(cc_base_id + s * 16 + base), sp.prod_pipe, 2});
+            }
+          }
+        } else {
+          for (unsigned s = 0; s != 2; ++s) {
+            for (int base = 0; base < sp.num_versions; ++base) {
+              flag_infos.push_back(FlagInfo{
+                  1, Integer(cc_base_id + s * 16 + base), sp.prod_pipe, 1});
+            }
+          }
+          for (int base = 0; base < sp.num_versions; ++base) {
+            flag_infos.push_back(
+                FlagInfo{0, cc_event_id + base, sp.prod_pipe, 2});
           }
         }
-
-        PrimExpr iteration =
-            loop_info.CalculateIterationCount() - Integer(distance);
-        PrimExpr event_id =
-            indexmod(iteration, Integer(num_versions)) + base_id->second;
-        base_id->second += num_versions;
-
-        Stmt set_stmt = makeAscendSetFlag(hard_event, event_id);
-        InsertStatementIntoScheduleUnit(unit, set_stmt, false, wg_id);
-
-        Stmt wait_stmt = makeAscendWaitFlag(hard_event, event_id);
-        InsertStatementIntoScheduleUnit(waiting_unit, wait_stmt, true,
-                                        waiting_wg_id);
       }
+      if (!sp.prod_wg) {
+        Stmt set_stmt =
+            makeAscendCrossCoreSetFlag(sp.mode_id, sp.prod_pipe, cc_event_id);
+        InsertStatementIntoScheduleUnit(sp.prod_unit, set_stmt, false,
+                                        sp.prod_wg_id);
+        for (unsigned s = 0; s != 2; ++s) {
+          Stmt wait_stmt = makeAscendCrossCoreWaitFlag(
+              sp.mode_id, sp.cons_pipe,
+              IntImm(DataType::Int(64), cc_base_id + 16 * s));
+          InsertStatementIntoScheduleUnit(sp.cons_unit, wait_stmt, true,
+                                          sp.cons_wg_id);
+        }
+      } else {
+        for (unsigned s = 0; s != 2; ++s) {
+          Stmt set_stmt = makeAscendCrossCoreSetFlag(
+              sp.mode_id, sp.prod_pipe,
+              IntImm(DataType::Int(64), cc_base_id + 16 * s));
+          InsertStatementIntoScheduleUnit(sp.prod_unit, set_stmt, false,
+                                          sp.prod_wg_id);
+        }
+        Stmt wait_stmt =
+            makeAscendCrossCoreWaitFlag(sp.mode_id, sp.cons_pipe, cc_event_id);
+        InsertStatementIntoScheduleUnit(sp.cons_unit, wait_stmt, true,
+                                        sp.cons_wg_id);
+      }
+    } else if (sp.type == SyncType::IntraCore) {
+      auto base_id = event_id_map.find(sp.hard_event);
+      if (base_id == event_id_map.end()) {
+        event_id_map[sp.hard_event] = 0;
+        base_id = event_id_map.find(sp.hard_event);
+      }
+      int base_id_val = base_id->second;
+      base_id->second += sp.num_versions;
+
+      PrimExpr iteration =
+          loop_info.CalculateIterationCount() - Integer(sp.distance);
+      PrimExpr event_id =
+          indexmod(iteration, Integer(sp.num_versions)) + base_id_val;
+
+      if (sp.cons_idx < sp.prod_idx) {
+        for (int base = 0; base < sp.num_versions; ++base) {
+          flag_infos.push_back(FlagInfo{sp.prod_wg, Integer(base_id_val + base),
+                                        sp.hard_event, 0});
+        }
+      }
+
+      Stmt set_stmt = makeAscendSetFlag(sp.hard_event, event_id);
+      InsertStatementIntoScheduleUnit(sp.prod_unit, set_stmt, false,
+                                      sp.prod_wg_id);
+
+      Stmt wait_stmt = makeAscendWaitFlag(sp.hard_event, event_id);
+      InsertStatementIntoScheduleUnit(sp.cons_unit, wait_stmt, true,
+                                      sp.cons_wg_id);
     }
   }
 }
@@ -774,8 +845,8 @@ static void AnalyzeSequenceNodeBarriers(
     auto unit = static_cast<ScheduleUnit *>(child.get());
     units.push_back(unit);
     if (GetInnerTask(unit) != nullptr) {
-      // We will handle these units specially in InsertSynchronization, so we
-      // skip it here.
+      // We will handle these units specially in
+      // CollectSyncPoints/InsertSyncPoints, so we skip it here.
       continue;
     }
     if (unit->child->IsSequence() || unit->child->IsControl() ||
@@ -790,8 +861,9 @@ static void AnalyzeSequenceNodeBarriers(
 
   // Analyze dependencies and insert synchronization
   auto sync_infos = GetSyncInfos(units, 2);
-  InsertSynchronization(units, sync_infos, event_id_map, flag_infos, sid,
-                        barrier_buffers, barrier_map, loop_info);
+  auto sync_points = CollectSyncPoints(units, sync_infos);
+  sync_points = OptimizeSyncPoints(sync_points);
+  InsertSyncPoints(sync_points, flag_infos, sid, event_id_map, loop_info);
 }
 
 static void AnalyzeControlNodeBarriers(
@@ -818,8 +890,8 @@ static void AnalyzeControlNodeBarriers(
     auto unit = static_cast<ScheduleUnit *>(child.get());
     units.push_back(unit);
     if (GetInnerTask(unit) != nullptr) {
-      // We will handle these units specially in InsertSynchronization, so we
-      // skip it here.
+      // We will handle these units specially in
+      // CollectSyncPoints/InsertSyncPoints, so we skip it here.
       continue;
     }
     if (unit->child->IsSequence() || unit->child->IsControl() ||
@@ -890,8 +962,9 @@ static void AnalyzeControlNodeBarriers(
 
   // Analyze dependencies and insert synchronization
   auto sync_infos = GetSyncInfos(units, 2, buffer_num_versions, true);
-  InsertSynchronization(units, sync_infos, event_id_map, flag_infos, sid,
-                        barrier_buffers, barrier_map, loop_info);
+  auto sync_points = CollectSyncPoints(units, sync_infos);
+  sync_points = OptimizeSyncPoints(sync_points);
+  InsertSyncPoints(sync_points, flag_infos, sid, event_id_map, loop_info);
 
   // Remove this loop from nesting info when exiting
   loop_info.PopLoop();
