@@ -94,7 +94,7 @@ if __name__ == "__main__":
     # Create and compile kernel
     print("Compiling gemm kernel...")
     program = gemm(M_DIM, K_DIM, N_DIM)
-    kernel = tilelang.compile(program, out_idx=-1)
+    kernel = tilelang.compile(program, out_idx=-1, pass_configs={tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False})
     print("Compilation succeeded!")
 
     # Print generated source code

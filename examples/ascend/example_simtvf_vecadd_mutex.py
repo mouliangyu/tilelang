@@ -39,7 +39,6 @@ def vector_add(N):
                 "float32",
             )
 
-
             for iter in range(TOTAL_TILES):
                 begin = (iter * NUM_BLOCKS + bx) * TILE_ELEMS
                 end = (iter * NUM_BLOCKS + bx + 1) * TILE_ELEMS
@@ -62,7 +61,6 @@ def vector_add(N):
                 T.copy(temp3[stage, :], C[begin:end])
                 T.ascend_rls_buf("PIPE_MTE3", stage)
 
-
     return main
 
 
@@ -83,7 +81,7 @@ if __name__ == "__main__":
     # Create and compile kernel
     print(f"Compiling vector_add kernel (N={N})...")
     program = vector_add(N)
-    kernel = tilelang.compile(program, out_idx=-1)
+    kernel = tilelang.compile(program, out_idx=-1, pass_configs={tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False})
     print("Compilation succeeded!")
 
     # Print generated source code
