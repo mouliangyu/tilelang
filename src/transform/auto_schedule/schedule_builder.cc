@@ -145,7 +145,8 @@ bool HasRegisterDependency(const IRStructure *a, const IRStructure *b) {
   if (b->ContainsLoopBreak())
     return true;
   for (const auto &write_region_a : a->GetWriteRegions()) {
-    if (IsSharedBuffer(write_region_a.get()->buffer))
+    if (IsSharedBuffer(write_region_a.get()->buffer) ||
+        IsL1Buffer(write_region_a.get()->buffer))
       continue;
     for (const auto &read_region_b : b->GetReadRegions()) {
       if (SameBuffer(write_region_a, read_region_b))
@@ -157,7 +158,8 @@ bool HasRegisterDependency(const IRStructure *a, const IRStructure *b) {
     }
   }
   for (const auto &read_region_a : a->GetReadRegions()) {
-    if (IsSharedBuffer(read_region_a.get()->buffer))
+    if (IsSharedBuffer(read_region_a.get()->buffer) ||
+        IsL1Buffer(read_region_a.get()->buffer))
       continue;
     for (const auto &write_region_b : b->GetWriteRegions()) {
       if (SameBuffer(read_region_a, write_region_b))
@@ -171,7 +173,8 @@ std::set<Buffer> GetSharedDependencies(const IRStructure *a,
                                        const IRStructure *b) {
   std::set<Buffer> deps;
   for (const auto &write_region_a : a->GetWriteRegions()) {
-    if (!IsSharedBuffer(write_region_a->buffer))
+    if (!IsSharedBuffer(write_region_a->buffer) &&
+        !IsL1Buffer(write_region_a->buffer))
       continue;
     for (const auto &read_region_b : b->GetReadRegions()) {
       if (SameBuffer(write_region_a, read_region_b))
@@ -183,7 +186,8 @@ std::set<Buffer> GetSharedDependencies(const IRStructure *a,
     }
   }
   for (const auto &read_region_a : a->GetReadRegions()) {
-    if (!IsSharedBuffer(read_region_a->buffer))
+    if (!IsSharedBuffer(read_region_a->buffer) &&
+        !IsL1Buffer(read_region_a->buffer))
       continue;
     for (const auto &write_region_b : b->GetWriteRegions()) {
       if (SameBuffer(read_region_a, write_region_b))

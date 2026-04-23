@@ -165,8 +165,8 @@ def dual_copy(
     src_m, src_n = src_shape[-2], src_shape[-1]
     dst_m, dst_n = dst_shape[-2], dst_shape[-1]
 
-    m_halved = _is_half(src_m, dst_m)
-    n_halved = _is_half(src_n, dst_n)
+    m_halved = _is_half(src_m, dst_m) or _is_half(dst_m, src_m)
+    n_halved = _is_half(src_n, dst_n) or _is_half(dst_n, src_n)
 
     if m_halved and not n_halved:
         dual_dst_ctl = 1  # M-split (0b01)
@@ -181,15 +181,14 @@ def dual_copy(
     # This allows src[M,N] to be copied to dst[M/2,N] or dst[M,N/2]
     src_region = to_buffer_region(src)
     dst_region = to_buffer_region(dst)
+    annotations = {
+        "dual_dst_ctl": dual_dst_ctl,
+        "unit_flag_ctl": unit_flag_ctl,
+    }
+    if _is_half(dst_m, src_m) or _is_half(dst_n, src_n):
+        annotations["double"] = True
 
-    return copy(
-        src_region,
-        dst_region,
-        annotations={
-            "dual_dst_ctl": dual_dst_ctl,
-            "unit_flag_ctl": unit_flag_ctl,
-        },
-    )
+    return copy(src_region, dst_region, annotations=annotations)
 
 
 def c2d_im2col(

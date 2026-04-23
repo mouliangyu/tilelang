@@ -412,11 +412,6 @@ private:
       };
       std::vector<TensorCoreShape> tensor_core_shapes;
 
-      // GemmInst: the resolved tensor core instruction (single, asserted
-      // shared)
-      GemmInst gemm_inst{GemmInst::kMMA};
-      bool has_gemm_inst{false};
-
       // Target and block_size for GemmInst determination
       Target target;
       int64_t block_size;
@@ -459,24 +454,9 @@ private:
           pipe_mask |= GetCopyPipeMask(copy->src, copy->dst);
         } else if (op->op.same_as(gemm_py_op) || op->op.same_as(gemm_op)) {
           pipe_mask |= static_cast<uint16_t>(ResourcePipe::kCube);
-
-          int64_t m = op->args[5].as<IntImmNode>()->value;
-          int64_t n = op->args[6].as<IntImmNode>()->value;
-          int64_t k = op->args[7].as<IntImmNode>()->value;
-          tensor_core_shapes.emplace_back(m, n, k);
-
-          // Determine the final GemmInst using GemmPyNode::getGemmInst
-          if (target.defined()) {
-            GemmPy gemm_py(op->args);
-            GemmInst inst =
-                gemm_py->getGemmInst(static_cast<int>(block_size), target);
-            ICHECK(!has_gemm_inst || gemm_inst == inst)
-                << "All gemm operations in a task must use the same GemmInst, "
-                << "but got " << GemmInstToString(gemm_inst) << " and "
-                << GemmInstToString(inst);
-            gemm_inst = inst;
-            has_gemm_inst = true;
-          }
+          GemmPy gemm_py(op->args);
+          tensor_core_shapes.emplace_back(gemm_py->m_, gemm_py->n_,
+                                          gemm_py->k_);
         }
 
         StmtExprVisitor::VisitExpr_(op);
@@ -500,10 +480,6 @@ private:
         if (shape.m > 0 && shape.n > 0 && shape.k > 0) {
           task_node->AddTensorCoreShape(shape.m, shape.n, shape.k);
         }
-      }
-      // Set GemmInst information
-      if (analyzer.has_gemm_inst) {
-        task_node->SetGemmInst(analyzer.gemm_inst);
       }
     }
 
@@ -569,6 +545,31 @@ struct ScheduledKernelResult {
   std::vector<MultiVersionBufferInfo> buffer_infos;
 };
 
+// Recursively check if any TaskNode has the given warpgroup_id.
+static bool HasWarpgroupId(IRStructure *node, int wg_id) {
+  if (!node)
+    return false;
+  if (node->IsTask())
+    return static_cast<TaskNode *>(node)->GetWarpgroupId() == wg_id;
+  if (node->IsSequence()) {
+    for (auto &c : static_cast<SequenceNode *>(node)->children)
+      if (HasWarpgroupId(c.get(), wg_id))
+        return true;
+  } else if (node->IsControl()) {
+    return HasWarpgroupId(static_cast<ControlNode *>(node)->child.get(), wg_id);
+  } else if (node->IsWrapper()) {
+    return HasWarpgroupId(static_cast<WrapperNode *>(node)->child.get(), wg_id);
+  } else if (node->IsScheduleUnit()) {
+    return HasWarpgroupId(static_cast<ScheduleUnit *>(node)->child.get(),
+                          wg_id);
+  } else if (node->IsIf()) {
+    auto ifn = static_cast<IfNode *>(node);
+    return HasWarpgroupId(ifn->then_child.get(), wg_id) ||
+           (ifn->else_child && HasWarpgroupId(ifn->else_child.get(), wg_id));
+  }
+  return false;
+}
+
 // Schedule a single kernel body.
 
 // Handles IRStructure building, Z3 scheduling (with Ascend sync insertion),
@@ -617,45 +618,53 @@ static ScheduledKernelResult ScheduleSingleKernel(const Stmt &kernel_body,
   }
 
   EventIdMap event_id_map;
-  HardEventInfoList hard_event_infos;
+  FlagInfoList flag_infos;
   LoopNestingInfo loop_info;
-  AnalyzeAndInsertBarriers(ir_structure.get(), event_id_map, hard_event_infos,
+  Var sid("sid", DataType::Int(32));
+  AnalyzeAndInsertBarriers(ir_structure.get(), event_id_map, flag_infos, sid,
                            result.barrier_buffers, result.barrier_map,
                            loop_info, result.buffer_infos);
 
-  // Clone by warpgroup: wg0=Vector, wg1=Cube, then wrap in Cube/Vector blocks
-  auto wg0_structure =
-      CloneIRStructureWithWarpgroupFilter(ir_structure.get(), 0);
-  auto wg1_structure =
-      CloneIRStructureWithWarpgroupFilter(ir_structure.get(), 1);
+  Stmt wg0_body = Evaluate(0);
+  Stmt wg1_body = Evaluate(0);
 
-  Stmt wg0_body = wg0_structure ? ConvertIRStructureToStmt(wg0_structure.get())
-                                : Evaluate(0);
-  Stmt wg1_body = wg1_structure ? ConvertIRStructureToStmt(wg1_structure.get())
-                                : Evaluate(0);
+  bool has_wg0 = HasWarpgroupId(ir_structure.get(), 0);
+  bool has_wg1 = HasWarpgroupId(ir_structure.get(), 1);
 
-  bool has_wg0 = wg0_structure && !IsEvaluateZero(wg0_body);
-  bool has_wg1 = wg1_structure && !IsEvaluateZero(wg1_body);
+  if (has_wg0) {
+    auto wg = CloneIRStructureWithWarpgroupFilter(ir_structure.get(), 0);
+    wg0_body = ConvertIRStructureToStmt(wg.get(), sid);
+  }
+  if (has_wg1) {
+    auto wg = CloneIRStructureWithWarpgroupFilter(ir_structure.get(), 1);
+    wg1_body = ConvertIRStructureToStmt(wg.get(), sid);
+  }
 
-  if (!hard_event_infos.empty()) {
+  if (!flag_infos.empty()) {
     std::vector<Stmt> stmts[2];
     auto seq = static_cast<SequenceNode *>(ir_structure.get());
     auto pro_task0 = std::make_shared<TaskNode>();
     auto pro_task1 = std::make_shared<TaskNode>();
     auto epi_task0 = std::make_shared<TaskNode>();
     auto epi_task1 = std::make_shared<TaskNode>();
-    for (const auto &info : hard_event_infos) {
-      for (int base = 0; base < info.num_versions; ++base) {
+    for (const auto &info : flag_infos) {
+      if (info.mode == 0) {
         stmts[info.warpgroup_id].push_back(
-            makeAscendSetFlag(info.hardevent, Integer(base + info.offset)));
+            makeAscendSetFlag(info.hardevent, info.flag_var));
+      } else if (info.mode == 1) {
+        stmts[info.warpgroup_id].push_back(
+            makeAscendCrossCoreSetFlag(4, info.hardevent, info.flag_var));
       }
     }
     stmts[0].push_back(wg0_body);
     stmts[1].push_back(wg1_body);
-    for (const auto &info : hard_event_infos) {
-      for (int base = 0; base < info.num_versions; ++base) {
+    for (const auto &info : flag_infos) {
+      if (info.mode == 0) {
         stmts[info.warpgroup_id].push_back(
-            makeAscendWaitFlag(info.hardevent, Integer(base + info.offset)));
+            makeAscendWaitFlag(info.hardevent, info.flag_var));
+      } else if (info.mode == 2) {
+        stmts[info.warpgroup_id].push_back(
+            makeAscendCrossCoreWaitFlag(4, info.hardevent, info.flag_var));
       }
     }
     if (has_wg0) {
@@ -671,11 +680,16 @@ static ScheduledKernelResult ScheduleSingleKernel(const Stmt &kernel_body,
         Block({}, {}, {}, "CUBE", wg1_body, std::nullopt, {}, {}, {}));
     Map<String, ObjectRef> vec_annotations;
     vec_annotations.Set("vector_count", Integer(2));
-    blocks.push_back(Block({}, {}, {}, "VECTOR", wg0_body, std::nullopt, {}, {},
+    IterVar sid_thread(Range(0, 2), sid, IterVarType::kThreadIndex, "cthread");
+    Stmt vec_body =
+        AttrStmt(sid_thread, tir::attr::thread_extent, Integer(2), wg0_body);
+    blocks.push_back(Block({}, {}, {}, "VECTOR", vec_body, std::nullopt, {}, {},
                            vec_annotations));
     result.scheduled_body = SeqStmt(blocks);
+  } else if (has_wg0) {
+    result.scheduled_body = wg0_body;
   } else {
-    result.scheduled_body = has_wg0 ? wg0_body : wg1_body;
+    result.scheduled_body = wg1_body;
   }
   return result;
 }

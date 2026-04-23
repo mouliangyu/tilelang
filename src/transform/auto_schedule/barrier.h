@@ -146,27 +146,27 @@ struct MultiVersionBufferInfo {
 using EventIdMap = std::unordered_map<std::string, int>;
 
 // Per-hard_event metadata for prologue/epilogue generation
-struct HardEventInfo {
+struct FlagInfo {
   int warpgroup_id; // which side (0=Vector, 1=Cube)
-  int offset;
-  int num_versions;
+  PrimExpr flag_var;
   std::string hardevent;
+  int mode;
 };
-using HardEventInfoList = std::vector<HardEventInfo>;
+using FlagInfoList = std::vector<FlagInfo>;
 
 static void AnalyzeAndInsertBarriers(
-    IRStructure *node, EventIdMap &event_id_map,
-    HardEventInfoList &hard_event_infos, std::vector<Buffer> &barrier_buffers,
+    IRStructure *node, EventIdMap &event_id_map, FlagInfoList &flag_infos,
+    Var sid, std::vector<Buffer> &barrier_buffers,
     Map<ObjectRef, ObjectRef> &barrier_map, LoopNestingInfo &loop_info,
     std::vector<MultiVersionBufferInfo> &buffer_infos);
 static void AnalyzeSequenceNodeBarriers(
-    SequenceNode *seq, EventIdMap &event_id_map,
-    HardEventInfoList &hard_event_infos, std::vector<Buffer> &barrier_buffers,
+    SequenceNode *seq, EventIdMap &event_id_map, FlagInfoList &flag_infos,
+    Var sid, std::vector<Buffer> &barrier_buffers,
     Map<ObjectRef, ObjectRef> &barrier_map, LoopNestingInfo &loop_info,
     std::vector<MultiVersionBufferInfo> &buffer_infos);
 static void AnalyzeControlNodeBarriers(
-    ControlNode *ctrl, EventIdMap &event_id_map,
-    HardEventInfoList &hard_event_infos, std::vector<Buffer> &barrier_buffers,
+    ControlNode *ctrl, EventIdMap &event_id_map, FlagInfoList &flag_infos,
+    Var sid, std::vector<Buffer> &barrier_buffers,
     Map<ObjectRef, ObjectRef> &barrier_map, LoopNestingInfo &loop_info,
     std::vector<MultiVersionBufferInfo> &buffer_infos);
 
@@ -409,8 +409,8 @@ static void InsertStatementIntoScheduleUnit(ScheduleUnit *task,
 
 // Barrier dependency analysis implementation
 static void AnalyzeAndInsertBarriers(
-    IRStructure *node, EventIdMap &event_id_map,
-    HardEventInfoList &hard_event_infos, std::vector<Buffer> &barrier_buffers,
+    IRStructure *node, EventIdMap &event_id_map, FlagInfoList &flag_infos,
+    Var sid, std::vector<Buffer> &barrier_buffers,
     Map<ObjectRef, ObjectRef> &barrier_map, LoopNestingInfo &loop_info,
     std::vector<MultiVersionBufferInfo> &buffer_infos) {
   if (!node)
@@ -418,27 +418,27 @@ static void AnalyzeAndInsertBarriers(
 
   if (node->IsSequence()) {
     AnalyzeSequenceNodeBarriers(static_cast<SequenceNode *>(node), event_id_map,
-                                hard_event_infos, barrier_buffers, barrier_map,
+                                flag_infos, sid, barrier_buffers, barrier_map,
                                 loop_info, buffer_infos);
   } else if (node->IsControl()) {
     AnalyzeControlNodeBarriers(static_cast<ControlNode *>(node), event_id_map,
-                               hard_event_infos, barrier_buffers, barrier_map,
+                               flag_infos, sid, barrier_buffers, barrier_map,
                                loop_info, buffer_infos);
   } else if (node->IsWrapper()) {
     auto wrapper = static_cast<WrapperNode *>(node);
-    AnalyzeAndInsertBarriers(wrapper->child.get(), event_id_map,
-                             hard_event_infos, barrier_buffers, barrier_map,
-                             loop_info, buffer_infos);
+    AnalyzeAndInsertBarriers(wrapper->child.get(), event_id_map, flag_infos,
+                             sid, barrier_buffers, barrier_map, loop_info,
+                             buffer_infos);
   } else if (node->IsIf()) {
     auto if_node = static_cast<IfNode *>(node);
     if (if_node->then_child) {
       AnalyzeAndInsertBarriers(if_node->then_child.get(), event_id_map,
-                               hard_event_infos, barrier_buffers, barrier_map,
+                               flag_infos, sid, barrier_buffers, barrier_map,
                                loop_info, buffer_infos);
     }
     if (if_node->else_child) {
       AnalyzeAndInsertBarriers(if_node->else_child.get(), event_id_map,
-                               hard_event_infos, barrier_buffers, barrier_map,
+                               flag_infos, sid, barrier_buffers, barrier_map,
                                loop_info, buffer_infos);
     }
   } else if (node->IsTask()) {
@@ -466,6 +466,8 @@ GetSyncInfos(const std::vector<ScheduleUnit *> &units, int num_wgs,
   std::set<Buffer> buffers;
   for (auto *unit : units) {
     for (const auto &buffer_access : unit->GetBufferAccessInfo(num_wgs)) {
+      if (IsLocalBuffer(buffer_access.buffer, true))
+        continue;
       buffers.insert(buffer_access.buffer);
     }
   }
@@ -569,7 +571,20 @@ static Stmt makeAscendPipeBarrier(const std::string &pipe) {
       Call(DataType::Handle(), ascend_pipe_barrier(), {StringImm(pipe)}));
 }
 
+static Stmt makeAscendCrossCoreSetFlag(int mode_id, const std::string &pipe,
+                                       PrimExpr flag_id) {
+  return Evaluate(Call(DataType::Handle(), ascend_cross_core_set_flag(),
+                       {Integer(mode_id), StringImm(pipe), flag_id}));
+}
+
+static Stmt makeAscendCrossCoreWaitFlag(int mode_id, const std::string &pipe,
+                                        PrimExpr flag_id) {
+  return Evaluate(Call(DataType::Handle(), ascend_cross_core_wait_flag(),
+                       {Integer(mode_id), StringImm(pipe), flag_id}));
+}
+
 static std::string GetPipeName(uint16_t mask) {
+  ICHECK((mask & (mask - 1)) == 0) << "Multiple pipes in one pipe: " << mask;
   if (mask & static_cast<uint16_t>(ResourcePipe::kMTE1))
     return "MTE1";
   if (mask & static_cast<uint16_t>(ResourcePipe::kMTE2))
@@ -584,12 +599,17 @@ static std::string GetPipeName(uint16_t mask) {
     return "FIX";
   if (mask & static_cast<uint16_t>(ResourcePipe::kScalar))
     return "S";
-  return "ALL";
+  LOG(FATAL) << "Unknown pipe";
 }
 
 static std::string GetHardEvent(uint16_t producer_mask,
                                 uint16_t consumer_mask) {
-  return GetPipeName(producer_mask) + "_" + GetPipeName(consumer_mask);
+  auto event = GetPipeName(producer_mask) + "_" + GetPipeName(consumer_mask);
+  if (event == "MTE2_M")
+    return "MTE2_MTE1";
+  if (event == "M_MTE2")
+    return "MTE1_MTE2";
+  return event;
 }
 
 static void InsertSynchronization(
@@ -598,7 +618,7 @@ static void InsertSynchronization(
         std::pair<ScheduleUnit *, int>,
         std::pair<int, std::map<std::pair<ScheduleUnit *, int>, int>>>
         &sync_infos,
-    EventIdMap &event_id_map, HardEventInfoList &hard_event_infos,
+    EventIdMap &event_id_map, FlagInfoList &flag_infos, Var sid,
     std::vector<Buffer> &barrier_buffers,
     Map<ObjectRef, ObjectRef> &barrier_map, LoopNestingInfo &loop_info) {
   // Build unit→index map for order comparison
@@ -629,18 +649,84 @@ static void InsertSynchronization(
             static_cast<TaskNode *>(unit->child.get())->GetWarpgroupId();
         int cons_wg = static_cast<TaskNode *>(waiting_unit->child.get())
                           ->GetWarpgroupId();
-        ICHECK_EQ(prod_wg, cons_wg)
-            << "Producer and consumer must have the same warpgroup_id";
 
         uint16_t producer_mask = unit->GetPipeMask();
         uint16_t consumer_mask = waiting_unit->GetPipeMask();
         std::string hard_event = GetHardEvent(producer_mask, consumer_mask);
+        int prod_idx = unit_index[unit];
+        int cons_idx = unit_index[waiting_unit];
 
+        if (prod_wg != cons_wg) {
+          // Cross-core sync: use ascend_cross_core_set_flag / wait_flag
+          // flag_id = base + sid * 16 (sid=0,1 for two AIV cores)
+          std::string prod_pipe = "PIPE_" + GetPipeName(producer_mask);
+          std::string cons_pipe = "PIPE_" + GetPipeName(consumer_mask);
+          int mode_id = 4;
+          auto cc_id = event_id_map.find("Cube-Vector");
+          if (cc_id == event_id_map.end()) {
+            event_id_map["Cube-Vector"] = 0;
+            cc_id = event_id_map.find("Cube-Vector");
+          }
+          PrimExpr cc_event_id = cc_id->second + sid * 16;
+
+          if (cons_idx < prod_idx) {
+            if (!prod_wg) {
+              for (int base = 0; base < num_versions; ++base) {
+                flag_infos.push_back(
+                    FlagInfo{0, cc_event_id + base, prod_pipe, 1});
+              }
+              for (unsigned sid = 0; sid != 2; ++sid) {
+                for (int base = 0; base < num_versions; ++base) {
+                  flag_infos.push_back(
+                      FlagInfo{1, Integer(cc_id->second + sid * 16 + base),
+                               prod_pipe, 2});
+                }
+              }
+            } else {
+              for (unsigned sid = 0; sid != 2; ++sid) {
+                for (int base = 0; base < num_versions; ++base) {
+                  flag_infos.push_back(
+                      FlagInfo{1, Integer(cc_id->second + sid * 16 + base),
+                               prod_pipe, 1});
+                }
+              }
+              for (int base = 0; base < num_versions; ++base) {
+                flag_infos.push_back(
+                    FlagInfo{0, cc_event_id + base, prod_pipe, 2});
+              }
+            }
+          }
+          if (!prod_wg) {
+            Stmt set_stmt =
+                makeAscendCrossCoreSetFlag(mode_id, prod_pipe, cc_event_id);
+            InsertStatementIntoScheduleUnit(unit, set_stmt, false, wg_id);
+            for (unsigned sid = 0; sid != 2; ++sid) {
+              Stmt wait_stmt = makeAscendCrossCoreWaitFlag(
+                  mode_id, cons_pipe,
+                  IntImm(DataType::Int(64), cc_id->second + 16 * sid));
+              InsertStatementIntoScheduleUnit(waiting_unit, wait_stmt, true,
+                                              waiting_wg_id);
+            }
+          } else {
+            for (unsigned sid = 0; sid != 2; ++sid) {
+              Stmt set_stmt = makeAscendCrossCoreSetFlag(
+                  mode_id, prod_pipe,
+                  IntImm(DataType::Int(64), cc_id->second + 16 * sid));
+              InsertStatementIntoScheduleUnit(unit, set_stmt, false, wg_id);
+            }
+            Stmt wait_stmt =
+                makeAscendCrossCoreWaitFlag(mode_id, cons_pipe, cc_event_id);
+            InsertStatementIntoScheduleUnit(waiting_unit, wait_stmt, true,
+                                            waiting_wg_id);
+          }
+          cc_id->second += num_versions;
+          continue;
+        }
+
+        // Intra-core sync: use ascend_set_flag / wait_flag
         // Record hard_event info for prologue/epilogue
         // Need prologue when consumer (wait_flag) appears before producer
         // (set_flag) in the loop body execution order.
-        int prod_idx = unit_index[unit];
-        int cons_idx = unit_index[waiting_unit];
         auto base_id = event_id_map.find(hard_event);
         if (base_id == event_id_map.end()) {
           event_id_map[hard_event] = 0;
@@ -648,15 +734,17 @@ static void InsertSynchronization(
         }
 
         if (cons_idx < prod_idx) {
-          hard_event_infos.push_back(HardEventInfo{prod_wg, base_id->second,
-                                                   num_versions, hard_event});
+          for (int base = 0; base < num_versions; ++base) {
+            flag_infos.push_back(FlagInfo{
+                prod_wg, Integer(base_id->second + base), hard_event, 0});
+          }
         }
 
         PrimExpr iteration =
             loop_info.CalculateIterationCount() - Integer(distance);
         PrimExpr event_id =
             indexmod(iteration, Integer(num_versions)) + base_id->second;
-        base_id->second = num_versions;
+        base_id->second += num_versions;
 
         Stmt set_stmt = makeAscendSetFlag(hard_event, event_id);
         InsertStatementIntoScheduleUnit(unit, set_stmt, false, wg_id);
@@ -670,8 +758,8 @@ static void InsertSynchronization(
 }
 
 static void AnalyzeSequenceNodeBarriers(
-    SequenceNode *seq, EventIdMap &event_id_map,
-    HardEventInfoList &hard_event_infos, std::vector<Buffer> &barrier_buffers,
+    SequenceNode *seq, EventIdMap &event_id_map, FlagInfoList &flag_infos,
+    Var sid, std::vector<Buffer> &barrier_buffers,
     Map<ObjectRef, ObjectRef> &barrier_map, LoopNestingInfo &loop_info,
     std::vector<MultiVersionBufferInfo> &buffer_infos) {
   if (!seq)
@@ -691,21 +779,21 @@ static void AnalyzeSequenceNodeBarriers(
         unit->child->IsIf()) {
       // If child is SequenceNode, ControlNode, or IfNode, recursively analyze
       // it
-      AnalyzeAndInsertBarriers(unit->child.get(), event_id_map,
-                               hard_event_infos, barrier_buffers, barrier_map,
-                               loop_info, buffer_infos);
+      AnalyzeAndInsertBarriers(unit->child.get(), event_id_map, flag_infos, sid,
+                               barrier_buffers, barrier_map, loop_info,
+                               buffer_infos);
     }
   }
 
   // Analyze dependencies and insert synchronization
   auto sync_infos = GetSyncInfos(units, 2);
-  InsertSynchronization(units, sync_infos, event_id_map, hard_event_infos,
+  InsertSynchronization(units, sync_infos, event_id_map, flag_infos, sid,
                         barrier_buffers, barrier_map, loop_info);
 }
 
 static void AnalyzeControlNodeBarriers(
-    ControlNode *ctrl, EventIdMap &event_id_map,
-    HardEventInfoList &hard_event_infos, std::vector<Buffer> &barrier_buffers,
+    ControlNode *ctrl, EventIdMap &event_id_map, FlagInfoList &flag_infos,
+    Var sid, std::vector<Buffer> &barrier_buffers,
     Map<ObjectRef, ObjectRef> &barrier_map, LoopNestingInfo &loop_info,
     std::vector<MultiVersionBufferInfo> &buffer_infos) {
   if (!ctrl || !ctrl->child)
@@ -735,9 +823,9 @@ static void AnalyzeControlNodeBarriers(
         unit->child->IsIf()) {
       // If child is SequenceNode, ControlNode, or IfNode, recursively analyze
       // it
-      AnalyzeAndInsertBarriers(unit->child.get(), event_id_map,
-                               hard_event_infos, barrier_buffers, barrier_map,
-                               loop_info, buffer_infos);
+      AnalyzeAndInsertBarriers(unit->child.get(), event_id_map, flag_infos, sid,
+                               barrier_buffers, barrier_map, loop_info,
+                               buffer_infos);
     }
   }
 
@@ -799,7 +887,7 @@ static void AnalyzeControlNodeBarriers(
 
   // Analyze dependencies and insert synchronization
   auto sync_infos = GetSyncInfos(units, 2, buffer_num_versions, true);
-  InsertSynchronization(units, sync_infos, event_id_map, hard_event_infos,
+  InsertSynchronization(units, sync_infos, event_id_map, flag_infos, sid,
                         barrier_buffers, barrier_map, loop_info);
 
   // Remove this loop from nesting info when exiting

@@ -59,6 +59,8 @@
 #include <vector>
 
 #include "../../op/builtin.h"
+#include "../../op/copy.h"
+#include "../../op/region.h"
 #include "../../target/utils.h"
 #include "../common/attr.h"
 #include "../common/collector.h"
@@ -345,21 +347,6 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id) {
   return CloneIRStructureWithWarpgroupFilter(node, warpgroup_id, var_remap);
 }
 
-// For each child of a root SequenceNode, apply
-// CloneIRStructureWithWarpgroupFilter individually.
-std::vector<std::shared_ptr<IRStructure>>
-CloneIRStructureChildrenWithWarpgroupFilter(SequenceNode *root_seq,
-                                            int warpgroup_id,
-                                            Map<Var, PrimExpr> &var_remap) {
-  std::vector<std::shared_ptr<IRStructure>> result;
-  result.reserve(root_seq->children.size());
-  for (const auto &child : root_seq->children) {
-    result.push_back(CloneIRStructureWithWarpgroupFilter(
-        child.get(), warpgroup_id, var_remap));
-  }
-  return result;
-}
-
 std::shared_ptr<IRStructure>
 RemoveUnusedLetDecls(std::shared_ptr<IRStructure> root) {
   if (!root)
@@ -540,28 +527,7 @@ RemoveUnusedLetDecls(std::shared_ptr<IRStructure> root) {
   return filter_tree(root);
 }
 
-class SimtCopyDetector : public StmtExprVisitor {
-public:
-  static bool Detect(const Stmt &stmt) {
-    SimtCopyDetector detector;
-    detector.VisitStmt(stmt);
-    return detector.has_simt_copy_;
-  }
-
-private:
-  void VisitStmt_(const BufferStoreNode *op) final {
-    auto scope =
-        runtime::StorageScope::Create(GetPtrStorageScope(op->buffer->data));
-    if (scope.to_string() != "global") {
-      has_simt_copy_ = true;
-    }
-    StmtExprVisitor::VisitStmt_(op);
-  }
-
-  bool has_simt_copy_{false};
-};
-
-Stmt ConvertIRStructureToStmt(IRStructure *structure) {
+Stmt ConvertIRStructureToStmt(IRStructure *structure, Var sid) {
   if (!structure) {
     return Evaluate(0);
   }
@@ -570,7 +536,61 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure) {
     auto task = static_cast<TaskNode *>(structure);
     if (task->stmts.empty()) {
       return Evaluate(0);
-    } else if (task->stmts.size() == 1) {
+    }
+    // Check for dual_copy: rewrite to copies with sid-based offset
+    if (task->stmts.size() == 1) {
+      if (auto *eval = task->stmts[0].as<EvaluateNode>()) {
+        if (auto *call = eval->value.as<CallNode>()) {
+          static const auto copy_op = Op::Get("tl.tileop.copy");
+          if (call->op.same_as(copy_op)) {
+            Copy cp(call->args, call->annotations);
+            if (cp->annotations.Get("double")) {
+              int dual_ctl = cp->GetDualDstCtl();
+              auto &src = cp->src;
+              auto &dst = cp->dst;
+              auto &src_r = cp->src_range;
+              auto &dst_r = cp->dst_range;
+              int split_dim = (dual_ctl == 1) ? 0 : 1;
+              // Remove dual_dst_ctl from annotations
+              Map<String, ObjectRef> new_ann;
+              for (auto &kv : call->annotations) {
+                if (kv.first != "dual_dst_ctl" && kv.first != "unit_flag_ctl")
+                  new_ann.Set(kv.first, kv.second);
+              }
+              // Use RegionOp to get buffer/range info from the Call args
+              auto src_call = Downcast<Call>(call->args[0]);
+              auto dst_call = Downcast<Call>(call->args[1]);
+              RegionOp dst_rop(dst_call->args);
+              int dst_mask = dst_rop->GetAccessMask();
+              auto dst_ranges = dst_rop->GetRanges();
+              auto dst_buf = dst_rop->GetBuffer();
+              // Single copy with sid-based offset: offset = sid * half
+              PrimExpr off = sid * src_r[split_dim]->extent;
+              // Build new dst region args
+              Array<PrimExpr> dst_indices;
+              for (size_t d = 0; d < dst_ranges.size(); ++d) {
+                if (static_cast<int>(d) == split_dim)
+                  dst_indices.push_back(dst_ranges[d]->min + off);
+                else
+                  dst_indices.push_back(dst_ranges[d]->min);
+              }
+              auto dst_load = BufferLoad(dst_buf, dst_indices);
+              Array<PrimExpr> dst_args = {dst_load, Integer(dst_mask)};
+              for (size_t d = 0; d < dst_ranges.size(); ++d) {
+                if (static_cast<int>(d) == split_dim)
+                  dst_args.push_back(src_r[split_dim]->extent);
+                else
+                  dst_args.push_back(dst_ranges[d]->extent);
+              }
+              auto new_dst =
+                  Call(DataType::Handle(), RegionOp::Get(), dst_args);
+              Array<PrimExpr> new_args = {src_call, new_dst};
+              auto new_call = Call(call->dtype, copy_op, new_args, new_ann);
+              return Evaluate(new_call);
+            }
+          }
+        }
+      }
       return task->stmts[0];
     } else {
       return SeqStmt(task->stmts);
@@ -585,7 +605,7 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure) {
           stmts.push_back(stmt);
         }
       }
-      Stmt child_stmt = ConvertIRStructureToStmt(unit->child.get());
+      Stmt child_stmt = ConvertIRStructureToStmt(unit->child.get(), sid);
       stmts.push_back(child_stmt);
       for (auto &[_, after] : unit->after) {
         for (auto &stmt : after) {
@@ -622,7 +642,7 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure) {
             stmts.push_back(stmt);
           }
         }
-        stmts.push_back(ConvertIRStructureToStmt(unit->child.get()));
+        stmts.push_back(ConvertIRStructureToStmt(unit->child.get(), sid));
         for (auto &[_, after] : unit->after) {
           for (auto &stmt : after) {
             stmts.push_back(stmt);
@@ -638,7 +658,7 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure) {
               stmts.push_back(stmt);
             }
           }
-          stmts.push_back(ConvertIRStructureToStmt(unit->child.get()));
+          stmts.push_back(ConvertIRStructureToStmt(unit->child.get(), sid));
           for (auto &[_, after] : unit->after) {
             for (auto &stmt : after) {
               stmts.push_back(stmt);
@@ -647,7 +667,7 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure) {
         }
       } else if (ctrl->child->IsTask()) {
         auto task = static_cast<TaskNode *>(ctrl->child.get());
-        stmts.push_back(ConvertIRStructureToStmt(task));
+        stmts.push_back(ConvertIRStructureToStmt(task, sid));
       } else {
         LOG(FATAL);
       }
@@ -663,7 +683,7 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure) {
     auto wrapper = static_cast<const WrapperNode *>(structure);
     Stmt body = Evaluate(0);
     if (wrapper->child) {
-      body = ConvertIRStructureToStmt(wrapper->child.get());
+      body = ConvertIRStructureToStmt(wrapper->child.get(), sid);
     }
     if (const auto *let = wrapper->wrapper.as<LetStmtNode>()) {
       return LetStmt(let->var, let->value, body);
@@ -674,10 +694,10 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure) {
     }
   } else if (structure->IsIf()) {
     auto if_node = static_cast<const IfNode *>(structure);
-    Stmt then_stmt = ConvertIRStructureToStmt(if_node->then_child.get());
+    Stmt then_stmt = ConvertIRStructureToStmt(if_node->then_child.get(), sid);
     Optional<Stmt> else_stmt;
     if (if_node->else_child) {
-      else_stmt = ConvertIRStructureToStmt(if_node->else_child.get());
+      else_stmt = ConvertIRStructureToStmt(if_node->else_child.get(), sid);
     }
     return IfThenElse(if_node->condition, then_stmt, else_stmt);
   }

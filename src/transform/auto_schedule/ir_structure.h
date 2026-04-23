@@ -245,25 +245,6 @@ public:
   }
   bool HasTensorCoreShape() const { return !tensor_core_shapes_.empty(); }
 
-  // GemmInst: the final tensor core instruction for this task.
-  // All gemm operations within a single task must use the same instruction.
-  void SetGemmInst(GemmInst inst) {
-    ICHECK(!has_gemm_inst_ || gemm_inst_ == inst)
-        << "All gemm operations in a task must use the same GemmInst, "
-        << "but got " << GemmInstToString(gemm_inst_) << " and "
-        << GemmInstToString(inst);
-    gemm_inst_ = inst;
-    has_gemm_inst_ = true;
-  }
-  bool HasGemmInst() const { return has_gemm_inst_; }
-  GemmInst GetGemmInst() const {
-    ICHECK(has_gemm_inst_) << "GemmInst not set";
-    return gemm_inst_;
-  }
-
-  // Check if this task uses MAD instruction (Ascend Cube)
-  bool is_MAD() const { return has_gemm_inst_ && gemm_inst_ == GemmInst::kMAD; }
-
   // Get aggregated shape information for II estimation
   int64_t GetTotalTensorCoreOps() const {
     int64_t total_ops = 0;
@@ -307,7 +288,7 @@ public:
                           std::set<BufferAccessInfo> &result) const override;
 
   bool containWarpgroupId(int id) const override {
-    return ContainsLoopBreak() || warpgroup_id_ == id;
+    return ContainsLoopBreak() || warpgroup_id_ == -1 || warpgroup_id_ == id;
   }
 
   // Check if this task contains loop_break call

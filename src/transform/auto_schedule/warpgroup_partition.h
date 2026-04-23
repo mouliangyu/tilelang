@@ -42,14 +42,7 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id);
 std::shared_ptr<IRStructure>
 RemoveUnusedLetDecls(std::shared_ptr<IRStructure> root);
 
-std::vector<std::shared_ptr<IRStructure>>
-CloneIRStructureChildrenWithWarpgroupFilter(SequenceNode *root_seq,
-                                            int warpgroup_id,
-                                            Map<Var, PrimExpr> &var_remap);
-
-class SimtCopyDetector;
-
-Stmt ConvertIRStructureToStmt(IRStructure *root);
+Stmt ConvertIRStructureToStmt(IRStructure *root, Var sid = Var());
 
 Stmt ReNestLetStmts(const Stmt &stmt);
 

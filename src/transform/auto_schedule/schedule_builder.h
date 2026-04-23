@@ -319,7 +319,7 @@ public:
     int64_t memory_limit = shared_memory_limit_;
     for (const auto &buffer_access : ctrl->GetBufferAccessInfo()) {
       const auto &buffer = buffer_access.buffer;
-      if (!IsSharedBuffer(buffer)) {
+      if (!IsSharedBuffer(buffer) && !IsL1Buffer(buffer)) {
         continue; // Only consider shared buffers for multi-buffer
       }
       if (buffer_to_num_versions.count(buffer)) {
