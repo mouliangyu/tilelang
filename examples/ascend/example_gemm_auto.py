@@ -53,7 +53,7 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, MIXED=True):
                     T.copy(W[n_tile * TILE_N : (n_tile + 1) * TILE_N, kt * TILE_K : (kt + 1) * TILE_K], w_l1)  # Cube
                     T.gemm(x_l1, w_l1, res, transpose_B=True, clear_accum=(kt == 0))  # Cube
                 if MIXED:
-                    T.dual_copy(res, temp)  # Vector
+                    T.dual_copy(res, temp)  # Cube
                     T.dual_copy(temp, C[m_tile * TILE_M : (m_tile + 1) * TILE_M, n_tile * TILE_N : (n_tile + 1) * TILE_N])  # Vector
                 else:
                     T.copy(res, C[m_tile * TILE_M, n_tile * TILE_N])  # Cube

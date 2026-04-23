@@ -642,11 +642,6 @@ static ScheduledKernelResult ScheduleSingleKernel(const Stmt &kernel_body,
 
   if (!flag_infos.empty()) {
     std::vector<Stmt> stmts[2];
-    auto seq = static_cast<SequenceNode *>(ir_structure.get());
-    auto pro_task0 = std::make_shared<TaskNode>();
-    auto pro_task1 = std::make_shared<TaskNode>();
-    auto epi_task0 = std::make_shared<TaskNode>();
-    auto epi_task1 = std::make_shared<TaskNode>();
     for (const auto &info : flag_infos) {
       if (info.mode == 0) {
         stmts[info.warpgroup_id].push_back(
