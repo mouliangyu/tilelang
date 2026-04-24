@@ -90,7 +90,9 @@ inline int64_t GetSharedMemoryLimit(Target target) {
   } else if (TargetIsSm100(target)) {
     return 228 * 1024;
   } else if (TargetIsAscend(target)) {
-    return 256 * 1024;
+    // Physical UB = 248 KB, but SimtVF (asc_vf_call) reserves at least 32 KB
+    // for thread context. Usable shared buffer = 248 - 32 = 216 KB.
+    return 216 * 1024;
   } else {
     return 48 * 1024;
   }
