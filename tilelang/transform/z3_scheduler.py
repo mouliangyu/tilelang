@@ -6,7 +6,6 @@ called from C++ via TVM FFI.
 
 import tvm_ffi
 import os
-import sys
 import json
 import time
 import threading
@@ -57,7 +56,7 @@ def z3_schedule_python(
     resource_flags: list[int],
     data_deps: list[tuple[int, int]],
     resource_deps: list[tuple[int, int]],
-    verbose: bool = True,
+    verbose: bool = False,
 ) -> tuple[list[int], list[int]]:
     """Z3-based scheduler implemented in Python.
 
@@ -88,12 +87,12 @@ def z3_schedule_python(
         raise RuntimeError("Z3 scheduling failed: n too small")
 
     if verbose:
-        print(f"[Python Z3] Starting scheduling for {n} tasks", file=sys.stderr)
-        print(f"[Python Z3] Latencies: {latencies}", file=sys.stderr)
-        print(f"[Python Z3] IIs: {iis}", file=sys.stderr)
-        print(f"[Python Z3] Resource flags: {resource_flags}", file=sys.stderr)
-        print(f"[Python Z3] Data dependencies: {data_deps}", file=sys.stderr)
-        print(f"[Python Z3] Resource dependencies: {resource_deps}", file=sys.stderr)
+        print(f"[Python Z3] Starting scheduling for {n} tasks")
+        print(f"[Python Z3] Latencies: {latencies}")
+        print(f"[Python Z3] IIs: {iis}")
+        print(f"[Python Z3] Resource flags: {resource_flags}")
+        print(f"[Python Z3] Data dependencies: {data_deps}")
+        print(f"[Python Z3] Resource dependencies: {resource_deps}")
 
     assert Z3_AVAILABLE, "z3-solver package is required but not installed"
 
@@ -115,7 +114,7 @@ def z3_schedule_python(
             latency_i = latencies[i]
             solver.add(start_vars[j] >= start_vars[i] + latency_i)
             if verbose:
-                print(f"[Python Z3] Data dependency: task {j} >= task {i} + {latency_i}", file=sys.stderr)
+                print(f"[Python Z3] Data dependency: task {j} >= task {i} + {latency_i}")
 
     # Add resource dependency constraints
     # For tasks i and j that use same resource, they cannot execute simultaneously
@@ -135,7 +134,7 @@ def z3_schedule_python(
             solver.add(z3.Implies(z3.Not(o_ij), start_vars[i] >= start_vars[j] + ii_j))
 
             if verbose:
-                print(f"[Python Z3] Resource dependency between {i} and {j}: ii_i={ii_i}, ii_j={ii_j}", file=sys.stderr)
+                print(f"[Python Z3] Resource dependency between {i} and {j}: ii_i={ii_i}, ii_j={ii_j}")
 
     # Objective: minimize maximum completion time (makespan)
     makespan = z3.Int("makespan")
@@ -167,7 +166,7 @@ def z3_schedule_python(
         task_indices.sort(key=lambda idx: (start_times[idx], idx))
 
         if verbose:
-            print(f"[Python Z3] Scheduling completed. Makespan = {makespan_val}", file=sys.stderr)
+            print(f"[Python Z3] Scheduling completed. Makespan = {makespan_val}")
         for i in range(n):
             idx = task_indices[i]
             if verbose:
@@ -226,7 +225,7 @@ def z3_schedule_loop_python(
     resource_deps: list[tuple[int, int]],
     buffer_sizes: list[int],
     memory_limit: int,
-    verbose: bool = True,
+    verbose: bool = False,
 ) -> tuple[list[int], list[int], int]:
     """Z3-based scheduler for loops with distance-aware dependencies.
 
@@ -266,13 +265,13 @@ def z3_schedule_loop_python(
         raise RuntimeError("Z3 loop scheduling failed: n too small")
 
     if verbose:
-        print(f"[Python Z3 Loop] Starting scheduling for {n} tasks", file=sys.stderr)
-        print(f"[Python Z3 Loop] Latencies: {latencies}", file=sys.stderr)
-        print(f"[Python Z3 Loop] IIs: {iis}", file=sys.stderr)
-        print(f"[Python Z3 Loop] Resource flags: {resource_flags}", file=sys.stderr)
-        print(f"[Python Z3 Loop] Data dependencies with distances: {data_deps}", file=sys.stderr)
-        print(f"[Python Z3 Loop] Resource dependencies: {resource_deps}", file=sys.stderr)
-        print(f"[Python Z3 Loop] Buffer sizes: {buffer_sizes} within {memory_limit}", file=sys.stderr)
+        print(f"[Python Z3 Loop] Starting scheduling for {n} tasks")
+        print(f"[Python Z3 Loop] Latencies: {latencies}")
+        print(f"[Python Z3 Loop] IIs: {iis}")
+        print(f"[Python Z3 Loop] Resource flags: {resource_flags}")
+        print(f"[Python Z3 Loop] Data dependencies with distances: {data_deps}")
+        print(f"[Python Z3 Loop] Resource dependencies: {resource_deps}")
+        print(f"[Python Z3 Loop] Buffer sizes: {buffer_sizes} within {memory_limit}")
 
     assert Z3_AVAILABLE, "z3-solver package is required but not installed"
 
@@ -286,12 +285,12 @@ def z3_schedule_loop_python(
     best_start_vars = None
 
     if verbose:
-        print(f"[Python Z3 Loop] Binary search range: [{ii_lower}, {ii_upper}, file=sys.stderr)")
+        print(f"[Python Z3 Loop] Binary search range: [{ii_lower}, {ii_upper})")
 
     while ii_lower < ii_upper:
         ii_mid = (ii_lower + ii_upper) // 2
         if verbose:
-            print(f"[Python Z3 Loop] Testing II = {ii_mid}", file=sys.stderr)
+            print(f"[Python Z3 Loop] Testing II = {ii_mid}")
 
         # Create solver for feasibility check
         solver = z3.Solver()
@@ -317,14 +316,14 @@ def z3_schedule_loop_python(
         for i in range(len(buffer_sizes)):
             solver.add(buffer_vars[i] >= 1)
             solver.add(buffer_vars[i] <= num_stages)
-        solver.add(z3.Sum([buffer_vars[i] * buffer_sizes[i] for i in range(len(buffer_sizes))]) <= memory_limit)
+        # solver.add(z3.Sum([buffer_vars[i] * buffer_sizes[i] for i in range(len(buffer_sizes))]) <= memory_limit)
 
         # Add data dependency constraints with distance
         for u, v, distance in data_deps:
             latency_u = latencies[u]
             if distance >= 0:
                 if verbose:
-                    print(f"[Python Z3 Loop] Data dependency: task {v} - task {u} >= {latency_u} - {ii_mid}*{distance}", file=sys.stderr)
+                    print(f"[Python Z3 Loop] Data dependency: task {v} - task {u} >= {latency_u} - {ii_mid}*{distance}")
                 solver.add(start_vars[v] - start_vars[u] >= latency_u - ii_mid * distance)
             else:
                 buffer_var_id = -distance - 1  # Convert to 0-based index
@@ -359,14 +358,14 @@ def z3_schedule_loop_python(
                     solver.add(z3.Implies(z3.Not(o_ij), r_vars[j] - r_vars[i] + ii_mid >= ii_i))
 
                 if verbose:
-                    print(f"[Python Z3 Loop] Resource dependency between {i} and {j}: ii_i={ii_i}, ii_j={ii_j}", file=sys.stderr)
+                    print(f"[Python Z3 Loop] Resource dependency between {i} and {j}: ii_i={ii_i}, ii_j={ii_j}")
 
         # Check feasibility
         if verbose:
-            print(f"[Python Z3 Loop] Checking feasibility for II = {ii_mid}...", file=sys.stderr)
+            print(f"[Python Z3 Loop] Checking feasibility for II = {ii_mid}...")
         if solver.check() == z3.sat:
             if verbose:
-                print(f"[Python Z3 Loop] II = {ii_mid} is feasible", file=sys.stderr)
+                print(f"[Python Z3 Loop] II = {ii_mid} is feasible")
             best_ii = ii_mid
             best_model = solver.model()
             best_start_vars = start_vars
@@ -378,7 +377,7 @@ def z3_schedule_loop_python(
             ii_upper = ii_mid
         else:
             if verbose:
-                print(f"[Python Z3 Loop] II = {ii_mid} is infeasible", file=sys.stderr)
+                print(f"[Python Z3 Loop] II = {ii_mid} is infeasible")
             # Need larger II
             ii_lower = ii_mid + 1
 
@@ -386,7 +385,7 @@ def z3_schedule_loop_python(
         raise RuntimeError("Z3 loop scheduling failed: no feasible II found")
 
     if verbose:
-        print(f"[Python Z3 Loop] Minimal feasible II = {best_ii}", file=sys.stderr)
+        print(f"[Python Z3 Loop] Minimal feasible II = {best_ii}")
 
     # Extract start times from best model
     start_times = []
@@ -413,7 +412,7 @@ def z3_schedule_loop_python(
     task_indices.sort(key=lambda idx: (start_times[idx], idx))
 
     if verbose:
-        print(f"[Python Z3 Loop] Scheduling completed. Minimal II = {best_ii}.", file=sys.stderr)
+        print(f"[Python Z3 Loop] Scheduling completed. Minimal II = {best_ii}.")
     for i in range(n):
         idx = task_indices[i]
         if verbose:
@@ -424,7 +423,7 @@ def z3_schedule_loop_python(
             )
     if verbose:
         for i in range(len(buffer_sizes)):
-            print(f"[Python Z3 Loop]   Buffer {i}: size={buffer_sizes[i]}, num_versions={buffer_vars[i]}", file=sys.stderr)
+            print(f"[Python Z3 Loop]   Buffer {i}: size={buffer_sizes[i]}, num_versions={buffer_vars[i]}")
 
     # Save schedule visualization when verbose is True
     if verbose:
@@ -588,18 +587,18 @@ def z3_schedule_loop_python(
                 plt.savefig(pdf_file, bbox_inches="tight")
                 plt.close(fig)  # Close the figure to free memory
 
-                print(f"[Python Z3 Loop] Schedule visualization saved as PNG: {png_file}", file=sys.stderr)
-                print(f"[Python Z3 Loop] Schedule visualization saved as PDF: {pdf_file}", file=sys.stderr)
+                print(f"[Python Z3 Loop] Schedule visualization saved as PNG: {png_file}")
+                print(f"[Python Z3 Loop] Schedule visualization saved as PDF: {pdf_file}")
 
             except ImportError as e:
-                print(f"[Python Z3 Loop] Warning: matplotlib not available, skipping visualization: {e}", file=sys.stderr)
+                print(f"[Python Z3 Loop] Warning: matplotlib not available, skipping visualization: {e}")
             except Exception as e:
-                print(f"[Python Z3 Loop] Warning: Failed to generate visualization: {e}", file=sys.stderr)
+                print(f"[Python Z3 Loop] Warning: Failed to generate visualization: {e}")
 
-            print(f"[Python Z3 Loop] Schedule visualization saved to {schedule_dir}/ (text, JSON, PNG, PDF, file=sys.stderr)")
+            print(f"[Python Z3 Loop] Schedule visualization saved to {schedule_dir}/ (text, JSON, PNG, PDF)")
 
         except Exception as e:
-            print(f"[Python Z3 Loop] Warning: Failed to save schedule visualization: {e}", file=sys.stderr)
+            print(f"[Python Z3 Loop] Warning: Failed to save schedule visualization: {e}")
 
     return start_times, best_ii
 

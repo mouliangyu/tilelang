@@ -87,6 +87,9 @@ inline bool RegionsEqual(const Region &a, const Region &b) {
   return true;
 }
 
+// Check if a warpgroup_id represents a broadcast (all warpgroups)
+inline bool IsWarpgroupBroadcast(int wg_id) { return wg_id == -1; }
+
 // Base class for all IR nodes in scheduling
 class IRStructure {
 public:
@@ -141,6 +144,28 @@ public:
     std::set<BufferAccessInfo> result;
     CollectBufferAccessInfo(num_wgs, result);
     return std::vector<BufferAccessInfo>(result.begin(), result.end());
+  }
+
+  // Collect tasks that could possibly be the first/last to access a specific
+  // (buffer, is_write, wg_id) within this IR subtree.
+  virtual bool
+  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                          std::set<const TaskNode *> &result) const = 0;
+  virtual bool
+  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                         std::set<const TaskNode *> &result) const = 0;
+
+  std::set<const TaskNode *>
+  GetFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id) const {
+    std::set<const TaskNode *> result;
+    CollectFirstAccessTasks(buffer, is_write, wg_id, result);
+    return result;
+  }
+  std::set<const TaskNode *>
+  GetLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id) const {
+    std::set<const TaskNode *> result;
+    CollectLastAccessTasks(buffer, is_write, wg_id, result);
+    return result;
   }
 
   // Substitute a variable throughout this IR node
@@ -287,6 +312,13 @@ public:
   CollectBufferAccessInfo(int num_wgs,
                           std::set<BufferAccessInfo> &result) const override;
 
+  bool
+  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                          std::set<const TaskNode *> &result) const override;
+  bool
+  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                         std::set<const TaskNode *> &result) const override;
+
   bool containWarpgroupId(int id) const override {
     return ContainsLoopBreak() || warpgroup_id_ == -1 || warpgroup_id_ == id;
   }
@@ -417,6 +449,13 @@ public:
   CollectBufferAccessInfo(int num_wgs,
                           std::set<BufferAccessInfo> &result) const override;
 
+  bool
+  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                          std::set<const TaskNode *> &result) const override;
+  bool
+  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                         std::set<const TaskNode *> &result) const override;
+
   void SetIIperIter(int64_t ii) { ii_per_iter_ = ii; }
 
   int64_t GetIIperIter() const { return ii_per_iter_; }
@@ -530,6 +569,13 @@ public:
   void
   CollectBufferAccessInfo(int num_wgs,
                           std::set<BufferAccessInfo> &result) const override;
+
+  bool
+  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                          std::set<const TaskNode *> &result) const override;
+  bool
+  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                         std::set<const TaskNode *> &result) const override;
 
   // Clone method
   std::shared_ptr<IRStructure> Clone() const override;
@@ -668,6 +714,13 @@ public:
   CollectBufferAccessInfo(int num_wgs,
                           std::set<BufferAccessInfo> &result) const override;
 
+  bool
+  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                          std::set<const TaskNode *> &result) const override;
+  bool
+  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                         std::set<const TaskNode *> &result) const override;
+
   // Clone method
   std::shared_ptr<IRStructure> Clone() const override;
 
@@ -756,6 +809,13 @@ public:
   CollectBufferAccessInfo(int num_wgs,
                           std::set<BufferAccessInfo> &result) const override;
 
+  bool
+  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                          std::set<const TaskNode *> &result) const override;
+  bool
+  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                         std::set<const TaskNode *> &result) const override;
+
   bool isInnerTask() const { return child->IsTask(); }
   int GetWarpgroupId() const override {
     ICHECK(isInnerTask());
@@ -816,6 +876,13 @@ public:
   void
   CollectBufferAccessInfo(int num_wgs,
                           std::set<BufferAccessInfo> &result) const override;
+
+  bool
+  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                          std::set<const TaskNode *> &result) const override;
+  bool
+  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
+                         std::set<const TaskNode *> &result) const override;
 
   // Clone method
   std::shared_ptr<IRStructure> Clone() const override;
