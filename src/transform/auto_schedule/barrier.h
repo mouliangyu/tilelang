@@ -723,11 +723,6 @@ static std::vector<SyncPoint> CollectSyncPoints(
         int cons_idx = unit_index[waiting_unit];
 
         if (prod_wg != cons_wg) {
-          LOG(WARNING) << prod_wg << ": ==========================";
-          PrintIRStructure(unit);
-          PrintIRStructure(waiting_unit);
-          LOG(WARNING) << cons_wg << ": ==========================";
-          // Cross-core sync: use ascend_cross_core_set_flag / wait_flag
           size_t pos = hard_event.find('_');
           std::string prod_pipe = "PIPE_" + hard_event.substr(0, pos);
           std::string cons_pipe = "PIPE_" + hard_event.substr(pos + 1);
@@ -900,6 +895,19 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
                                         sp.cons_wg_id);
       }
     } else if (sp.type == SyncType::IntraCore) {
+      // When producer and consumer share the same pipe, insert a pipe_barrier
+      // before the consumer to ensure pipeline ordering.
+      size_t pos = sp.hard_event.find('_');
+      if (pos != std::string::npos) {
+        std::string prod_pipe = sp.hard_event.substr(0, pos);
+        std::string cons_pipe = sp.hard_event.substr(pos + 1);
+        if (prod_pipe == cons_pipe) {
+          Stmt barrier = makeAscendPipeBarrier("PIPE_" + prod_pipe);
+          InsertStatementIntoScheduleUnit(sp.cons_unit, barrier, true,
+                                          sp.cons_wg_id);
+          continue;
+        }
+      }
       auto base_id = event_id_map.find(sp.hard_event);
       if (base_id == event_id_map.end()) {
         event_id_map[sp.hard_event] = 0;
