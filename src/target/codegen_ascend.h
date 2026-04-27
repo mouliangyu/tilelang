@@ -23,6 +23,19 @@ public:
   bool IsScopePartOfType() const final;
 
   void VisitExpr_(const BroadcastNode *op, std::ostream &os) final; // NOLINT(*)
+  void VisitExpr_(const FloatImmNode *op, std::ostream &os) final;
+
+  // Vector element access (use .x/.y/.z/.w like CUDA, not .s0/.s1 from base)
+  void PrintVecElemLoad(const std::string &vec, DataType t, int i,
+                        std::ostream &os) final;
+  void PrintVecElemStore(const std::string &vec, DataType t, int i,
+                         const std::string &value) final;
+
+protected:
+  // Scalarize vector math calls (like CUDA)
+  void PrintCallExtern(Type ret_type, ffi::String global_symbol,
+                       const ffi::Array<PrimExpr> &args, bool skip_first_arg,
+                       std::ostream &os) final;
 
 private:
   int simtvf_helper_counter_{0};
@@ -34,6 +47,7 @@ private:
   bool has_nd2nz_copy_{false};
   bool has_nd2nz_copy_included_{false};
   bool has_simdvf_included_{false};
+  bool has_limits_included_{false};
 
   enum class AscendKernelMode { kVector, kCube, kMix };
   AscendKernelMode kernel_mode_{AscendKernelMode::kVector};

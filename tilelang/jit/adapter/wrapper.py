@@ -879,7 +879,7 @@ class TLAscendSourceWrapper(TLCUDASourceWrapper):
 
     _TYPE_MAP = {
         "float32": "float",
-        "float16": "half_t",
+        "float16": "half",
         "bfloat16": "bfloat16_t",
         "float64": "double",
         "int64": "int64_t",

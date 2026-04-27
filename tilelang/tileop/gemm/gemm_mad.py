@@ -63,7 +63,7 @@ def _make_access_ptr(buf, region, rw_mask):
 
 _ASCEND_DTYPE_MAP = {
     "bfloat16": "bfloat16_t",
-    "float16": "half_t",
+    "float16": "half",
     "float32": "float",
     "int8": "int8_t",
     "int16": "int16_t",

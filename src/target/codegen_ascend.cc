@@ -42,9 +42,15 @@ void CodeGenTileLangAscend::PrintType(DataType t, std::ostream &os) {
     switch (t.bits()) {
     case 16:
       if (lanes == 1) {
-        os << "half_t";
+        os << "half";
+      } else if (lanes == 2) {
+        os << "float16x2_t";
+      } else if (lanes == 4) {
+        os << "float16x4_t";
+      } else if (lanes == 8) {
+        os << "float16x8_t";
       } else {
-        fail = true; // half vector not yet supported
+        fail = true;
       }
       break;
     case 32:
@@ -167,6 +173,12 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   if (has_gemm_l1_ && !has_gemm_l1_included_) {
     decl_stream << "#include <tl_templates/ascend/gemm.h>\n";
     has_gemm_l1_included_ = true;
+  }
+
+  // Conditionally include <limits> for std::numeric_limits<T>::infinity()
+  if (!has_limits_included_) {
+    decl_stream << "#include <limits>\n";
+    has_limits_included_ = true;
   }
 
   // Conditionally include nd2nz_copy.h when ascend_nd2nz_copy is used
@@ -1404,6 +1416,54 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::LetStmtNode *op) {
   CodeGenC::VisitStmt_(op);
 }
 
+inline void PrintConst(const FloatImmNode *op, std::ostream &os,
+                       CodeGenTileLangAscend *p) { // NOLINT(*)
+  // Type code is kBFloat/kFloat16
+  // which is indeed CUTLASS supported types currently
+  if (op->dtype.is_bfloat16() || op->dtype.is_float16() ||
+      op->dtype.is_float()) {
+    std::ostringstream temp;
+    if (std::isinf(op->value)) {
+      if (op->value < 0) {
+        temp << "-";
+      }
+      temp << "std::numeric_limits<";
+      p->PrintType(op->dtype, temp);
+      temp << ">::infinity()";
+    } else if (std::isnan(op->value)) {
+      temp << "std::numeric_limits<";
+      p->PrintType(op->dtype, temp);
+      temp << ">::quiet_NaN()";
+    } else {
+      p->PrintType(op->dtype, temp);
+      temp << '(' << std::hexfloat << op->value << 'f';
+      temp << "/*" << std::scientific << op->value << "*/";
+      temp << ')';
+    }
+    p->MarkConst(temp.str());
+    os << temp.str();
+    return;
+  }
+  // Type code is kFloat8_e5m2 or kE4M4Float
+  if (op->dtype.is_float8() || op->dtype.is_float4()) {
+    p->PrintType(op->dtype, os);
+    os << '(' << std::hexfloat << op->value << 'f';
+    os << "/*" << std::scientific << op->value << "*/";
+    os << ')';
+    return;
+  }
+  // Type code is kFloat64/kFloat32 (kFloat16 is handled above)
+  switch (op->dtype.bits()) {
+  default:
+    LOG(FATAL) << "Bad bit-width for float: " << op->dtype << "\n";
+  }
+}
+
+void CodeGenTileLangAscend::VisitExpr_(const FloatImmNode *op,
+                                       std::ostream &os) { // NOLINT(*)
+  PrintConst(op, os, this);
+}
+
 void CodeGenTileLangAscend::PrintStorageSync(const CallNode *op) {
   ICHECK_GE(op->args.size(), 1U);
   PrintIndent();
@@ -1425,6 +1485,73 @@ void CodeGenTileLangAscend::PrintStorageScope(const std::string &scope,
 bool CodeGenTileLangAscend::IsScopePartOfType() const {
   // Ascend requires memory scope qualifiers as part of the pointer type
   return true;
+}
+
+void CodeGenTileLangAscend::PrintVecElemLoad(const std::string &vec, DataType t,
+                                             int i, std::ostream &os) {
+  if (t.is_scalar()) {
+    os << vec;
+    return;
+  }
+  static const char access[] = {'x', 'y', 'z', 'w'};
+  ICHECK(i >= 0 && i < 4) << "Ascend vector lanes max 4: i=" << i;
+  if (t.lanes() <= 4) {
+    os << vec << "." << access[i];
+  } else {
+    os << "((" << vec << ")." << access[i / 2] << ")";
+  }
+}
+
+void CodeGenTileLangAscend::PrintVecElemStore(const std::string &vec,
+                                              DataType t, int i,
+                                              const std::string &value) {
+  this->PrintIndent();
+  static const char access[] = {'x', 'y', 'z', 'w'};
+  ICHECK(i >= 0 && i < 4) << "Ascend vector lanes max 4: i=" << i;
+  if (t.lanes() <= 4) {
+    stream << vec << "." << access[i] << " = " << value << ";\n";
+  } else {
+    stream << "((" << vec << ")." << access[i / 2] << ") = " << value << ";\n";
+  }
+}
+
+void CodeGenTileLangAscend::PrintCallExtern(Type ret_type,
+                                            ffi::String global_symbol,
+                                            const ffi::Array<PrimExpr> &args,
+                                            bool skip_first_arg,
+                                            std::ostream &os) {
+  DataType ret_dtype = GetRuntimeDataType(ret_type);
+  if (ret_dtype.is_fixed_length_vector()) {
+    // Scalarize: for each lane, extract scalar args, call the scalar function,
+    // store result into the result vector lane.
+    std::string sret = name_supply_->FreshName("_");
+    this->PrintIndent();
+    this->PrintType(ret_dtype, stream);
+    stream << ' ' << sret << ";\n";
+    {
+      std::vector<std::string> sargs;
+      size_t arg_begin = static_cast<size_t>(skip_first_arg);
+      for (size_t i = arg_begin; i < args.size(); ++i) {
+        std::string val = SSAGetID(PrintExpr(args[i]), args[i].dtype());
+        sargs.push_back(std::move(val));
+      }
+      for (int i = 0; i < ret_dtype.lanes(); ++i) {
+        std::ostringstream scall;
+        scall << global_symbol << "(";
+        for (size_t j = 0; j < sargs.size(); ++j) {
+          if (j > 0)
+            scall << ", ";
+          PrintVecElemLoad(sargs[j], args[arg_begin + j].dtype(), i, scall);
+        }
+        scall << ")";
+        PrintVecElemStore(sret, ret_dtype, i, scall.str());
+      }
+    }
+    os << sret;
+  } else {
+    CodeGenC::PrintCallExtern(ret_type, global_symbol, args, skip_first_arg,
+                              os);
+  }
 }
 
 } // namespace codegen
