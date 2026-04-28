@@ -353,6 +353,19 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
         alloc_storage_scope_[v.get()] = scope;
       }
     }
+    // Reset variable naming state so the helper function body gets fresh names
+    std::unordered_map<const tir::VarNode*, std::string> saved_var_idmap;
+    saved_var_idmap.swap(var_idmap_);
+    NameSupply saved_name_supply = name_supply_;
+    name_supply_ = NameSupply();
+    // Pre-populate capture variable names so GetVarID works inside the body
+    for (const auto &v : captures) {
+      auto it = saved_var_idmap.find(v.get());
+      if (it != saved_var_idmap.end()) {
+        var_idmap_[v.get()] = it->second;
+        name_supply_->ReserveName(it->second);
+      }
+    }
     // Render body to temporary stream
     std::ostringstream saved_main_stream;
     stream.swap(saved_main_stream);
@@ -364,6 +377,9 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
     stream.str("");
     stream.clear();
     stream.swap(saved_main_stream);
+    // Restore naming state
+    var_idmap_.swap(saved_var_idmap);
+    name_supply_ = saved_name_supply;
 
     // Emit __simd_vf__ helper function to decl_stream
     decl_stream << "__simd_vf__ inline void " << helper_name << "(";
@@ -476,6 +492,19 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
       alloc_storage_scope_[v.get()] = scope;
     }
   }
+  // Reset variable naming state so the helper function body gets fresh names
+  std::unordered_map<const tir::VarNode*, std::string> saved_var_idmap;
+  saved_var_idmap.swap(var_idmap_);
+  NameSupply saved_name_supply = name_supply_;
+  name_supply_ = NameSupply();
+  // Pre-populate capture variable names so GetVarID works inside the body
+  for (const auto &v : captures) {
+    auto it = saved_var_idmap.find(v.get());
+    if (it != saved_var_idmap.end()) {
+      var_idmap_[v.get()] = it->second;
+      name_supply_->ReserveName(it->second);
+    }
+  }
   std::ostringstream saved_main_stream;
   stream.swap(saved_main_stream);
   bool old_inside_simtvf_body = inside_simtvf_body_;
@@ -486,6 +515,9 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
   stream.str("");
   stream.clear();
   stream.swap(saved_main_stream);
+  // Restore naming state
+  var_idmap_.swap(saved_var_idmap);
+  name_supply_ = saved_name_supply;
 
   int64_t total_threads = thread_x * thread_y * thread_z;
   decl_stream << "__simt_vf__ ";
