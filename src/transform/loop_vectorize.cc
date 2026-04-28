@@ -655,6 +655,9 @@ private:
     int min_vec_size = arith::ZeroAwareGCD(
         buffer_vec_size,
         vector_load_bits_max_ / (buffer->dtype.bits() * buffer->dtype.lanes()));
+    if (buffer->dtype.is_bfloat16()) {
+      min_vec_size = arith::ZeroAwareGCD(min_vec_size, 2);
+    }
     bool is_invariant = false;
     int try_vec_size = buffer_vec_size;
     while (try_vec_size >= min_vec_size) {

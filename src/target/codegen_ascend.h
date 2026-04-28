@@ -24,6 +24,7 @@ public:
 
   void VisitExpr_(const BroadcastNode *op, std::ostream &os) final; // NOLINT(*)
   void VisitExpr_(const FloatImmNode *op, std::ostream &os) final;
+  void VisitExpr_(const CastNode *op, std::ostream &os) final;
 
   // Vector element access (use .x/.y/.z/.w like CUDA, not .s0/.s1 from base)
   void PrintVecElemLoad(const std::string &vec, DataType t, int i,
@@ -48,6 +49,8 @@ private:
   bool has_nd2nz_copy_included_{false};
   bool has_simdvf_included_{false};
   bool has_limits_included_{false};
+  bool has_bf16_cast_{false};
+  bool has_bf16_cast_included_{false};
 
   enum class AscendKernelMode { kVector, kCube, kMix };
   AscendKernelMode kernel_mode_{AscendKernelMode::kVector};

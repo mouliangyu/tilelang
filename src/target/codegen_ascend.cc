@@ -106,6 +106,8 @@ void CodeGenTileLangAscend::PrintType(DataType t, std::ostream &os) {
   } else if (t.is_bfloat16()) {
     if (lanes == 1) {
       os << "bfloat16_t";
+    } else if (lanes == 2) {
+      os << "bfloat16x2_t";
     } else {
       fail = true;
     }
@@ -198,6 +200,38 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
     }
   });
 
+  // Pre-scan for bf16 buffers needing cast intrinsics
+  tir::PostOrderVisit(f->body, [&](const ObjectRef &n) {
+    if (const auto *alloc = n.as<tir::AllocateNode>()) {
+      if (alloc->dtype.is_bfloat16()) {
+        has_bf16_cast_ = true;
+      }
+    }
+    if (const auto *store = n.as<tir::BufferStoreNode>()) {
+      if (store->buffer->dtype.is_bfloat16()) {
+        has_bf16_cast_ = true;
+      }
+    }
+    if (const auto *load = n.as<tir::BufferLoadNode>()) {
+      if (load->buffer->dtype.is_bfloat16()) {
+        has_bf16_cast_ = true;
+      }
+    }
+    if (const auto *cast = n.as<tir::CastNode>()) {
+      if (cast->dtype.is_bfloat16() || cast->value->dtype.is_bfloat16()) {
+        has_bf16_cast_ = true;
+      }
+    }
+  });
+  if (!has_bf16_cast_) {
+    for (const auto &kv : f->buffer_map) {
+      if (kv.second->dtype.is_bfloat16()) {
+        has_bf16_cast_ = true;
+        break;
+      }
+    }
+  }
+
   // Conditionally include gemm.h when ascend_gemm_l1 is used
   if (has_gemm_l1_ && !has_gemm_l1_included_) {
     decl_stream << "#include <tl_templates/ascend/gemm.h>\n";
@@ -208,6 +242,12 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   if (!has_limits_included_) {
     decl_stream << "#include <limits>\n";
     has_limits_included_ = true;
+  }
+
+  // Include asc_bf16.h when bf16 buffers exist (needed for vector casts)
+  if (has_bf16_cast_ && !has_bf16_cast_included_) {
+    decl_stream << "#include <simt_api/asc_bf16.h>\n";
+    has_bf16_cast_included_ = true;
   }
 
   // Conditionally include nd2nz_copy.h when ascend_nd2nz_copy is used
@@ -1527,6 +1567,29 @@ inline void PrintConst(const FloatImmNode *op, std::ostream &os,
 void CodeGenTileLangAscend::VisitExpr_(const FloatImmNode *op,
                                        std::ostream &os) { // NOLINT(*)
   PrintConst(op, os, this);
+}
+
+void CodeGenTileLangAscend::VisitExpr_(const CastNode *op,
+                                       std::ostream &os) { // NOLINT(*)
+  DataType from = op->value->dtype;
+  DataType to = op->dtype;
+  if (from.is_bfloat16() && from.lanes() == 2 && to.is_float() &&
+      to.bits() == 32 && to.lanes() == 2) {
+    has_bf16_cast_ = true;
+    os << "__bfloat1622float2(";
+    PrintExpr(op->value, os);
+    os << ")";
+    return;
+  }
+  if (from.is_float() && from.bits() == 32 && from.lanes() == 2 &&
+      to.is_bfloat16() && to.lanes() == 2) {
+    has_bf16_cast_ = true;
+    os << "__float22bfloat162_rn(";
+    PrintExpr(op->value, os);
+    os << ")";
+    return;
+  }
+  CodeGenC::VisitExpr_(op, os);
 }
 
 void CodeGenTileLangAscend::PrintStorageSync(const CallNode *op) {
