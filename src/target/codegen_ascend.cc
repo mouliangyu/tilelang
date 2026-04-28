@@ -398,13 +398,11 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
     saved_var_idmap.swap(var_idmap_);
     NameSupply saved_name_supply = name_supply_;
     name_supply_ = NameSupply();
-    // Pre-populate capture variable names so GetVarID works inside the body
-    for (const auto &v : captures) {
-      auto it = saved_var_idmap.find(v.get());
-      if (it != saved_var_idmap.end()) {
-        var_idmap_[v.get()] = it->second;
-        name_supply_->ReserveName(it->second);
-      }
+    // Carry over all outer variable names so they remain accessible inside the
+    // helper body. Don't reserve them in name_supply_ so inner variables get
+    // clean unsuffixed names.
+    for (const auto &kv : saved_var_idmap) {
+      var_idmap_[kv.first] = kv.second;
     }
     // Render body to temporary stream
     std::ostringstream saved_main_stream;
@@ -537,13 +535,11 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
   saved_var_idmap.swap(var_idmap_);
   NameSupply saved_name_supply = name_supply_;
   name_supply_ = NameSupply();
-  // Pre-populate capture variable names so GetVarID works inside the body
-  for (const auto &v : captures) {
-    auto it = saved_var_idmap.find(v.get());
-    if (it != saved_var_idmap.end()) {
-      var_idmap_[v.get()] = it->second;
-      name_supply_->ReserveName(it->second);
-    }
+  // Carry over all outer variable names so they remain accessible inside the
+  // helper body. Don't reserve them in name_supply_ so inner variables get
+  // clean unsuffixed names.
+  for (const auto &kv : saved_var_idmap) {
+    var_idmap_[kv.first] = kv.second;
   }
   std::ostringstream saved_main_stream;
   stream.swap(saved_main_stream);
