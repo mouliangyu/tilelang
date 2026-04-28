@@ -45,8 +45,7 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, MIXED=True):
             w_l1 = T.alloc_l1((TILE_N, TILE_K), "bfloat16")
             temp = T.alloc_shared((TILE_M // 2, TILE_N), "float32")
 
-            for out_tile in T.Serial(TILES_PER_CORE):
-                tile_idx = out_tile * NUM_BLOCKS + bx
+            for tile_idx in T.Persistent([OUT_TILES], NUM_BLOCKS, bx):
                 m_tile, n_tile = aswt_swizzle(tile_idx)
                 for kt in T.Pipelined(K_TILES, num_stages=NUM_STAGES):
                     T.copy(X[m_tile * TILE_M : (m_tile + 1) * TILE_M, kt * TILE_K : (kt + 1) * TILE_K], x_l1)  # Cube
