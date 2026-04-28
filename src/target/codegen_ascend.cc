@@ -1256,6 +1256,10 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
 }
 
 void CodeGenTileLangAscend::VisitStmt_(const ForNode *op) {
+  if (op->kind == tir::ForKind::kUnrolled) {
+    PrintIndent();
+    stream << "#pragma unroll\n";
+  }
   CodeGenC::VisitStmt_(op);
 }
 
