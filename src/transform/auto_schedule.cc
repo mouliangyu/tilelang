@@ -585,7 +585,8 @@ static ScheduledKernelResult ScheduleSingleKernel(const Stmt &kernel_body,
 
   // Build ScheduleUnits from IRStructure (Z3 scheduling + Ascend sync)
   ScheduleUnitBuilder unit_builder;
-  unit_builder.SetSharedMemoryLimit(GetSharedMemoryLimit(target));
+  unit_builder.SetMemoryLimit("shared", GetSharedMemoryLimit(target));
+  unit_builder.SetMemoryLimit("shared.l1", GetL1MemoryLimit(target));
   unit_builder.ScheduleRecursive(ir_structure, {});
 
   // Assign warpgroup IDs based on pipe and buffer scopes

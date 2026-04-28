@@ -316,7 +316,18 @@ public:
     std::vector<int64_t> buffer_sizes;
     std::map<Buffer, int64_t> buffer_to_num_versions;
     std::set<Buffer> multi_buffering_buffers;
-    int64_t memory_limit = shared_memory_limit_;
+    // Build memory groups from memory_limits_ map.
+    // std::map iteration is ordered by key: "shared" then "shared.l1".
+    std::map<std::string, int> scope_to_group;
+    std::vector<int64_t> group_capacities;
+    std::vector<std::vector<int64_t>> group_indices;
+    for (const auto &entry : memory_limits_) {
+      if (entry.second > 0) {
+        scope_to_group[entry.first] = (int)group_capacities.size();
+        group_capacities.push_back(entry.second);
+        group_indices.push_back({});
+      }
+    }
     for (const auto &buffer_access : ctrl->GetBufferAccessInfo()) {
       const auto &buffer = buffer_access.buffer;
       if (!IsSharedBuffer(buffer) && !IsL1Buffer(buffer)) {
@@ -325,14 +336,17 @@ public:
       if (buffer_to_num_versions.count(buffer)) {
         continue;
       }
+      std::string scope = IsL1Buffer(buffer) ? "shared.l1" : "shared";
+      int group_id = scope_to_group[scope];
       // If the buffer is used outside the loop or is read before being written,
       // we cannot multi-buffer it
       if (used_buffers.count(buffer) || !check_buffer_write_first(buffer)) {
         buffer_to_num_versions[buffer] = 1;
-        memory_limit -= GetBufferSize(buffer);
+        group_capacities[group_id] -= GetBufferSize(buffer);
       } else {
         buffer_sizes.push_back(GetBufferSize(buffer));
         buffer_to_num_versions[buffer] = -(int64_t)buffer_sizes.size();
+        group_indices[group_id].push_back((int64_t)buffer_sizes.size() - 1);
         multi_buffering_buffers.insert(buffer);
       }
     }
@@ -403,6 +417,17 @@ public:
       tvm_buffer_sizes.push_back(val);
     }
 
+    // Build memory groups for FFI: each inner array is [capacity, idx0, idx1, ...]
+    ffi::Array<ffi::Array<int64_t>> tvm_memory_groups;
+    for (size_t g = 0; g < group_capacities.size(); ++g) {
+      ffi::Array<int64_t> group;
+      group.push_back(group_capacities[g]);
+      for (auto idx : group_indices[g]) {
+        group.push_back(idx);
+      }
+      tvm_memory_groups.push_back(group);
+    }
+
     // Extract results
     // Python function returns (start_times, stages) as a tuple of two
     // arrays
@@ -410,7 +435,7 @@ public:
         z3_schedule_loop_func
             .value()(num_stages, tvm_latencies, tvm_iis, tvm_resource_flags,
                      tvm_data_deps, tvm_resource_deps, tvm_buffer_sizes,
-                     memory_limit)
+                     tvm_memory_groups)
             .cast<ffi::Tuple<ffi::Array<int64_t>, int64_t>>();
 
     ffi::Array<int64_t> start_times = return_val.get<0>();
@@ -528,11 +553,13 @@ public:
     ctrl->multi_buffering_buffers = std::move(multi_buffering_buffers);
   }
 
-  // Set shared memory limit for pipeline (in bytes)
-  void SetSharedMemoryLimit(int64_t bytes) { shared_memory_limit_ = bytes; }
+  // Set memory limit for a given buffer scope (e.g. "shared", "shared.l1")
+  void SetMemoryLimit(const std::string& scope, int64_t bytes) {
+    memory_limits_[scope] = bytes;
+  }
 
 private:
-  int64_t shared_memory_limit_ = 48 * 1024;
+  std::map<std::string, int64_t> memory_limits_ = {{"shared", 48 * 1024}};
 };
 
 } // namespace tl

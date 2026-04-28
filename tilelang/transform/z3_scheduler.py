@@ -224,7 +224,7 @@ def z3_schedule_loop_python(
     data_deps: list[tuple[int, int, int]],  # (i, j, distance)
     resource_deps: list[tuple[int, int]],
     buffer_sizes: list[int],
-    memory_limit: int,
+    memory_groups: list[list[int]],  # [[capacity, idx0, idx1, ...], ...]
     verbose: bool = False,
 ) -> tuple[list[int], list[int], int]:
     """Z3-based scheduler for loops with distance-aware dependencies.
@@ -271,7 +271,7 @@ def z3_schedule_loop_python(
         print(f"[Python Z3 Loop] Resource flags: {resource_flags}")
         print(f"[Python Z3 Loop] Data dependencies with distances: {data_deps}")
         print(f"[Python Z3 Loop] Resource dependencies: {resource_deps}")
-        print(f"[Python Z3 Loop] Buffer sizes: {buffer_sizes} within {memory_limit}")
+        print(f"[Python Z3 Loop] Buffer sizes: {buffer_sizes} within groups {memory_groups}")
 
     assert Z3_AVAILABLE, "z3-solver package is required but not installed"
 
@@ -316,7 +316,11 @@ def z3_schedule_loop_python(
         for i in range(len(buffer_sizes)):
             solver.add(buffer_vars[i] >= 1)
             solver.add(buffer_vars[i] <= num_stages)
-        solver.add(z3.Sum([buffer_vars[i] * buffer_sizes[i] for i in range(len(buffer_sizes))]) <= memory_limit)
+        for group in memory_groups:
+            cap = group[0]
+            idxs = group[1:]
+            if idxs:
+                solver.add(z3.Sum([buffer_vars[i] * buffer_sizes[i] for i in idxs]) <= cap)
 
         # Add data dependency constraints with distance
         for u, v, distance in data_deps:
@@ -605,17 +609,23 @@ def z3_schedule_loop_python(
 
 # FFI-exposed function for loop scheduling
 @tvm_ffi.register_global_func("tl.transform.z3_schedule_loop_python")
-def z3_schedule_loop_ffi(num_stages, latencies, iis, resource_flags, data_deps, resource_deps, buffer_sizes, memory_limit):
+def z3_schedule_loop_ffi(num_stages, latencies, iis, resource_flags, data_deps, resource_deps, buffer_sizes, memory_groups):
     """FFI wrapper for z3_schedule_loop_python.
 
     This function accepts TVM containers and converts them to Python lists.
     Data dependencies are expected as triples (i, j, distance).
+    memory_groups is a list of lists: [[capacity, idx0, idx1, ...], ...]
     """
     # Convert TVM containers to Python lists
     latencies_list = list(latencies)
     iis_list = list(iis)
     resource_flags_list = list(resource_flags)
     buffer_sizes_list = list(buffer_sizes)
+    # Convert memory groups
+    memory_groups_list = []
+    if memory_groups is not None:
+        for i in range(len(memory_groups)):
+            memory_groups_list.append(list(memory_groups[i]))
     # Convert data dependencies (triples)
     data_deps_list = []
     if data_deps is not None:
@@ -634,7 +644,7 @@ def z3_schedule_loop_ffi(num_stages, latencies, iis, resource_flags, data_deps, 
     # Call the actual scheduler (Z3 is not thread-safe, serialize access)
     with _z3_lock:
         start_times, best_ii = z3_schedule_loop_python(
-            num_stages, latencies_list, iis_list, resource_flags_list, data_deps_list, resource_deps_list, buffer_sizes_list, memory_limit
+            num_stages, latencies_list, iis_list, resource_flags_list, data_deps_list, resource_deps_list, buffer_sizes_list, memory_groups_list
         )
 
     # Return start_times and promotes as separate arrays for easier FFI handling

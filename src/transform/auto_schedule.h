@@ -98,6 +98,13 @@ inline int64_t GetSharedMemoryLimit(Target target) {
   }
 }
 
+inline int64_t GetL1MemoryLimit(Target target) {
+  if (TargetIsAscend(target)) {
+    return 512 * 1024; // 512 KB L1 cache on Ascend
+  }
+  return 0;
+}
+
 // Function to rewrite alloc_buffers for multi-version (double buffer) support
 Stmt RewriteAllocBuffers(
     const Stmt &stmt, const std::vector<MultiVersionBufferInfo> &buffer_infos);
