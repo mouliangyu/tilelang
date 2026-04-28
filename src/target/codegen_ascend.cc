@@ -1,11 +1,40 @@
 #include "codegen_ascend.h"
 
 #include "../op/builtin.h"
+#include <sstream>
 #include <string>
 
 #include "../../3rdparty/tvm/src/tir/transforms/ir_utils.h"
 #include "../transform/common/attr.h"
 #include <tvm/tir/stmt_functor.h>
+
+static std::string FixIndent(const std::string &body) {
+  size_t min_indent = std::string::npos;
+  std::istringstream iss(body);
+  std::string line;
+  while (std::getline(iss, line)) {
+    if (line.empty()) continue;
+    size_t pos = line.find_first_not_of(' ');
+    if (pos != std::string::npos && pos < min_indent) {
+      min_indent = pos;
+    }
+  }
+  if (min_indent == std::string::npos || min_indent <= 2) {
+    return body;
+  }
+  size_t strip = min_indent - 2;
+  iss.clear();
+  iss.seekg(0);
+  std::ostringstream oss;
+  while (std::getline(iss, line)) {
+    if (line.size() >= strip && line.find_first_not_of(' ') != std::string::npos) {
+      oss << line.substr(strip) << "\n";
+    } else {
+      oss << line << "\n";
+    }
+  }
+  return oss.str();
+}
 
 namespace tvm {
 namespace codegen {
@@ -331,7 +360,7 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
     inside_simdvf_body_ = true;
     CodeGenC::VisitStmt(op->body);
     inside_simdvf_body_ = old_inside_simdvf_body;
-    std::string helper_body = stream.str();
+    std::string helper_body = FixIndent(stream.str());
     stream.str("");
     stream.clear();
     stream.swap(saved_main_stream);
@@ -453,7 +482,7 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
   inside_simtvf_body_ = true;
   CodeGenC::VisitStmt(op->body);
   inside_simtvf_body_ = old_inside_simtvf_body;
-  std::string helper_body = stream.str();
+  std::string helper_body = FixIndent(stream.str());
   stream.str("");
   stream.clear();
   stream.swap(saved_main_stream);
