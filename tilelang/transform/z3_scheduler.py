@@ -644,7 +644,14 @@ def z3_schedule_loop_ffi(num_stages, latencies, iis, resource_flags, data_deps, 
     # Call the actual scheduler (Z3 is not thread-safe, serialize access)
     with _z3_lock:
         start_times, best_ii = z3_schedule_loop_python(
-            num_stages, latencies_list, iis_list, resource_flags_list, data_deps_list, resource_deps_list, buffer_sizes_list, memory_groups_list
+            num_stages,
+            latencies_list,
+            iis_list,
+            resource_flags_list,
+            data_deps_list,
+            resource_deps_list,
+            buffer_sizes_list,
+            memory_groups_list,
         )
 
     # Return start_times and promotes as separate arrays for easier FFI handling

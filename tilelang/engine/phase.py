@@ -210,7 +210,6 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
         IRModule: The transformed module, ready for target-specific optimization passes.
     """
     mod = tir.transform.BindTarget(target)(mod)
-    print(mod)
     if is_ascend_target(target):
         mod = tilelang.analysis.VFFragmentNarrowChecker()(mod)
 
@@ -233,7 +232,6 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.AutoSchedule()(mod)
         mod = tilelang.transform.Simplify()(mod)
     # Lower T.Parallel inside SimdVF to MicroAPI vector ops (before layout passes)
-    print(mod)
     if is_ascend_target(target) and has_simdvf_region(mod):
         mod = tilelang.transform.AscendSimdVFLowerParallel()(mod)
     # Set layouts for reducers
@@ -323,11 +321,9 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     enable_aggressive_merge = should_enable_aggressive_merge(pass_ctx=pass_ctx, target=target)
     # Ascend VEC instructions require UB addresses to be 32-byte aligned.
     merge_align_bytes = 32 if is_ascend_target(target) else 16
-    print(mod)
     mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge, align_bytes=merge_align_bytes)(
         mod
     )
-    print(mod)
     if allow_tma_and_warp_specialized(pass_ctx=pass_ctx, target=target):
         mod = tilelang.transform.InjectFenceProxy()(mod)
     else:

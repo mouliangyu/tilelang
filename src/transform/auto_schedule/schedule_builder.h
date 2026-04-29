@@ -417,7 +417,8 @@ public:
       tvm_buffer_sizes.push_back(val);
     }
 
-    // Build memory groups for FFI: each inner array is [capacity, idx0, idx1, ...]
+    // Build memory groups for FFI: each inner array is [capacity, idx0, idx1,
+    // ...]
     ffi::Array<ffi::Array<int64_t>> tvm_memory_groups;
     for (size_t g = 0; g < group_capacities.size(); ++g) {
       ffi::Array<int64_t> group;
@@ -554,7 +555,7 @@ public:
   }
 
   // Set memory limit for a given buffer scope (e.g. "shared", "shared.l1")
-  void SetMemoryLimit(const std::string& scope, int64_t bytes) {
+  void SetMemoryLimit(const std::string &scope, int64_t bytes) {
     memory_limits_[scope] = bytes;
   }
 
