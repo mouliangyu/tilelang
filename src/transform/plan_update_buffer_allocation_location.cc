@@ -134,6 +134,53 @@ public:
     collector(func->body);
     managed_allocations_ = collector.managed_allocations;
 
+    // Collect SIMT_VF/SIMD_VF interior: for shared/global buffers whose LCA
+    // falls inside a VF block, we hoist them to the block containing the VF
+    // region.
+    std::unordered_set<const StmtNode *> vf_interior;
+    std::unordered_map<const StmtNode *, const BlockNode *> stmt_to_vf_block;
+    std::unordered_map<const BlockNode *, const BlockNode *> vf_to_parent_block;
+
+    struct SimtVFCollector : StmtExprVisitor {
+      std::unordered_set<const StmtNode *> &interior;
+      std::unordered_map<const StmtNode *, const BlockNode *> &stmt_to_vf;
+      std::unordered_map<const BlockNode *, const BlockNode *> &vf_to_parent;
+      std::vector<const BlockNode *> block_stack;
+      const BlockNode *current_vf = nullptr;
+
+      SimtVFCollector(
+          std::unordered_set<const StmtNode *> &i,
+          std::unordered_map<const StmtNode *, const BlockNode *> &s,
+          std::unordered_map<const BlockNode *, const BlockNode *> &v)
+          : interior(i), stmt_to_vf(s), vf_to_parent(v) {}
+
+      void VisitStmt(const Stmt &n) override {
+        if (current_vf) {
+          interior.insert(n.get());
+          stmt_to_vf[n.get()] = current_vf;
+        }
+        StmtExprVisitor::VisitStmt(n);
+      }
+
+      void VisitStmt_(const BlockNode *op) override {
+        const BlockNode *prev_vf = current_vf;
+        if (op->name_hint == "SIMT_VF" || op->name_hint == "SIMD_VF") {
+          current_vf = op;
+          const BlockNode *parent =
+              block_stack.empty() ? nullptr : block_stack.back();
+          vf_to_parent[op] = parent;
+        }
+        block_stack.push_back(op);
+        StmtExprVisitor::VisitStmt_(op);
+        block_stack.pop_back();
+        current_vf = prev_vf;
+      }
+    };
+
+    SimtVFCollector vf_collector{vf_interior, stmt_to_vf_block,
+                                 vf_to_parent_block};
+    vf_collector(func->body);
+
     for (const auto &kv : func->buffer_map) {
       const Buffer &buffer = kv.second;
       arg_buffer_vars.emplace(buffer->data.get());
@@ -156,6 +203,19 @@ public:
       if (stmt != nullptr || vit != var_lca.end()) {
         if (arg_buffer_vars.count(buffer->data.get())) {
           continue;
+        }
+        // Hoist non-local buffers out of SIMT_VF: only local-scope
+        // buffers (local, local.fragment) may stay inside VF.
+        if (stmt != nullptr && vf_interior.count(stmt)) {
+          if (buffer.scope() != "local") {
+            const BlockNode *vf_block = stmt_to_vf_block.at(stmt);
+            auto pit = vf_to_parent_block.find(vf_block);
+            if (pit != vf_to_parent_block.end() && pit->second != nullptr) {
+              stmt = pit->second;
+            } else {
+              continue;
+            }
+          }
         }
         if (managed_allocations_.count(buffer->data.get())) {
           alloc_buffers_[stmt].push_back(buffer);

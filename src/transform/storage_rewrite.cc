@@ -985,6 +985,8 @@ private:
       // Ascend SimtVF: if this is the begin of a simtvf_scope, override
       // thread_scope_ BEFORE processing gen events so that local
       // allocations first touched inside the scope attach to it.
+      // Shared/global buffers are kept at the parent scope via the
+      // effective_scope check in the FindAlloc call below.
       if (seq[i].scope_pair_offset > 0 && s.stmt->IsInstance<AttrStmtNode>()) {
         const auto *attr = static_cast<const AttrStmtNode *>(s.stmt);
         if (attr->attr_key == "tl.simtvf_scope" ||
@@ -1038,7 +1040,15 @@ private:
             }
           }
           if (dst_entry == nullptr) {
-            dst_entry = FindAlloc(alloc, thread_scope_, storage_scope,
+            // Shared/global buffers must not be attached inside simtvf_scope.
+            // Use the parent thread_scope_ instead.
+            const Object *effective_scope = thread_scope_;
+            if (saved_thread_scope_ != nullptr &&
+                (storage_scope.rank == StorageRank::kShared ||
+                 storage_scope.rank == StorageRank::kGlobal)) {
+              effective_scope = saved_thread_scope_;
+            }
+            dst_entry = FindAlloc(alloc, effective_scope, storage_scope,
                                   entry.num_physical_dimensions, enable_reuse,
                                   reuse_require_exact_matched_dtype);
           }
@@ -1055,9 +1065,6 @@ private:
           PlanNewScope(op);
         } else if (op->attr_key == "tl.simtvf_scope" ||
                    op->attr_key == "tl.simdvf_scope") {
-          // Ascend SimtVF: the scope enter (save/restore) is handled
-          // BEFORE gen event processing (see above). Here we only
-          // handle the exit: restore thread_scope_.
           if (seq[i].scope_pair_offset <= 0) {
             thread_scope_ = saved_thread_scope_;
             saved_thread_scope_ = nullptr;
