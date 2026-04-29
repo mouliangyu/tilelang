@@ -3,7 +3,7 @@ from tvm import tir, IRModule
 from tvm.target import Target
 import tilelang
 from tilelang.transform import PassContext
-from tilelang.contrib.nvcc import have_tma, is_hopper, have_pdl
+from tilelang.contrib.nvcc import have_tma, have_pdl
 
 
 def is_ascend_target(target: Target | None = None) -> bool:
@@ -210,6 +210,7 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
         IRModule: The transformed module, ready for target-specific optimization passes.
     """
     mod = tir.transform.BindTarget(target)(mod)
+    print(mod)
     if is_ascend_target(target):
         mod = tilelang.analysis.VFFragmentNarrowChecker()(mod)
 
@@ -232,6 +233,7 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.AutoSchedule()(mod)
         mod = tilelang.transform.Simplify()(mod)
     # Lower T.Parallel inside SimdVF to MicroAPI vector ops (before layout passes)
+    print(mod)
     if is_ascend_target(target) and has_simdvf_region(mod):
         mod = tilelang.transform.AscendSimdVFLowerParallel()(mod)
     # Set layouts for reducers
@@ -265,31 +267,8 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
 
 def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     pass_ctx = tilelang.transform.get_pass_context()
-    # Lower the shared.barrier into specific initialization slot
-    mod = tilelang.transform.LowerSharedBarrier()(mod)
-    # Lower the shared.tmem into specific initialization slot
-    mod = tilelang.transform.LowerSharedTmem()(mod)
-    # which may be introduced by the LegalizeSafeMemoryAccess
-    if allow_tma_and_warp_specialized(pass_ctx=pass_ctx, target=target):
-        mod = tilelang.transform.IfStmtBinding()(mod)
-        mod = tilelang.transform.MultiVersionBuffer()(mod)
-        mod = tilelang.transform.WarpSpecialized()(mod)
-        mod = tilelang.transform.InjectTmaBarrier()(mod)
-        # if tma is not enabled, we can also do pipeline planning
-        # to get better performance with async copy
-        mod = tilelang.transform.PipelinePlanning()(mod)
-        mod = tilelang.transform.InjectSoftwarePipeline()(mod)
-        # warp_specialized pass will pack the if stmt into the block
-        # so we need to lower the opaque block first
-        mod = tilelang.transform.LowerOpaqueBlock()(mod)
-        if is_hopper(target):
-            mod = tilelang.transform.RewriteWgmmaSync()(mod)
-    else:
-        mod = tilelang.transform.IfStmtBinding()(mod)
-        mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
-        mod = tilelang.transform.PipelinePlanning()(mod)
-        mod = tilelang.transform.InjectSoftwarePipeline()(mod)
 
+    mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tir.transform.NarrowDataType(32)(mod)
@@ -344,9 +323,11 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     enable_aggressive_merge = should_enable_aggressive_merge(pass_ctx=pass_ctx, target=target)
     # Ascend VEC instructions require UB addresses to be 32-byte aligned.
     merge_align_bytes = 32 if is_ascend_target(target) else 16
+    print(mod)
     mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge, align_bytes=merge_align_bytes)(
         mod
     )
+    print(mod)
     if allow_tma_and_warp_specialized(pass_ctx=pass_ctx, target=target):
         mod = tilelang.transform.InjectFenceProxy()(mod)
     else:
