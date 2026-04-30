@@ -1714,10 +1714,15 @@ void CodeGenTileLangAscend::PrintCallExtern(Type ret_type,
       return "%d";
     };
 
+    const char *pfx = inside_simtvf_body_ ? "printf" : "AscendC::printf";
+    const char *ctx_var = inside_simtvf_body_ ? "threadIdx.x" : "blockIdx.x";
+    const char *ctx_fmt = inside_simtvf_body_ ? "threadIdx=%d" : "blockIdx=%d";
+
     if (global_symbol == "debug_print_msg") {
       // args: [msg_string]
       std::string msg = Downcast<StringImm>(args[arg_start])->value;
-      os << "AscendC::printf(\"[blockIdx=%d] " << msg << "\\n\", blockIdx.x)";
+      os << pfx << "(\"[" << ctx_fmt << "] " << msg << "\\n\", " << ctx_var
+         << ")";
       return;
     }
 
@@ -1725,8 +1730,8 @@ void CodeGenTileLangAscend::PrintCallExtern(Type ret_type,
       // args: [msg_string, val]
       std::string msg = Downcast<StringImm>(args[arg_start])->value;
       std::string fmt = get_fmt(args[arg_start + 1].dtype());
-      os << "AscendC::printf(\"[blockIdx=%d] " << msg << " = " << fmt
-         << "\\n\", blockIdx.x, ";
+      os << pfx << "(\"[" << ctx_fmt << "] " << msg << " = " << fmt << "\\n\", "
+         << ctx_var << ", ";
       emit_val(arg_start + 1);
       os << ")";
       return;
@@ -1737,8 +1742,8 @@ void CodeGenTileLangAscend::PrintCallExtern(Type ret_type,
       std::string msg = Downcast<StringImm>(args[arg_start])->value;
       std::string buf_name = Downcast<StringImm>(args[arg_start + 1])->value;
       std::string fmt = get_fmt(args[arg_start + 3].dtype());
-      os << "AscendC::printf(\"[blockIdx=%d] " << msg << " " << buf_name
-         << "[%d] = " << fmt << "\\n\", blockIdx.x, ";
+      os << pfx << "(\"[" << ctx_fmt << "] " << msg << " " << buf_name
+         << "[%d] = " << fmt << "\\n\", " << ctx_var << ", ";
       PrintExpr(args[arg_start + 2], os);
       os << ", ";
       emit_val(arg_start + 3);
