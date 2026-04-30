@@ -331,9 +331,8 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
             # in hopper device, wgmma is an async proxy
             # so we need to inject a fence proxy before it
             mod = tilelang.transform.InjectFenceProxy()(mod)
-    if not is_ascend_target(target):
-        mod = tilelang.transform.ThreadSync("shared")(mod)
-        mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
+    mod = tilelang.transform.ThreadSync("shared")(mod)
+    mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
     mod = tilelang.transform.MergeIfStmt()(mod)
     # Inject PTX async copy must behind the thread sync pass
     # as ptx async copy won't be recognized as a valid buffer load

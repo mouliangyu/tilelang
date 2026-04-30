@@ -1652,16 +1652,56 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
   StorageScope sync_scope = StorageScope::Create(storage_scope);
   auto *n = func.CopyOnWrite();
   auto stmt = n->body;
-  if (sync_scope.rank == StorageRank::kShared && sync_scope.tag.empty()) {
-    stmt = ThreadSyncAfterWaitQueueInserter(sync_scope)(stmt);
-  }
+
   // Get warp size from target, defaulting to 32 if not available
   int warp_size = 32;
+  bool is_ascend = false;
   if (auto target = func->GetAttr<Target>(tvm::attr::kTarget)) {
     warp_size = target.value()
                     ->GetAttr<Integer>("thread_warp_size", 32)
                     .value()
                     .IntValue();
+    for (auto &key : target.value()->keys) {
+      is_ascend |= key == "ascend";
+    }
+  }
+
+  if (is_ascend) {
+    // Ascend: process each SimtVF block independently.
+    // ThreadSyncAfterWaitQueueInserter and ThreadPartialSyncRewriter are
+    // CUDA-specific and skipped for Ascend.
+    struct SimtVFThreadSyncMutator : StmtExprMutator {
+      StorageScope scope;
+      Map<Var, Buffer> buf_map;
+      int warp_size;
+      SimtVFThreadSyncMutator(StorageScope scope, Map<Var, Buffer> buf_map,
+                              int warp_size)
+          : scope(std::move(scope)), buf_map(std::move(buf_map)),
+            warp_size(warp_size) {}
+      Stmt VisitStmt_(const BlockNode *op) final {
+        if (op->name_hint == "SIMT_VF") {
+          TileLangThreadSyncPlanner planner(scope, warp_size);
+          for (const auto &[_, buffer] : buf_map) {
+            planner.SetBufferDataToBuffer(buffer->data, buffer);
+          }
+          Stmt body = op->body;
+          planner(body);
+          body = ThreadSyncInserter(scope, planner.syncs_inserted_)(body);
+          ObjectPtr<BlockNode> new_block = make_object<BlockNode>(*op);
+          new_block->body = body;
+          return Block(new_block);
+        }
+        return StmtExprMutator::VisitStmt_(op);
+      }
+    };
+    SimtVFThreadSyncMutator mutator{sync_scope, func->buffer_map, warp_size};
+    n->body = mutator(stmt);
+    return func;
+  }
+
+  // Original non-Ascend path
+  if (sync_scope.rank == StorageRank::kShared && sync_scope.tag.empty()) {
+    stmt = ThreadSyncAfterWaitQueueInserter(sync_scope)(stmt);
   }
   TileLangThreadSyncPlanner planner(sync_scope, warp_size);
   for (const auto &[_, buffer] : func->buffer_map) {
