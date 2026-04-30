@@ -13,7 +13,8 @@ static std::string FixIndent(const std::string &body) {
   std::istringstream iss(body);
   std::string line;
   while (std::getline(iss, line)) {
-    if (line.empty()) continue;
+    if (line.empty())
+      continue;
     size_t pos = line.find_first_not_of(' ');
     if (pos != std::string::npos && pos < min_indent) {
       min_indent = pos;
@@ -27,7 +28,8 @@ static std::string FixIndent(const std::string &body) {
   iss.seekg(0);
   std::ostringstream oss;
   while (std::getline(iss, line)) {
-    if (line.size() >= strip && line.find_first_not_of(' ') != std::string::npos) {
+    if (line.size() >= strip &&
+        line.find_first_not_of(' ') != std::string::npos) {
       oss << line.substr(strip) << "\n";
     } else {
       oss << line << "\n";
@@ -394,7 +396,7 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
       }
     }
     // Reset variable naming state so the helper function body gets fresh names
-    std::unordered_map<const tir::VarNode*, std::string> saved_var_idmap;
+    std::unordered_map<const tir::VarNode *, std::string> saved_var_idmap;
     saved_var_idmap.swap(var_idmap_);
     NameSupply saved_name_supply = name_supply_;
     name_supply_ = NameSupply();
@@ -531,7 +533,7 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
     }
   }
   // Reset variable naming state so the helper function body gets fresh names
-  std::unordered_map<const tir::VarNode*, std::string> saved_var_idmap;
+  std::unordered_map<const tir::VarNode *, std::string> saved_var_idmap;
   saved_var_idmap.swap(var_idmap_);
   NameSupply saved_name_supply = name_supply_;
   name_supply_ = NameSupply();
@@ -1672,10 +1674,115 @@ void CodeGenTileLangAscend::PrintCallExtern(Type ret_type,
       }
     }
     os << sret;
-  } else {
-    CodeGenC::PrintCallExtern(ret_type, global_symbol, args, skip_first_arg,
-                              os);
   }
+
+  // Intercept debug_print_* call_extern functions for Ascend.
+  // blockIdx is an ASC builtin available only inside kernel functions, so we
+  // emit AscendC::printf inline instead of calling through template helpers
+  // (which live at file scope and can't see the builtins).
+  {
+    size_t arg_start = static_cast<size_t>(skip_first_arg);
+
+    auto emit_val = [&](size_t idx) {
+      DataType dtype = args[idx].dtype();
+      if (dtype.is_bool()) {
+        PrintExpr(args[idx], os);
+        os << " ? \"true\" : \"false\"";
+      } else if ((dtype.is_float() || dtype.is_bfloat16()) &&
+                 dtype.bits() < 32) {
+        os << "(float)(";
+        PrintExpr(args[idx], os);
+        os << ")";
+      } else if (!dtype.is_float() && !dtype.is_bfloat16()) {
+        if (dtype.bits() < 32) {
+          os << "(int)(";
+          PrintExpr(args[idx], os);
+          os << ")";
+        } else {
+          PrintExpr(args[idx], os);
+        }
+      } else {
+        PrintExpr(args[idx], os);
+      }
+    };
+
+    auto get_fmt = [](DataType dtype) -> std::string {
+      if (dtype.is_bool())
+        return "%s";
+      if (dtype.is_float() || dtype.is_bfloat16())
+        return "%f";
+      return "%d";
+    };
+
+    if (global_symbol == "debug_print_msg") {
+      // args: [msg_string]
+      std::string msg = Downcast<StringImm>(args[arg_start])->value;
+      os << "AscendC::printf(\"[blockIdx=%d] " << msg << "\\n\", blockIdx.x)";
+      return;
+    }
+
+    if (global_symbol == "debug_print_var") {
+      // args: [msg_string, val]
+      std::string msg = Downcast<StringImm>(args[arg_start])->value;
+      std::string fmt = get_fmt(args[arg_start + 1].dtype());
+      os << "AscendC::printf(\"[blockIdx=%d] " << msg << " = " << fmt
+         << "\\n\", blockIdx.x, ";
+      emit_val(arg_start + 1);
+      os << ")";
+      return;
+    }
+
+    if (global_symbol == "debug_print_buffer_value") {
+      // args: [msg_string, buf_name, index, val]
+      std::string msg = Downcast<StringImm>(args[arg_start])->value;
+      std::string buf_name = Downcast<StringImm>(args[arg_start + 1])->value;
+      std::string fmt = get_fmt(args[arg_start + 3].dtype());
+      os << "AscendC::printf(\"[blockIdx=%d] " << msg << " " << buf_name
+         << "[%d] = " << fmt << "\\n\", blockIdx.x, ";
+      PrintExpr(args[arg_start + 2], os);
+      os << ", ";
+      emit_val(arg_start + 3);
+      os << ")";
+      return;
+    }
+
+    if (global_symbol == "debug_print_buffer_dump") {
+      // args: [msg, buf_name, ptr, size, type_str]
+      uint64_t size_val = Downcast<IntImm>(args[arg_start + 3])->value;
+      std::string dtype_str = Downcast<StringImm>(args[arg_start + 4])->value;
+      os << "AscendC::DumpTensor(AscendC::LocalTensor<" << dtype_str
+         << ">(AscendC::TPosition::VECIN, (uint32_t)(uintptr_t)";
+      PrintExpr(args[arg_start + 2], os);
+      os << ", " << size_val << "), 0, " << size_val << ")";
+      return;
+    }
+    if (global_symbol == "debug_print_global_buffer_dump") {
+      // args: [msg, buf_name, ptr, size, type_str]
+      uint64_t size_val = Downcast<IntImm>(args[arg_start + 3])->value;
+      std::string dtype_str = Downcast<StringImm>(args[arg_start + 4])->value;
+      this->PrintIndent();
+      this->stream << "{ AscendC::GlobalTensor<" << dtype_str
+                   << "> __dump_gt; __dump_gt.SetGlobalBuffer(";
+      // args[arg_start+2] via access_ptr → resolve to the raw buffer Var
+      if (auto *call = args[arg_start + 2].as<tir::CallNode>()) {
+        // tvm_access_ptr(base, ...) → extract base Var
+        if (call->args.size() >= 2) {
+          PrintExpr(call->args[1], this->stream);
+        } else {
+          PrintExpr(args[arg_start + 2], this->stream);
+        }
+      } else {
+        PrintExpr(args[arg_start + 2], this->stream);
+      }
+      this->stream << ", " << size_val
+                   << "); AscendC::DumpTensor(__dump_gt, 0, " << size_val
+                   << "); }\n";
+      return;
+    }
+  }
+  // debug_print_global_buffer_dump handled in VisitStmt_(EvaluateNode)
+
+  CodeGenC::PrintCallExtern(ret_type, global_symbol, args, skip_first_arg, os);
 }
 
 } // namespace codegen
