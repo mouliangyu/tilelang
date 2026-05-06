@@ -1238,6 +1238,9 @@ private:
     if (lhs.touched.size() != 1 || rhs.touched.size() != 1) {
       return false;
     }
+    if (lhs.buffer_indices.size() > 1 || rhs.buffer_indices.size() > 1) {
+      return false;
+    }
     ConstrSet prev_cset{lhs.cset};
     ConstrSet curr_cset{rhs.cset};
     arith::Analyzer analyzer;
@@ -1400,21 +1403,20 @@ private:
       return false;
     }
 
-    if (prev.buffer_indices.size() != curr.buffer_indices.size()) {
-      // They are not the same indices, should be conflict.
-      return true;
-    }
-
     if (prev.is_pointer_access || curr.is_pointer_access) {
       // For accesses created via tvm_access_ptr we may still be able to prove
       // disjointness using their byte ranges. If both sides expose a touched
       // interval and we can show they don't overlap, skip the conflict.
-      if (prev.is_pointer_access && curr.is_pointer_access &&
-          PointerAccessIsDisjoint(prev, curr)) {
+      if (PointerAccessIsDisjoint(prev, curr)) {
         return false;
       }
       // Otherwise fall back to the conservative answer: treat them as
       // overlapping.
+      return true;
+    }
+
+    if (prev.buffer_indices.size() != curr.buffer_indices.size()) {
+      // They are not the same indices, should be conflict.
       return true;
     }
 
