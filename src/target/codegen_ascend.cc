@@ -1674,6 +1674,7 @@ void CodeGenTileLangAscend::PrintCallExtern(Type ret_type,
       }
     }
     os << sret;
+    return;
   }
 
   // Intercept debug_print_* call_extern functions for Ascend.
