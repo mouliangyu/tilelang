@@ -269,10 +269,10 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
     mix_aiv_count_ = vector_count;
   } else if (has_cube || has_vector) {
     LOG(FATAL) << "T.Cube() and T.Vector() must be used together for Mix mode";
-  } else if (has_simtvf || has_simdvf) {
-    kernel_mode_ = AscendKernelMode::kVector;
-  } else {
+  } else if (has_gemm_l1_ || has_nd2nz_copy_) {
     kernel_mode_ = AscendKernelMode::kCube;
+  } else {
+    kernel_mode_ = AscendKernelMode::kVector;
   }
 
   auto global_symbol = f->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol);
