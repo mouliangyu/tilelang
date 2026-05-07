@@ -134,52 +134,56 @@ public:
     collector(func->body);
     managed_allocations_ = collector.managed_allocations;
 
-    // Collect SIMT_VF/SIMD_VF interior: for shared/global buffers whose LCA
-    // falls inside a VF block, we hoist them to the block containing the VF
-    // region.
-    std::unordered_set<const StmtNode *> vf_interior;
-    std::unordered_map<const StmtNode *, const BlockNode *> stmt_to_vf_block;
-    std::unordered_map<const BlockNode *, const BlockNode *> vf_to_parent_block;
+    // Collect Ascend region block interiors (SIMT_VF, SIMD_VF, CUBE, VECTOR):
+    // for shared/global buffers whose LCA falls inside a region block, we hoist
+    // them to the block containing that region.
+    std::unordered_set<const StmtNode *> region_interior;
+    std::unordered_map<const StmtNode *, const BlockNode *>
+        stmt_to_region_block;
+    std::unordered_map<const BlockNode *, const BlockNode *>
+        region_to_parent_block;
 
-    struct SimtVFCollector : StmtExprVisitor {
+    struct AscendRegionCollector : StmtExprVisitor {
       std::unordered_set<const StmtNode *> &interior;
-      std::unordered_map<const StmtNode *, const BlockNode *> &stmt_to_vf;
-      std::unordered_map<const BlockNode *, const BlockNode *> &vf_to_parent;
+      std::unordered_map<const StmtNode *, const BlockNode *> &stmt_to_region;
+      std::unordered_map<const BlockNode *, const BlockNode *>
+          &region_to_parent;
       std::vector<const BlockNode *> block_stack;
-      const BlockNode *current_vf = nullptr;
+      const BlockNode *current_region = nullptr;
 
-      SimtVFCollector(
+      AscendRegionCollector(
           std::unordered_set<const StmtNode *> &i,
           std::unordered_map<const StmtNode *, const BlockNode *> &s,
           std::unordered_map<const BlockNode *, const BlockNode *> &v)
-          : interior(i), stmt_to_vf(s), vf_to_parent(v) {}
+          : interior(i), stmt_to_region(s), region_to_parent(v) {}
 
       void VisitStmt(const Stmt &n) override {
-        if (current_vf) {
+        if (current_region) {
           interior.insert(n.get());
-          stmt_to_vf[n.get()] = current_vf;
+          stmt_to_region[n.get()] = current_region;
         }
         StmtExprVisitor::VisitStmt(n);
       }
 
       void VisitStmt_(const BlockNode *op) override {
-        const BlockNode *prev_vf = current_vf;
-        if (op->name_hint == "SIMT_VF" || op->name_hint == "SIMD_VF") {
-          current_vf = op;
+        const BlockNode *prev_region = current_region;
+        if (op->name_hint == "SIMT_VF" || op->name_hint == "SIMD_VF" ||
+            op->name_hint == "CUBE" || op->name_hint == "VECTOR") {
+          current_region = op;
           const BlockNode *parent =
               block_stack.empty() ? nullptr : block_stack.back();
-          vf_to_parent[op] = parent;
+          region_to_parent[op] = parent;
         }
         block_stack.push_back(op);
         StmtExprVisitor::VisitStmt_(op);
         block_stack.pop_back();
-        current_vf = prev_vf;
+        current_region = prev_region;
       }
     };
 
-    SimtVFCollector vf_collector{vf_interior, stmt_to_vf_block,
-                                 vf_to_parent_block};
-    vf_collector(func->body);
+    AscendRegionCollector region_collector{
+        region_interior, stmt_to_region_block, region_to_parent_block};
+    region_collector(func->body);
 
     for (const auto &kv : func->buffer_map) {
       const Buffer &buffer = kv.second;
@@ -204,18 +208,51 @@ public:
         if (arg_buffer_vars.count(buffer->data.get())) {
           continue;
         }
-        // Hoist non-local buffers out of SIMT_VF: only local-scope
-        // buffers (local, local.fragment) may stay inside VF.
-        if (stmt != nullptr && vf_interior.count(stmt)) {
-          if (buffer.scope() != "local") {
-            const BlockNode *vf_block = stmt_to_vf_block.at(stmt);
-            auto pit = vf_to_parent_block.find(vf_block);
-            if (pit != vf_to_parent_block.end() && pit->second != nullptr) {
-              stmt = pit->second;
+        // Hoist buffers out of region blocks.  When regions are nested (e.g.
+        // SimtVF inside VECTOR), we loop until the allocation site is outside
+        // all region blocks or a region allows the buffer scope to stay.
+        if (stmt != nullptr) {
+          // Identify the region block (if any) that stmt falls inside or is
+          // itself equal to.
+          auto get_region = [&](const StmtNode *s) -> const BlockNode * {
+            auto it = stmt_to_region_block.find(s);
+            if (it != stmt_to_region_block.end()) return it->second;
+            for (const auto &kv : region_to_parent_block) {
+              if (static_cast<const StmtNode *>(kv.first) == s) return kv.first;
+            }
+            return nullptr;
+          };
+
+          for (;;) {
+            const BlockNode *region_block = get_region(stmt);
+            if (!region_block) break;
+
+            const std::string &hint = region_block->name_hint;
+            bool should_hoist = false;
+
+            if (hint == "SIMT_VF" || hint == "SIMD_VF") {
+              should_hoist = (buffer.scope() != "local");
+            } else if (hint == "CUBE" || hint == "VECTOR") {
+              auto scope = buffer.scope();
+              should_hoist =
+                  (scope == "shared" || scope == "shared.dyn");
+            }
+
+            if (should_hoist) {
+              auto pit = region_to_parent_block.find(region_block);
+              if (pit != region_to_parent_block.end() &&
+                  pit->second != nullptr) {
+                stmt = pit->second;
+              } else {
+                stmt = nullptr;
+                break;
+              }
             } else {
-              continue;
+              break;
             }
           }
+
+          if (!stmt) continue;
         }
         if (managed_allocations_.count(buffer->data.get())) {
           alloc_buffers_[stmt].push_back(buffer);
