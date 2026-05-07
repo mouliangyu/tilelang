@@ -38,6 +38,10 @@ protected:
                        const ffi::Array<PrimExpr> &args, bool skip_first_arg,
                        std::ostream &os) final;
 
+  // Scalarize vector binary ops (add/sub/mul/div) into per-element ops
+  void PrintVecBinaryOp(const std::string &op, DataType t, PrimExpr lhs,
+                        PrimExpr rhs, std::ostream &os) final;
+
 private:
   int simtvf_helper_counter_{0};
   bool inside_simtvf_body_{false};

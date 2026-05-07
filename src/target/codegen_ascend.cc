@@ -1641,6 +1641,36 @@ void CodeGenTileLangAscend::PrintVecElemStore(const std::string &vec,
   }
 }
 
+void CodeGenTileLangAscend::PrintVecBinaryOp(const std::string &op, DataType t,
+                                             PrimExpr lhs, PrimExpr rhs,
+                                             std::ostream &os) {
+  // Only scalarize float4 division; other vector binary ops fall through
+  // to the base CodeGenC implementation.
+  if (op != "/" || t.lanes() <= 1) {
+    CodeGenC::PrintVecBinaryOp(op, t, lhs, rhs, os);
+    return;
+  }
+
+  std::string sret = name_supply_->FreshName("_");
+  this->PrintIndent();
+  this->PrintType(t, stream);
+  stream << ' ' << sret << ";\n";
+  {
+    std::string vlhs = SSAGetID(PrintExpr(lhs), lhs.dtype());
+    std::string vrhs = SSAGetID(PrintExpr(rhs), rhs.dtype());
+    for (int i = 0; i < t.lanes(); ++i) {
+      std::ostringstream value_temp;
+      value_temp << "(";
+      PrintVecElemLoad(vlhs, lhs.dtype(), i, value_temp);
+      value_temp << " / ";
+      PrintVecElemLoad(vrhs, rhs.dtype(), i, value_temp);
+      value_temp << ")";
+      PrintVecElemStore(sret, t, i, value_temp.str());
+    }
+  }
+  os << sret;
+}
+
 void CodeGenTileLangAscend::PrintCallExtern(Type ret_type,
                                             ffi::String global_symbol,
                                             const ffi::Array<PrimExpr> &args,
