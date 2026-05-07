@@ -71,6 +71,8 @@ struct Constr {
     case kConstr:
       return value;
     case kBindValue:
+      if (var.dtype().is_vector())
+        return Bool(true);
       return var == value;
     case kBindRange:
       return tir::And(var >= range->min, var < (range->min + range->extent));
