@@ -47,6 +47,7 @@ private:
   bool inside_simtvf_body_{false};
   int simdvf_helper_counter_{0};
   bool inside_simdvf_body_{false};
+  bool has_gemm_l0_{false};
   bool has_gemm_l1_{false};
   bool has_gemm_l1_included_{false};
   bool has_nd2nz_copy_{false};

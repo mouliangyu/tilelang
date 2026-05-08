@@ -196,6 +196,9 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
       if (call->op.same_as(tl::ascend_gemm_l1())) {
         has_gemm_l1_ = true;
       }
+      if (call->op.same_as(tl::ascend_mad())) {
+        has_gemm_l0_ = true;
+      }
       if (call->op.same_as(tl::ascend_nd2nz_copy())) {
         has_nd2nz_copy_ = true;
       }
@@ -269,7 +272,7 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
     mix_aiv_count_ = vector_count;
   } else if (has_cube || has_vector) {
     LOG(FATAL) << "T.Cube() and T.Vector() must be used together for Mix mode";
-  } else if (has_gemm_l1_ || has_nd2nz_copy_) {
+  } else if (has_gemm_l0_ || has_gemm_l1_ || has_nd2nz_copy_) {
     kernel_mode_ = AscendKernelMode::kCube;
   } else {
     kernel_mode_ = AscendKernelMode::kVector;
