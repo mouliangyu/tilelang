@@ -216,26 +216,33 @@ public:
           // itself equal to.
           auto get_region = [&](const StmtNode *s) -> const BlockNode * {
             auto it = stmt_to_region_block.find(s);
-            if (it != stmt_to_region_block.end()) return it->second;
+            if (it != stmt_to_region_block.end())
+              return it->second;
             for (const auto &kv : region_to_parent_block) {
-              if (static_cast<const StmtNode *>(kv.first) == s) return kv.first;
+              if (static_cast<const StmtNode *>(kv.first) == s)
+                return kv.first;
             }
             return nullptr;
           };
 
           for (;;) {
             const BlockNode *region_block = get_region(stmt);
-            if (!region_block) break;
+            if (!region_block)
+              break;
 
             const std::string &hint = region_block->name_hint;
             bool should_hoist = false;
 
             if (hint == "SIMT_VF" || hint == "SIMD_VF") {
-              should_hoist = (buffer.scope() != "local");
+              auto scope = buffer.scope();
+              std::string_view sv(scope.data(), scope.size());
+              std::string_view prefix = "local";
+              should_hoist = (sv.substr(0, prefix.size()) != prefix);
             } else if (hint == "CUBE" || hint == "VECTOR") {
               auto scope = buffer.scope();
-              should_hoist =
-                  (scope == "shared" || scope == "shared.dyn");
+              std::string_view sv(scope.data(), scope.size());
+              std::string_view prefix = "shared";
+              should_hoist = (sv.substr(0, prefix.size()) == prefix);
             }
 
             if (should_hoist) {
@@ -252,7 +259,8 @@ public:
             }
           }
 
-          if (!stmt) continue;
+          if (!stmt)
+            continue;
         }
         if (managed_allocations_.count(buffer->data.get())) {
           alloc_buffers_[stmt].push_back(buffer);
