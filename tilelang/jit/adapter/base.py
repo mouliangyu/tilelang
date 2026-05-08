@@ -53,7 +53,9 @@ class BaseKernelAdapter(ABC):
         time) so that any upstream stream guards are respected. If CUDA is
         unavailable, it returns a lambda that yields 0.
         """
-        if torch.cuda.is_available():
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return lambda: int(torch.npu.current_stream().npu_stream)
+        elif torch.cuda.is_available():
             try:
                 torch.cuda._lazy_init()
                 current_device = torch._C._cuda_getDevice
@@ -62,8 +64,6 @@ class BaseKernelAdapter(ABC):
             except Exception:
                 # Fallback to Python API if internal handles are unavailable
                 return lambda: int(torch.cuda.current_stream().cuda_stream)
-        elif hasattr(torch, "npu") and torch.npu.is_available():
-            return lambda: int(torch.npu.current_stream().npu_stream)
         # CPU or device unavailable: no stream semantics
         return lambda: 0
 
@@ -82,6 +82,8 @@ class BaseKernelAdapter(ABC):
                 return lambda: torch.device("cuda", current_device())
             except Exception:
                 return lambda: torch.device("cuda", torch.cuda.current_device())
+        elif hasattr(torch, "npu") and torch.npu.is_available():
+            return lambda: torch.device("npu", torch.npu.current_device())
         # CPU fallback
         return lambda: torch.device("cpu")
 

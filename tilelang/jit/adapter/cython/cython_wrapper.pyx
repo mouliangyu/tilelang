@@ -177,13 +177,13 @@ cdef class CythonKernelWrapper:
 
         # Use current device stream if none specified
         if stream == -1:
-            if torch.cuda.is_available():
+            if hasattr(torch, 'npu') and torch.npu.is_available():
+                stream = torch.npu.current_stream().npu_stream
+            elif torch.cuda.is_available():
                 try:
                     stream = torch._C._cuda_getCurrentRawStream(torch.cuda.current_device())
-                except ImportError:
+                except (ImportError, AttributeError):
                     stream = torch.cuda.current_stream().cuda_stream
-            elif hasattr(torch, 'npu') and torch.npu.is_available():
-                stream = torch.npu.current_stream().npu_stream
             else:
                 stream = 0
 
