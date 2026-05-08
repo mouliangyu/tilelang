@@ -139,7 +139,15 @@ def print_buffer_dump_ascend(buffer: tir.Buffer, msg: str, elems: int) -> None:
     (outside SimtVF).
     """
     type_str = _dtype_to_ascend_type_str(buffer.dtype)
-    tir.call_extern("handle", "debug_print_buffer_dump", msg, buffer.name, buffer.data, elems, type_str)
+    tir.call_extern(
+        "handle",
+        "debug_print_buffer_dump",
+        msg,
+        buffer.name,
+        T.address_of(buffer[[0] * len(buffer.shape)]),
+        elems,
+        type_str,
+    )
 
 
 @macro
