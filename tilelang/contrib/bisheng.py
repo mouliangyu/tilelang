@@ -79,7 +79,7 @@ def compile_ascend(
         Contents of the compiled output file.
     """
     if npu_arch is None:
-        npu_arch = os.environ.get("ASCEND_NPU_ARCH", None)
+        npu_arch = os.environ.get("ASCEND_NPU_ARCH", "dav-3510")
 
     temp = utils.tempdir()
     # Use .asc suffix so bisheng auto-detects the language without ``-x asc``

@@ -113,7 +113,7 @@ class LibraryGenerator:
             src = tempfile.NamedTemporaryFile(mode="w", suffix=".asc", delete=False)  # noqa: SIM115
             libpath = src.name.replace(".asc", ".so")
 
-            npu_arch = os.environ.get("ASCEND_NPU_ARCH", None)
+            npu_arch = os.environ.get("ASCEND_NPU_ARCH", "dav-3510")
             command = [
                 find_bisheng_path(),
                 "-fPIC",
