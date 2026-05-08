@@ -399,14 +399,15 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
             StringImm(ss.str()), BufferLoad(clear_buffer, red_indices)};
         // The butterfly reduce path needs one shared-memory slot per
         // thread in the block.
-        if (reducing_threads > 32) {
-          int workspace_size;
-          if (T.target->HasKey("ascend")) {
-            workspace_size = reducing_threads / 32;
-          } else {
-            workspace_size =
-                static_cast<int>(*as_const_int(T.thread_bounds->extent));
-          }
+        bool need_workspace = reducing_threads > 32;
+        if (T.target->HasKey("ascend")) {
+          bool is_pow2 = (reducing_threads & (reducing_threads - 1)) == 0;
+          need_workspace =
+              reducing_threads > 32 || (reducing_threads > 1 && !is_pow2);
+        }
+        if (need_workspace) {
+          int workspace_size =
+              static_cast<int>(*as_const_int(T.thread_bounds->extent));
 
           PrimExpr workspace =
               T.AddWorkspace(workspace_size, clear_buffer->dtype);

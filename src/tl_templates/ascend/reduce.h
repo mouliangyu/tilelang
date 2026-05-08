@@ -23,15 +23,59 @@ struct MinOp {
 
 template <class Reducer, int threads, int scale = 1, int thread_offset = 0>
 struct AscendAllReduce {
+private:
+  static constexpr bool is_pow2(int n) { return n > 0 && (n & (n - 1)) == 0; }
+
+  static __simt_callee__ float shfl_reduce(float x) {
+    if constexpr (threads <= 1)
+      return x;
+    Reducer op;
+    if constexpr (threads >= 32)
+      x = op(x, asc_shfl_xor(x, 16));
+    if constexpr (threads >= 16)
+      x = op(x, asc_shfl_xor(x, 8));
+    if constexpr (threads >= 8)
+      x = op(x, asc_shfl_xor(x, 4));
+    if constexpr (threads >= 4)
+      x = op(x, asc_shfl_xor(x, 2));
+    if constexpr (threads >= 2)
+      x = op(x, asc_shfl_xor(x, 1));
+    return x;
+  }
+
+  // Fallback for non-power-of-2 groups using UB buffer.
+  static __simt_callee__ float ub_reduce(float x, __ubuf__ float *red_buf) {
+    int tx = threadIdx.x - thread_offset;
+    int group = tx / threads;
+    int lane = tx % threads;
+    Reducer op;
+
+    red_buf[tx] = x;
+    asc_syncthreads();
+
+    float result = x;
+    if (lane == 0) {
+      for (int i = 1; i < threads; i++)
+        result = op(result, red_buf[group * threads + i]);
+    }
+    asc_syncthreads();
+
+    if (lane == 0)
+      red_buf[group] = result;
+    asc_syncthreads();
+    result = red_buf[group];
+    asc_syncthreads();
+    return result;
+  }
+
+public:
   static __simt_callee__ float run(float x, __ubuf__ float *red_buf = nullptr) {
     if constexpr (threads <= 32) {
-      // Single warp: hardware reduce only, no UB needed
-      if constexpr (std::is_same_v<Reducer, SumOp>)
-        return asc_reduce_add(x);
-      else if constexpr (std::is_same_v<Reducer, MaxOp>)
-        return asc_reduce_max(x);
-      else
-        return asc_reduce_min(x);
+      if constexpr (is_pow2(threads)) {
+        return shfl_reduce(x);
+      } else {
+        return ub_reduce(x, red_buf);
+      }
     } else {
       constexpr int num_warps = threads / 32;
       int tx = threadIdx.x - thread_offset;

@@ -113,13 +113,14 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
   }
   Array<PrimExpr> thread_reduce_args = {StringImm(ss.str()),
                                         BufferLoad(buffer, indices_0)};
-  if (reducing_threads > 32) {
-    int workspace_size;
-    if (T.target->HasKey("ascend")) {
-      workspace_size = reducing_threads / 32;
-    } else {
-      workspace_size = *as_const_int(T.thread_bounds->extent);
-    }
+  bool need_workspace = reducing_threads > 32;
+  if (T.target->HasKey("ascend")) {
+    bool is_pow2 = (reducing_threads & (reducing_threads - 1)) == 0;
+    need_workspace =
+        reducing_threads > 32 || (reducing_threads > 1 && !is_pow2);
+  }
+  if (need_workspace) {
+    int workspace_size = *as_const_int(T.thread_bounds->extent);
     PrimExpr workspace = T.AddWorkspace(workspace_size, buffer->dtype);
     thread_reduce_args.push_back(workspace);
   }
