@@ -11,10 +11,6 @@ Performance (fp32, batch=4096, HBM peak 1600 GB/s):
   d=7168: ~165 us,  1400+ GB/s (88%+ peak)
 """
 
-import os
-
-os.environ.setdefault("ASCEND_NPU_ARCH", "dav-3510")
-
 import tilelang
 import tilelang.language as T
 import torch
