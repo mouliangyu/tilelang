@@ -142,11 +142,13 @@ def dual_copy(
     dst: BufferLikeType,
     *,
     unit_flag_ctl: int = 0,
+    nd2nz: bool = False,
 ) -> tir.PrimExpr | tir.Stmt:
-    """Copy data from L0C to UB with dualDst (M-split or N-split across 2 AIVs).
+    """Copy data between memory regions with dualDst (M-split or N-split across 2 AIVs).
 
-    Generates a ``copy_matrix_cc_to_ub`` instruction with ``dual_dst_ctl`` enabled.
-    The split direction is auto-inferred from the shape mismatch between src and dst:
+    The split direction is auto-inferred from the shape mismatch between src and dst.
+    Supports L0C→UB and UB→L1 transfers.  For UB→L1 copies, ``nd2nz=True`` enables
+    dense-to-fractal (ND→NZ) layout conversion via SimdVF scatter.
 
     - ``src[M, N]`` → ``dst[M/2, N]``: M-split (``dual_dst_ctl=0b01``)
       AIV0 receives rows ``[0, M/2)``, AIV1 receives rows ``[M/2, M)``
@@ -154,9 +156,10 @@ def dual_copy(
       AIV0 receives cols ``[0, N/2)``, AIV1 receives cols ``[N/2, N)``
 
     Args:
-        src: Source buffer in L0C (``__cc__``), shape ``[M, N]``
-        dst: Destination buffer in UB (``__ubuf__``), shape ``[M/2, N]`` or ``[M, N/2]``
+        src: Source buffer (L0C ``__cc__`` or UB ``__ubuf__``), shape ``[M, N]``
+        dst: Destination buffer (UB ``__ubuf__`` or L1 ``__cbuf__``), shape ``[M/2, N]`` or ``[M, N/2]``
         unit_flag_ctl: Unit flag control (0=manual sync, 3=pipelined with mad)
+        nd2nz: If True, fuse ND→NZ scatter for UB→L1 copy (Ascend only).
 
     Raises:
         ValueError: If the split direction cannot be inferred from shapes.
@@ -190,6 +193,8 @@ def dual_copy(
         "dual_dst_ctl": dual_dst_ctl,
         "unit_flag_ctl": unit_flag_ctl,
     }
+    if nd2nz:
+        annotations["nd2nz"] = 1
     if _is_half(dst_m, src_m) or _is_half(dst_n, src_n):
         annotations["double"] = True
 
