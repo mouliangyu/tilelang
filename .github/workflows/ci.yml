@@ -182,7 +182,7 @@ jobs:
           fi
 
           # Run cmake to create the build directory with compile_commands.json
-          cmake -S . -B cmake-build --fresh ${CLANG_TIDY_CMAKE_OPTIONS}  # no quotes here
+          cmake -S . -B cmake-build --fresh ${CLANG_TIDY_CMAKE_OPTIONS} -DUSE_CUDA=OFF  # no quotes here
           echo "::group::compile_commands.json"
           ls -alh cmake-build/compile_commands.json
           uv run --no-project -m -- json.tool --no-ensure-ascii cmake-build/compile_commands.json
