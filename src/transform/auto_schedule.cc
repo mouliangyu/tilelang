@@ -458,28 +458,26 @@ private:
           tensor_core_shapes.emplace_back(gemm_py->m_, gemm_py->n_,
                                           gemm_py->k_);
         } else if (op->op.same_as(builtin::call_extern())) {
-          if (op->args.size() > 0) {
-            if (auto sym = op->args[0].as<StringImmNode>()) {
-              const std::string &name = sym->value;
-              if (name == "debug_print_msg" || name == "debug_print_var" ||
-                  name == "debug_print_buffer_value") {
-                // (AscendC::)printf -> S pipe
-                pipe_mask |= static_cast<uint16_t>(ResourcePipe::kScalar);
-              } else if (name == "debug_print_buffer_dump") {
-                auto scope = op->args[3]
-                                 .as<CallNode>()
-                                 ->args[0]
-                                 .as<BufferLoadNode>()
-                                 ->buffer.scope();
-                if (scope == "shared" || scope == "shared.dyn") {
-                  pipe_mask |= static_cast<uint16_t>(ResourcePipe::kVector);
-                } else {
-                  pipe_mask |= static_cast<uint16_t>(ResourcePipe::kCube);
-                }
-              } else if (name == "debug_print_global_buffer_dump") {
-                // AscendC::DumpTensor(GlobalTensor<T>) reads GM
-                pipe_mask |= static_cast<uint16_t>(ResourcePipe::kMTE3);
+          if (auto sym = op->args[0].as<StringImmNode>()) {
+            const std::string &name = sym->value;
+            if (name == "debug_print_msg" || name == "debug_print_var" ||
+                name == "debug_print_buffer_value") {
+              // (AscendC::)printf -> S pipe
+              pipe_mask |= static_cast<uint16_t>(ResourcePipe::kScalar);
+            } else if (name == "debug_print_buffer_dump") {
+              auto scope = op->args[3]
+                               .as<CallNode>()
+                               ->args[0]
+                               .as<BufferLoadNode>()
+                               ->buffer.scope();
+              if (scope == "shared" || scope == "shared.dyn") {
+                pipe_mask |= static_cast<uint16_t>(ResourcePipe::kVector);
+              } else {
+                pipe_mask |= static_cast<uint16_t>(ResourcePipe::kCube);
               }
+            } else if (name == "debug_print_global_buffer_dump") {
+              // AscendC::DumpTensor(GlobalTensor<T>) reads GM
+              pipe_mask |= static_cast<uint16_t>(ResourcePipe::kMTE3);
             }
           }
         }
@@ -765,7 +763,7 @@ tvm::transform::Pass AutoSchedule() {
     Array<Stmt> combined_stmts;
 
     for (size_t i = 0; i < kernel_stmts.size(); ++i) {
-      Stmt kernel_subtree = kernel_stmts[i];
+      const Stmt &kernel_subtree = kernel_stmts[i];
 
       TilelangRootBodyExtractor extractor;
       extractor(kernel_subtree);
