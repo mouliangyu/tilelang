@@ -466,8 +466,16 @@ private:
                 // (AscendC::)printf -> S pipe
                 pipe_mask |= static_cast<uint16_t>(ResourcePipe::kScalar);
               } else if (name == "debug_print_buffer_dump") {
-                // AscendC::DumpTensor(LocalTensor<T>(VECIN, ...)) reads UB
-                pipe_mask |= static_cast<uint16_t>(ResourcePipe::kVector);
+                auto scope = op->args[3]
+                                 .as<CallNode>()
+                                 ->args[0]
+                                 .as<BufferLoadNode>()
+                                 ->buffer.scope();
+                if (scope == "shared" || scope == "shared.dyn") {
+                  pipe_mask |= static_cast<uint16_t>(ResourcePipe::kVector);
+                } else {
+                  pipe_mask |= static_cast<uint16_t>(ResourcePipe::kCube);
+                }
               } else if (name == "debug_print_global_buffer_dump") {
                 // AscendC::DumpTensor(GlobalTensor<T>) reads GM
                 pipe_mask |= static_cast<uint16_t>(ResourcePipe::kMTE3);
