@@ -1,10 +1,10 @@
 ---
 name: tilelang-ascend
 description: >
-  TileLang Ascend NPU backend development guide. Covers SimtVF programming model,
-  bisheng compiler integration, codegen customization, and debugging techniques
-  for Ascend 910 series NPUs. Use this skill when developing or debugging
-  TileLang kernels for Huawei Ascend hardware.
+TileLang Ascend NPU backend development guide. Covers SimtVF programming model,
+bisheng compiler integration, codegen customization, and debugging techniques
+for Ascend 910 series NPUs. Use this skill when developing or debugging
+TileLang kernels for Huawei Ascend hardware.
 ---
 
 # TileLang Ascend 后端开发指南
@@ -99,7 +99,7 @@ __simt_vf__ __launch_bounds__(128) inline void simt_vf_0(
 ) {
   int32_t simtvf_tx = threadIdx.x;
   for (int32_t i = 0; i < 2; ++i) {
-    *(__gm__ float4*)(C + offset) = *(__gm__ float4*)(A + offset) 
+    *(__gm__ float4*)(C + offset) = *(__gm__ float4*)(A + offset)
                                   + *(__gm__ float4*)(B + offset);
   }
 }
@@ -379,11 +379,11 @@ if __name__ == "__main__":
     N = 1024
     device = torch.device("npu")
     kernel = tilelang.compile(vector_add(N), target="ascend", out_idx=-1)
-    
+
     a = torch.randn(N, device=device)
     b = torch.randn(N, device=device)
     c = kernel(a, b)
-    
+
     expected = a + b
     assert torch.equal(c, expected), "Verification failed!"
     print("SUCCESS!")
@@ -490,7 +490,7 @@ sudo -E ASCEND_NPU_ARCH=dav-3101 python test.py
 > ```
 > /usr/local/Ascend/cann-9.0.T530/tools/bisheng_compiler/lib/clang/15.0.5/include/
 > ```
-> 
+>
 > **要求**: 每次找到有用的接口后，请更新到下面的表格中。
 
 ### 12.1 向量类型
