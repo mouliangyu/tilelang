@@ -11,6 +11,52 @@ from tilelang.language.utils import get_extent
 from tvm import ir, tir
 
 
+def _shape_for_nd2nz(buf: BufferLikeType):
+    """Return the underlying buffer's full (M, N) shape for nd2nz tmp sizing.
+
+    The dst passed to nd2nz copy may be a sliced sub-region (e.g. after an
+    M-split); the SimdVF scatter still needs the *full* L1 buffer's M to
+    compute fractal strides, so we look through to the underlying Buffer.
+    """
+    if isinstance(buf, tir.Buffer):
+        return buf.shape, buf.dtype
+    if isinstance(buf, tir.BufferLoad):
+        return buf.buffer.shape, buf.buffer.dtype
+    if isinstance(buf, tir.BufferRegion):
+        return buf.buffer.shape, buf.buffer.dtype
+    raise TypeError(f"Cannot infer nd2nz shape from {type(buf)}")
+
+
+def _allocate_nd2nz_tmp(src: BufferLikeType, dst: BufferLikeType):
+    """Allocate the UB scratch buffer that the Ascend nd2nz lowering needs.
+
+    Sized to one sub-tile in NZ layout (ROWS x COLS of dst dtype) — matches
+    what `ascend_nd2nz_scatter<ROWS, COLS, ROWS, ...>` writes. Returned as a
+    `tl.region` PrimExpr so it can be threaded as the 3rd positional arg of
+    `tl.tileop.copy`.
+    """
+    from tilelang.language.allocate import alloc_shared
+
+    src_shape, _ = _shape_for_nd2nz(src)
+    dst_shape, dst_dtype = _shape_for_nd2nz(dst)
+    # Sub-tile rows/cols come from the src side (the contiguous ND tile we
+    # will scatter); src may itself be a sliced region, so look through.
+    if isinstance(src, tir.BufferRegion):
+        rows = src.region[-2].extent
+        cols = src.region[-1].extent
+    elif isinstance(src, tir.BufferLoad):
+        # rare: a scalar BufferLoad here would have been short-circuited
+        # earlier in copy(); fall back to the underlying buffer's tail dims
+        rows, cols = src_shape[-2], src_shape[-1]
+    else:
+        rows, cols = src_shape[-2], src_shape[-1]
+    rows_v = rows.value if isinstance(rows, tir.IntImm) else int(rows)
+    cols_v = cols.value if isinstance(cols, tir.IntImm) else int(cols)
+    tmp_elems = rows_v * cols_v
+    tmp_buf = alloc_shared((tmp_elems,), dst_dtype, "shared.dyn")
+    return to_buffer_region(tmp_buf, access_type="rw", extents=[tmp_elems])
+
+
 def copy(
     src: BufferLikeType,
     dst: BufferLikeType,
@@ -80,6 +126,10 @@ def copy(
     # Align and broadcast extents from the right (tail) side.
     src_extent, dst_extent = legalize_pairwise_extents(src_extent, dst_extent)
 
+    # Capture originals before to_buffer_region rewrites src/dst — we need
+    # them later to size the nd2nz tmp UB scratch.
+    src_orig, dst_orig = src, dst
+
     # Use legalized extents for src and dst respectively.
     src = to_buffer_region(src, access_type="r", extents=src_extent)
     dst = to_buffer_region(dst, access_type="w", extents=dst_extent)
@@ -108,7 +158,158 @@ def copy(
     if nd2nz and "nd2nz" not in ann:
         ann["nd2nz"] = 1
 
+    # Ascend nd2nz: bypass tl.tileop.copy entirely and emit the scatter +
+    # post_copy intrinsics directly so each step is a separate TIR stmt that
+    # downstream passes (codegen, dump_ir) can see without LowerTileOp.
+    nd2nz_active = bool(ann.get("nd2nz", 0))
+    if nd2nz_active:
+        return _emit_nd2nz_seq(src, dst, src_orig, dst_orig, src_extent, dst_extent, ann)
+
     return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.copy"), src, dst, annotations=ann if ann else None)
+
+
+def _emit_nd2nz_seq(
+    src: tir.PrimExpr,
+    dst: tir.PrimExpr,
+    src_orig: BufferLikeType,
+    dst_orig: BufferLikeType,
+    src_extent: list,
+    dst_extent: list,
+    ann: dict,
+) -> tir.PrimExpr:
+    """Emit the Ascend ND→NZ copy as one or two raw intrinsic calls.
+
+    Multi-fractal:  scatter src ND tile → NZ tmp UB, then strided UB→L1 copy.
+                    The scatter is emitted into the active IRBuilder frame and
+                    the post_copy is returned as a PrimExpr so the caller
+                    auto-evaluates it (matches the single-Call return shape of
+                    `T.copy(...)`).
+    Small (≤16×16): skip the scatter (ND == NZ for a single fractal) and
+                    return the single post_copy reading the src ND tile
+                    directly.
+
+    Dual (``ann['double']``): src is the half-size per-AIV tile and dst is the
+    full-size L1 buffer. The post_copy is emitted with two extra trailing args
+    (``dual_split_dim``, ``dual_half_extent``) so AutoSchedule's
+    ``warpgroup_partition`` can rewrite the dst access_ptr's BufferLoad indices
+    to add ``sid * half_extent`` along the split axis. After that rewrite the
+    extras are stripped and codegen sees the standard 6-arg form.
+    """
+    import tvm.script.ir_builder.tir as tb_tir
+    from tilelang.language.builtin import access_ptr as _access_ptr
+
+    is_dual = bool(ann.get("double"))
+    # For dual_copy: src is half-size (per-AIV tile), dst is full-size. Rows/cols
+    # describe the per-AIV tile, so use src extents. Otherwise (regular nd2nz),
+    # src and dst extents match — pick dst as before.
+    rows_src = src_extent[-2]
+    cols_src = src_extent[-1]
+    rows_dst = dst_extent[-2]
+    cols_dst = dst_extent[-1]
+    rows = rows_src if is_dual else rows_dst
+    cols = cols_src if is_dual else cols_dst
+
+    # Look through the tl.tileop.region wrappers to recover the underlying
+    # buffers (for dtype + full L1 M dim).
+    src_buf = src.args[0].buffer
+    dst_buf = dst.args[0].buffer
+    full_rows = dst_buf.shape[-2]
+
+    def _to_dtype_str(dt) -> str:
+        s = str(dt)
+        if "bfloat16" in s:
+            return "bfloat16_t"
+        if "float16" in s:
+            return "half"
+        if s in ("float32", "float"):
+            return "float"
+        raise ValueError(f"Unsupported nd2nz dtype: {s}")
+
+    src_dtype_str = _to_dtype_str(src_buf.dtype)
+    dst_dtype_str = _to_dtype_str(dst_buf.dtype)
+    fuse_cast = 1 if src_buf.dtype != dst_buf.dtype else 0
+
+    src_ptr = _access_ptr(src_orig, "r")
+    dst_ptr = _access_ptr(dst_orig, "w")
+
+    def _as_int(e):
+        if isinstance(e, int):
+            return e
+        if isinstance(e, tir.IntImm):
+            return int(e.value)
+        return None
+
+    rows_i = _as_int(rows)
+    cols_i = _as_int(cols)
+    small_fractal = rows_i is not None and cols_i is not None and rows_i <= 16 and cols_i <= 16
+
+    scatter_op = tir.op.Op.get("tl.ascend_nd2nz_scatter")
+    post_copy_op = tir.op.Op.get("tl.ascend_nd2nz_post_copy")
+
+    # Optional dual-split hint args appended to post_copy. dual_dst_ctl: 1=M, 2=N.
+    dual_extras: list = []
+    if is_dual:
+        dual_dst_ctl = int(ann.get("dual_dst_ctl", 0))
+        if dual_dst_ctl not in (1, 2):
+            raise ValueError(f"dual_copy(nd2nz=True) requires dual_dst_ctl in {{1, 2}}, got {dual_dst_ctl}")
+        # split_dim is along the trailing-2 axes (-2 = M, -1 = N).
+        split_dim_neg2 = 0 if dual_dst_ctl == 1 else 1  # 0 → M, 1 → N
+        half_extent = src_extent[-2 + split_dim_neg2]
+        dual_extras = [
+            tir.IntImm("int32", split_dim_neg2),
+            half_extent,
+        ]
+
+    if small_fractal:
+        if fuse_cast:
+            raise ValueError(
+                "ascend_nd2nz small single-fractal path (rows<=16 && cols<=16) "
+                "cannot fuse a dtype cast — the cast lives in the SimdVF "
+                f"scatter, which is skipped here. src={src_buf.dtype}, dst={dst_buf.dtype}"
+            )
+        return tir.call_intrin(
+            "handle",
+            post_copy_op,
+            dst_ptr,
+            src_ptr,
+            rows,
+            cols,
+            full_rows,
+            dst_dtype_str,
+            *dual_extras,
+        )
+
+    # Multi-fractal: allocate a UB scratch buffer for the NZ-laid intermediate,
+    # emit the scatter into the active IRBuilder frame, and return the
+    # post_copy Call so the eager-builder auto-evaluates it.
+    tmp_region = _allocate_nd2nz_tmp(src_orig, dst_orig)
+    tmp_buf = tmp_region.args[0].buffer
+    tmp_ptr = _access_ptr(tmp_buf, "rw")
+
+    scatter = tir.call_intrin(
+        "handle",
+        scatter_op,
+        src_ptr,
+        tmp_ptr,
+        rows,
+        cols,
+        fuse_cast,
+        dst_dtype_str,
+        src_dtype_str,
+    )
+    tb_tir.evaluate(scatter)
+
+    return tir.call_intrin(
+        "handle",
+        post_copy_op,
+        dst_ptr,
+        tmp_ptr,
+        rows,
+        cols,
+        full_rows,
+        dst_dtype_str,
+        *dual_extras,
+    )
 
 
 def _get_shape(buf):

@@ -313,6 +313,7 @@ private:
   void VisitExpr_(const CallNode *op) override {
     static const auto region_op = Op::Get("tl.tileop.region");
     static const auto reduce_op = Op::Get("tl.tileop.reduce");
+    static const auto tl_access_ptr_op = Op::Get("tl.access_ptr");
 
     // Check for tl.tileop.region call
     if (op->op.same_as(region_op)) {
@@ -421,6 +422,37 @@ private:
     // Handle other calls (e.g., builtin::tvm_access_ptr)
     if (op->op.same_as(builtin::tvm_access_ptr())) {
       // Simplified: skip for now
+      StmtExprVisitor::VisitExpr_(op);
+      return;
+    }
+
+    // Handle TileLang `tl.access_ptr(BufferLoad(buf, mins), extent, rw_mask)`.
+    if (op->op.same_as(tl_access_ptr_op)) {
+      if (op->args.size() >= 3) {
+        const auto *buffer_load = op->args[0].as<BufferLoadNode>();
+        const auto *mask_int = op->args[2].as<IntImmNode>();
+        if (buffer_load && mask_int) {
+          Buffer buffer = buffer_load->buffer;
+          int rw_mask = mask_int->value;
+          std::vector<arith::IntSet> full_region;
+          full_region.reserve(buffer->shape.size());
+          for (const PrimExpr &dim : buffer->shape) {
+            full_region.push_back(
+                arith::IntSet::FromRange(Range::FromMinExtent(0, dim)));
+          }
+          if (rw_mask & 1) {
+            Update(&read_buffers_, &read_regions_, buffer, full_region);
+          }
+          if (rw_mask & 2) {
+            Update(&write_buffers_, &write_regions_, buffer, full_region);
+          }
+          for (const PrimExpr &index : buffer_load->indices) {
+            VisitExpr(index);
+          }
+          VisitExpr(op->args[1]);
+          return;
+        }
+      }
       StmtExprVisitor::VisitExpr_(op);
       return;
     }

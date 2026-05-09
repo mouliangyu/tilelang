@@ -452,6 +452,12 @@ private:
           Copy copy_obj(op->args, op->annotations);
           const CopyNode *copy = copy_obj.get();
           pipe_mask |= GetCopyPipeMask(copy->src, copy->dst);
+        } else if (op->op.same_as(tl::ascend_nd2nz_scatter())) {
+          // SimdVF MicroAPI scatter writing into a UB tmp.
+          pipe_mask |= static_cast<uint16_t>(ResourcePipe::kVector);
+        } else if (op->op.same_as(tl::ascend_nd2nz_post_copy())) {
+          // Per-D-group copy_ubuf_to_cbuf: UB → L1 = MTE3.
+          pipe_mask |= static_cast<uint16_t>(ResourcePipe::kMTE3);
         } else if (op->op.same_as(gemm_py_op) || op->op.same_as(gemm_op)) {
           pipe_mask |= static_cast<uint16_t>(ResourcePipe::kCube);
           GemmPy gemm_py(op->args);

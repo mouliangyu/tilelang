@@ -470,8 +470,13 @@ TIR_DEFINE_TL_BUILTIN(ascend_copy_ubuf_to_cbuf)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_nd2nz_copy)
-    .set_num_inputs(9)
+TIR_DEFINE_TL_BUILTIN(ascend_nd2nz_scatter)
+    .set_num_inputs(7)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(ascend_nd2nz_post_copy)
+    .set_num_inputs(6)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 

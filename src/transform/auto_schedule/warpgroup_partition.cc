@@ -538,6 +538,51 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure, Var sid) {
       if (auto *eval = task->stmts[0].as<EvaluateNode>()) {
         if (auto *call = eval->value.as<CallNode>()) {
           static const auto copy_op = Op::Get("tl.tileop.copy");
+          static const auto post_copy_op = Op::Get("tl.ascend_nd2nz_post_copy");
+          static const auto access_ptr_op = Op::Get("tl.access_ptr");
+          if (call->op.same_as(post_copy_op) && call->args.size() == 8) {
+            const auto *split_imm = call->args[6].as<IntImmNode>();
+            ICHECK(split_imm)
+                << "ascend_nd2nz_post_copy dual split_dim must be "
+                   "an IntImm (0=M, 1=N along trailing-2 axes)";
+            int split_dim_neg2 = split_imm->value;
+            ICHECK(split_dim_neg2 == 0 || split_dim_neg2 == 1)
+                << "ascend_nd2nz_post_copy dual split_dim must be 0 or 1, got "
+                << split_dim_neg2;
+            PrimExpr half_extent = call->args[7];
+            // args[0] = tl.access_ptr(BufferLoad(buf, mins), extent, rw_mask)
+            const auto *dst_ap = call->args[0].as<CallNode>();
+            ICHECK(dst_ap && dst_ap->op.same_as(access_ptr_op))
+                << "ascend_nd2nz_post_copy dst arg must be a tl.access_ptr "
+                   "Call; got "
+                << call->args[0];
+            ICHECK_EQ(dst_ap->args.size(), 3);
+            const auto *dst_load = dst_ap->args[0].as<BufferLoadNode>();
+            ICHECK(dst_load) << "tl.access_ptr first arg must be a BufferLoad";
+            int ndim = static_cast<int>(dst_load->indices.size());
+            ICHECK_GE(ndim, 2)
+                << "nd2nz dst BufferLoad must have at least 2 indices, got "
+                << ndim;
+            int split_axis = ndim - 2 + split_dim_neg2;
+            Array<PrimExpr> new_indices;
+            new_indices.reserve(ndim);
+            for (int d = 0; d < ndim; ++d) {
+              if (d == split_axis) {
+                new_indices.push_back(dst_load->indices[d] + sid * half_extent);
+              } else {
+                new_indices.push_back(dst_load->indices[d]);
+              }
+            }
+            BufferLoad new_dst_load(dst_load->buffer, new_indices);
+            Call new_dst_ap(dst_ap->dtype, access_ptr_op,
+                            {new_dst_load, dst_ap->args[1], dst_ap->args[2]});
+            Array<PrimExpr> new_args = {new_dst_ap};
+            for (size_t i = 1; i < 6; ++i) {
+              new_args.push_back(call->args[i]);
+            }
+            Call new_call(call->dtype, post_copy_op, new_args);
+            return Evaluate(new_call);
+          }
           if (call->op.same_as(copy_op)) {
             Copy cp(call->args, call->annotations);
             if (cp->annotations.Get("double")) {

@@ -199,7 +199,8 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
       if (call->op.same_as(tl::ascend_mad())) {
         has_gemm_l0_ = true;
       }
-      if (call->op.same_as(tl::ascend_nd2nz_copy())) {
+      if (call->op.same_as(tl::ascend_nd2nz_scatter()) ||
+          call->op.same_as(tl::ascend_nd2nz_post_copy())) {
         has_nd2nz_copy_ = true;
       }
     }
@@ -1013,165 +1014,107 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->PrintExpr(op->args[i], this->stream);
     }
     this->stream << ");\n";
-  } else if (op->op.same_as(tl::ascend_nd2nz_copy())) {
-    // ascend_nd2nz_copy(dst_l1, src_ub, rows, cols, fuse_cast,
-    //                   dst_dtype_str, src_dtype_str)
-    ICHECK_EQ(op->args.size(), 8)
-        << "tl.ascend_nd2nz_copy expects exactly 8 arguments";
+  } else if (op->op.same_as(tl::ascend_nd2nz_scatter())) {
+    // ascend_nd2nz_scatter(src_ub, tmp_ub, rows, cols, fuse_cast,
+    //                      dst_dtype_str, src_dtype_str)
+    // Emits the SimdVF scatter from an ND tile in `src_ub` into the NZ-laid
+    // tmp buffer `tmp_ub`. The post-scatter UB→L1 raw DMA is emitted as a
+    // separate ascend_nd2nz_post_copy stmt.
+    ICHECK_EQ(op->args.size(), 7)
+        << "tl.ascend_nd2nz_scatter expects exactly 7 arguments";
     int rows = op->args[2].as<IntImmNode>()->value;
     int cols = op->args[3].as<IntImmNode>()->value;
     int fuse_cast = op->args[4].as<IntImmNode>()->value;
     std::string dst_dtype = op->args[5].as<StringImmNode>()->value;
     std::string src_dtype = op->args[6].as<StringImmNode>()->value;
-    int full_rows = op->args[7].as<IntImmNode>()->value;
+    this->PrintIndent();
+    this->stream << "ascend_nd2nz_scatter<" << rows << ", " << cols << ", "
+                 << rows << ", " << (fuse_cast ? "true" : "false") << ", "
+                 << dst_dtype << ", " << src_dtype << ">((__ubuf__ "
+                 << src_dtype << "*)(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << "), (__ubuf__ " << dst_dtype << "*)(";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << "));\n";
+    this->PrintIndent();
+    this->stream << "pipe_barrier(PIPE_ALL);\n";
+  } else if (op->op.same_as(tl::ascend_nd2nz_post_copy())) {
+    // ascend_nd2nz_post_copy(dst_l1, src_ub, rows, cols, full_rows,
+    //                        dst_dtype_str)
+    // For multi-fractal: src_ub is the NZ tmp buffer produced by the scatter
+    // — emit per-D-group copy_ubuf_to_cbuf with sid correction.
+    // For single-fractal (rows<=16 && cols<=16): src_ub is the raw ND source —
+    // emit one direct copy (ND == NZ in this case).
+    ICHECK_EQ(op->args.size(), 6)
+        << "tl.ascend_nd2nz_post_copy expects exactly 6 arguments";
+    int rows = op->args[2].as<IntImmNode>()->value;
+    int cols = op->args[3].as<IntImmNode>()->value;
+    int full_rows = op->args[4].as<IntImmNode>()->value;
+    std::string dst_dtype = op->args[5].as<StringImmNode>()->value;
 
     int dst_elem_bytes = (dst_dtype == "float") ? 4 : 2;
-    int src_elem_bytes = (src_dtype == "float") ? 4 : 2;
-    // NZ size in L1: full_nBlk * dBlk * C0^2 * elem_size
     int full_nBlk = full_rows / 16;
     int dBlk = cols / 16;
-    int nz_elems =
-        full_nBlk * dBlk * 256; // total NZ elements for complete matrix
-    int nz_bytes_sub =
-        rows * cols * dst_elem_bytes; // bytes this sub-tile contributes
-    // tmp buffer must be large enough for the NZ scatter layout
-    int tmp_nz_elems = nz_elems; // D-group stride requires full layout
-    int tmp_nz_bytes = tmp_nz_elems * dst_elem_bytes;
 
     if (rows <= 16 && cols <= 16) {
-      // Single fractal: ND == NZ, just raw copy (no scatter needed)
-      if (fuse_cast && src_dtype != dst_dtype) {
-        // Need cast first — but for single fractal this is trivial
-        // For now, just do raw copy (cast already happened in SimtVF)
-      }
-      int total_bytes_raw =
-          rows * cols * (fuse_cast ? dst_elem_bytes : src_elem_bytes);
+      // Single fractal: ND == NZ, emit one raw copy.
+      int total_bytes = rows * cols * dst_elem_bytes;
       this->PrintIndent();
       this->stream << "copy_ubuf_to_cbuf((__cbuf__ void*)(";
       this->PrintExpr(op->args[0], this->stream);
       this->stream << "), (__ubuf__ void*)(";
       this->PrintExpr(op->args[1], this->stream);
-      this->stream << "), 0, " << total_bytes_raw / 32 << ", 1, 0, 0);\n";
+      this->stream << "), 0, " << total_bytes / 32 << ", 1, 0, 0);\n";
     } else {
-      // Multi-fractal: need ND→NZ scatter in UB, then raw copy to L1
+      // Multi-fractal: per-D-group strided copy from NZ tmp to L1.
+      //
+      // Sub-tile NZ:  nBlk_sub  = rows / 16,         dBlk = cols / 16
+      // Full NZ:      nBlk_full = full_rows / 16
+      // Sub-tile fractal (n_sub, d) sits in tmp at offset
+      //     (d * nBlk_sub + n_sub) * 256 elements.
+      // Full fractal in L1 lives at
+      //     p_l1_base + (d * nBlk_full + n_start + n_sub) * 256
+      // where n_start = sid * nBlk_sub depends on the AIV id.
+      //
+      // The dst_ptr we receive from the lowering already includes an
+      // ND-style sid offset: dst_ptr = p_l1_base + sid * rows * cols. We
+      // need the NZ-style base p_l1_base + sid * nBlk_sub * 256 instead.
+      // We can't recover p_l1_base + sid at codegen time, so we emit the
+      // correction inline against the supplied dst_ptr:
+      //     target = dst_ptr
+      //            + (d * nBlk_full * 256 + sid * nBlk_sub * 256
+      //               - sid * rows * cols)
+      //            = dst_ptr + d * nBlk_full * 256
+      //                       - sid * (rows * cols - nBlk_sub * 256)
+      //                      [= rows * (cols - 16), per-sid correction]
+      // sid is unknown at compile time, so it stays in the emitted C++.
+      int nBlk_sub = rows / 16;
+      int frac_elems = 256;
+      int frac_bytes = frac_elems * dst_elem_bytes;
+      int nd_vs_nz_correction = rows * cols - nBlk_sub * frac_elems;
       this->PrintIndent();
       this->stream << "{\n";
       this->PrintIndent();
-      this->stream << "  // ND→NZ scatter (SimdVF) + UB→L1 raw copy\n";
-      this->PrintIndent();
       this->stream << "  __ubuf__ " << dst_dtype << "* _nd2nz_tmp = (__ubuf__ "
-                   << dst_dtype << "*)((__ubuf__ uint8_t*)(";
+                   << dst_dtype << "*)(";
       this->PrintExpr(op->args[1], this->stream);
-      this->stream << ") + " << rows * cols * src_elem_bytes << ");\n";
-      // Zero-init tmp to avoid garbage in unfilled fractal slots
-      this->PrintIndent();
-      this->stream << "  // tmp needs " << tmp_nz_bytes
-                   << " bytes for full NZ layout\n";
-      // Phase 1: SimdVF scatter
-      this->PrintIndent();
-      // Phase 1: scatter with sub-tile nBlk (FULL_ROWS = ROWS)
-      this->stream << "  ascend_nd2nz_scatter<" << rows << ", " << cols << ", "
-                   << rows << ", " << (fuse_cast ? "true" : "false") << ", "
-                   << dst_dtype << ", " << src_dtype << ">((__ubuf__ "
-                   << src_dtype << "*)(";
-      this->PrintExpr(op->args[1], this->stream);
-      this->stream << "), _nd2nz_tmp);\n";
-      // Phase 2: pipe barrier
-      this->PrintIndent();
-      this->stream << "  pipe_barrier(PIPE_ALL);\n";
-      // Phase 3: copy each D-group's fractal to the correct NZ offset in L1
-      // Sub-tile NZ: nBlk_sub = rows/16, dBlk = cols/16
-      // Full NZ:     nBlk_full = full_rows/16
-      // Sub-tile frac(n_sub, d) at tmp offset (d * nBlk_sub + n_sub) * 256
-      // elements Full frac at L1: the dst_ptr already points to the correct
-      // n-offset
-      //   (sid * rows elements in L1 from kernel code), so we need to map
-      //   sub-tile D-groups to full NZ D-groups.
-      // Full NZ frac offset: d * nBlk_full * 256 elements from dst base
-      // Sub NZ frac offset:  d * nBlk_sub * 256 elements from tmp base
-      {
-        int nBlk_sub = rows / 16;
-        int frac_elems = 256;
-        int frac_bytes = frac_elems * dst_elem_bytes;
-        // For each D-group (column block), copy nBlk_sub fractals from tmp to
-        // L1. The dst_ptr from codegen already includes the sid-based offset
-        // (computed as sid * rows * cols elements in ND addressing).
-        // But in NZ, the correct offset for the n-th fractal row within
-        // D-group d is: d * nBlk_full * 256 + n * 256.
-        // We need to replace the ND-based dst offset with NZ-based.
-        // The original dst_ptr = p_l1_base + sid * rows * cols (ND offset).
-        // In NZ, it should be p_l1_base + sid * nBlk_sub * 256 (NZ n-offset).
-        // Since nBlk_sub = rows/16 and cols may != 16, ND offset =
-        // sid*rows*cols and NZ n-offset = sid * nBlk_sub * 256 = sid * rows
-        // * 16. Correction: subtract the ND offset, add the NZ offset. But we
-        // don't easily have sid here. Instead, let's compute directly: The
-        // dst_ptr already points to p_l1 + (sid * rows * cols) in ND terms. We
-        // need it to point to p_l1 + (sid * nBlk_sub * 256) in NZ terms. Delta
-        // = sid * nBlk_sub * 256 - sid * rows * cols
-        //       = sid * rows * 16 - sid * rows * cols
-        //       = sid * rows * (16 - cols)
-        // This is negative when cols > 16. We need to adjust the pointer.
-        // But we don't have sid as a compile-time constant...
-        //
-        // Better approach: emit the per-D-group copies using a RUNTIME sid
-        // offset. NZ target for this sub-tile's D-group d, n-block n:
-        //   p_l1_base + (d * nBlk_full + n_start + n) * 256
-        // where n_start depends on sid (unknown at compile time).
-        //
-        // Since dst_ptr = p_l1_base + sid * rows * cols (ND addressing),
-        // the p_l1_base is not directly available. We need to undo the ND
-        // offset.
-        //
-        // Simpler: just emit the correct NZ offset relative to the original
-        // dst_ptr, accounting for the ND→NZ address mapping difference.
-        //
-        // NZ offset of D-group d relative to this sub-tile's base in NZ:
-        //   d * nBlk_full * 256
-        // But the raw dst_ptr has ND-based offset. The difference between
-        // ND offset (sid*rows*cols) and what we need as the base for D-group 0:
-        //   NZ base = sid * nBlk_sub * 256  (fractal n-offset for this AIV)
-        //   ND base = sid * rows * cols     (row offset)
-        // When cols > 16: ND_base > NZ_base.
-        // correction = NZ_base - ND_base (per element, applied to dst_ptr)
-        // But dst_ptr is a tvm_access_ptr, we can't easily subtract from it.
-        //
-        // The cleanest fix: DON'T use the auto-computed dst_ptr.
-        // Instead, emit the correct NZ address directly from p_l1 base.
-        // But we'd need the p_l1 base pointer and sid...
-
-        // PRAGMATIC FIX: since the ND offset is dst_ptr = base + sid*rows*cols,
-        // and we need base + d*nBlk_full*256 + sid*nBlk_sub*256,
-        // relative to dst_ptr: offset = d*nBlk_full*256 + sid*nBlk_sub*256 -
-        // sid*rows*cols = d*nBlk_full*256 - sid*(rows*cols - nBlk_sub*256) =
-        // d*nBlk_full*256 - sid*(rows*cols - rows*16) = d*nBlk_full*256 -
-        // sid*rows*(cols-16) This is only computable if we have sid at codegen
-        // time (we don't).
-        //
-        // Since sid is runtime, we emit code that reads sid and computes the
-        // offset.
-        for (int d = 0; d < dBlk; ++d) {
-          int tmp_offset_elems = d * nBlk_sub * frac_elems;
-          int copy_bytes = nBlk_sub * frac_bytes;
-          this->PrintIndent();
-          // Compute correct NZ L1 address at runtime:
-          // target = p_l1_base_ptr + (d * nBlk_full + n_start) * 256
-          // where n_start = sid * nBlk_sub
-          // Since dst_ptr = p_l1_base_ptr + sid * rows * cols (ND offset),
-          // target = dst_ptr + (d * nBlk_full * 256 + sid * nBlk_sub * 256 -
-          // sid * rows * cols) = dst_ptr + d * nBlk_full * 256 - sid * (rows *
-          // cols - nBlk_sub * 256)
-          int d_group_offset = d * full_nBlk * frac_elems;
-          int nd_vs_nz_correction =
-              rows * cols - nBlk_sub * frac_elems; // per-sid correction
-          this->stream << "  copy_ubuf_to_cbuf((__cbuf__ void*)((__cbuf__ "
-                       << dst_dtype << "*)(";
-          this->PrintExpr(op->args[0], this->stream);
-          this->stream << ") + " << d_group_offset << " - sid * "
-                       << nd_vs_nz_correction
-                       << "), (__ubuf__ void*)(_nd2nz_tmp + "
-                       << tmp_offset_elems << "), 0, " << copy_bytes / 32
-                       << ", 1, 0, 0);\n";
-        }
+      this->stream << ");\n";
+      // For each D-group, copy nBlk_sub fractals from tmp to the right NZ
+      // slot in L1. d_group_offset = d * nBlk_full * 256 (full-NZ stride);
+      // the runtime `- sid * nd_vs_nz_correction` undoes the ND sid offset
+      // baked into dst_ptr.
+      for (int d = 0; d < dBlk; ++d) {
+        int tmp_offset_elems = d * nBlk_sub * frac_elems;
+        int copy_bytes = nBlk_sub * frac_bytes;
+        int d_group_offset = d * full_nBlk * frac_elems;
+        this->PrintIndent();
+        this->stream << "  copy_ubuf_to_cbuf((__cbuf__ void*)((__cbuf__ "
+                     << dst_dtype << "*)(";
+        this->PrintExpr(op->args[0], this->stream);
+        this->stream << ") + " << d_group_offset << " - sid * "
+                     << nd_vs_nz_correction
+                     << "), (__ubuf__ void*)(_nd2nz_tmp + " << tmp_offset_elems
+                     << "), 0, " << copy_bytes / 32 << ", 1, 0, 0);\n";
       }
       this->PrintIndent();
       this->stream << "}\n";

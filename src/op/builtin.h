@@ -665,13 +665,21 @@ TVM_DLL const Op &ascend_copy_matrix_cc_to_ub();
 TVM_DLL const Op &ascend_copy_ubuf_to_cbuf();
 
 /*!
- * \brief Ascend fused ND→NZ copy from UBuf to CBuf (L1).
+ * \brief Ascend ND→NZ scatter (SimdVF) from UB ND tile to UB NZ tile.
  *
- * ascend_nd2nz_copy(dst_l1, src_ub, tmp_nz_ub, rows, cols, fuse_cast,
- *                   dst_dtype_str, src_dtype_str)
+ * ascend_nd2nz_scatter(src_ub, tmp_nz_ub, rows, cols, fuse_cast,
+ *                      dst_dtype_str, src_dtype_str)
  *
  */
-TVM_DLL const Op &ascend_nd2nz_copy();
+TVM_DLL const Op &ascend_nd2nz_scatter();
+
+/*!
+ * \brief Ascend post-scatter UB→L1 raw DMA with NZ-fractal stride correction.
+ *
+ * ascend_nd2nz_post_copy(dst_l1, src_ub, rows, cols, full_rows, dst_dtype_str)
+ *
+ */
+TVM_DLL const Op &ascend_nd2nz_post_copy();
 
 TVM_DLL const Op &ascend_copy_matrix_cc_to_gm();
 
