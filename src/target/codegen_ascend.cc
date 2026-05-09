@@ -1789,8 +1789,18 @@ void CodeGenTileLangAscend::PrintCallExtern(Type ret_type,
       // args: [msg, buf_name, ptr, size, type_str]
       uint64_t size_val = Downcast<IntImm>(args[arg_start + 3])->value;
       std::string dtype_str = Downcast<StringImm>(args[arg_start + 4])->value;
+      std::string position = "VECIN";
+      auto scope = args[arg_start + 2]
+                       .as<CallNode>()
+                       ->args[0]
+                       .as<BufferLoadNode>()
+                       ->buffer.scope();
+      if (scope == "shared.l0c") {
+        position = "CO1";
+      }
+
       os << "AscendC::DumpTensor(AscendC::LocalTensor<" << dtype_str
-         << ">(AscendC::TPosition::VECIN, (uint32_t)(uintptr_t)";
+         << ">(AscendC::TPosition::" << position << ", (uint32_t)(uintptr_t)";
       PrintExpr(args[arg_start + 2], os);
       os << ", " << size_val << "), 0, " << size_val << ")";
       return;
