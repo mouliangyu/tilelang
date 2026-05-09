@@ -457,6 +457,23 @@ private:
           GemmPy gemm_py(op->args);
           tensor_core_shapes.emplace_back(gemm_py->m_, gemm_py->n_,
                                           gemm_py->k_);
+        } else if (op->op.same_as(builtin::call_extern())) {
+          if (op->args.size() > 0) {
+            if (auto sym = op->args[0].as<StringImmNode>()) {
+              const std::string &name = sym->value;
+              if (name == "debug_print_msg" || name == "debug_print_var" ||
+                  name == "debug_print_buffer_value") {
+                // (AscendC::)printf -> S pipe
+                pipe_mask |= static_cast<uint16_t>(ResourcePipe::kScalar);
+              } else if (name == "debug_print_buffer_dump") {
+                // AscendC::DumpTensor(LocalTensor<T>(VECIN, ...)) reads UB
+                pipe_mask |= static_cast<uint16_t>(ResourcePipe::kVector);
+              } else if (name == "debug_print_global_buffer_dump") {
+                // AscendC::DumpTensor(GlobalTensor<T>) reads GM
+                pipe_mask |= static_cast<uint16_t>(ResourcePipe::kMTE3);
+              }
+            }
+          }
         }
 
         StmtExprVisitor::VisitExpr_(op);
