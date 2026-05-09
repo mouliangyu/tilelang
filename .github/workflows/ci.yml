@@ -113,8 +113,11 @@ jobs:
 
       - name: Create venv from system Python
         run: |
-          python -m venv --system-site-packages .venv
-          echo "$(pwd)/.venv/bin" >> "${GITHUB_PATH}"
+          VENV_DIR="${{ runner.tool_cache }}/.ci-venv-${{ matrix.runner.name }}"
+          if [ ! -d "${VENV_DIR}" ]; then
+            python -m venv --system-site-packages "${VENV_DIR}"
+          fi
+          echo "${VENV_DIR}/bin" >> "${GITHUB_PATH}"
 
       - name: Setup dependencies
         run: |
