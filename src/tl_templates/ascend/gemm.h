@@ -63,7 +63,6 @@ ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
     bisheng::cce::load_cbuf_to_ca((__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)),
                                   cbuf_a_ptr, 0, (sk * kStep), mStepA, kStep,
                                   mStepA, mStepA, 0);
-    rls_buf(PIPE_MTE1, buf_offset + (sk & 1), false);
     if constexpr (TRANS_B) {
       // NT case: W[N,K] in L1, transpose=false (ZZ)
       // rows=N, cols=K → sub-K along cols (kStart)
@@ -84,8 +83,7 @@ ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
           kStep,        // dstStride: mStep
           1);
     }
-    AscendC::SetFlag<AscendC::HardEvent::MTE1_M>((sk & 1));
-    AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>((sk & 1));
+    rls_buf(PIPE_MTE1, buf_offset + (sk & 1), false);
     get_buf(PIPE_M, buf_offset + (sk & 1), false);
     bisheng::cce::mad(cc_ptr, (__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)),
                       (__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), M,

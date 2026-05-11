@@ -668,6 +668,10 @@ static std::string GetHardEvent(uint16_t producer_mask,
     return "MTE2_MTE1";
   if (event == "M_MTE2")
     return "MTE1_MTE2";
+  if (event == "MTE3_M")
+    return "MTE3_MTE1";
+  if (event == "M_MTE3")
+    return "MTE1_MTE3";
   return event;
 }
 
