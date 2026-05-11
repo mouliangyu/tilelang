@@ -284,13 +284,12 @@ def _emit_nd2nz_seq(
     # post_copy Call so the eager-builder auto-evaluates it.
     tmp_region = _allocate_nd2nz_tmp(src_orig, dst_orig)
     tmp_buf = tmp_region.args[0].buffer
-    tmp_ptr = _access_ptr(tmp_buf, "rw")
 
     scatter = tir.call_intrin(
         "handle",
         scatter_op,
         src_ptr,
-        tmp_ptr,
+        _access_ptr(tmp_buf, "w"),
         rows,
         cols,
         fuse_cast,
@@ -303,7 +302,7 @@ def _emit_nd2nz_seq(
         "handle",
         post_copy_op,
         dst_ptr,
-        tmp_ptr,
+        _access_ptr(tmp_buf, "r"),
         rows,
         cols,
         full_rows,
