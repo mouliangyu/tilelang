@@ -34,7 +34,7 @@ env:
 jobs:
   lint:
     name: Quick Lint
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ascend]
     timeout-minutes: 30
     steps:
       - name: Checkout repository
@@ -43,25 +43,35 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      - name: Setup Python 3.9
-        id: setup-pylowest
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.9"
-          update-environment: true
-          cache: pip
-          cache-dependency-path: |
-            pyproject.toml
-            requirements*.txt
-            .pre-commit-config.yaml
-
-      - name: Check AST with Python 3.9
+      - name: Set environment (self-hosted runners)
         run: |
-          "${{ steps.setup-pylowest.outputs.python-path }}" -m compileall -q -f tilelang
+          # Use runner tool_cache as cache root for self-hosted runners to avoid internet connection
+          # issues and to share cache between jobs.
+          export XDG_CACHE_HOME="${{ runner.tool_cache }}/.ci-cache-${{ github.workflow }}"
+          echo "XDG_CACHE_HOME=${XDG_CACHE_HOME}" | tee -a "${GITHUB_ENV}"
+          echo "PIP_CACHE_DIR=${XDG_CACHE_HOME}/pip" | tee -a "${GITHUB_ENV}"
+          echo "PRE_COMMIT_HOME=${XDG_CACHE_HOME}/pip/.pre-commit" | tee -a "${GITHUB_ENV}"
+
+      - name: Create venv from system Python
+        run: |
+          VENV_DIR="${{ runner.tool_cache }}/.ci-venv-self-hosted-ascend"
+          if [ ! -d "${VENV_DIR}" ]; then
+            python -m venv --system-site-packages "${VENV_DIR}"
+          fi
+          echo "${VENV_DIR}/bin" >> "${GITHUB_PATH}"
+
+      - name: Install lint dependencies
+        run: |
+          pip install --upgrade pip setuptools wheel
+          pip install -r requirements-lint.txt
+
+      - name: Check AST
+        run: |
+          python -m compileall -q -f tilelang
 
       - name: Pre-commit Lint
         run: |
-          if ! pipx run pre-commit run --all-files --color=always --show-diff-on-failure; then
+          if ! pre-commit run --all-files --color=always --show-diff-on-failure; then
             echo "::error::Pre-commit checks failed. Please run 'pre-commit install' and 'pre-commit run --all-files' locally to see the issues."
             exit 1
           fi
