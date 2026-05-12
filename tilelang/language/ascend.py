@@ -433,6 +433,24 @@ def ascend_simd_neg(dst, src, mask) -> None:
     return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_neg"), dst, src, mask)
 
 
+def ascend_simd_duplicate(dst, src, mask) -> None:
+    """Ascend SimdVF MicroAPI Duplicate: broadcast lowest element of src to all lanes.
+
+    Low-level op emitted by AscendLowerParallelToVector pass.
+    Generates: AscendC::MicroAPI::Duplicate<dtype, LOWEST>(dst, src, mask)
+
+    Parameters
+    ----------
+    dst : Var
+        Destination fragment register (data field).
+    src : Var
+        Source fragment register whose lowest lane is broadcast.
+    mask : PrimExpr
+        Mask register controlling active lanes.
+    """
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_duplicate"), dst, src, mask)
+
+
 def ascend_simd_create_addr_reg(*args, dtype="float"):
     """MicroAPI::CreateAddrReg<dtype>(idx0, stride0, idx1, stride1, ...)
 
@@ -457,6 +475,26 @@ def ascend_simd_load(dst_frag, src_ptr, addr_reg=None, dtype="float") -> None:
     if addr_reg is not None:
         return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_load"), dtype, dst_frag, src_ptr, addr_reg)
     return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_load"), dtype, dst_frag, src_ptr)
+
+
+def ascend_simd_load_single(dst_frag, src_ptr, dtype="float") -> None:
+    """Ascend SimdVF MicroAPI LoadAlign with DIST_BRC: load single scalar and broadcast to all lanes.
+
+    The load_dist (DIST_BRC_B8/B16/B32) is automatically inferred from dtype bit width:
+        float/int32/uint32 → DIST_BRC_B32,  half/int16/uint16 → DIST_BRC_B16,  int8/uint8 → DIST_BRC_B8
+
+    Generates: AscendC::MicroAPI::LoadAlign<dtype, MicroAPI::LoadDist::DIST_BRC_*>(dst, src)
+
+    Parameters
+    ----------
+    dst_frag : Var
+        Destination fragment register (data field).
+    src_ptr : PrimExpr
+        Source UB pointer (address_of a scalar element).
+    dtype : str
+        C++ type name for template parameter (e.g. "float", "half_t", "int8_t").
+    """
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_load_single"), dtype, dst_frag, src_ptr)
 
 
 def ascend_simd_store(dst_ptr, src_frag, mask, addr_reg=None, dtype="float") -> None:

@@ -1037,7 +1037,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[1], this->stream);
     this->stream << "));\n";
     this->PrintIndent();
-    this->stream << "pipe_barrier(PIPE_ALL);\n";
+    // this->stream << "pipe_barrier(PIPE_ALL);\n";
   } else if (op->op.same_as(tl::ascend_nd2nz_post_copy())) {
     // ascend_nd2nz_post_copy(dst_l1, src_ub, rows, cols, full_rows,
     //                        dst_dtype_str)
@@ -1220,7 +1220,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
            op->op.same_as(tl::ascend_simd_sqrt()) ||
            op->op.same_as(tl::ascend_simd_rsqrt()) ||
            op->op.same_as(tl::ascend_simd_abs()) ||
-           op->op.same_as(tl::ascend_simd_neg())) {
+           op->op.same_as(tl::ascend_simd_neg()) ||
+           op->op.same_as(tl::ascend_simd_duplicate())) {
     ICHECK_EQ(op->args.size(), 3);
     const char *name = nullptr;
     if (op->op.same_as(tl::ascend_simd_exp()))
@@ -1233,6 +1234,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       name = "Rsqrt";
     else if (op->op.same_as(tl::ascend_simd_abs()))
       name = "Abs";
+    else if (op->op.same_as(tl::ascend_simd_duplicate()))
+      name = "Duplicate";
     else
       name = "Neg";
     this->PrintIndent();
@@ -1257,6 +1260,48 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->stream << ", ";
       this->PrintExpr(op->args[3], this->stream);
     }
+    this->stream << ");\n";
+  }
+  // --- SimdVF load_single: (dtype_str, dst, src) ---
+  else if (op->op.same_as(tl::ascend_simd_load_single())) {
+    ICHECK_EQ(op->args.size(), 3);
+    std::string dtype_str = Downcast<StringImm>(op->args[0])->value;
+    // Infer LoadDist bit width from dtype:
+    //   float, int32/uint32 → 4 bytes → DIST_BRC_B32
+    //   half_t, bfloat16_t, int16/uint16 → 2 bytes → DIST_BRC_B16
+    //   int8/uint8 → 1 byte → DIST_BRC_B8
+    int bit_width = 32;
+    if (dtype_str == "float") {
+      bit_width = 32;
+    } else if (dtype_str == "half_t" || dtype_str == "bfloat16_t") {
+      bit_width = 16;
+    } else {
+      // Parse "intN_t" / "uintN_t" → extract N
+      auto pos = dtype_str.find_first_of("0123456789");
+      if (pos != std::string::npos)
+        bit_width = std::stoi(dtype_str.substr(pos));
+    }
+    int dist_val = bit_width / 8; // 4, 2, or 1
+    const char *dist_str = nullptr;
+    switch (dist_val) {
+    case 1:
+      dist_str = "MicroAPI::LoadDist::DIST_BRC_B8";
+      break;
+    case 2:
+      dist_str = "MicroAPI::LoadDist::DIST_BRC_B16";
+      break;
+    case 4:
+      dist_str = "MicroAPI::LoadDist::DIST_BRC_B32";
+      break;
+    default:
+      LOG(FATAL) << "Unsupported bit width for load_single: " << bit_width;
+    }
+    this->PrintIndent();
+    this->stream << "AscendC::MicroAPI::LoadAlign<" << dtype_str << ", "
+                 << dist_str << ">(";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[2], this->stream);
     this->stream << ");\n";
   }
   // --- SimdVF store: 4 args (simple) or 5 args (with AddrReg) ---

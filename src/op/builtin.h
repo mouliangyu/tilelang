@@ -547,8 +547,10 @@ TVM_DLL const Op &ascend_simd_sqrt();
 TVM_DLL const Op &ascend_simd_rsqrt();
 TVM_DLL const Op &ascend_simd_abs();
 TVM_DLL const Op &ascend_simd_neg();
+TVM_DLL const Op &ascend_simd_duplicate();
 // SimdVF memory: (dtype_str, dst, src [, addr_reg] [, mask])
 TVM_DLL const Op &ascend_simd_load();
+TVM_DLL const Op &ascend_simd_load_single();
 TVM_DLL const Op &ascend_simd_store();
 // SimdVF addr: (dtype_str, idx0, stride0, ...) → AddrReg handle
 TVM_DLL const Op &ascend_simd_create_addr_reg();
