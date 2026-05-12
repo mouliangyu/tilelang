@@ -292,19 +292,18 @@ public:
       resource_flags.push_back(static_cast<int64_t>(node->GetPipeMask()));
     }
 
-    // Helper function to check if a buffer is written before being read
+    // Helper function to check if a buffer is written before being read.
+    // Recurses in program order through the child subtrees and (at TaskNode
+    // leaves) into the TIR Stmt itself, so a child that internally produces
+    // before consuming counts as write-first. Conservative on if/while:
+    // conditional writes and loops that may not execute do NOT count as
+    // guaranteed writes.
     auto check_buffer_write_first = [&nodes](const Buffer &buffer) {
       for (const auto &node : nodes) {
-        for (const auto &region : node->GetReadRegions()) {
-          if (region->buffer.same_as(buffer)) {
-            return false; // read access found before any write
-          }
-        }
-        for (const auto &region : node->GetWriteRegions()) {
-          if (region->buffer.same_as(buffer)) {
-            return true; // write access found before any read
-          }
-        }
+        auto order = node->ClassifyBufferAccess(buffer);
+        if (order == BufferAccessOrder::kUntouched)
+          continue;
+        return order == BufferAccessOrder::kWriteFirst;
       }
       return false;
     };
