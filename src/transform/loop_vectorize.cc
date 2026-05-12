@@ -683,7 +683,12 @@ private:
       return 1;
     }
     if (is_independent) {
-      return buffer_vec_size; // only limited constraint from this buffer
+      // Even when the offset is independent of the loop var (broadcast
+      // pattern), the vector size must still respect the hardware lane
+      // capacity. Otherwise a single independent load can inflate the
+      // final vector_size far beyond what the hardware supports
+      // (e.g. fp32 x 64 lanes = 2048 bits on an Ascend 128-bit target).
+      return arith::ZeroAwareGCD(buffer_vec_size, min_vec_size);
     }
     // 4. Try to find max vectorize size for this buffer
     while (buffer_vec_size > 1 &&

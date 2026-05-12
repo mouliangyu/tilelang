@@ -1449,7 +1449,7 @@ private:
       }
     }
 
-    if (has_same_index) {
+    if (has_same_index && false) {
       // Use Z3 to check if prev and curr constraints are equivalent.
       // If equivalent, the same set of threads execute both accesses, so no
       // sync is needed.

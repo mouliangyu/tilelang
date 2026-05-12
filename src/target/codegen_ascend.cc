@@ -1285,13 +1285,13 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     const char *dist_str = nullptr;
     switch (dist_val) {
     case 1:
-      dist_str = "MicroAPI::LoadDist::DIST_BRC_B8";
+      dist_str = "AscendC::MicroAPI::LoadDist::DIST_BRC_B8";
       break;
     case 2:
-      dist_str = "MicroAPI::LoadDist::DIST_BRC_B16";
+      dist_str = "AscendC::MicroAPI::LoadDist::DIST_BRC_B16";
       break;
     case 4:
-      dist_str = "MicroAPI::LoadDist::DIST_BRC_B32";
+      dist_str = "AscendC::MicroAPI::LoadDist::DIST_BRC_B32";
       break;
     default:
       LOG(FATAL) << "Unsupported bit width for load_single: " << bit_width;
