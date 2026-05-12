@@ -14,6 +14,7 @@
 #include "../transform/common/loop_fusion_utils.h"
 #include "../transform/loop_partition.h"
 #include "../transform/loop_vectorize.h"
+#include "ascend_mte_plan.h"
 #include "utils.h"
 
 #include "builtin.h"
@@ -907,28 +908,69 @@ Stmt CopyNode::LowerAscendDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
   PrimExpr total_bytes = row_bytes * n_rows;
 
   PrimExpr call;
-  if (dma_path == 0) {
-    if (is_single_row) {
-      call =
-          Call(DataType::Void(), ascend_copy_gm_to_ubuf(),
-               {dst_ptr, src_ptr, sid, total_bytes / I(32), I(1), zero, zero});
-    } else {
-      PrimExpr len_burst = row_bytes / I(32);
-      PrimExpr src_stride = (src_row_stride_bytes - row_bytes) / I(32);
-      PrimExpr dst_stride = (dst_row_stride_bytes - row_bytes) / I(32);
-      call = Call(
-          DataType::Void(), ascend_copy_gm_to_ubuf(),
-          {dst_ptr, src_ptr, sid, n_rows, len_burst, src_stride, dst_stride});
+  if (dma_path == 0 || dma_path == 1) {
+    // GM <-> UBuf: use StridedLayout + PlanMTECopy for correct stride handling
+    auto src_layout =
+        StridedLayout::FromBufferRange(src, src_range, elem_bytes);
+    auto dst_layout =
+        StridedLayout::FromBufferRange(dst, dst_range, elem_bytes);
+    auto plan = PlanMTECopy(src_layout, dst_layout, analyzer);
+
+    PrimExpr plan_total_elems = plan.row_bytes / I(elem_bytes) * plan.n_rows;
+    PrimExpr plan_src_ptr =
+        make_access_ptr(src, plan.src_offset, plan_total_elems, 1);
+    PrimExpr plan_dst_ptr =
+        make_access_ptr(dst, plan.dst_offset, plan_total_elems, 2);
+
+    // Determine if this is effectively a single contiguous copy
+    auto as_int_plan = [](PrimExpr e) -> int64_t {
+      if (auto *imm = e.as<IntImmNode>())
+        return imm->value;
+      return -1;
+    };
+    bool plan_single_row = false;
+    int64_t nr_plan = as_int_plan(plan.n_rows);
+    int64_t rb_plan = as_int_plan(plan.row_bytes);
+    if (nr_plan == 1 || (rb_plan >= 0 && rb_plan < 32)) {
+      plan_single_row = true;
     }
-  } else if (dma_path == 1) {
-    if (is_single_row) {
-      call = Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
-                  {dst_ptr, src_ptr, sid, I(1), total_bytes, zero, total_bytes,
-                   total_bytes});
+
+    PrimExpr plan_total_bytes = plan.row_bytes * plan.n_rows;
+
+    if (!plan_single_row) {
+      // Multi-row path requires row_bytes to be 32B-aligned
+      ICHECK(rb_plan > 0 && rb_plan % 32 == 0)
+          << "Ascend MTE multi-row copy requires row_bytes to be a multiple "
+             "of 32B, but got row_bytes="
+          << rb_plan;
+    }
+
+    if (dma_path == 0) {
+      // GM -> UBuf
+      if (plan_single_row) {
+        call = Call(DataType::Void(), ascend_copy_gm_to_ubuf(),
+                    {plan_dst_ptr, plan_src_ptr, sid, plan_total_bytes / I(32),
+                     I(1), zero, zero});
+      } else {
+        PrimExpr len_burst = plan.row_bytes / I(32);
+        PrimExpr src_gap = (plan.src_stride_bytes - plan.row_bytes) / I(32);
+        PrimExpr dst_gap = (plan.dst_stride_bytes - plan.row_bytes) / I(32);
+        call = Call(DataType::Void(), ascend_copy_gm_to_ubuf(),
+                    {plan_dst_ptr, plan_src_ptr, sid, plan.n_rows, len_burst,
+                     src_gap, dst_gap});
+      }
     } else {
-      call = Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
-                  {dst_ptr, src_ptr, sid, n_rows, row_bytes, zero,
-                   dst_row_stride_bytes, src_row_stride_bytes});
+      // UBuf -> GM (dma_path == 1)
+      if (plan_single_row) {
+        call = Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
+                    {plan_dst_ptr, plan_src_ptr, sid, I(1), plan_total_bytes,
+                     zero, plan_total_bytes, plan_total_bytes});
+      } else {
+        call =
+            Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
+                 {plan_dst_ptr, plan_src_ptr, sid, plan.n_rows, plan.row_bytes,
+                  zero, plan.dst_stride_bytes, plan.src_stride_bytes});
+      }
     }
   } else if (dma_path == 2) {
     PrimExpr transpose_flag = I(this->GetTranspose());
