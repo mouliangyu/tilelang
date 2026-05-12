@@ -100,8 +100,8 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
   std::stringstream ss;
   auto thread_offset = T.thread_bounds->min;
   if (T.target->HasKey("ascend")) {
-    ss << "tl::AscendAllReduce<" << op_str << ", " << reducing_threads
-       << ">::run";
+    ss << "tl::AscendAllReduce<" << op_str << ", " << reducing_threads << ", "
+       << scale << ", " << thread_offset << ">::run";
   } else if (TargetHasSMVersionGE(T.target, 90)) {
     auto all_threads = T.thread_bounds->extent;
     ss << "tl::AllReduce<" << op_str << ", " << reducing_threads << ", " << 1

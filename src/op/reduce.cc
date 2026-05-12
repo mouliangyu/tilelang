@@ -384,7 +384,8 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         auto thread_offset = T.thread_bounds->min;
         if (T.target->HasKey("ascend")) {
           ss << "tl::AscendAllReduce<" << this->MakeCodegenReducer() << ", "
-             << reducing_threads << ">::run";
+             << reducing_threads << ", " << (*scale) << ", " << thread_offset
+             << ">::run";
         } else if (TargetHasSMVersionGE(T.target, 90)) {
           auto all_threads = T.thread_bounds->extent;
           ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
@@ -402,8 +403,12 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         bool need_workspace = reducing_threads > 32;
         if (T.target->HasKey("ascend")) {
           bool is_pow2 = (reducing_threads & (reducing_threads - 1)) == 0;
-          need_workspace =
-              reducing_threads > 32 || (reducing_threads > 1 && !is_pow2);
+          bool scale_is_pow2 = ((*scale) & ((*scale) - 1)) == 0;
+          int extent_val = reducing_threads / (*scale);
+          bool extent_is_pow2 = (extent_val & (extent_val - 1)) == 0;
+          need_workspace = reducing_threads > 32 ||
+                           (reducing_threads > 1 &&
+                            (!is_pow2 || !scale_is_pow2 || !extent_is_pow2));
         }
         if (need_workspace) {
           int workspace_size =
