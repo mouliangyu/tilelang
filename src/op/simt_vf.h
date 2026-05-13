@@ -33,10 +33,6 @@ public:
                         InferLevel level) const override;
 
   TileOperator Clone() const override;
-
-private:
-  Array<Var> CollectCaptures(const LowerArgs &T) const;
-  static bool IsSupportedCaptureVar(const Var &var);
 };
 
 class SimtVFOp : public TileOperator {

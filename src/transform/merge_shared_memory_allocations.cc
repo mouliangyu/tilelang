@@ -43,7 +43,6 @@
 
 #include "../op/builtin.h"
 #include "../target/utils.h"
-#include "common/attr.h"
 #include "runtime/thread_storage_scope.h"
 #include "tir/transforms/ir_utils.h"
 #include "tvm/tir/function.h"
@@ -533,53 +532,7 @@ private:
   }
 
   Stmt VisitStmt_(const BlockNode *op) final {
-    if (op->name_hint != "SIMT_VF" && op->name_hint != "SIMD_VF") {
-      return StmtExprMutator::VisitStmt_(op);
-    }
-
-    // Get the current captures
-    const char *captures_key = (op->name_hint == "SIMT_VF")
-                                   ? tilelang_simt_vf_captures
-                                   : tilelang_simd_vf_captures;
-    auto opt_captures = op->annotations.Get(captures_key);
-    if (!opt_captures) {
-      return StmtExprMutator::VisitStmt_(op);
-    }
-
-    auto captures_arr = opt_captures.value().as<Array<Var>>();
-    if (!captures_arr) {
-      return StmtExprMutator::VisitStmt_(op);
-    }
-
-    // Build new captures: remove shared memory buffers, add buf_dyn_shmem
-    Array<Var> new_captures;
-    std::unordered_set<const VarNode *> shared_vars_removed;
-    bool buf_dyn_shmem_added = false;
-
-    for (const Var &v : captures_arr.value()) {
-      bool is_shmem = v->type_annotation.as<PointerTypeNode>() &&
-                      IsAppropriateSharedMemory(v);
-      if (is_shmem) {
-        shared_vars_removed.insert(v.get());
-      } else {
-        new_captures.push_back(v);
-      }
-    }
-
-    // If any shared memory vars were removed, add buf_dyn_shmem
-    if (!shared_vars_removed.empty() && !buf_dyn_shmem_added) {
-      new_captures.push_back(merged_buf_var_);
-      buf_dyn_shmem_added = true;
-    }
-
-    // Visit the body and update the BlockNode
-    Block new_block = Downcast<Block>(StmtExprMutator::VisitStmt_(op));
-    if (!shared_vars_removed.empty()) {
-      auto *ptr = new_block.CopyOnWrite();
-      ptr->annotations.Set(captures_key, new_captures);
-    }
-
-    return std::move(new_block);
+    return StmtExprMutator::VisitStmt_(op);
   }
 
   Stmt VisitStmt_(const DeclBufferNode *op) final {

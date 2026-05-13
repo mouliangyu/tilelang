@@ -57,6 +57,12 @@ private:
   bool has_bf16_cast_{false};
   bool has_bf16_cast_included_{false};
 
+  ffi::Array<tir::Var> CollectVFCaptures(const tir::BlockNode *op) const;
+  void EmitVFFunction(const tir::BlockNode *op,
+                      const ffi::Array<tir::Var> &captures,
+                      const std::string &helper_name,
+                      const std::string &func_attrs, bool &inside_vf_body);
+
   enum class AscendKernelMode { kVector, kCube, kMix };
   AscendKernelMode kernel_mode_{AscendKernelMode::kVector};
   int mix_aiv_count_{2};

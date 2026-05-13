@@ -5,11 +5,7 @@
 
 #include "simt_vf.h"
 
-#include <unordered_set>
-
 #include <tvm/tir/analysis.h>
-
-#include "../transform/common/attr.h"
 
 namespace tvm {
 namespace tl {
@@ -23,56 +19,10 @@ void SimtVFOpNode::RegisterReflection() {
 
 TileOperator SimtVFOpNode::Clone() const { return SimtVFOp(root_); }
 
-bool SimtVFOpNode::IsSupportedCaptureVar(const Var &var) {
-  const DataType dtype = var->dtype;
-  if (dtype.lanes() != 1) {
-    return false;
-  }
-  return dtype.is_int() || dtype.is_uint() || dtype.is_float() ||
-         dtype.is_handle() || dtype.is_bool();
-}
-
-Array<Var> SimtVFOpNode::CollectCaptures(const LowerArgs &T) const {
-  Array<Var> predefined;
-  if (T.thread_var.defined()) {
-    predefined.push_back(T.thread_var);
-  }
-
-  // Exclude Block-owned alloc_buffers from capture analysis.
-  // These are fragment buffers that will be placed inside the VF
-  // function by StorageRewrite (via tl.simtvf_scope). Without this
-  // exclusion, LCA analysis sees them as external references and
-  // places their Allocate outside the SIMT_VF region.
-  for (const tir::Buffer &buf : root_->alloc_buffers) {
-    predefined.push_back(buf->data);
-  }
-
-  Array<Var> undefined = UndefinedVars(root_->body, predefined);
-
-  Array<Var> captures;
-  std::unordered_set<const VarNode *> seen;
-  for (const Var &var : undefined) {
-    if (seen.count(var.get())) {
-      continue;
-    }
-    seen.insert(var.get());
-    ICHECK(IsSupportedCaptureVar(var))
-        << "SimtVF capture variable `" << var << "` has unsupported dtype `"
-        << var->dtype
-        << "`. Only scalar int/uint/float/bool/handle are currently supported.";
-    captures.push_back(var);
-  }
-  return captures;
-}
-
 Stmt SimtVFOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   (void)analyzer;
-  Block lowered = root_;
-  auto captures = CollectCaptures(T);
-
-  auto ptr = lowered.CopyOnWrite();
-  ptr->annotations.Set(tilelang_simt_vf_captures, captures);
-  return lowered;
+  (void)T;
+  return root_;
 }
 
 LayoutMap SimtVFOpNode::InferLayout(const LayoutInferArgs &T,

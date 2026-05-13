@@ -3,9 +3,10 @@
 #include "../op/builtin.h"
 #include <sstream>
 #include <string>
+#include <unordered_set>
 
 #include "../../3rdparty/tvm/src/tir/transforms/ir_utils.h"
-#include "../transform/common/attr.h"
+#include <tvm/tir/analysis.h>
 #include <tvm/tir/stmt_functor.h>
 
 static std::string FixIndent(const std::string &body) {
@@ -345,6 +346,104 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   this->stream << "}\n\n";
 }
 
+Array<Var>
+CodeGenTileLangAscend::CollectVFCaptures(const tir::BlockNode *op) const {
+  Array<Var> predefined;
+  for (const tir::Buffer &buf : op->alloc_buffers) {
+    predefined.push_back(buf->data);
+  }
+  Array<Var> undefined = UndefinedVars(op->body, predefined);
+  Array<Var> captures;
+  std::unordered_set<const VarNode *> seen;
+  for (const Var &var : undefined) {
+    if (seen.count(var.get()))
+      continue;
+    seen.insert(var.get());
+    const DataType dtype = var->dtype;
+    ICHECK(dtype.lanes() == 1 &&
+           (dtype.is_int() || dtype.is_uint() || dtype.is_float() ||
+            dtype.is_handle() || dtype.is_bool()))
+        << op->name_hint << " capture variable `" << var
+        << "` has unsupported dtype `" << dtype
+        << "`. Only scalar int/uint/float/bool/handle are supported.";
+    captures.push_back(var);
+  }
+  return captures;
+}
+
+void CodeGenTileLangAscend::EmitVFFunction(const tir::BlockNode *op,
+                                           const ffi::Array<tir::Var> &captures,
+                                           const std::string &helper_name,
+                                           const std::string &func_attrs,
+                                           bool &inside_vf_body) {
+  // Register captures with their storage scope
+  for (const auto &v : captures) {
+    if (v->type_annotation.as<PointerTypeNode>()) {
+      alloc_storage_scope_[v.get()] = GetPtrStorageScope(v);
+    }
+  }
+  // Save and reset variable naming state
+  std::unordered_map<const tir::VarNode *, std::string> saved_var_idmap;
+  saved_var_idmap.swap(var_idmap_);
+  NameSupply saved_name_supply = name_supply_;
+  name_supply_ = NameSupply();
+  for (const auto &kv : saved_var_idmap) {
+    var_idmap_[kv.first] = kv.second;
+  }
+  // Render body to temporary stream
+  std::ostringstream saved_main_stream;
+  stream.swap(saved_main_stream);
+  bool old_inside = inside_vf_body;
+  inside_vf_body = true;
+  CodeGenC::VisitStmt(op->body);
+  inside_vf_body = old_inside;
+  std::string helper_body = FixIndent(stream.str());
+  stream.str("");
+  stream.clear();
+  stream.swap(saved_main_stream);
+  // Restore naming state
+  var_idmap_.swap(saved_var_idmap);
+  name_supply_ = saved_name_supply;
+
+  auto resolve_var_name = [this](const Var &v) -> std::string {
+    auto it = var_idmap_.find(v.get());
+    if (it != var_idmap_.end())
+      return it->second;
+    return v->name_hint;
+  };
+
+  // Emit helper function to decl_stream
+  decl_stream << func_attrs << " " << helper_name << "(";
+  for (size_t i = 0; i < captures.size(); ++i) {
+    if (i != 0)
+      decl_stream << ", ";
+    const Var &v = captures[i];
+    std::string vname = resolve_var_name(v);
+    if (!v->type_annotation.as<PointerTypeNode>()) {
+      PrintType(v.dtype(), decl_stream);
+      decl_stream << " " << vname;
+    } else {
+      auto it = handle_data_type_.find(v.get());
+      if (it == handle_data_type_.end()) {
+        for (const auto &kv : handle_data_type_) {
+          if (kv.first->name_hint == v->name_hint) {
+            it = handle_data_type_.find(kv.first);
+            break;
+          }
+        }
+      }
+      PrintStorageScope(GetPtrStorageScope(v), decl_stream);
+      if (it != handle_data_type_.end()) {
+        PrintType(it->second, decl_stream);
+        decl_stream << "* " << vname;
+      } else {
+        decl_stream << "void* " << vname;
+      }
+    }
+  }
+  decl_stream << ") {\n" << helper_body << "}\n\n";
+}
+
 void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
   if (op->name_hint == "CUBE") {
     if (kernel_mode_ == AscendKernelMode::kMix) {
@@ -375,245 +474,76 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
     return;
   }
   if (op->name_hint == "SIMD_VF") {
-    ffi::Array<Var> captures;
-    if (auto opt_captures =
-            op->annotations.Get(tvm::tl::tilelang_simd_vf_captures)) {
-      if (auto arr = opt_captures.value().as<ffi::Array<Var>>()) {
-        captures = arr.value();
-      }
-    }
+    auto captures = CollectVFCaptures(op);
     std::string helper_name =
         "simd_vf_" + std::to_string(simdvf_helper_counter_++);
-    auto resolve_var_name = [this](const Var &v) -> std::string {
-      auto it = var_idmap_.find(v.get());
-      if (it != var_idmap_.end()) {
-        return it->second;
-      }
-      return v->name_hint;
-    };
+    EmitVFFunction(op, captures, helper_name, "__simd_vf__ inline void",
+                   inside_simdvf_body_);
 
-    // Register captures with their storage scope
-    for (const auto &v : captures) {
-      if (v->type_annotation.as<PointerTypeNode>()) {
-        auto scope = GetPtrStorageScope(v);
-        alloc_storage_scope_[v.get()] = scope;
-      }
-    }
-    // Reset variable naming state so the helper function body gets fresh names
-    std::unordered_map<const tir::VarNode *, std::string> saved_var_idmap;
-    saved_var_idmap.swap(var_idmap_);
-    NameSupply saved_name_supply = name_supply_;
-    name_supply_ = NameSupply();
-    // Carry over all outer variable names so they remain accessible inside the
-    // helper body. Don't reserve them in name_supply_ so inner variables get
-    // clean unsuffixed names.
-    for (const auto &kv : saved_var_idmap) {
-      var_idmap_[kv.first] = kv.second;
-    }
-    // Render body to temporary stream
-    std::ostringstream saved_main_stream;
-    stream.swap(saved_main_stream);
-    bool old_inside_simdvf_body = inside_simdvf_body_;
-    inside_simdvf_body_ = true;
-    CodeGenC::VisitStmt(op->body);
-    inside_simdvf_body_ = old_inside_simdvf_body;
-    std::string helper_body = FixIndent(stream.str());
-    stream.str("");
-    stream.clear();
-    stream.swap(saved_main_stream);
-    // Restore naming state
-    var_idmap_.swap(saved_var_idmap);
-    name_supply_ = saved_name_supply;
-
-    // Emit __simd_vf__ helper function to decl_stream
-    decl_stream << "__simd_vf__ inline void " << helper_name << "(";
-    for (size_t i = 0; i < captures.size(); ++i) {
-      if (i != 0) {
-        decl_stream << ", ";
-      }
-      const Var &v = captures[i];
-      std::string vname = resolve_var_name(v);
-      if (!v->type_annotation.as<PointerTypeNode>()) {
-        PrintType(v.dtype(), decl_stream);
-        decl_stream << " " << vname;
-      } else {
-        auto it = handle_data_type_.find(v.get());
-        if (it == handle_data_type_.end()) {
-          for (const auto &kv : handle_data_type_) {
-            if (kv.first->name_hint == v->name_hint) {
-              it = handle_data_type_.find(kv.first);
-              break;
-            }
-          }
-        }
-        auto scope = GetPtrStorageScope(v);
-        PrintStorageScope(scope, decl_stream);
-        if (it != handle_data_type_.end()) {
-          PrintType(it->second, decl_stream);
-          decl_stream << "* " << vname;
-        } else {
-          decl_stream << "void* " << vname;
-        }
-      }
-    }
-    decl_stream << ") {\n";
-    decl_stream << helper_body;
-    decl_stream << "}\n\n";
-
-    // Emit direct inline call (no asc_vf_call)
     PrintIndent();
     stream << helper_name << "(";
     for (size_t i = 0; i < captures.size(); ++i) {
-      if (i != 0) {
+      if (i != 0)
         stream << ", ";
-      }
-      stream << resolve_var_name(captures[i]);
+      auto it = var_idmap_.find(captures[i].get());
+      stream << (it != var_idmap_.end() ? it->second
+                                        : std::string(captures[i]->name_hint));
     }
     stream << ");\n";
     return;
   }
-  if (op->name_hint != "SIMT_VF") {
-    PrintStmt(op->body);
+  if (op->name_hint == "SIMT_VF") {
+    int64_t thread_x = 1, thread_y = 1, thread_z = 1;
+    {
+      const tir::Stmt *cur = &op->body;
+      while (const auto *attr = (*cur).as<AttrStmtNode>()) {
+        if (attr->attr_key != tir::attr::thread_extent)
+          break;
+        const auto *iv = attr->node.as<IterVarNode>();
+        if (!iv)
+          break;
+        if (const auto *imm = attr->value.as<IntImmNode>()) {
+          if (iv->thread_tag == "threadIdx.x")
+            thread_x = imm->value;
+          else if (iv->thread_tag == "threadIdx.y")
+            thread_y = imm->value;
+          else if (iv->thread_tag == "threadIdx.z")
+            thread_z = imm->value;
+        }
+        cur = &attr->body;
+      }
+    }
+
+    auto captures = CollectVFCaptures(op);
+    std::string helper_name =
+        "simt_vf_" + std::to_string(simtvf_helper_counter_++);
+
+    int64_t total_threads = thread_x * thread_y * thread_z;
+    std::string func_attrs = "__simt_vf__ ";
+    if (total_threads > 0) {
+      func_attrs += "__launch_bounds__(" + std::to_string(total_threads) + ") ";
+    }
+    func_attrs += "inline void";
+    EmitVFFunction(op, captures, helper_name, func_attrs, inside_simtvf_body_);
+
+    PrintIndent();
+    stream << "asc_vf_call<" << helper_name << ">(cce::dim3(" << thread_x;
+    if (thread_y > 1 || thread_z > 1) {
+      stream << ", " << thread_y;
+      if (thread_z > 1)
+        stream << ", " << thread_z;
+    }
+    stream << ")";
+    for (size_t i = 0; i < captures.size(); ++i) {
+      auto it = var_idmap_.find(captures[i].get());
+      stream << ", "
+             << (it != var_idmap_.end() ? it->second
+                                        : std::string(captures[i]->name_hint));
+    }
+    stream << ");\n";
     return;
   }
-
-  int64_t thread_x = 1, thread_y = 1, thread_z = 1;
-  {
-    const tir::Stmt *cur = &op->body;
-    while (const auto *attr = (*cur).as<AttrStmtNode>()) {
-      if (attr->attr_key != tir::attr::thread_extent)
-        break;
-      const auto *iv = attr->node.as<IterVarNode>();
-      if (!iv)
-        break;
-      if (const auto *imm = attr->value.as<IntImmNode>()) {
-        if (iv->thread_tag == "threadIdx.x")
-          thread_x = imm->value;
-        else if (iv->thread_tag == "threadIdx.y")
-          thread_y = imm->value;
-        else if (iv->thread_tag == "threadIdx.z")
-          thread_z = imm->value;
-      }
-      cur = &attr->body;
-    }
-  }
-
-  // Check that no shared buffer allocations exist inside SimtVF region
-  tir::PostOrderVisit(op->body, [](const ObjectRef &n) {
-    if (const auto *alloc = n.as<AllocateNode>()) {
-      auto alloc_scope = GetPtrStorageScope(alloc->buffer_var);
-      ICHECK(alloc_scope != "shared" && alloc_scope != "shared.dyn")
-          << "Shared buffer allocation (T.alloc_shared) must be placed OUTSIDE "
-             "SimtVF region. "
-          << "Found buffer '" << alloc->buffer_var->name_hint
-          << "' with scope '" << alloc_scope << "' inside SimtVF body.";
-    }
-  });
-
-  ffi::Array<Var> captures;
-  if (auto opt_captures =
-          op->annotations.Get(tvm::tl::tilelang_simt_vf_captures)) {
-    if (auto arr = opt_captures.value().as<ffi::Array<Var>>()) {
-      captures = arr.value();
-    }
-  }
-  std::string helper_name =
-      "simt_vf_" + std::to_string(simtvf_helper_counter_++);
-  auto resolve_var_name = [this](const Var &v) -> std::string {
-    auto it = var_idmap_.find(v.get());
-    if (it != var_idmap_.end()) {
-      return it->second;
-    }
-    return v->name_hint;
-  };
-
-  // Capture helper body by rendering the region body to a temporary stream.
-  // Register captures with their storage scope so GetBufferRef adds correct
-  // qualifier
-  for (const auto &v : captures) {
-    if (v->type_annotation.as<PointerTypeNode>()) {
-      auto scope = GetPtrStorageScope(v);
-      alloc_storage_scope_[v.get()] = scope;
-    }
-  }
-  // Reset variable naming state so the helper function body gets fresh names
-  std::unordered_map<const tir::VarNode *, std::string> saved_var_idmap;
-  saved_var_idmap.swap(var_idmap_);
-  NameSupply saved_name_supply = name_supply_;
-  name_supply_ = NameSupply();
-  // Carry over all outer variable names so they remain accessible inside the
-  // helper body. Don't reserve them in name_supply_ so inner variables get
-  // clean unsuffixed names.
-  for (const auto &kv : saved_var_idmap) {
-    var_idmap_[kv.first] = kv.second;
-  }
-  std::ostringstream saved_main_stream;
-  stream.swap(saved_main_stream);
-  bool old_inside_simtvf_body = inside_simtvf_body_;
-  inside_simtvf_body_ = true;
-  CodeGenC::VisitStmt(op->body);
-  inside_simtvf_body_ = old_inside_simtvf_body;
-  std::string helper_body = FixIndent(stream.str());
-  stream.str("");
-  stream.clear();
-  stream.swap(saved_main_stream);
-  // Restore naming state
-  var_idmap_.swap(saved_var_idmap);
-  name_supply_ = saved_name_supply;
-
-  int64_t total_threads = thread_x * thread_y * thread_z;
-  decl_stream << "__simt_vf__ ";
-  if (total_threads > 0) {
-    decl_stream << "__launch_bounds__(" << total_threads << ") ";
-  }
-  decl_stream << "inline void " << helper_name << "(";
-  for (size_t i = 0; i < captures.size(); ++i) {
-    if (i != 0) {
-      decl_stream << ", ";
-    }
-    const Var &v = captures[i];
-    std::string vname = resolve_var_name(v);
-    if (!v->type_annotation.as<PointerTypeNode>()) {
-      PrintType(v.dtype(), decl_stream);
-      decl_stream << " " << vname;
-    } else {
-      auto it = handle_data_type_.find(v.get());
-      if (it == handle_data_type_.end()) {
-        for (const auto &kv : handle_data_type_) {
-          if (kv.first->name_hint == v->name_hint) {
-            it = handle_data_type_.find(kv.first);
-            break;
-          }
-        }
-      }
-      auto scope = GetPtrStorageScope(v);
-      PrintStorageScope(scope, decl_stream);
-      if (it != handle_data_type_.end()) {
-        PrintType(it->second, decl_stream);
-        decl_stream << "* " << vname;
-      } else {
-        decl_stream << "void* " << vname;
-      }
-    }
-  }
-  decl_stream << ") {\n";
-  decl_stream << helper_body;
-  decl_stream << "}\n\n";
-
-  PrintIndent();
-  stream << "asc_vf_call<" << helper_name << ">(cce::dim3(";
-  stream << thread_x;
-  if (thread_y > 1 || thread_z > 1) {
-    stream << ", " << thread_y;
-    if (thread_z > 1) {
-      stream << ", " << thread_z;
-    }
-  }
-  stream << ")";
-  for (size_t i = 0; i < captures.size(); ++i) {
-    stream << ", " << resolve_var_name(captures[i]);
-  }
-  stream << ");\n";
+  PrintStmt(op->body);
 }
 
 void CodeGenTileLangAscend::VisitExpr_(const BroadcastNode *op,
