@@ -398,17 +398,26 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         }
         Array<PrimExpr> thread_reduce_args = {
             StringImm(ss.str()), BufferLoad(clear_buffer, red_indices)};
-        // The butterfly reduce path needs one shared-memory slot per
-        // thread in the block.
+        // Determine whether a UB workspace buffer is needed.
+        // CUDA/HIP: shared memory needed when reducing_threads > 32.
+        // Ascend: warp-internal paths (pow2, <= 32) are register-only;
+        //   cross-warp (> 32, pow2, scale <= 32) uses UB;
+        //   non-pow2 uses UB fallback regardless of size.
         bool need_workspace = reducing_threads > 32;
         if (T.target->HasKey("ascend")) {
           bool is_pow2 = (reducing_threads & (reducing_threads - 1)) == 0;
           bool scale_is_pow2 = ((*scale) & ((*scale) - 1)) == 0;
-          int extent_val = reducing_threads / (*scale);
-          bool extent_is_pow2 = (extent_val & (extent_val - 1)) == 0;
-          need_workspace = reducing_threads > 32 ||
-                           (reducing_threads > 1 &&
-                            (!is_pow2 || !scale_is_pow2 || !extent_is_pow2));
+          if (reducing_threads <= 32 && is_pow2 && scale_is_pow2) {
+            // Warp-internal: hw_reduce or butterfly, no workspace needed.
+            need_workspace = false;
+          } else if (reducing_threads > 32 && is_pow2 && (*scale) <= 32 &&
+                     scale_is_pow2) {
+            // Cross-warp: needs UB for inter-warp communication.
+            need_workspace = true;
+          } else {
+            // Non-pow2 or other edge cases: UB fallback.
+            need_workspace = reducing_threads > 1;
+          }
         }
         if (need_workspace) {
           int workspace_size =

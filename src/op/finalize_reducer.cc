@@ -113,11 +113,19 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
   }
   Array<PrimExpr> thread_reduce_args = {StringImm(ss.str()),
                                         BufferLoad(buffer, indices_0)};
+  // finalize_reducer always has scale == 1.
+  // Ascend: pow2 and <= 32 uses register-only warp reduce (no workspace);
+  //   pow2 and > 32 uses cross-warp via UB; non-pow2 uses UB fallback.
   bool need_workspace = reducing_threads > 32;
   if (T.target->HasKey("ascend")) {
     bool is_pow2 = (reducing_threads & (reducing_threads - 1)) == 0;
-    need_workspace =
-        reducing_threads > 32 || (reducing_threads > 1 && !is_pow2);
+    if (reducing_threads <= 32 && is_pow2) {
+      need_workspace = false;
+    } else if (reducing_threads > 32 && is_pow2) {
+      need_workspace = true;
+    } else {
+      need_workspace = reducing_threads > 1;
+    }
   }
   if (need_workspace) {
     int workspace_size = *as_const_int(T.thread_bounds->extent);
