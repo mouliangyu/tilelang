@@ -512,7 +512,8 @@ private:
   int64_t ii_per_iter_{0};
 
 public:
-  std::set<Buffer> multi_buffering_buffers;
+  std::map<Buffer, int64_t> buffer_num_versions; // Map from buffer to number of
+                                                 // versions for multi-buffering
 };
 
 // Wrapper node: contains a Wrapper statement with variable, value, and child

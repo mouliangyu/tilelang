@@ -474,8 +474,7 @@ static TaskNode *GetInnerTask(ScheduleUnit *unit) {
 
 static auto
 GetSyncInfos(const std::vector<ScheduleUnit *> &units, int num_wgs,
-             const std::unordered_map<Buffer, int, ObjectPtrHash,
-                                      ObjectPtrEqual> &buffer_num_versions = {},
+             const std::map<Buffer, int64_t> &buffer_num_versions = {},
              bool is_loop = false) {
   std::set<Buffer> buffers;
   for (auto *unit : units) {
@@ -1035,46 +1034,15 @@ static void AnalyzeControlNodeBarriers(
     }
   }
 
-  // Detect multi-version buffers and create new buffers for them
+  // Create new buffers for multi-buffer
   std::unordered_map<Buffer, Buffer, ObjectPtrHash, ObjectPtrEqual>
       multi_buffer;
-  std::unordered_map<Buffer, int, ObjectPtrHash, ObjectPtrEqual>
-      buffer_num_versions;
-  int num_wgs = 2;
-  for (const auto &unit : units) {
-    for (const auto &buffer_access : unit->GetBufferAccessInfo(num_wgs)) {
-      auto &buffer = buffer_access.buffer;
-      if (!ctrl->multi_buffering_buffers.count(buffer))
-        continue;
-      for (const auto &other_unit : units) {
-        if (unit == other_unit)
-          continue;
-        int distance = unit->child->GetStartTime() + unit->child->GetLatency() -
-                       other_unit->child->GetStartTime();
-        if (distance <= 0)
-          continue;
-        distance = (distance - 1) / ctrl->GetIIperIter() + 1;
-        for (const auto &other_buffer_access :
-             other_unit->GetBufferAccessInfo(num_wgs)) {
-          auto &other_buffer = other_buffer_access.buffer;
-          if (!buffer.same_as(other_buffer))
-            continue;
-          if (buffer_access.is_write || other_buffer_access.is_write) {
-            auto &num_versions = buffer_num_versions[buffer];
-            num_versions = std::max(num_versions, distance);
-          }
-        }
-      }
-    }
-  }
   for (auto &region : ctrl->GetWriteRegions()) {
     auto &buffer = region.get()->buffer;
-    if (!ctrl->multi_buffering_buffers.count(buffer))
-      continue;
     if (multi_buffer.find(buffer) != multi_buffer.end())
       continue;
-    auto it = buffer_num_versions.find(buffer);
-    if (it == buffer_num_versions.end())
+    auto it = ctrl->buffer_num_versions.find(buffer);
+    if (it == ctrl->buffer_num_versions.end())
       continue;
     int num_versions = it->second;
     if (num_versions == 1)
@@ -1092,7 +1060,7 @@ static void AnalyzeControlNodeBarriers(
   RewriteTaskNodeBuffers(ctrl, multi_buffer, iteration);
 
   // Analyze dependencies and insert synchronization
-  auto sync_infos = GetSyncInfos(units, 2, buffer_num_versions, true);
+  auto sync_infos = GetSyncInfos(units, 2, ctrl->buffer_num_versions, true);
   auto sync_points = CollectSyncPoints(units, sync_infos);
   sync_points = OptimizeSyncPoints(sync_points);
   InsertSyncPoints(sync_points, flag_infos, sid, event_id_map, loop_info);

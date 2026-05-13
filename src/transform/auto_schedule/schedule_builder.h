@@ -308,13 +308,12 @@ public:
       return false;
     };
 
-    // Collect all shared buffers
-    // The negative number means we can use multi-buffering for this buffer, so
-    // we need to create a variable for the number of versions for this buffer
-    // in z3 scheduler.
+    // Collect all shared buffers and detect multi-buffer candidates.
+    // Then we need to add variables and constraints in Z3 scheduler for these
+    // buffers.
     std::vector<int64_t> buffer_sizes;
-    std::map<Buffer, int64_t> buffer_to_num_versions;
-    std::set<Buffer> multi_buffering_buffers;
+    std::set<Buffer> visited_buffers;
+    std::map<Buffer, size_t> buffer_var_id;
     // Build memory groups from memory_limits_ map.
     // std::map iteration is ordered by key: "shared" then "shared.l1".
     std::map<std::string, int> scope_to_group;
@@ -332,21 +331,23 @@ public:
       if (!IsSharedBuffer(buffer) && !IsL1Buffer(buffer)) {
         continue; // Only consider shared buffers for multi-buffer
       }
-      if (buffer_to_num_versions.count(buffer)) {
+      if (visited_buffers.count(buffer)) {
         continue;
       }
+      visited_buffers.insert(buffer);
       std::string scope = IsL1Buffer(buffer) ? "shared.l1" : "shared";
       int group_id = scope_to_group[scope];
       // If the buffer is used outside the loop or is read before being written,
       // we cannot multi-buffer it
       if (used_buffers.count(buffer) || !check_buffer_write_first(buffer)) {
-        buffer_to_num_versions[buffer] = 1;
+        // These buffers cannot be multi-buffered, and cannot share memory with
+        // other buffers either, so we directly reduce the capacity of the
+        // memory group by their size
         group_capacities[group_id] -= GetBufferSize(buffer);
       } else {
+        buffer_var_id[buffer] = buffer_sizes.size();
+        group_indices[group_id].push_back((int64_t)buffer_sizes.size());
         buffer_sizes.push_back(GetBufferSize(buffer));
-        buffer_to_num_versions[buffer] = -(int64_t)buffer_sizes.size();
-        group_indices[group_id].push_back((int64_t)buffer_sizes.size() - 1);
-        multi_buffering_buffers.insert(buffer);
       }
     }
 
@@ -364,7 +365,14 @@ public:
             } else {
               auto deps = GetSharedDependencies(nodes[i], nodes[j]);
               for (const auto &buffer : deps) {
-                data_deps.emplace_back(i, j, buffer_to_num_versions[buffer]);
+                auto it = buffer_var_id.find(buffer);
+                int64_t distance = 1;
+                if (it != buffer_var_id.end()) {
+                  // Encode the buffer id in the negative distance for the Z3
+                  // scheduler to recognize
+                  distance = -(int64_t)it->second - 1;
+                }
+                data_deps.emplace_back(i, j, distance);
               }
             }
           }
@@ -429,17 +437,19 @@ public:
     }
 
     // Extract results
-    // Python function returns (start_times, stages) as a tuple of two
-    // arrays
+    // Python function returns (start_times, buffer_versions, best_ii) as a
+    // tuple
     auto return_val =
         z3_schedule_loop_func
             .value()(num_stages, tvm_latencies, tvm_iis, tvm_resource_flags,
                      tvm_data_deps, tvm_resource_deps, tvm_buffer_sizes,
                      tvm_memory_groups)
-            .cast<ffi::Tuple<ffi::Array<int64_t>, int64_t>>();
+            .cast<ffi::Tuple<ffi::Array<int64_t>, ffi::Array<int64_t>,
+                             int64_t>>();
 
     ffi::Array<int64_t> start_times = return_val.get<0>();
-    ii = return_val.get<1>();
+    ffi::Array<int64_t> buffer_versions = return_val.get<1>();
+    ii = return_val.get<2>();
 
     // Apply start times and promote flags to nodes
     for (size_t i = 0; i < n; ++i) {
@@ -550,7 +560,10 @@ public:
     ctrl->SetII(overall_latency);
     ctrl->SetLatency(overall_latency);
     ctrl->SetIIperIter(ii);
-    ctrl->multi_buffering_buffers = std::move(multi_buffering_buffers);
+    ctrl->buffer_num_versions.clear();
+    for (auto &[buffer, id] : buffer_var_id) {
+      ctrl->buffer_num_versions[buffer] = buffer_versions[id];
+    }
   }
 
   // Set memory limit for a given buffer scope (e.g. "shared", "shared.l1")

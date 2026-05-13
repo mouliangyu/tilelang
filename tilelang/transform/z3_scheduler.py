@@ -225,6 +225,7 @@ def z3_schedule_loop_python(
     resource_deps: list[tuple[int, int]],
     buffer_sizes: list[int],
     memory_groups: list[list[int]],  # [[capacity, idx0, idx1, ...], ...]
+    recalculate_buffer_versions: bool = True,
     verbose: bool = False,
 ) -> tuple[list[int], list[int], int]:
     """Z3-based scheduler for loops with distance-aware dependencies.
@@ -251,12 +252,17 @@ def z3_schedule_loop_python(
         with distance d (loop iterations distance)
     resource_deps : list[tuple[int, int]]
         Resource dependency pairs (i, j) where tasks i and j use same resource
+    buffer_sizes : list[int]
+        Buffer size for each buffer (for negative distance dependencies)
+    memory_groups : list[list[int]]
+        Memory groups with capacity and buffer indices, e.g. [[capacity, idx0, idx1, ...], ...]
 
     Returns
     -------
-    tuple[list[int], list[int]]
+    tuple[list[int], list[int], int]
         start_times: Start time for each task
-        sorted_indices: Task indices sorted by start time
+        buffer_versions: Number of versions for each buffer
+        minimal_II: The minimal initiation interval found
     """
     n = len(latencies)
 
@@ -406,10 +412,25 @@ def z3_schedule_loop_python(
     for i in range(n):
         start_time = best_model.eval(best_start_vars[i]).as_long() - offset * best_ii
         start_times.append(start_time)
-    buffer_vars = []
-    for i in range(len(buffer_sizes)):
-        buffer_var = best_model.eval(best_buffer_vars[i]).as_long()
-        buffer_vars.append(buffer_var)
+
+    # Extract buffer versions from best model
+    if recalculate_buffer_versions:
+        # if recalculation is true, we recalculate based on the schedule and dependencies
+        buffer_versions = len(buffer_sizes) * [1]
+        for u, v, distance in data_deps:
+            latency_u = latencies[u]
+            if distance < 0:
+                buffer_var_id = -distance - 1
+                from math import ceil
+
+                buffer_versions[buffer_var_id] = max(
+                    buffer_versions[buffer_var_id], ceil((latency_u + start_times[u] - start_times[v]) / best_ii)
+                )
+    else:
+        buffer_versions = []
+        for i in range(len(buffer_sizes)):
+            buffer_var = best_model.eval(best_buffer_vars[i]).as_long()
+            buffer_versions.append(buffer_var)
 
     # Sort tasks by start time (and by index as tie-breaker)
     task_indices = list(range(n))
@@ -427,7 +448,7 @@ def z3_schedule_loop_python(
             )
     if verbose:
         for i in range(len(buffer_sizes)):
-            print(f"[Python Z3 Loop]   Buffer {i}: size={buffer_sizes[i]}, num_versions={buffer_vars[i]}")
+            print(f"[Python Z3 Loop]   Buffer {i}: size={buffer_sizes[i]}, num_versions={buffer_versions[i]}")
 
     # Save schedule visualization when verbose is True
     if verbose:
@@ -604,7 +625,7 @@ def z3_schedule_loop_python(
         except Exception as e:
             print(f"[Python Z3 Loop] Warning: Failed to save schedule visualization: {e}")
 
-    return start_times, best_ii
+    return start_times, buffer_versions, best_ii
 
 
 # FFI-exposed function for loop scheduling
@@ -643,7 +664,7 @@ def z3_schedule_loop_ffi(num_stages, latencies, iis, resource_flags, data_deps, 
 
     # Call the actual scheduler (Z3 is not thread-safe, serialize access)
     with _z3_lock:
-        start_times, best_ii = z3_schedule_loop_python(
+        start_times, buffer_versions, best_ii = z3_schedule_loop_python(
             num_stages,
             latencies_list,
             iis_list,
@@ -654,6 +675,6 @@ def z3_schedule_loop_ffi(num_stages, latencies, iis, resource_flags, data_deps, 
             memory_groups_list,
         )
 
-    # Return start_times and promotes as separate arrays for easier FFI handling
-    # C++ side expects a tuple of (start_times_array, promotes_array)
-    return (start_times, best_ii)
+    # Return start_times and buffer_versions as separate arrays for easier FFI handling
+    # C++ side expects a tuple of (start_times_array, buffer_versions_array, best_ii)
+    return (start_times, buffer_versions, best_ii)
