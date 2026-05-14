@@ -105,6 +105,13 @@ inline int64_t GetL1MemoryLimit(Target target) {
   return 0;
 }
 
+inline int64_t GetL0CMemoryLimit(Target target) {
+  if (TargetIsAscend(target)) {
+    return 256 * 1024; // 256 KB L0C buffer on Ascend
+  }
+  return 0;
+}
+
 // Function to rewrite alloc_buffers for multi-version (double buffer) support
 Stmt RewriteAllocBuffers(
     const Stmt &stmt, const std::vector<MultiVersionBufferInfo> &buffer_infos);

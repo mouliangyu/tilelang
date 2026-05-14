@@ -328,14 +328,17 @@ public:
     }
     for (const auto &buffer_access : ctrl->GetBufferAccessInfo()) {
       const auto &buffer = buffer_access.buffer;
-      if (!IsSharedBuffer(buffer) && !IsL1Buffer(buffer)) {
-        continue; // Only consider shared buffers for multi-buffer
+      if (!IsSharedBuffer(buffer) && !IsL1Buffer(buffer) &&
+          !IsL0CBuffer(buffer)) {
+        continue; // Only consider on-chip buffers for multi-buffer
       }
       if (visited_buffers.count(buffer)) {
         continue;
       }
       visited_buffers.insert(buffer);
-      std::string scope = IsL1Buffer(buffer) ? "shared.l1" : "shared";
+      std::string scope = IsL1Buffer(buffer)
+                              ? "shared.l1"
+                              : (IsL0CBuffer(buffer) ? "shared.l0c" : "shared");
       int group_id = scope_to_group[scope];
       // If the buffer is used outside the loop or is read before being written,
       // we cannot multi-buffer it

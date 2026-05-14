@@ -616,6 +616,7 @@ static ScheduledKernelResult ScheduleSingleKernel(const Stmt &kernel_body,
   ScheduleUnitBuilder unit_builder;
   unit_builder.SetMemoryLimit("shared", GetSharedMemoryLimit(target));
   unit_builder.SetMemoryLimit("shared.l1", GetL1MemoryLimit(target));
+  unit_builder.SetMemoryLimit("shared.l0c", GetL0CMemoryLimit(target));
   unit_builder.ScheduleRecursive(ir_structure, {});
 
   // Assign warpgroup IDs based on pipe and buffer scopes
