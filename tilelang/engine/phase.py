@@ -3,7 +3,7 @@ from tvm import tir, IRModule
 from tvm.target import Target
 import tilelang
 from tilelang.transform import PassContext
-from tilelang.contrib.nvcc import have_tma, have_pdl
+from tilelang.contrib.nvcc import have_tma
 
 
 def is_ascend_target(target: Target | None = None) -> bool:
@@ -14,7 +14,7 @@ def is_ascend_target(target: Target | None = None) -> bool:
     return "ascend" in target.keys
 
 
-def has_simtvf_region(mod: IRModule) -> bool:
+def has_vf_region(mod: IRModule) -> bool:
     for _, func in mod.functions.items():
         if not isinstance(func, tir.PrimFunc):
             continue
@@ -24,26 +24,7 @@ def has_simtvf_region(mod: IRModule) -> bool:
             nonlocal found
             if found:
                 return
-            if isinstance(node, tir.Block) and node.name_hint == "SIMT_VF":
-                found = True
-
-        tir.stmt_functor.post_order_visit(func.body, _visit)
-        if found:
-            return True
-    return False
-
-
-def has_simdvf_region(mod: IRModule) -> bool:
-    for _, func in mod.functions.items():
-        if not isinstance(func, tir.PrimFunc):
-            continue
-        found = False
-
-        def _visit(node):
-            nonlocal found
-            if found:
-                return
-            if isinstance(node, tir.Block) and node.name_hint == "SIMD_VF":
+            if isinstance(node, tir.Block) and (node.name_hint == "SIMD_VF" or node.name_hint == "SIMT_VF"):
                 found = True
 
         tir.stmt_functor.post_order_visit(func.body, _visit)
@@ -210,8 +191,6 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
         IRModule: The transformed module, ready for target-specific optimization passes.
     """
     mod = tir.transform.BindTarget(target)(mod)
-    if is_ascend_target(target):
-        mod = tilelang.analysis.VFFragmentNarrowChecker()(mod)
 
     if should_force_let_inline():
         # Force-let inline whenever the pass config requests it.
@@ -232,8 +211,7 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.AutoSchedule()(mod)
         mod = tilelang.transform.Simplify()(mod)
     # Lower T.Parallel inside SimdVF to MicroAPI vector ops (before layout passes)
-    if is_ascend_target(target) and has_simdvf_region(mod):
-        mod = tilelang.transform.AscendSimdVFLowerParallel()(mod)
+    mod = tilelang.transform.AscendSimdVFLowerParallel()(mod)
     # Set layouts for reducers
     mod = tilelang.transform.LayoutReducer()(mod)
     # Infer memory layouts for fragments and shared memory
@@ -280,15 +258,13 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # SimtVF defines a control boundary for region-local SIMT predicates.
     # On Ascend path, skip hoisting-related passes to avoid leaking thread
     # predicates across SimtVF regions.
-    allow_if_hoist_across_vf = not (is_ascend_target(target) and (has_simtvf_region(mod) or has_simdvf_region(mod)))
-    if allow_if_hoist_across_vf:
+    if not has_vf_region(mod):
         mod = tilelang.transform.LoopUnswitching()(mod)
     mod = tilelang.transform.UnrollLoop()(mod)
     mod = tir.transform.RenormalizeSplitPattern()(mod)
     mod = tir.transform.Simplify()(mod)
     mod = tir.transform.RemoveNoOp()(mod)
-    if allow_if_hoist_across_vf:
-        mod = tir.transform.HoistIfThenElse()(mod)
+    mod = tir.transform.HoistIfThenElse()(mod)
 
     mod = tir.transform.VerifyMemory()(mod)
     mod = tir.transform.AnnotateEntryFunc()(mod)
@@ -303,8 +279,6 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # the Legalization.
     mod = tir.transform.InferFragment()(mod)
     mod = tilelang.transform.LowerThreadAllreduce()(mod)
-    mod = tilelang.transform.LowerLDGSTG()(mod)
-    mod = tilelang.transform.LowerHopperIntrin()(mod)
     # Global Barrier Synchronization must be applied before
     # SplitHostDevice pass, as the global barrier
     if allow_global_thread_synchronization():
@@ -312,33 +286,16 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.AnnotateDeviceRegions()(mod)
     mod = tilelang.transform.SplitHostDevice()(mod)
 
-    # Mark the function contains pdl_sync or pdl_trigger
-    mod = tilelang.transform.MarkCudaSyncCalls(have_pdl(target))(mod)
-
     mod = tilelang.transform.AnnotateReadOnlyParams()(mod)
     # MergeSharedMemoryAllocations must be applied after SplitHostDevice
     # because the merged allocation site is at the beginning of each device function
-    enable_aggressive_merge = should_enable_aggressive_merge(pass_ctx=pass_ctx, target=target)
+
     # Ascend VEC instructions require UB addresses to be 32-byte aligned.
     merge_align_bytes = 32 if is_ascend_target(target) else 16
-    mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge, align_bytes=merge_align_bytes)(
-        mod
-    )
-    if allow_tma_and_warp_specialized(pass_ctx=pass_ctx, target=target):
-        mod = tilelang.transform.InjectFenceProxy()(mod)
-    else:
-        if allow_fence_proxy(target=target):
-            # in hopper device, wgmma is an async proxy
-            # so we need to inject a fence proxy before it
-            mod = tilelang.transform.InjectFenceProxy()(mod)
+    mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=False, align_bytes=merge_align_bytes)(mod)
     mod = tilelang.transform.ThreadSync("shared")(mod)
     mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
     mod = tilelang.transform.MergeIfStmt()(mod)
-    # Inject PTX async copy must behind the thread sync pass
-    # as ptx async copy won't be recognized as a valid buffer load
-    mod = tilelang.transform.InjectPTXAsyncCopy()(mod)
-    if allow_tma_and_warp_specialized(pass_ctx=pass_ctx, target=target):
-        mod = tilelang.transform.AnnotateWarpGroupRegAlloc()(mod)
     mod = tilelang.transform.MakePackedAPI()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.LowerDeviceKernelLaunch()(mod)
