@@ -326,6 +326,7 @@ public:
         group_indices.push_back({});
       }
     }
+    std::map<Buffer, int64_t> annotated_buffer_versions;
     for (const auto &buffer_access : ctrl->GetBufferAccessInfo()) {
       const auto &buffer = buffer_access.buffer;
       if (!IsSharedBuffer(buffer) && !IsL1Buffer(buffer) &&
@@ -348,9 +349,18 @@ public:
         // memory group by their size
         group_capacities[group_id] -= GetBufferSize(buffer);
       } else {
-        buffer_var_id[buffer] = buffer_sizes.size();
-        group_indices[group_id].push_back((int64_t)buffer_sizes.size());
-        buffer_sizes.push_back(GetBufferSize(buffer));
+        // Check if this buffer has a manually annotated version count
+        auto override_it =
+            buffer_versions_overrides_.find(buffer->data->name_hint);
+        if (override_it != buffer_versions_overrides_.end()) {
+          int64_t override_val = override_it->second;
+          annotated_buffer_versions[buffer] = override_val;
+          group_capacities[group_id] -= GetBufferSize(buffer) * override_val;
+        } else {
+          buffer_var_id[buffer] = buffer_sizes.size();
+          group_indices[group_id].push_back((int64_t)buffer_sizes.size());
+          buffer_sizes.push_back(GetBufferSize(buffer));
+        }
       }
     }
 
@@ -374,6 +384,12 @@ public:
                   // Encode the buffer id in the negative distance for the Z3
                   // scheduler to recognize
                   distance = -(int64_t)it->second - 1;
+                } else {
+                  // Check if this buffer has a manually annotated version count
+                  auto ann_it = annotated_buffer_versions.find(buffer);
+                  if (ann_it != annotated_buffer_versions.end()) {
+                    distance = ann_it->second;
+                  }
                 }
                 data_deps.emplace_back(i, j, distance);
               }
@@ -564,6 +580,9 @@ public:
     ctrl->SetLatency(overall_latency);
     ctrl->SetIIperIter(ii);
     ctrl->buffer_num_versions.clear();
+    for (auto &[buffer, versions] : annotated_buffer_versions) {
+      ctrl->buffer_num_versions[buffer] = versions;
+    }
     for (auto &[buffer, id] : buffer_var_id) {
       ctrl->buffer_num_versions[buffer] = buffer_versions[id];
     }
@@ -574,8 +593,16 @@ public:
     memory_limits_[scope] = bytes;
   }
 
+  // Set manual buffer version overrides (from annotate_buffer_versions).
+  // Keys are buffer data variable names, values are fixed num_versions.
+  void
+  SetBufferVersionsOverride(const std::map<std::string, int64_t> &overrides) {
+    buffer_versions_overrides_ = overrides;
+  }
+
 private:
   std::map<std::string, int64_t> memory_limits_ = {{"shared", 48 * 1024}};
+  std::map<std::string, int64_t> buffer_versions_overrides_;
 };
 
 } // namespace tl

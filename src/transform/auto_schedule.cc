@@ -24,6 +24,7 @@
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/container/array.h>
+#include <tvm/ffi/container/map.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/function.h>
@@ -70,14 +71,30 @@ namespace tl {
 using namespace tir;
 using ffi::GetRef;
 
-// Mutator to replace the body of tilelang_root block
+// Mutator to extract the body of tilelang_root block and optional
+// buffer version overrides annotation.
 class TilelangRootBodyExtractor : public StmtVisitor {
 public:
   Stmt body;
+  std::map<std::string, int64_t> buffer_versions_overrides;
 
   void VisitStmt_(const BlockNode *op) override {
     if (op->name_hint == "tilelang_root") {
       body = op->body;
+      auto ann_val = op->annotations.Get("tl.buffer_versions_map");
+      if (ann_val.has_value()) {
+        auto *map_obj = ann_val.value().as<ffi::MapObj>();
+        if (map_obj) {
+          for (auto it : *map_obj) {
+            if (auto *var = it.first.as<VarNode>()) {
+              LOG(WARNING) << it.second.GetTypeKey();
+              if (auto imm = it.second.as<int>()) {
+                buffer_versions_overrides[var->name_hint] = imm.value();
+              }
+            }
+          }
+        }
+      }
       return; // Don't visit children
     }
     StmtVisitor::VisitStmt_(op);
@@ -599,12 +616,11 @@ static bool HasWarpgroupId(IRStructure *node, int wg_id) {
   return false;
 }
 
-// Schedule a single kernel body.
-
 // Handles IRStructure building, Z3 scheduling (with Ascend sync insertion),
 // and Stmt conversion.
-static ScheduledKernelResult ScheduleSingleKernel(const Stmt &kernel_body,
-                                                  Target target) {
+static ScheduledKernelResult ScheduleSingleKernel(
+    const Stmt &kernel_body, Target target,
+    const std::map<std::string, int64_t> &buffer_versions_overrides = {}) {
   // Build IRStructure from the body to schedule
   ScheduledKernelResult result;
   IRStructureBuilder builder;
@@ -617,6 +633,7 @@ static ScheduledKernelResult ScheduleSingleKernel(const Stmt &kernel_body,
   unit_builder.SetMemoryLimit("shared", GetSharedMemoryLimit(target));
   unit_builder.SetMemoryLimit("shared.l1", GetL1MemoryLimit(target));
   unit_builder.SetMemoryLimit("shared.l0c", GetL0CMemoryLimit(target));
+  unit_builder.SetBufferVersionsOverride(buffer_versions_overrides);
   unit_builder.ScheduleRecursive(ir_structure, {});
 
   // Assign warpgroup IDs based on pipe and buffer scopes
@@ -752,7 +769,8 @@ tvm::transform::Pass AutoSchedule() {
         body_to_schedule = func->body;
       }
 
-      auto kr = ScheduleSingleKernel(body_to_schedule, target);
+      auto overrides = extractor.buffer_versions_overrides;
+      auto kr = ScheduleSingleKernel(body_to_schedule, target, overrides);
 
       TilelangRootBodyReplacer replacer(kr.scheduled_body);
       Stmt final_body = replacer(func->body);
@@ -787,7 +805,8 @@ tvm::transform::Pass AutoSchedule() {
 
       Stmt body_to_schedule = extractor.body;
 
-      auto result = ScheduleSingleKernel(body_to_schedule, target);
+      auto overrides = extractor.buffer_versions_overrides;
+      auto result = ScheduleSingleKernel(body_to_schedule, target, overrides);
       Stmt scheduled_body = result.scheduled_body;
 
       TilelangRootBodyReplacer replacer(scheduled_body);
