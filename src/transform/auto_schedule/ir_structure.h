@@ -90,16 +90,6 @@ inline bool RegionsEqual(const Region &a, const Region &b) {
 // Check if a warpgroup_id represents a broadcast (all warpgroups)
 inline bool IsWarpgroupBroadcast(int wg_id) { return wg_id == -1; }
 
-// Program-order classification of how a subtree first accesses a given buffer.
-// Used to decide whether the buffer's prior content is irrelevant in this
-// subtree (precondition for multi-buffering).
-enum class BufferAccessOrder {
-  kUntouched,  // subtree provably never accesses the buffer
-  kWriteFirst, // first access in program order is a guaranteed write
-  kReadFirst,  // a read may happen before any guaranteed write (incl.
-               // conditional writes, loops that may not execute, etc.)
-};
-
 // Base class for all IR nodes in scheduling
 class IRStructure {
 public:
@@ -176,26 +166,6 @@ public:
     std::set<const TaskNode *> result;
     CollectLastAccessTasks(buffer, is_write, wg_id, result);
     return result;
-  }
-
-  // Classify how this subtree first accesses `buffer` in program order.
-  // Used by multi-buffering analysis to decide whether the buffer's prior
-  // content is irrelevant within this subtree.
-  //
-  // Conservative semantics:
-  //   - Inside a loop that may not execute (extent or step not provably
-  //     >= 1), a body that would otherwise be kWriteFirst is demoted to
-  //     kReadFirst (write not guaranteed).
-  //   - For an IfNode, kWriteFirst is returned ONLY when both branches
-  //     write before any read AND the condition itself doesn't read the
-  //     buffer. A missing else branch can never produce kWriteFirst.
-  virtual BufferAccessOrder
-  ClassifyBufferAccess(const Buffer &buffer) const = 0;
-
-  // True iff this subtree is GUARANTEED to write `buffer` before any
-  // potential read of `buffer`.
-  bool IsBufferWriteFirst(const Buffer &buffer) const {
-    return ClassifyBufferAccess(buffer) == BufferAccessOrder::kWriteFirst;
   }
 
   // Substitute a variable throughout this IR node
@@ -349,8 +319,6 @@ public:
   CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
                          std::set<const TaskNode *> &result) const override;
 
-  BufferAccessOrder ClassifyBufferAccess(const Buffer &buffer) const override;
-
   bool containWarpgroupId(int id) const override {
     return ContainsLoopBreak() || warpgroup_id_ == -1 || warpgroup_id_ == id;
   }
@@ -488,8 +456,6 @@ public:
   CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
                          std::set<const TaskNode *> &result) const override;
 
-  BufferAccessOrder ClassifyBufferAccess(const Buffer &buffer) const override;
-
   void SetIIperIter(int64_t ii) { ii_per_iter_ = ii; }
 
   int64_t GetIIperIter() const { return ii_per_iter_; }
@@ -611,8 +577,6 @@ public:
   bool
   CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
                          std::set<const TaskNode *> &result) const override;
-
-  BufferAccessOrder ClassifyBufferAccess(const Buffer &buffer) const override;
 
   // Clone method
   std::shared_ptr<IRStructure> Clone() const override;
@@ -758,8 +722,6 @@ public:
   CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
                          std::set<const TaskNode *> &result) const override;
 
-  BufferAccessOrder ClassifyBufferAccess(const Buffer &buffer) const override;
-
   // Clone method
   std::shared_ptr<IRStructure> Clone() const override;
 
@@ -855,8 +817,6 @@ public:
   CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
                          std::set<const TaskNode *> &result) const override;
 
-  BufferAccessOrder ClassifyBufferAccess(const Buffer &buffer) const override;
-
   bool isInnerTask() const { return child->IsTask(); }
   int GetWarpgroupId() const override {
     ICHECK(isInnerTask());
@@ -924,8 +884,6 @@ public:
   bool
   CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
                          std::set<const TaskNode *> &result) const override;
-
-  BufferAccessOrder ClassifyBufferAccess(const Buffer &buffer) const override;
 
   // Clone method
   std::shared_ptr<IRStructure> Clone() const override;

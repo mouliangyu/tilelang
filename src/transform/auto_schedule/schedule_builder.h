@@ -74,14 +74,11 @@ bool HasResourceDependency(const IRStructure *a, const IRStructure *b);
 // Builder that collects ScheduleUnits from IRStructure
 class ScheduleUnitBuilder {
 public:
-  void Build(std::shared_ptr<IRStructure> &root) {
-    ScheduleRecursive(root, {});
-  }
+  void Build(std::shared_ptr<IRStructure> &root) { ScheduleRecursive(root); }
 
   // Recursive scheduling function
   // Directly schedules the entire IRStructure tree recursively in place
-  void ScheduleRecursive(std::shared_ptr<IRStructure> &node,
-                         const std::set<Buffer> &used_buffers);
+  void ScheduleRecursive(std::shared_ptr<IRStructure> &node);
 
   // Z3-based scheduler that calls Python implementation via FFI
   std::vector<IRStructure *>
@@ -230,8 +227,7 @@ public:
 
   // Z3-based scheduler for loops that calls Python implementation via FFI
   // with distance-aware dependencies
-  void Z3SchedulePythonLoop(ControlNode *ctrl,
-                            const std::set<Buffer> &used_buffers) {
+  void Z3SchedulePythonLoop(ControlNode *ctrl) {
     if (ctrl->child == nullptr) {
       LOG(WARNING)
           << "Z3SchedulePythonLoop called on a control node without child";
@@ -292,21 +288,19 @@ public:
       resource_flags.push_back(static_cast<int64_t>(node->GetPipeMask()));
     }
 
-    // Helper function to check if a buffer is written before being read.
-    // Recurses in program order through the child subtrees and (at TaskNode
-    // leaves) into the TIR Stmt itself, so a child that internally produces
-    // before consuming counts as write-first. Conservative on if/while:
-    // conditional writes and loops that may not execute do NOT count as
-    // guaranteed writes.
-    auto check_buffer_write_first = [&nodes](const Buffer &buffer) {
-      for (const auto &node : nodes) {
-        auto order = node->ClassifyBufferAccess(buffer);
-        if (order == BufferAccessOrder::kUntouched)
-          continue;
-        return order == BufferAccessOrder::kWriteFirst;
+    // Multi-buffer eligible set from AnnotateMultiBufferEligible pass.
+    // The pass runs before IfConditionExtract and records on the For loop
+    // which on-chip buffers are safe to multi-buffer (written before any
+    // read inside the loop, not referenced outside).
+    std::set<Buffer> eligible_set;
+    {
+      auto v = ctrl->control->annotations.Get("multi_buffer_eligible");
+      if (v.has_value()) {
+        for (const auto &b : v.value().cast<Array<Buffer>>()) {
+          eligible_set.insert(b);
+        }
       }
-      return false;
-    };
+    }
 
     // Collect all shared buffers and detect multi-buffer candidates.
     // Then we need to add variables and constraints in Z3 scheduler for these
@@ -341,9 +335,7 @@ public:
                               ? "shared.l1"
                               : (IsL0CBuffer(buffer) ? "shared.l0c" : "shared");
       int group_id = scope_to_group[scope];
-      // If the buffer is used outside the loop or is read before being written,
-      // we cannot multi-buffer it
-      if (used_buffers.count(buffer) || !check_buffer_write_first(buffer)) {
+      if (!eligible_set.count(buffer)) {
         // These buffers cannot be multi-buffered, and cannot share memory with
         // other buffers either, so we directly reduce the capacity of the
         // memory group by their size

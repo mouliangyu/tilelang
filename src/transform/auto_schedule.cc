@@ -87,7 +87,6 @@ public:
         if (map_obj) {
           for (auto it : *map_obj) {
             if (auto *var = it.first.as<VarNode>()) {
-              LOG(WARNING) << it.second.GetTypeKey();
               if (auto imm = it.second.as<int>()) {
                 buffer_versions_overrides[var->name_hint] = imm.value();
               }
@@ -634,7 +633,7 @@ static ScheduledKernelResult ScheduleSingleKernel(
   unit_builder.SetMemoryLimit("shared.l1", GetL1MemoryLimit(target));
   unit_builder.SetMemoryLimit("shared.l0c", GetL0CMemoryLimit(target));
   unit_builder.SetBufferVersionsOverride(buffer_versions_overrides);
-  unit_builder.ScheduleRecursive(ir_structure, {});
+  unit_builder.ScheduleRecursive(ir_structure);
 
   // Assign warpgroup IDs based on pipe and buffer scopes
   {

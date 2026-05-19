@@ -529,6 +529,11 @@ def IfConditionExtract():
     return _ffi_api.IfConditionExtract()  # type: ignore
 
 
+def AnnotateMultiBufferEligible():
+    """Annotate each For loop with the set of buffers that can be multi-buffered."""
+    return _ffi_api.AnnotateMultiBufferEligible()  # type: ignore
+
+
 def AutoSchedule():
     """Auto schedule for high-level operations"""
     return _ffi_api.AutoSchedule()  # type: ignore

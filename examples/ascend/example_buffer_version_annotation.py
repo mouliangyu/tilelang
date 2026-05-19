@@ -46,7 +46,7 @@ def rms_norm_fwd(batch, d, dtype="float32"):
             # Load weights once
             T.copy(W[:d], w_ub[:d])
 
-            for t in T.Pipelined(n_tokens_per_core, num_stages=2):
+            for t in T.Pipelined(n_tokens_per_core, num_stages=2, annotations={"multi_buffer_eligible": [x_ub, y_ub, z_rstd_ub]}):
                 base = (t * N_CORES + core_id) * d
 
                 T.copy(X[base : base + d], x_ub[:d])

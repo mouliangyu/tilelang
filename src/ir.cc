@@ -111,7 +111,8 @@ ForFrame PipelinedFor(PrimExpr start, const PrimExpr &stop, int num_stages,
                       const Array<PrimExpr> &order,
                       const Array<PrimExpr> &stages,
                       const Array<Array<PrimExpr>> &sync,
-                      const Array<Array<PrimExpr>> &groups) {
+                      const Array<Array<PrimExpr>> &groups,
+                      const Map<String, tvm::ffi::Any> &annotations) {
   using namespace tvm::tir;
   ObjectPtr<ForFrameNode> n = tvm::ffi::make_object<ForFrameNode>();
   DataType dtype = stop.dtype();
@@ -123,7 +124,7 @@ ForFrame PipelinedFor(PrimExpr start, const PrimExpr &stop, int num_stages,
     ICHECK_EQ(vars.size(), doms.size());
     int n = vars.size();
     ICHECK(n == 1);
-    Map<String, tvm::ffi::Any> anno;
+    Map<String, tvm::ffi::Any> anno = annotations;
     if (num_stages > 0)
       anno.Set("num_stages", PrimExpr(num_stages));
     if (!order.empty())
@@ -144,7 +145,8 @@ ForFrame PipelinedFor(PrimExpr start, const PrimExpr &stop, int num_stages,
 
 ForFrame PersistentFor(const Array<PrimExpr> &domain, const PrimExpr &wave_size,
                        const PrimExpr &index, PrimExpr group_size,
-                       int num_stages) {
+                       int num_stages,
+                       const Map<String, tvm::ffi::Any> &annotations) {
   using namespace tvm::tir;
   ICHECK(!domain.empty());
   ObjectPtr<ForFrameNode> n = tvm::ffi::make_object<ForFrameNode>();
@@ -179,7 +181,7 @@ ForFrame PersistentFor(const Array<PrimExpr> &domain, const PrimExpr &wave_size,
                            const Array<Optional<PrimExpr>> &steps,
                            Stmt body) -> Stmt {
     ICHECK_EQ(vars.size(), doms.size());
-    Map<String, tvm::ffi::Any> anno;
+    Map<String, tvm::ffi::Any> anno = annotations;
     if (num_stages > 0) {
       anno.Set("num_stages", PrimExpr(num_stages));
     }

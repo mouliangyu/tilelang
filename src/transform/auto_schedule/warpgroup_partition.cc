@@ -702,9 +702,10 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure, Var sid) {
       LOG(FATAL);
     }
     Stmt body = SeqStmt::Flatten(stmts);
-    // Filter out "num_stages" annotation
+    // Filter out scheduling-only annotations now that AutoSchedule is done.
     Map<String, Any> filtered_annotations = ctrl->control->annotations;
     filtered_annotations.erase("num_stages");
+    filtered_annotations.erase("multi_buffer_eligible");
     return For(loop_var, loop_start, loop_extent, ctrl->control->kind, body,
                ctrl->control->thread_binding, filtered_annotations);
   } else if (structure->IsWrapper()) {

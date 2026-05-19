@@ -207,6 +207,7 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     # Simplify the IR expressions
     mod = tilelang.transform.Simplify()(mod)
     if allow_autoschedule():
+        mod = tilelang.transform.AnnotateMultiBufferEligible()(mod)
         mod = tilelang.transform.IfConditionExtract()(mod)
         mod = tilelang.transform.AutoSchedule()(mod)
         mod = tilelang.transform.Simplify()(mod)

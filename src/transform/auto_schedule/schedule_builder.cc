@@ -222,7 +222,7 @@ SequenceNode with Z3-scheduled children wrapped in ScheduleUnits. 3) For each
 IfNode, its then_child and else_child are recursively scheduled (if exist).
 */
 void ScheduleUnitBuilder::ScheduleRecursive(
-    std::shared_ptr<IRStructure> &node, const std::set<Buffer> &used_buffers) {
+    std::shared_ptr<IRStructure> &node) {
   if (!node)
     return;
 
@@ -283,18 +283,7 @@ void ScheduleUnitBuilder::ScheduleRecursive(
     std::vector<std::shared_ptr<IRStructure>> seq_children, origin_children;
     GatherTaskNodes(seq->children, origin_children);
     for (auto &child : origin_children) {
-      auto child_used_buffers = used_buffers;
-      for (auto &other_child : origin_children) {
-        if (child.get() != other_child.get()) {
-          for (const auto &region : other_child->GetReadRegions()) {
-            child_used_buffers.insert(region.get()->buffer);
-          }
-          for (const auto &region : other_child->GetWriteRegions()) {
-            child_used_buffers.insert(region.get()->buffer);
-          }
-        }
-      }
-      ScheduleRecursive(child, child_used_buffers);
+      ScheduleRecursive(child);
     }
 
     seq->children = ChildrenScheduleHelper(origin_children);
@@ -314,46 +303,24 @@ void ScheduleUnitBuilder::ScheduleRecursive(
         std::vector<std::shared_ptr<IRStructure>> origin_children;
         GatherTaskNodes(seq_body->children, origin_children);
         for (auto &child : origin_children) {
-          auto child_used_buffers = used_buffers;
-          for (auto &other_child : origin_children) {
-            if (child.get() != other_child.get()) {
-              for (const auto &region : other_child->GetReadRegions()) {
-                child_used_buffers.insert(region.get()->buffer);
-              }
-              for (const auto &region : other_child->GetWriteRegions()) {
-                child_used_buffers.insert(region.get()->buffer);
-              }
-            }
-          }
-          ScheduleRecursive(child, child_used_buffers);
+          ScheduleRecursive(child);
         }
-        Z3SchedulePythonLoop(ctrl, used_buffers);
+        Z3SchedulePythonLoop(ctrl);
       } else if (ctrl->child->IsWrapper()) {
         auto wrapper = static_cast<WrapperNode *>(ctrl->child.get());
         std::vector<std::shared_ptr<IRStructure>> origin_children;
         GatherTaskNodes({wrapper->task, wrapper->child}, origin_children);
         for (auto &child : origin_children) {
-          auto child_used_buffers = used_buffers;
-          for (auto &other_child : origin_children) {
-            if (child.get() != other_child.get()) {
-              for (const auto &region : other_child->GetReadRegions()) {
-                child_used_buffers.insert(region.get()->buffer);
-              }
-              for (const auto &region : other_child->GetWriteRegions()) {
-                child_used_buffers.insert(region.get()->buffer);
-              }
-            }
-          }
-          ScheduleRecursive(child, child_used_buffers);
+          ScheduleRecursive(child);
         }
-        Z3SchedulePythonLoop(ctrl, used_buffers);
+        Z3SchedulePythonLoop(ctrl);
       } else {
-        ScheduleRecursive(ctrl->child, used_buffers);
+        ScheduleRecursive(ctrl->child);
         auto old_child = ctrl->child;
         auto seq_node = std::make_shared<SequenceNode>();
         seq_node->children = {old_child};
         ctrl->child = seq_node;
-        Z3SchedulePythonLoop(ctrl, used_buffers);
+        Z3SchedulePythonLoop(ctrl);
       }
     }
     return;
@@ -362,18 +329,7 @@ void ScheduleUnitBuilder::ScheduleRecursive(
     std::vector<std::shared_ptr<IRStructure>> origin_children;
     GatherTaskNodes({wrapper->task, wrapper->child}, origin_children);
     for (auto &child : origin_children) {
-      auto child_used_buffers = used_buffers;
-      for (auto &other_child : origin_children) {
-        if (child.get() != other_child.get()) {
-          for (const auto &region : other_child->GetReadRegions()) {
-            child_used_buffers.insert(region.get()->buffer);
-          }
-          for (const auto &region : other_child->GetWriteRegions()) {
-            child_used_buffers.insert(region.get()->buffer);
-          }
-        }
-      }
-      ScheduleRecursive(child, child_used_buffers);
+      ScheduleRecursive(child);
     }
     auto seq_node = std::make_shared<SequenceNode>();
     seq_node->children = ChildrenScheduleHelper(origin_children);
@@ -388,10 +344,10 @@ void ScheduleUnitBuilder::ScheduleRecursive(
   } else if (node->IsIf()) {
     auto if_node = static_cast<IfNode *>(node.get());
     if (if_node->then_child) {
-      ScheduleRecursive(if_node->then_child, used_buffers);
+      ScheduleRecursive(if_node->then_child);
     }
     if (if_node->else_child) {
-      ScheduleRecursive(if_node->else_child, used_buffers);
+      ScheduleRecursive(if_node->else_child);
     }
     if_node->SetLatency(
         std::max(if_node->then_child ? if_node->then_child->GetLatency() : 0,
