@@ -765,7 +765,7 @@ static std::vector<SyncPoint> CollectSyncPoints(
                                  prod_wg,
                                  {},
                                  0,
-                                 0,
+                                 distance,
                                  PrimExpr(),
                                  sync_info_set});
           continue;
@@ -864,13 +864,11 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
       int cc_base_id = cc_id->second;
       cc_id->second += sp.num_versions;
 
-      PrimExpr cc_event_id = cc_base_id + sid * 16;
-
       if (sp.cons_idx < sp.prod_idx) {
         if (!sp.prod_wg) {
           for (int base = 0; base < sp.num_versions; ++base) {
             flag_infos.push_back(
-                FlagInfo{0, cc_event_id + base, sp.prod_pipe, 1});
+                FlagInfo{0, cc_base_id + sid * 16 + base, sp.prod_pipe, 1});
           }
           for (unsigned s = 0; s != 2; ++s) {
             for (int base = 0; base < sp.num_versions; ++base) {
@@ -887,10 +885,16 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
           }
           for (int base = 0; base < sp.num_versions; ++base) {
             flag_infos.push_back(
-                FlagInfo{0, cc_event_id + base, sp.prod_pipe, 2});
+                FlagInfo{0, cc_base_id + sid * 16 + base, sp.prod_pipe, 2});
           }
         }
       }
+
+      PrimExpr iteration =
+          loop_info.CalculateIterationCount() - Integer(sp.distance);
+      PrimExpr cc_event_id =
+          indexmod(iteration, Integer(sp.num_versions)) + cc_base_id + sid * 16;
+
       if (!sp.prod_wg) {
         Stmt set_stmt =
             makeAscendCrossCoreSetFlag(sp.mode_id, sp.prod_pipe, cc_event_id);
@@ -899,7 +903,8 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
         for (unsigned s = 0; s != 2; ++s) {
           Stmt wait_stmt = makeAscendCrossCoreWaitFlag(
               sp.mode_id, sp.cons_pipe,
-              IntImm(DataType::Int(64), cc_base_id + 16 * s));
+              indexmod(iteration, Integer(sp.num_versions)) +
+                  Integer(cc_base_id + 16 * s));
           InsertStatementIntoScheduleUnit(sp.cons_unit, wait_stmt, true,
                                           sp.cons_wg_id);
         }
@@ -907,7 +912,8 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
         for (unsigned s = 0; s != 2; ++s) {
           Stmt set_stmt = makeAscendCrossCoreSetFlag(
               sp.mode_id, sp.prod_pipe,
-              IntImm(DataType::Int(64), cc_base_id + 16 * s));
+              indexmod(iteration, Integer(sp.num_versions)) +
+                  Integer(cc_base_id + 16 * s));
           InsertStatementIntoScheduleUnit(sp.prod_unit, set_stmt, false,
                                           sp.prod_wg_id);
         }
