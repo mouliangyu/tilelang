@@ -591,11 +591,18 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure, Var sid) {
               auto &dst = cp->dst;
               auto &src_r = cp->src_range;
               auto &dst_r = cp->dst_range;
-              int split_dim = (dual_ctl == 1) ? 0 : 1;
-              // Remove dual_dst_ctl from annotations
+              // Use last-2-dims relative indexing so that leading
+              // dimensions (e.g. buffer version) don't shift the split
+              // axis (matching the nd2nz path above).
+              int src_split_dim =
+                  static_cast<int>(src_r.size()) - 2 + (dual_ctl == 1 ? 0 : 1);
+              int dst_split_dim =
+                  static_cast<int>(dst_r.size()) - 2 + (dual_ctl == 1 ? 0 : 1);
+              // Remove dual_dst_ctl, unit_flag_ctl, and double from annotations
               Map<String, ObjectRef> new_ann;
               for (auto &kv : call->annotations) {
-                if (kv.first != "dual_dst_ctl" && kv.first != "unit_flag_ctl")
+                if (kv.first != "dual_dst_ctl" && kv.first != "unit_flag_ctl" &&
+                    kv.first != "double")
                   new_ann.Set(kv.first, kv.second);
               }
               // Use RegionOp to get buffer/range info from the Call args
@@ -606,11 +613,11 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure, Var sid) {
               auto dst_ranges = dst_rop->GetRanges();
               auto dst_buf = dst_rop->GetBuffer();
               // Single copy with sid-based offset: offset = sid * half
-              PrimExpr off = sid * src_r[split_dim]->extent;
+              PrimExpr off = sid * src_r[src_split_dim]->extent;
               // Build new dst region args
               Array<PrimExpr> dst_indices;
               for (size_t d = 0; d < dst_ranges.size(); ++d) {
-                if (static_cast<int>(d) == split_dim)
+                if (static_cast<int>(d) == dst_split_dim)
                   dst_indices.push_back(dst_ranges[d]->min + off);
                 else
                   dst_indices.push_back(dst_ranges[d]->min);
@@ -618,8 +625,8 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure, Var sid) {
               auto dst_load = BufferLoad(dst_buf, dst_indices);
               Array<PrimExpr> dst_args = {dst_load, Integer(dst_mask)};
               for (size_t d = 0; d < dst_ranges.size(); ++d) {
-                if (static_cast<int>(d) == split_dim)
-                  dst_args.push_back(src_r[split_dim]->extent);
+                if (static_cast<int>(d) == dst_split_dim)
+                  dst_args.push_back(src_r[src_split_dim]->extent);
                 else
                   dst_args.push_back(dst_ranges[d]->extent);
               }
