@@ -186,15 +186,15 @@ def determine_target(target: str | Target | Literal["auto"] = "auto", return_obj
         is_ascend_available = check_ascend_availability()
 
         # Determine the target based on availability
-        if is_cuda_available:
+        if is_ascend_available:
+            return_var = "c -keys=ascend"
+        elif is_cuda_available:
             if torch.cuda.is_available() and (cap := torch.cuda.get_device_capability(0)):
                 return_var = Target({"kind": "cuda", "arch": f"sm_{nvcc.get_target_arch(cap)}"})
             else:
                 return_var = "cuda"
         elif is_hip_available:
             return_var = "hip"
-        elif is_ascend_available:
-            return_var = "c -keys=ascend"
         elif check_metal_availability():
             return_var = "metal"
         else:
