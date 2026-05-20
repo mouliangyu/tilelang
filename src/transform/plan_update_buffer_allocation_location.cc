@@ -348,6 +348,28 @@ private:
     return node;
   }
 
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    auto it = alloc_buffers_.find(op);
+    if (it == alloc_buffers_.end()) {
+      return StmtMutator::VisitStmt_(op);
+    }
+    for (const Buffer &buf : it->second) {
+      PushBinding(buf->data, buf);
+    }
+    Stmt new_stmt = StmtMutator::VisitStmt_(op);
+    ffi::Array<Buffer> new_block_alloc_bufs;
+    for (const Buffer &buf : it->second) {
+      if (managed_allocations_.count(buf->data.get())) {
+        PopBinding(buf->data);
+        new_block_alloc_bufs.push_back(buf);
+      }
+    }
+    if (!new_block_alloc_bufs.empty()) {
+      return InjectOpaqueBlock(new_stmt, new_block_alloc_bufs);
+    }
+    return new_stmt;
+  }
+
   Stmt VisitStmt_(const BlockNode *op) final {
     ICHECK(!op->init.defined());
     ffi::Array<Buffer> alloc_buffers;
