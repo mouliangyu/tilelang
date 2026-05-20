@@ -59,28 +59,10 @@ public:
   }
 
 private:
-  Stmt VisitStmt_(const BlockRealizeNode *op) final {
-    // We have convert blocks into opaque blocks in previous passes.
-    ICHECK(op->iter_values.empty())
-        << "Non-opaque blocks are not allowed in FlattenBuffer. Please "
-           "call pass ConvertBlocksToOpaque before.";
-    // Step 1. Visit the body
-    Block new_block = Downcast<Block>(this->VisitStmt(op->block));
-    PrimExpr predicate = this->VisitExpr(op->predicate);
-    // Step 2. Transform the `predicate` to if-then-else
-    Stmt body = new_block->body;
-    if (!is_one(predicate)) {
-      body = IfThenElse(predicate, std::move(body));
-    }
-    // Step 3. Handle annotations, block annotations are not preserved by
-    // default.
-    std::vector<std::pair<std::string, PrimExpr>> pragma_attrs;
-    HandleAnnotations(new_block->annotations, &pragma_attrs, /*is_block=*/true,
-                      new_block->alloc_buffers);
-
-    // Step 4. Handle allocations in reverse order
-    for (size_t i = new_block->alloc_buffers.size(); i > 0; --i) {
-      const Buffer &buffer = new_block->alloc_buffers[i - 1];
+  Stmt MaterializeAllocations(const ffi::Array<Buffer> &alloc_buffers,
+                              Stmt body) {
+    for (size_t i = alloc_buffers.size(); i > 0; --i) {
+      const Buffer &buffer = alloc_buffers[i - 1];
       Array<PrimExpr> allocation_shape = GetBufferAllocationShape(buffer);
       body = DeclBuffer(buffer, std::move(body));
       Map<String, ffi::Any> allocate_annotations;
@@ -101,6 +83,34 @@ private:
       body = Allocate(buffer->data, buffer->dtype, allocation_shape,
                       const_true(), std::move(body), allocate_annotations);
     }
+    return body;
+  }
+
+  Stmt VisitStmt_(const BlockRealizeNode *op) final {
+    // We have convert blocks into opaque blocks in previous passes.
+    ICHECK(op->iter_values.empty())
+        << "Non-opaque blocks are not allowed in FlattenBuffer. Please "
+           "call pass ConvertBlocksToOpaque before.";
+    // Step 1. Visit the body (BlockNode handler returns the block as-is for
+    // realized blocks because we are about to consume alloc_buffers here).
+    bool prev_inside_realize = inside_realize_;
+    inside_realize_ = true;
+    Block new_block = Downcast<Block>(this->VisitStmt(op->block));
+    inside_realize_ = prev_inside_realize;
+    PrimExpr predicate = this->VisitExpr(op->predicate);
+    // Step 2. Transform the `predicate` to if-then-else
+    Stmt body = new_block->body;
+    if (!is_one(predicate)) {
+      body = IfThenElse(predicate, std::move(body));
+    }
+    // Step 3. Handle annotations, block annotations are not preserved by
+    // default.
+    std::vector<std::pair<std::string, PrimExpr>> pragma_attrs;
+    HandleAnnotations(new_block->annotations, &pragma_attrs, /*is_block=*/true,
+                      new_block->alloc_buffers);
+
+    // Step 4. Lower allocations
+    body = MaterializeAllocations(new_block->alloc_buffers, std::move(body));
     // Step 5. Insert attribute statements converted from pragmas
     for (auto it = pragma_attrs.rbegin(); it != pragma_attrs.rend(); ++it) {
       body = AttrStmt(Integer(0), it->first, it->second, std::move(body));
@@ -108,9 +118,19 @@ private:
     return body;
   }
   Stmt VisitStmt_(const BlockNode *op) final {
+    bool was_inside_realize = inside_realize_;
+    inside_realize_ = false;
     Block block = Downcast<Block>(StmtExprMutator::VisitStmt_(op));
+    inside_realize_ = was_inside_realize;
     if (block->annotations.count("stmt_group")) {
       return block->body;
+    }
+    if (!inside_realize_ && !block->alloc_buffers.empty()) {
+      Stmt new_body = MaterializeAllocations(block->alloc_buffers, block->body);
+      auto n = block.CopyOnWrite();
+      n->body = std::move(new_body);
+      n->alloc_buffers = ffi::Array<Buffer>();
+      return block;
     }
     return block;
   }
@@ -290,6 +310,11 @@ private:
 
   /*! \brief Local var initializers collected from block annotations. */
   Map<Var, PrimExpr> local_var_init_map_;
+
+  /*! \brief True while we are visiting the inner Block of a BlockRealize.
+   * Used so that the BlockNode handler does not double-lower alloc_buffers
+   * when the enclosing BlockRealize handler is about to do it itself. */
+  bool inside_realize_ = false;
 };
 
 PrimFunc TLLowerOpaqueBlock(PrimFunc f) {

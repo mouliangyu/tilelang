@@ -28,15 +28,9 @@
 #include <tvm/tir/transform.h>
 #include <tvm/tir/var.h>
 
-#include "tir/transforms/ir_utils.h"
+#include <deque>
 
-// Forward-declare tir's var-level LCA helper which has no public header.
-namespace tvm {
-namespace tir {
-ffi::Map<Var, ffi::Optional<Stmt>>
-DetectBufferVarAccessLCA(const PrimFunc &func);
-}
-} // namespace tvm
+#include "tir/transforms/ir_utils.h"
 
 namespace tvm {
 namespace tl {
@@ -44,7 +38,166 @@ namespace tl {
 using namespace tir;
 using namespace tir::transform;
 
-// Use TVM's tir analysis API for LCA detection.
+namespace {
+
+/*!
+ * \brief Buffer/var access LCA detector used by
+ *        PlanAndUpdateBufferAllocationLocation.
+ */
+class TLAccessLCADetector : public StmtExprVisitor {
+public:
+  struct Result {
+    ffi::Map<Buffer, ffi::Optional<Stmt>> buffer_lca;
+    ffi::Map<Var, ffi::Optional<Stmt>> var_lca;
+  };
+
+  static Result Detect(const PrimFunc &func) {
+    TLAccessLCADetector d;
+    d.arena_.emplace_back();
+    d.scopes_.push_back(&d.arena_.front());
+    for (const auto &kv : func->buffer_map) {
+      d.UpdateBuffer(kv.second, d.scopes_.back());
+    }
+    d(func->body);
+    return d.Finalize();
+  }
+
+private:
+  enum class RegionKind { kNone, kSimtSimdVF, kCubeVector };
+
+  struct ScopeInfo {
+    const ScopeInfo *parent = nullptr;
+    const StmtNode *stmt = nullptr;
+    int depth = 0;
+    RegionKind region = RegionKind::kNone;
+  };
+
+  void PushScope(const StmtNode *stmt, RegionKind region) {
+    arena_.emplace_back();
+    auto *s = &arena_.back();
+    s->parent = scopes_.back();
+    s->stmt = stmt;
+    s->depth = static_cast<int>(scopes_.size());
+    s->region = region;
+    scopes_.push_back(s);
+  }
+  void PopScope() { scopes_.pop_back(); }
+
+  void VisitStmt_(const ForNode *op) final {
+    PushScope(op, RegionKind::kNone);
+    StmtExprVisitor::VisitStmt_(op);
+    PopScope();
+  }
+
+  void VisitStmt_(const BlockNode *op) final {
+    RegionKind kind = RegionKind::kNone;
+    if (op->name_hint == "SIMT_VF" || op->name_hint == "SIMD_VF") {
+      kind = RegionKind::kSimtSimdVF;
+    } else if (op->name_hint == "CUBE" || op->name_hint == "VECTOR") {
+      kind = RegionKind::kCubeVector;
+    }
+    PushScope(op, kind);
+    for (const auto &match : op->match_buffers) {
+      UpdateBuffer(match->source->buffer, scopes_.back());
+    }
+    StmtExprVisitor::VisitStmt_(op);
+    PopScope();
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+    UpdateBuffer(op->buffer, scopes_.back());
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    UpdateBuffer(op->buffer, scopes_.back());
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitExpr_(const VarNode *op) final {
+    UpdateVar(op, scopes_.back());
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  // Snap a candidate access scope up past any enclosing region block
+  // that is incompatible with the buffer's memory scope.
+  static const ScopeInfo *EffectiveScope(const Buffer &buf,
+                                         const ScopeInfo *scope) {
+    auto s = buf.scope();
+    std::string_view sv(s.data(), s.size());
+    bool is_local = sv.size() >= 5 && std::string_view(sv.data(), 5) == "local";
+    bool is_shared =
+        sv.size() >= 6 && std::string_view(sv.data(), 6) == "shared";
+    if (is_local)
+      return scope;
+    // shared / global: never live inside SIMT_VF / SIMD_VF.
+    while (scope && scope->region == RegionKind::kSimtSimdVF) {
+      scope = scope->parent;
+    }
+    if (is_shared) {
+      // shared additionally never lives inside CUBE / VECTOR.
+      while (scope && scope->region == RegionKind::kCubeVector) {
+        scope = scope->parent;
+      }
+    }
+    return scope;
+  }
+
+  void UpdateBuffer(const Buffer &buf, const ScopeInfo *scope) {
+    const ScopeInfo *eff = EffectiveScope(buf, scope);
+    const ScopeInfo *&blca = buffer_lca_[buf.get()];
+    blca = LCA(blca, eff);
+    const ScopeInfo *&vlca = var_lca_[buf->data.get()];
+    vlca = LCA(vlca, eff);
+  }
+
+  void UpdateVar(const VarNode *var, const ScopeInfo *scope) {
+    const ScopeInfo *&vlca = var_lca_[var];
+    vlca = LCA(vlca, scope);
+  }
+
+  static const ScopeInfo *LCA(const ScopeInfo *a, const ScopeInfo *b) {
+    if (a == nullptr)
+      return b;
+    if (b == nullptr)
+      return a;
+    while (a->depth > b->depth)
+      a = a->parent;
+    while (b->depth > a->depth)
+      b = b->parent;
+    while (a != b) {
+      if (!a || !b)
+        return nullptr;
+      a = a->parent;
+      b = b->parent;
+    }
+    return a;
+  }
+
+  Result Finalize() const {
+    Result r;
+    for (const auto &kv : buffer_lca_) {
+      ffi::Optional<Stmt> s;
+      if (kv.second && kv.second->stmt)
+        s = ffi::GetRef<Stmt>(kv.second->stmt);
+      r.buffer_lca.Set(ffi::GetRef<Buffer>(kv.first), s);
+    }
+    for (const auto &kv : var_lca_) {
+      ffi::Optional<Stmt> s;
+      if (kv.second && kv.second->stmt)
+        s = ffi::GetRef<Stmt>(kv.second->stmt);
+      r.var_lca.Set(ffi::GetRef<Var>(kv.first), s);
+    }
+    return r;
+  }
+
+  std::deque<ScopeInfo> arena_;
+  std::vector<const ScopeInfo *> scopes_;
+  std::unordered_map<const BufferNode *, const ScopeInfo *> buffer_lca_;
+  std::unordered_map<const VarNode *, const ScopeInfo *> var_lca_;
+};
+
+} // namespace
 
 class CollectManagedAllocations : public StmtExprVisitor {
 public:
@@ -119,11 +272,10 @@ private:
 class BufferAllocationLocator : public StmtExprMutator {
 public:
   explicit BufferAllocationLocator(const PrimFunc &func) {
-    // Use TVM's tir LCA detection implementation
-    ffi::Map<Buffer, ffi::Optional<Stmt>> buffer_lca =
-        tir::DetectBufferAccessLCA(func);
-    ffi::Map<Var, ffi::Optional<Stmt>> var_lca =
-        tir::DetectBufferVarAccessLCA(func);
+    // Region-aware LCA detection
+    TLAccessLCADetector::Result lca_result = TLAccessLCADetector::Detect(func);
+    ffi::Map<Buffer, ffi::Optional<Stmt>> &buffer_lca = lca_result.buffer_lca;
+    ffi::Map<Var, ffi::Optional<Stmt>> &var_lca = lca_result.var_lca;
 
     // The buffer_alloc_recorder Array is used to keep the buffer allocation
     // order since the buffer_lca Map is unordered.
@@ -133,57 +285,6 @@ public:
     CollectManagedAllocations collector;
     collector(func->body);
     managed_allocations_ = collector.managed_allocations;
-
-    // Collect Ascend region block interiors (SIMT_VF, SIMD_VF, CUBE, VECTOR):
-    // for shared/global buffers whose LCA falls inside a region block, we hoist
-    // them to the block containing that region.
-    std::unordered_set<const StmtNode *> region_interior;
-    std::unordered_map<const StmtNode *, const BlockNode *>
-        stmt_to_region_block;
-    std::unordered_map<const BlockNode *, const BlockNode *>
-        region_to_parent_block;
-
-    struct AscendRegionCollector : StmtExprVisitor {
-      std::unordered_set<const StmtNode *> &interior;
-      std::unordered_map<const StmtNode *, const BlockNode *> &stmt_to_region;
-      std::unordered_map<const BlockNode *, const BlockNode *>
-          &region_to_parent;
-      std::vector<const BlockNode *> block_stack;
-      const BlockNode *current_region = nullptr;
-
-      AscendRegionCollector(
-          std::unordered_set<const StmtNode *> &i,
-          std::unordered_map<const StmtNode *, const BlockNode *> &s,
-          std::unordered_map<const BlockNode *, const BlockNode *> &v)
-          : interior(i), stmt_to_region(s), region_to_parent(v) {}
-
-      void VisitStmt(const Stmt &n) override {
-        if (current_region) {
-          interior.insert(n.get());
-          stmt_to_region[n.get()] = current_region;
-        }
-        StmtExprVisitor::VisitStmt(n);
-      }
-
-      void VisitStmt_(const BlockNode *op) override {
-        const BlockNode *prev_region = current_region;
-        if (op->name_hint == "SIMT_VF" || op->name_hint == "SIMD_VF" ||
-            op->name_hint == "CUBE" || op->name_hint == "VECTOR") {
-          current_region = op;
-          const BlockNode *parent =
-              block_stack.empty() ? nullptr : block_stack.back();
-          region_to_parent[op] = parent;
-        }
-        block_stack.push_back(op);
-        StmtExprVisitor::VisitStmt_(op);
-        block_stack.pop_back();
-        current_region = prev_region;
-      }
-    };
-
-    AscendRegionCollector region_collector{
-        region_interior, stmt_to_region_block, region_to_parent_block};
-    region_collector(func->body);
 
     for (const auto &kv : func->buffer_map) {
       const Buffer &buffer = kv.second;
@@ -208,65 +309,9 @@ public:
         if (arg_buffer_vars.count(buffer->data.get())) {
           continue;
         }
-        // Hoist buffers out of region blocks.  When regions are nested (e.g.
-        // SimtVF inside VECTOR), we loop until the allocation site is outside
-        // all region blocks or a region allows the buffer scope to stay.
-        if (stmt != nullptr) {
-          // Identify the region block (if any) that stmt falls inside or is
-          // itself equal to.
-          auto get_region = [&](const StmtNode *s) -> const BlockNode * {
-            auto it = stmt_to_region_block.find(s);
-            if (it != stmt_to_region_block.end())
-              return it->second;
-            for (const auto &kv : region_to_parent_block) {
-              if (static_cast<const StmtNode *>(kv.first) == s)
-                return kv.first;
-            }
-            return nullptr;
-          };
-
-          for (;;) {
-            const BlockNode *region_block = get_region(stmt);
-            if (!region_block)
-              break;
-
-            const std::string &hint = region_block->name_hint;
-            bool should_hoist = false;
-
-            if (hint == "SIMT_VF" || hint == "SIMD_VF") {
-              auto scope = buffer.scope();
-              std::string_view sv(scope.data(), scope.size());
-              std::string_view prefix = "local";
-              should_hoist = (sv.substr(0, prefix.size()) != prefix);
-            } else if (hint == "CUBE" || hint == "VECTOR") {
-              auto scope = buffer.scope();
-              std::string_view sv(scope.data(), scope.size());
-              std::string_view prefix = "shared";
-              should_hoist = (sv.substr(0, prefix.size()) == prefix);
-            }
-
-            if (should_hoist) {
-              auto pit = region_to_parent_block.find(region_block);
-              if (pit != region_to_parent_block.end() &&
-                  pit->second != nullptr) {
-                stmt = pit->second;
-              } else {
-                stmt = nullptr;
-                break;
-              }
-            } else {
-              break;
-            }
-          }
-
-          if (!stmt)
-            continue;
-        }
         if (managed_allocations_.count(buffer->data.get())) {
           alloc_buffers_[stmt].push_back(buffer);
         }
-        // Do not push binding here. Bindings should reflect scope accurately,
-        // and will be pushed/popped when visiting the owning stmt.
       }
     }
   }
