@@ -749,6 +749,21 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << "rls_buf(" << pipe_str << ", ";
     this->PrintExpr(op->args[1], this->stream);
     this->stream << ", " << (mode ? "true" : "false") << ");\n";
+  } else if (op->op.same_as(tl::ascend_set_hf32_mode())) {
+    ICHECK_EQ(op->args.size(), 1)
+        << "tl.ascend_set_hf32_mode expects exactly 1 argument (mode_int)";
+    int mode = Downcast<IntImm>(op->args[0])->value;
+    this->PrintIndent();
+    if (mode == 0) {
+      this->stream << "AscendC::SetHF32Mode(AscendC::HF32Mode::DISABLE);\n";
+    } else {
+      this->stream << "AscendC::SetHF32Mode(AscendC::HF32Mode::ENABLE);\n";
+      this->PrintIndent();
+      this->stream << "AscendC::SetHF32TransMode(AscendC::"
+                   << (mode == 1 ? "HF32TransMode::NEAREST_ZERO"
+                                 : "HF32TransMode::NEAREST_EVEN")
+                   << ");\n";
+    }
   } else if (op->op.same_as(tl::ascend_reduce_add())) {
     os << "asc_reduce_add(" << PrintExpr(op->args[0]) << ")";
   } else if (op->op.same_as(tl::ascend_reduce_max())) {

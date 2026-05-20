@@ -720,6 +720,15 @@ TVM_DLL const Op &ascend_get_buf();
 TVM_DLL const Op &ascend_rls_buf();
 
 /*!
+ * \brief Ascend set HF32 mode for fp32 matmul.
+ *
+ * ascend_set_hf32_mode(mode_int)
+ *   mode_int: 0=disable, 1=enable nearest_zero, 2=enable nearest_even
+ *
+ */
+TVM_DLL const Op &ascend_set_hf32_mode();
+
+/*!
  * \brief Programmatic dependency trigger.
  *
  * pdl_trigger()

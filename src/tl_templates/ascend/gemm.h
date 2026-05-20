@@ -42,15 +42,19 @@ template <int M, int K, int N, int TILE_K_SUB, bool TRANS_B, typename InT,
 __aicore__ inline void
 ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
                __cbuf__ InT *cbuf_b_ptr, int clear_accum, int buf_offset = 0) {
+  // C0 = 32B / sizeof(InT): 16 for bf16/fp16, 8 for fp32, 32 for int8.
+  // FRAC_N = 16: row-block size in the n-direction, dtype-independent.
+  constexpr int C0 = 32 / sizeof(InT);
+  constexpr int FRAC_N = 16;
+
   static_assert(K % TILE_K_SUB == 0, "K must be divisible by TILE_K_SUB");
-  static_assert(TILE_K_SUB % 16 == 0, "TILE_K_SUB must be a multiple of 16");
-  static_assert(M % 16 == 0, "M must be a multiple of 16");
-  static_assert(N % 16 == 0, "N must be a multiple of 16");
+  static_assert(TILE_K_SUB % C0 == 0, "TILE_K_SUB must be a multiple of C0");
+  static_assert(M % FRAC_N == 0, "M must be a multiple of 16");
+  static_assert(N % FRAC_N == 0, "N must be a multiple of 16");
 
   constexpr int SUB_K = K / TILE_K_SUB;
-  constexpr int C0 = 16;
-  constexpr int mStepA = M / C0;
-  constexpr int mStepB = N / C0;
+  constexpr int mStepA = M / FRAC_N;
+  constexpr int mStepB = N / FRAC_N;
   constexpr int kStep = TILE_K_SUB / C0;
   constexpr int L0A_STAGE = M * TILE_K_SUB;
   constexpr int L0B_STAGE = N * TILE_K_SUB;
@@ -64,22 +68,25 @@ ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
                                   cbuf_a_ptr, 0, (sk * kStep), mStepA, kStep,
                                   mStepA, mStepA, 0);
     if constexpr (TRANS_B) {
-      // NT case: W[N,K] in L1, transpose=false (ZZ)
+      // NT case: W[N,K] in L1, cb transpose=false (ZZ)
       // rows=N, cols=K → sub-K along cols (kStart)
+      // mStep=N/16 (nBlk), kStep=TILE_K_SUB/C0 (nGroups in K)
       bisheng::cce::load_cbuf_to_cb(
           (__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), cbuf_b_ptr, 0,
           (sk * kStep), mStepB, kStep, mStepB, mStepB, 0);
     } else {
-      // NN case: B[K,N] in L1, transpose=true (ZN)
+      // NN case: B[K,N] in L1, cb transpose=true (ZN).
+      // ⚠️ transpose=true in load_cbuf_to_cb only works for b16 types;
+      //    fp32 NN matmul MUST use the NT path (transpose during GM→L1).
       // rows=K, cols=N → sub-K along rows (mStart)
-      constexpr int srcStrideNN = K / C0; // nBlk = K/16
+      constexpr int srcStrideNN = K / C0; // nBlk in L1
       bisheng::cce::load_cbuf_to_cb(
           (__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), cbuf_b_ptr,
           (sk * kStep), // mStartPosition: sub-K row offset
           0,            // kStartPosition: start from col 0
-          kStep,        // mStep: TILE_K_SUB/16 K-row fractals
-          mStepB,       // kStep: N/16 N-col fractals
-          srcStrideNN,  // srcStride: K/16 (nBlk in L1)
+          kStep,        // mStep: TILE_K_SUB/C0 K-row fractals
+          mStepB,       // kStep: N/FRAC_N N-col fractals
+          srcStrideNN,  // srcStride: K/C0 (nBlk in L1)
           kStep,        // dstStride: mStep
           1);
     }

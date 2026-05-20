@@ -140,6 +140,7 @@ from .ascend import (
     ascend_init_mask,  # noqa: F401
     ascend_get_buf,  # noqa: F401
     ascend_rls_buf,  # noqa: F401
+    set_hf32_mode,  # noqa: F401
 )
 from .builtin import __ldg as __ldg  # noqa: F401
 from .builtin import ldg32 as ldg32  # noqa: F401

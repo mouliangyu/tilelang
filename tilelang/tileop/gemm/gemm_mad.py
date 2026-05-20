@@ -88,16 +88,17 @@ class GemmMAD(GemmBase):
     def _compute_tile_k_sub(self):
         """Compute sub-K chunk size that fits in L0A/L0B (64KB each, double-buffered)."""
         elem_bytes = DataType(self.in_dtype).bits // 8
+        C0 = 32 // elem_bytes  # 16 for bf16/fp16, 8 for fp32, 32 for int8
         l0_capacity = 65536  # 64KB per L0A/L0B
         num_l0_stages = 2  # double-buffered
         l0_per_stage = l0_capacity // num_l0_stages
         max_k_a = l0_per_stage // (self.M * elem_bytes)
         max_k_b = l0_per_stage // (self.N * elem_bytes)
         max_k = min(max_k_a, max_k_b, self.K)
-        tile_k_sub = (max_k // 16) * 16
+        tile_k_sub = (max_k // C0) * C0
         assert tile_k_sub > 0, f"Cannot fit any sub-K tile in L0: M={self.M}, N={self.N}, dtype={self.in_dtype}, L0 capacity={l0_capacity}"
-        while self.K % tile_k_sub != 0 and tile_k_sub > 16:
-            tile_k_sub -= 16
+        while self.K % tile_k_sub != 0 and tile_k_sub > C0:
+            tile_k_sub -= C0
         assert tile_k_sub > 0 and self.K % tile_k_sub == 0, f"K ({self.K}) is not divisible by any valid TILE_K_SUB <= {max_k}"
         return tile_k_sub
 

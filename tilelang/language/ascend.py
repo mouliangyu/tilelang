@@ -599,3 +599,35 @@ def ascend_init_mask(count):
     if isinstance(count, int):
         count = tir.IntImm("int32", count)
     return tir.call_intrin("handle", tir.op.Op.get("tl.ascend_init_mask"), count)
+
+
+def set_hf32_mode(mode=None):
+    """Set HF32 mode for Ascend Cube fp32 matmul.
+
+    Controls whether fp32 inputs to the Cube unit are truncated to
+    HF32 (19-bit mantissa) before multiplication, trading precision for
+    throughput (~2x).  Ignored for non-fp32 input types.
+
+    Generates: AscendC::SetHF32Mode(HF32Mode::DISABLE/ENABLE) and
+               AscendC::SetHF32TransMode(HF32TransMode::NEAREST_ZERO/NEAREST_EVEN).
+
+    Parameters
+    ----------
+    mode : None | "nearest_zero" | "nearest_even"
+        - None (default): disable HF32, full fp32 precision.
+        - "nearest_zero": enable HF32, round toward zero.
+        - "nearest_even": enable HF32, round to nearest even.
+
+    Example
+    -------
+    >>> T.set_hf32_mode("nearest_even")   # enable HF32
+    >>> T.set_hf32_mode(None)             # restore full fp32
+    """
+    _HF32_MODE_INT = {None: 0, "nearest_zero": 1, "nearest_even": 2}
+    if mode not in _HF32_MODE_INT:
+        raise ValueError(f"hf32 mode must be None, 'nearest_zero', or 'nearest_even', got {mode!r}")
+    return tir.call_intrin(
+        "void",
+        tir.op.Op.get("tl.ascend_set_hf32_mode"),
+        tir.IntImm("int32", _HF32_MODE_INT[mode]),
+    )
