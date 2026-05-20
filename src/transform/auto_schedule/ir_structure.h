@@ -68,6 +68,23 @@ struct BufferAccessInfo {
   }
 };
 
+// Structure to represent a specific access to a buffer (used for ordering
+// accesses)
+struct BufferAccessPoint {
+  const TaskNode *task; // The task where the access occurs
+  int64_t timestamp;    // The time at which the access occurs
+
+  BufferAccessPoint(const TaskNode *task, int64_t timestamp)
+      : task(task), timestamp(timestamp) {}
+
+  bool operator<(const BufferAccessPoint &other) const {
+    if (timestamp != other.timestamp) {
+      return timestamp < other.timestamp;
+    }
+    return task < other.task;
+  }
+};
+
 // Helper function to compare if two regions are equal
 inline bool RegionsEqual(const Region &a, const Region &b) {
   if (a.size() != b.size())
@@ -147,24 +164,30 @@ public:
   }
 
   // Collect tasks that could possibly be the first/last to access a specific
-  // (buffer, is_write, wg_id) within this IR subtree.
-  virtual bool
-  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
-                          std::set<const TaskNode *> &result) const = 0;
-  virtual bool
-  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
-                         std::set<const TaskNode *> &result) const = 0;
+  // (buffer, is_write, wg_id) within this IR subtree, together with the
+  // earliest (First) / latest (Last) possible task start time relative to this
+  // subtree's root (in cycles).
+  virtual bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write,
+                                        int wg_id,
+                                        std::set<BufferAccessPoint> &result,
+                                        int64_t time_offset = 0) const = 0;
+  virtual bool CollectLastAccessPoints(const Buffer &buffer, bool is_write,
+                                       int wg_id,
+                                       std::set<BufferAccessPoint> &result,
+                                       int64_t time_offset = 0) const = 0;
 
-  std::set<const TaskNode *>
-  GetFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id) const {
-    std::set<const TaskNode *> result;
-    CollectFirstAccessTasks(buffer, is_write, wg_id, result);
+  std::set<BufferAccessPoint> GetFirstAccessPoints(const Buffer &buffer,
+                                                   bool is_write,
+                                                   int wg_id = -1) const {
+    std::set<BufferAccessPoint> result;
+    CollectFirstAccessPoints(buffer, is_write, wg_id, result);
     return result;
   }
-  std::set<const TaskNode *>
-  GetLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id) const {
-    std::set<const TaskNode *> result;
-    CollectLastAccessTasks(buffer, is_write, wg_id, result);
+  std::set<BufferAccessPoint> GetLastAccessPoints(const Buffer &buffer,
+                                                  bool is_write,
+                                                  int wg_id = -1) const {
+    std::set<BufferAccessPoint> result;
+    CollectLastAccessPoints(buffer, is_write, wg_id, result);
     return result;
   }
 
@@ -178,11 +201,6 @@ public:
 
   // Check if this node (or any descendant) contains a loop_break call
   virtual bool ContainsLoopBreak() const = 0;
-
-  // Start time for scheduling
-  void SetStartTime(int64_t start_time) { start_time_ = start_time; }
-  int64_t GetStartTime() const { return start_time_; }
-  int64_t start_time_{0}; // Scheduled start time in cycles
 };
 
 // Task node: contains a vector of statements
@@ -312,12 +330,12 @@ public:
   CollectBufferAccessInfo(int num_wgs,
                           std::set<BufferAccessInfo> &result) const override;
 
-  bool
-  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
-                          std::set<const TaskNode *> &result) const override;
-  bool
-  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
-                         std::set<const TaskNode *> &result) const override;
+  bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+                                std::set<BufferAccessPoint> &result,
+                                int64_t time_offset = 0) const override;
+  bool CollectLastAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+                               std::set<BufferAccessPoint> &result,
+                               int64_t time_offset = 0) const override;
 
   bool containWarpgroupId(int id) const override {
     return ContainsLoopBreak() || warpgroup_id_ == -1 || warpgroup_id_ == id;
@@ -449,12 +467,12 @@ public:
   CollectBufferAccessInfo(int num_wgs,
                           std::set<BufferAccessInfo> &result) const override;
 
-  bool
-  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
-                          std::set<const TaskNode *> &result) const override;
-  bool
-  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
-                         std::set<const TaskNode *> &result) const override;
+  bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+                                std::set<BufferAccessPoint> &result,
+                                int64_t time_offset = 0) const override;
+  bool CollectLastAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+                               std::set<BufferAccessPoint> &result,
+                               int64_t time_offset = 0) const override;
 
   void SetIIperIter(int64_t ii) { ii_per_iter_ = ii; }
 
@@ -469,6 +487,34 @@ public:
 
   bool ContainsLoopBreak() const override {
     return false; // Loop does not contain loop break
+  }
+
+  int64_t GetTripCount() const {
+    PrimExpr loop_extent = control->extent;
+    PrimExpr loop_step = control->step.has_value()
+                             ? control->step.value()
+                             : IntImm(DataType::Int(32), 1);
+    // Try to convert loop_extent and loop_step to int64_t
+    if (const int64_t *extent_ptr = as_const_int(loop_extent)) {
+      if (const int64_t *step_ptr = as_const_int(loop_step)) {
+        // Calculate ceil(extent / step)
+        int64_t extent = *extent_ptr;
+        int64_t step = *step_ptr;
+        if (step > 0) {
+          // ceil(extent / step) = (extent + step - 1) / step
+          return (extent + step - 1) / step;
+        } else {
+          // Invalid step, use extent as fallback
+          return extent;
+        }
+      } else {
+        // Step is not constant, use 100 as default
+        return 100;
+      }
+    } else {
+      // Extent is not constant, use 100 as default
+      return 100;
+    }
   }
 
 private:
@@ -571,12 +617,12 @@ public:
   CollectBufferAccessInfo(int num_wgs,
                           std::set<BufferAccessInfo> &result) const override;
 
-  bool
-  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
-                          std::set<const TaskNode *> &result) const override;
-  bool
-  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
-                         std::set<const TaskNode *> &result) const override;
+  bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+                                std::set<BufferAccessPoint> &result,
+                                int64_t time_offset = 0) const override;
+  bool CollectLastAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+                               std::set<BufferAccessPoint> &result,
+                               int64_t time_offset = 0) const override;
 
   // Clone method
   std::shared_ptr<IRStructure> Clone() const override;
@@ -715,12 +761,12 @@ public:
   CollectBufferAccessInfo(int num_wgs,
                           std::set<BufferAccessInfo> &result) const override;
 
-  bool
-  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
-                          std::set<const TaskNode *> &result) const override;
-  bool
-  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
-                         std::set<const TaskNode *> &result) const override;
+  bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+                                std::set<BufferAccessPoint> &result,
+                                int64_t time_offset = 0) const override;
+  bool CollectLastAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+                               std::set<BufferAccessPoint> &result,
+                               int64_t time_offset = 0) const override;
 
   // Clone method
   std::shared_ptr<IRStructure> Clone() const override;
@@ -810,12 +856,12 @@ public:
   CollectBufferAccessInfo(int num_wgs,
                           std::set<BufferAccessInfo> &result) const override;
 
-  bool
-  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
-                          std::set<const TaskNode *> &result) const override;
-  bool
-  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
-                         std::set<const TaskNode *> &result) const override;
+  bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+                                std::set<BufferAccessPoint> &result,
+                                int64_t time_offset = 0) const override;
+  bool CollectLastAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+                               std::set<BufferAccessPoint> &result,
+                               int64_t time_offset = 0) const override;
 
   bool isInnerTask() const { return child->IsTask(); }
   int GetWarpgroupId() const override {
@@ -834,10 +880,18 @@ public:
     return child && child->ContainsLoopBreak();
   }
 
+  // Start time assigned by the Z3 scheduler. Only meaningful on ScheduleUnits
+  // produced by ScheduleUnitBuilder — i.e. the children of a scheduled
+  // SequenceNode. Expressed as cycle offset relative to that parent sequence's
+  // start.
+  void SetStartTime(int64_t start_time) { start_time_ = start_time; }
+  int64_t GetStartTime() const { return start_time_; }
+
 private:
   // Latency estimation
   int64_t latency_{0}; // Estimated latency in cycles
   int64_t ii_{0};      // Initiation interval in cycles
+  int64_t start_time_{0};
 };
 
 // Sequence node: contains a vector of child IRStructures
@@ -878,12 +932,12 @@ public:
   CollectBufferAccessInfo(int num_wgs,
                           std::set<BufferAccessInfo> &result) const override;
 
-  bool
-  CollectFirstAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
-                          std::set<const TaskNode *> &result) const override;
-  bool
-  CollectLastAccessTasks(const Buffer &buffer, bool is_write, int wg_id,
-                         std::set<const TaskNode *> &result) const override;
+  bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+                                std::set<BufferAccessPoint> &result,
+                                int64_t time_offset = 0) const override;
+  bool CollectLastAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+                               std::set<BufferAccessPoint> &result,
+                               int64_t time_offset = 0) const override;
 
   // Clone method
   std::shared_ptr<IRStructure> Clone() const override;

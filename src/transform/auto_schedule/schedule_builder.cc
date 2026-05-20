@@ -109,29 +109,9 @@ bool SameBuffer(const BufferRegion &a, const BufferRegion &b) {
 
 bool SameVar(const Var &a, const Var &b) { return a.same_as(b); }
 
-bool HasDependency(const IRStructure *a, const IRStructure *b) {
-  if (a->ContainsLoopBreak())
+bool HasNormalDependency(const IRStructure *a, const IRStructure *b) {
+  if (a->ContainsLoopBreak() || b->ContainsLoopBreak()) {
     return true;
-  if (b->ContainsLoopBreak())
-    return true;
-  for (const auto &write_region_a : a->GetWriteRegions()) {
-    for (const auto &read_region_b : b->GetReadRegions()) {
-      if (SameBuffer(write_region_a, read_region_b) &&
-          !IsGlobalBuffer(write_region_a->buffer))
-        return true;
-    }
-    for (const auto &write_region_b : b->GetWriteRegions()) {
-      if (SameBuffer(write_region_a, write_region_b) &&
-          !IsGlobalBuffer(write_region_a->buffer))
-        return true;
-    }
-  }
-  for (const auto &read_region_a : a->GetReadRegions()) {
-    for (const auto &write_region_b : b->GetWriteRegions()) {
-      if (SameBuffer(read_region_a, write_region_b) &&
-          !IsGlobalBuffer(write_region_b->buffer))
-        return true;
-    }
   }
   for (const auto &write_var_a : a->GetWriteVars()) {
     for (const auto &read_var_b : b->GetReadVars()) {
@@ -142,48 +122,10 @@ bool HasDependency(const IRStructure *a, const IRStructure *b) {
   return false;
 }
 
-bool HasRegisterDependency(const IRStructure *a, const IRStructure *b) {
-  if (a->ContainsLoopBreak())
-    return true;
-  if (b->ContainsLoopBreak())
-    return true;
-  for (const auto &write_region_a : a->GetWriteRegions()) {
-    if (IsSharedBuffer(write_region_a->buffer) ||
-        IsL1Buffer(write_region_a->buffer) ||
-        IsL0CBuffer(write_region_a->buffer) ||
-        IsGlobalBuffer(write_region_a->buffer))
-      continue;
-    for (const auto &read_region_b : b->GetReadRegions()) {
-      if (SameBuffer(write_region_a, read_region_b))
-        return true;
-    }
-    for (const auto &write_region_b : b->GetWriteRegions()) {
-      if (SameBuffer(write_region_a, write_region_b))
-        return true;
-    }
-  }
-  for (const auto &read_region_a : a->GetReadRegions()) {
-    if (IsSharedBuffer(read_region_a->buffer) ||
-        IsL1Buffer(read_region_a->buffer) ||
-        IsL0CBuffer(read_region_a->buffer) ||
-        IsGlobalBuffer(read_region_a->buffer))
-      continue;
-    for (const auto &write_region_b : b->GetWriteRegions()) {
-      if (SameBuffer(read_region_a, write_region_b))
-        return true;
-    }
-  }
-  return false;
-}
-
-std::set<Buffer> GetSharedDependencies(const IRStructure *a,
+std::set<Buffer> GetBufferDependencies(const IRStructure *a,
                                        const IRStructure *b) {
   std::set<Buffer> deps;
   for (const auto &write_region_a : a->GetWriteRegions()) {
-    if (!IsSharedBuffer(write_region_a->buffer) &&
-        !IsL1Buffer(write_region_a->buffer) &&
-        !IsL0CBuffer(write_region_a->buffer))
-      continue;
     for (const auto &read_region_b : b->GetReadRegions()) {
       if (SameBuffer(write_region_a, read_region_b))
         deps.insert(write_region_a->buffer);
@@ -194,10 +136,6 @@ std::set<Buffer> GetSharedDependencies(const IRStructure *a,
     }
   }
   for (const auto &read_region_a : a->GetReadRegions()) {
-    if (!IsSharedBuffer(read_region_a->buffer) &&
-        !IsL1Buffer(read_region_a->buffer) &&
-        !IsL0CBuffer(read_region_a->buffer))
-      continue;
     for (const auto &write_region_b : b->GetWriteRegions()) {
       if (SameBuffer(read_region_a, write_region_b))
         deps.insert(read_region_a->buffer);
@@ -226,55 +164,6 @@ void ScheduleUnitBuilder::ScheduleRecursive(
   if (!node)
     return;
 
-  auto ChildrenScheduleHelper =
-      [&](std::vector<std::shared_ptr<IRStructure>> origin_children)
-      -> std::vector<std::shared_ptr<IRStructure>> {
-    std::vector<IRStructure *> child_nodes;
-    child_nodes.reserve(origin_children.size());
-    for (const auto &child : origin_children) {
-      child_nodes.push_back(child.get());
-    }
-
-    std::vector<IRStructure *> sorted_nodes;
-    sorted_nodes = Z3SchedulePython(child_nodes);
-
-    bool order_changed = false;
-    for (size_t i = 0; i < sorted_nodes.size(); ++i) {
-      if (sorted_nodes[i] != child_nodes[i]) {
-        order_changed = true;
-        break;
-      }
-    }
-
-    if (order_changed) {
-      std::unordered_map<IRStructure *, size_t> node_to_index;
-      for (size_t i = 0; i < child_nodes.size(); ++i) {
-        node_to_index[child_nodes[i]] = i;
-      }
-
-      std::vector<std::shared_ptr<IRStructure>> reordered_children;
-      reordered_children.reserve(sorted_nodes.size());
-
-      for (IRStructure *sorted_node : sorted_nodes) {
-        auto it = node_to_index.find(sorted_node);
-        if (it == node_to_index.end()) {
-          LOG(FATAL) << "[ScheduleRecursive] IRStructure not found in "
-                        "children mapping";
-        }
-        size_t old_idx = it->second;
-        reordered_children.emplace_back(origin_children[old_idx]);
-      }
-
-      origin_children = reordered_children;
-    }
-    for (auto &node : origin_children) {
-      auto unit = std::make_shared<ScheduleUnit>();
-      unit->child = std::shared_ptr<IRStructure>(node);
-      node = unit;
-    }
-    return origin_children;
-  };
-
   if (node->IsTask()) {
     return;
   } else if (node->IsSequence()) {
@@ -286,7 +175,7 @@ void ScheduleUnitBuilder::ScheduleRecursive(
       ScheduleRecursive(child);
     }
 
-    seq->children = ChildrenScheduleHelper(origin_children);
+    seq->children = Z3SchedulePython(origin_children);
     int64_t overall_latency = 0;
     for (const auto &child : seq->children) {
       overall_latency += child->GetLatency();
@@ -332,7 +221,7 @@ void ScheduleUnitBuilder::ScheduleRecursive(
       ScheduleRecursive(child);
     }
     auto seq_node = std::make_shared<SequenceNode>();
-    seq_node->children = ChildrenScheduleHelper(origin_children);
+    seq_node->children = Z3SchedulePython(origin_children);
     int64_t overall_latency = 0;
     for (const auto &child : seq_node->children) {
       overall_latency += child->GetLatency();

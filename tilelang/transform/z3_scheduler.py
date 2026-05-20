@@ -24,7 +24,7 @@ except ImportError:
     print("[Python Z3] WARNING: z3-solver package not installed. Z3 scheduling will not work.")
 
 
-def _find_next_schedule_number(base_dir="test"):
+def _find_next_schedule_number(base_dir="debug"):
     """Find the smallest available number for schedule_xxx directory."""
     if not os.path.exists(base_dir):
         return 0
@@ -54,7 +54,7 @@ def z3_schedule_python(
     latencies: list[int],
     iis: list[int],
     resource_flags: list[int],
-    data_deps: list[tuple[int, int]],
+    data_deps: list[tuple[int, int, int]],
     resource_deps: list[tuple[int, int]],
     verbose: bool = False,
 ) -> tuple[list[int], list[int]]:
@@ -69,8 +69,8 @@ def z3_schedule_python(
     resource_flags : list[int]
         Resource pipe mask for each task (bitmask of ResourcePipe values):
         MTE1=1, MTE2=2, MTE3=4, Cube=8, Vector=16, Fixpipe=32, Scalar=64
-    data_deps : list[tuple[int, int]]
-        Data dependency pairs (i, j) where task j depends on task i
+    data_deps : list[tuple[int, int, int]]
+        Data dependency pairs (i, j, latency) where task j depends on task i and must start after i starts + latency
     resource_deps : list[tuple[int, int]]
         Resource dependency pairs (i, j) where tasks i and j use same resource
 
@@ -108,13 +108,11 @@ def z3_schedule_python(
         solver.add(var >= 0)
 
     # Add data dependency constraints
-    # For each data dependency (i, j), task j must start after task i completes
-    for i, j in data_deps:
-        if i < j:  # Ensure i < j as in original order
-            latency_i = latencies[i]
-            solver.add(start_vars[j] >= start_vars[i] + latency_i)
-            if verbose:
-                print(f"[Python Z3] Data dependency: task {j} >= task {i} + {latency_i}")
+    # For each data dependency (i, j, latency), task j must start after task i starts + latency
+    for i, j, latency in data_deps:
+        solver.add(start_vars[j] >= start_vars[i] + latency)
+        if verbose:
+            print(f"[Python Z3] Data dependency: task {j} >= task {i} + {latency}")
 
     # Add resource dependency constraints
     # For tasks i and j that use same resource, they cannot execute simultaneously
@@ -196,10 +194,10 @@ def z3_schedule_ffi(latencies, iis, resource_flags, data_deps, resource_deps):
     # Convert data dependencies
     data_deps_list = []
     if data_deps is not None:
-        # Assuming data_deps is a list of pairs
+        # Assuming data_deps is a list of triples
         for i in range(len(data_deps)):
-            if hasattr(data_deps[i], "__len__") and len(data_deps[i]) == 2:
-                data_deps_list.append((int(data_deps[i][0]), int(data_deps[i][1])))
+            if hasattr(data_deps[i], "__len__") and len(data_deps[i]) == 3:
+                data_deps_list.append((int(data_deps[i][0]), int(data_deps[i][1]), int(data_deps[i][2])))
 
     # Convert resource dependencies
     resource_deps_list = []
@@ -221,7 +219,7 @@ def z3_schedule_loop_python(
     latencies: list[int],
     iis: list[int],
     resource_flags: list[int],
-    data_deps: list[tuple[int, int, int]],  # (i, j, distance)
+    data_deps: list[tuple[int, int, int, int]],  # (i, j, distance, latency)
     resource_deps: list[tuple[int, int]],
     buffer_sizes: list[int],
     memory_groups: list[list[int]],  # [[capacity, idx0, idx1, ...], ...]
@@ -247,9 +245,9 @@ def z3_schedule_loop_python(
     resource_flags : list[int]
         Resource pipe mask for each task (bitmask of ResourcePipe values):
         MTE1=1, MTE2=2, MTE3=4, Cube=8, Vector=16, Fixpipe=32, Scalar=64
-    data_deps : list[tuple[int, int, int]]
-        Data dependency tuples (i, j, distance) where task j depends on task i
-        with distance d (loop iterations distance)
+    data_deps : list[tuple[int, int, int, int]]
+        Data dependency tuples (i, j, distance, latency) where task j depends on task i
+        with distance d (loop iterations distance) and latency l
     resource_deps : list[tuple[int, int]]
         Resource dependency pairs (i, j) where tasks i and j use same resource
     buffer_sizes : list[int]
@@ -329,19 +327,18 @@ def z3_schedule_loop_python(
                 solver.add(z3.Sum([buffer_vars[i] * buffer_sizes[i] for i in idxs]) <= cap)
 
         # Add data dependency constraints with distance
-        for u, v, distance in data_deps:
-            latency_u = latencies[u]
+        for u, v, distance, latency in data_deps:
             if distance >= 0:
                 if verbose:
-                    print(f"[Python Z3 Loop] Data dependency: task {v} - task {u} >= {latency_u} - {ii_mid}*{distance}")
-                solver.add(start_vars[v] - start_vars[u] >= latency_u - ii_mid * distance)
+                    print(f"[Python Z3 Loop] Data dependency: task {v} - task {u} >= {latency} - {ii_mid}*{distance}")
+                solver.add(start_vars[v] - start_vars[u] >= latency - ii_mid * distance)
             else:
                 buffer_var_id = -distance - 1  # Convert to 0-based index
                 if verbose:
                     print(
-                        f"[Python Z3 Loop] Data dependency with negative distance: task {v} - task {u} >= {latency_u} - {ii_mid}*buf_{buffer_var_id}"
+                        f"[Python Z3 Loop] Data dependency with negative distance: task {v} - task {u} >= {latency} - {ii_mid}*buf_{buffer_var_id}"
                     )
-                solver.add(start_vars[v] - start_vars[u] >= latency_u - ii_mid * buffer_vars[buffer_var_id])
+                solver.add(start_vars[v] - start_vars[u] >= latency - ii_mid * buffer_vars[buffer_var_id])
 
         # Add resource dependency constraints
         # For tasks i and j that use same resource, they cannot execute simultaneously
@@ -417,14 +414,13 @@ def z3_schedule_loop_python(
     if recalculate_buffer_versions:
         # if recalculation is true, we recalculate based on the schedule and dependencies
         buffer_versions = len(buffer_sizes) * [1]
-        for u, v, distance in data_deps:
-            latency_u = latencies[u]
+        for u, v, distance, latency in data_deps:
             if distance < 0:
                 buffer_var_id = -distance - 1
                 from math import ceil
 
                 buffer_versions[buffer_var_id] = max(
-                    buffer_versions[buffer_var_id], ceil((latency_u + start_times[u] - start_times[v]) / best_ii)
+                    buffer_versions[buffer_var_id], ceil((latency + start_times[u] - start_times[v]) / best_ii)
                 )
     else:
         buffer_versions = []
@@ -455,7 +451,7 @@ def z3_schedule_loop_python(
         try:
             # Find the next available schedule number
             schedule_num = _find_next_schedule_number()
-            schedule_dir = Path(f"test/schedule_{schedule_num:03d}")
+            schedule_dir = Path(f"debug/schedule_{schedule_num:03d}")
             schedule_dir.mkdir(parents=True, exist_ok=True)
 
             # Save schedule information
@@ -634,7 +630,7 @@ def z3_schedule_loop_ffi(num_stages, latencies, iis, resource_flags, data_deps, 
     """FFI wrapper for z3_schedule_loop_python.
 
     This function accepts TVM containers and converts them to Python lists.
-    Data dependencies are expected as triples (i, j, distance).
+    Data dependencies are expected as 4-tuples (i, j, distance, latency).
     memory_groups is a list of lists: [[capacity, idx0, idx1, ...], ...]
     """
     # Convert TVM containers to Python lists
@@ -647,13 +643,13 @@ def z3_schedule_loop_ffi(num_stages, latencies, iis, resource_flags, data_deps, 
     if memory_groups is not None:
         for i in range(len(memory_groups)):
             memory_groups_list.append(list(memory_groups[i]))
-    # Convert data dependencies (triples)
+    # Convert data dependencies (4-tuples)
     data_deps_list = []
     if data_deps is not None:
-        # Assuming data_deps is a list of triples
+        # Assuming data_deps is a list of 4-tuples
         for i in range(len(data_deps)):
-            if hasattr(data_deps[i], "__len__") and len(data_deps[i]) == 3:
-                data_deps_list.append((int(data_deps[i][0]), int(data_deps[i][1]), int(data_deps[i][2])))
+            if hasattr(data_deps[i], "__len__") and len(data_deps[i]) == 4:
+                data_deps_list.append((int(data_deps[i][0]), int(data_deps[i][1]), int(data_deps[i][2]), int(data_deps[i][3])))
 
     # Convert resource dependencies (pairs)
     resource_deps_list = []

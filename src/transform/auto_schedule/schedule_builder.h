@@ -55,13 +55,12 @@ bool SameBuffer(const BufferRegion &a, const BufferRegion &b);
 // Check if two variables are the same
 bool SameVar(const Var &a, const Var &b);
 
-bool HasDependency(const IRStructure *a, const IRStructure *b);
+// Check if there is a normal dependency (loop break or let vars) between two
+// IRStructures
+bool HasNormalDependency(const IRStructure *a, const IRStructure *b);
 
-// Check if two IRStructures have data dependency (excluding read-after-read)
-bool HasRegisterDependency(const IRStructure *a, const IRStructure *b);
-
-// Get shared buffers two IRStructures both access (excluding read-after-read)
-std::set<Buffer> GetSharedDependencies(const IRStructure *a,
+// Get buffer dependencies between two IRStructures (excluding read-after-read)
+std::set<Buffer> GetBufferDependencies(const IRStructure *a,
                                        const IRStructure *b);
 
 // Check if an IRStructure has any register region
@@ -80,15 +79,33 @@ public:
   // Directly schedules the entire IRStructure tree recursively in place
   void ScheduleRecursive(std::shared_ptr<IRStructure> &node);
 
-  // Z3-based scheduler that calls Python implementation via FFI
-  std::vector<IRStructure *>
-  Z3SchedulePython(const std::vector<IRStructure *> &nodes) {
-    size_t n = nodes.size();
+  // Helper: wrap each child in a ScheduleUnit (start_time=0). Used for
+  // fallback paths that bypass the Z3 scheduler.
+  static std::vector<std::shared_ptr<IRStructure>>
+  WrapAsScheduleUnits(const std::vector<std::shared_ptr<IRStructure>> &children,
+                      const std::vector<int64_t> &start_times) {
+    std::vector<std::shared_ptr<IRStructure>> wrapped;
+    wrapped.reserve(children.size());
+    for (size_t i = 0; i < children.size(); ++i) {
+      auto unit = std::make_shared<ScheduleUnit>();
+      unit->child = children[i];
+      unit->SetStartTime(i < start_times.size() ? start_times[i] : 0);
+      wrapped.push_back(std::move(unit));
+    }
+    return wrapped;
+  }
+
+  // Z3-based scheduler that calls Python implementation via FFI.
+  // Wraps each scheduled child in a ScheduleUnit carrying its start_time and
+  // returns the units (as shared_ptr<IRStructure>) in start_time order (ties
+  // broken by original index). Callers can assign the result directly to a
+  // SequenceNode's children.
+  std::vector<std::shared_ptr<IRStructure>> Z3SchedulePython(
+      const std::vector<std::shared_ptr<IRStructure>> &origin_children) {
+    size_t n = origin_children.size();
     if (n <= 1) {
-      if (n == 1) {
-        nodes[0]->SetStartTime(0);
-      }
-      return nodes;
+      std::vector<int64_t> zero_times(n, 0);
+      return WrapAsScheduleUnits(origin_children, zero_times);
     }
 
     try {
@@ -98,14 +115,15 @@ public:
       if (!z3_schedule_func.has_value()) {
         LOG(WARNING) << "Python Z3 scheduler not registered, falling back to "
                         "topological sort";
-        return nodes;
+        std::vector<int64_t> zero_times(n, 0);
+        return WrapAsScheduleUnits(origin_children, zero_times);
       }
 
       // Prepare input data
       std::vector<int64_t> latencies;
       std::vector<int64_t> iis;
       std::vector<int64_t> resource_flags;
-      std::vector<std::pair<int64_t, int64_t>> data_deps;
+      std::vector<std::tuple<int64_t, int64_t, int64_t>> data_deps;
       std::vector<std::pair<int64_t, int64_t>> resource_deps;
 
       latencies.reserve(n);
@@ -113,7 +131,7 @@ public:
       resource_flags.reserve(n);
 
       for (size_t i = 0; i < n; ++i) {
-        const IRStructure *node = nodes[i];
+        const IRStructure *node = origin_children[i].get();
         latencies.push_back(node->GetLatency());
         iis.push_back(node->GetII());
 
@@ -124,8 +142,41 @@ public:
       // Collect data dependencies
       for (size_t i = 0; i < n; ++i) {
         for (size_t j = i + 1; j < n; ++j) {
-          if (HasDependency(nodes[i], nodes[j])) {
-            data_deps.emplace_back(i, j);
+          if (HasNormalDependency(origin_children[i].get(),
+                                  origin_children[j].get())) {
+            data_deps.emplace_back(i, j, latencies[i]);
+            continue;
+          }
+          auto &&buffers = GetBufferDependencies(origin_children[i].get(),
+                                                 origin_children[j].get());
+          int64_t latency = -1;
+          for (auto buffer : buffers) {
+            auto ra = origin_children[i]->GetLastAccessPoints(buffer, false);
+            auto wa = origin_children[i]->GetLastAccessPoints(buffer, true);
+            auto rb = origin_children[j]->GetFirstAccessPoints(buffer, false);
+            auto wb = origin_children[j]->GetFirstAccessPoints(buffer, true);
+            auto update = [&](const BufferAccessPoint &a,
+                              const BufferAccessPoint &b) {
+              int64_t l = a.timestamp + a.task->GetLatency() - b.timestamp;
+              ICHECK(l <= origin_children[i]->GetLatency());
+              if (l < 0)
+                l = 0;
+              if (l > latency)
+                latency = l;
+            };
+            for (const auto &a : wa) {
+              for (const auto &b : rb)
+                update(a, b);
+              for (const auto &b : wb)
+                update(a, b);
+            }
+            for (const auto &a : ra) {
+              for (const auto &b : wb)
+                update(a, b);
+            }
+          }
+          if (latency >= 0) {
+            data_deps.emplace_back(i, j, latency);
           }
         }
       }
@@ -133,7 +184,8 @@ public:
       // Collect resource dependencies
       for (size_t i = 0; i < n; ++i) {
         for (size_t j = i + 1; j < n; ++j) {
-          if (HasResourceDependency(nodes[i], nodes[j])) {
+          if (HasResourceDependency(origin_children[i].get(),
+                                    origin_children[j].get())) {
             resource_deps.emplace_back(i, j);
           }
         }
@@ -157,8 +209,9 @@ public:
       }
       for (const auto &dep : data_deps) {
         ffi::Array<int64_t> pair;
-        pair.push_back(dep.first);
-        pair.push_back(dep.second);
+        pair.push_back(std::get<0>(dep));
+        pair.push_back(std::get<1>(dep));
+        pair.push_back(std::get<2>(dep));
         tvm_data_deps.push_back(pair);
       }
       for (const auto &dep : resource_deps) {
@@ -180,23 +233,16 @@ public:
       if (start_times.size() != n) {
         LOG(WARNING) << "Python Z3 scheduler returned invalid results (size "
                         "mismatch), falling back to topological sort";
-        return nodes;
+        std::vector<int64_t> zero_times(n, 0);
+        return WrapAsScheduleUnits(origin_children, zero_times);
       }
 
-      // Apply start times to nodes
-      for (size_t i = 0; i < n; ++i) {
-        nodes[i]->SetStartTime(start_times[i]);
-      }
-
-      // Create sorted task list based on start_time (and original index as
-      // tie-breaker)
+      // Sort by start_time, then by original index
       std::vector<std::pair<int64_t, size_t>> start_time_with_idx;
       start_time_with_idx.reserve(n);
       for (size_t i = 0; i < n; ++i) {
         start_time_with_idx.emplace_back(start_times[i], i);
       }
-
-      // Sort by start_time, then by original index
       std::sort(start_time_with_idx.begin(), start_time_with_idx.end(),
                 [](const std::pair<int64_t, size_t> &a,
                    const std::pair<int64_t, size_t> &b) {
@@ -205,23 +251,27 @@ public:
                   return a.second < b.second;
                 });
 
-      // Create sorted node list
-      std::vector<IRStructure *> sorted_nodes;
-      sorted_nodes.reserve(n);
+      // Wrap each child in a ScheduleUnit with its start_time, in sorted order.
+      std::vector<std::shared_ptr<IRStructure>> sorted_units;
+      sorted_units.reserve(n);
       for (const auto &p : start_time_with_idx) {
-        sorted_nodes.push_back(nodes[p.second]);
+        auto unit = std::make_shared<ScheduleUnit>();
+        unit->child = origin_children[p.second];
+        unit->SetStartTime(p.first);
+        sorted_units.push_back(std::move(unit));
       }
-
-      return sorted_nodes;
+      return sorted_units;
 
     } catch (const std::exception &e) {
       LOG(WARNING) << "Python Z3 scheduler failed with exception: " << e.what()
                    << ", falling back to topological sort";
-      return nodes;
+      std::vector<int64_t> zero_times(n, 0);
+      return WrapAsScheduleUnits(origin_children, zero_times);
     } catch (...) {
       LOG(WARNING) << "Python Z3 scheduler failed with unknown exception, "
                       "falling back to topological sort";
-      return nodes;
+      std::vector<int64_t> zero_times(n, 0);
+      return WrapAsScheduleUnits(origin_children, zero_times);
     }
   }
 
@@ -271,8 +321,8 @@ public:
     std::vector<int64_t> latencies;
     std::vector<int64_t> iis;
     std::vector<int64_t> resource_flags;
-    std::vector<std::tuple<int64_t, int64_t, int64_t>>
-        data_deps; // (i, j, distance)
+    std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t>>
+        data_deps; // (i, j, distance, latency)
     std::vector<std::pair<int64_t, int64_t>> resource_deps;
 
     latencies.reserve(n);
@@ -357,34 +407,56 @@ public:
     }
 
     // Collect data dependencies with distance
-    // distance = 0 if i < j (same iteration), distance = 1 if i > j (next
-    // iteration)
     for (size_t i = 0; i < n; ++i) {
       for (size_t j = 0; j < n; ++j) {
-        if (HasDependency(nodes[i], nodes[j])) {
-          if (i < j) {
-            data_deps.emplace_back(i, j, 0);
-          } else {
-            if (HasRegisterDependency(nodes[i], nodes[j])) {
-              data_deps.emplace_back(i, j, 1);
+        if (i < j && HasNormalDependency(nodes[i], nodes[j])) {
+          data_deps.emplace_back(i, j, 0, latencies[i]);
+          continue;
+        }
+        auto &&buffers = GetBufferDependencies(nodes[i], nodes[j]);
+        for (auto buffer : buffers) {
+          auto ra = nodes[i]->GetLastAccessPoints(buffer, false);
+          auto wa = nodes[i]->GetLastAccessPoints(buffer, true);
+          auto rb = nodes[j]->GetFirstAccessPoints(buffer, false);
+          auto wb = nodes[j]->GetFirstAccessPoints(buffer, true);
+          int64_t latency = -1;
+          auto update = [&](const BufferAccessPoint &a,
+                            const BufferAccessPoint &b) {
+            int64_t l = a.timestamp + a.task->GetLatency() - b.timestamp;
+            ICHECK(l <= nodes[i]->GetLatency());
+            if (l < 0)
+              l = 0;
+            if (l > latency)
+              latency = l;
+          };
+          for (const auto &a : wa) {
+            for (const auto &b : rb)
+              update(a, b);
+            for (const auto &b : wb)
+              update(a, b);
+          }
+          for (const auto &a : ra) {
+            for (const auto &b : wb)
+              update(a, b);
+          }
+          if (latency >= 0) {
+            if (i < j) {
+              data_deps.emplace_back(i, j, 0, latency);
             } else {
-              auto deps = GetSharedDependencies(nodes[i], nodes[j]);
-              for (const auto &buffer : deps) {
-                auto it = buffer_var_id.find(buffer);
-                int64_t distance = 1;
-                if (it != buffer_var_id.end()) {
-                  // Encode the buffer id in the negative distance for the Z3
-                  // scheduler to recognize
-                  distance = -(int64_t)it->second - 1;
-                } else {
-                  // Check if this buffer has a manually annotated version count
-                  auto ann_it = annotated_buffer_versions.find(buffer);
-                  if (ann_it != annotated_buffer_versions.end()) {
-                    distance = ann_it->second;
-                  }
+              auto it = buffer_var_id.find(buffer);
+              int64_t distance = 1;
+              if (it != buffer_var_id.end()) {
+                // Encode the buffer id in the negative distance for the Z3
+                // scheduler to recognize
+                distance = -(int64_t)it->second - 1;
+              } else {
+                // Check if this buffer has a manually annotated version count
+                auto ann_it = annotated_buffer_versions.find(buffer);
+                if (ann_it != annotated_buffer_versions.end()) {
+                  distance = ann_it->second;
                 }
-                data_deps.emplace_back(i, j, distance);
               }
+              data_deps.emplace_back(i, j, distance, latency);
             }
           }
         }
@@ -423,6 +495,7 @@ public:
       triple.push_back(std::get<0>(dep));
       triple.push_back(std::get<1>(dep));
       triple.push_back(std::get<2>(dep));
+      triple.push_back(std::get<3>(dep));
       tvm_data_deps.push_back(triple);
     }
     for (const auto &dep : resource_deps) {
@@ -462,10 +535,7 @@ public:
     ffi::Array<int64_t> buffer_versions = return_val.get<1>();
     ii = return_val.get<2>();
 
-    // Apply start times and promote flags to nodes
-    for (size_t i = 0; i < n; ++i) {
-      nodes[i]->SetStartTime(start_times[i]);
-    }
+    // Sort children by start_time (with original index as tie-breaker).
     std::vector<std::pair<int64_t, size_t>> start_time_with_idx;
     start_time_with_idx.reserve(n);
     for (size_t i = 0; i < n; ++i) {
@@ -481,11 +551,16 @@ public:
                 return a.second < b.second;
               });
 
-    // Create sorted node list
+    // Create sorted node list and a parallel vector of start_times in
+    // post-sort order so we can write start_time onto each ScheduleUnit
+    // after wrapping below.
     std::vector<IRStructure *> sorted_nodes;
+    std::vector<int64_t> sorted_start_times;
     sorted_nodes.reserve(n);
+    sorted_start_times.reserve(n);
     for (const auto &p : start_time_with_idx) {
       sorted_nodes.push_back(nodes[p.second]);
+      sorted_start_times.push_back(p.first);
     }
 
     // Reorder children if order changed
@@ -530,42 +605,20 @@ public:
       return false;
     };
 
-    for (auto &node : seq_body->children) {
+    for (size_t k = 0; k < seq_body->children.size(); ++k) {
       auto unit = std::make_shared<ScheduleUnit>();
-      unit->child = std::move(node);
-      node = std::move(unit);
+      unit->child = std::move(seq_body->children[k]);
+      unit->SetStartTime(sorted_start_times[k]);
+      seq_body->children[k] = std::move(unit);
     }
 
     // Estimate overall latency: II * tripcount
-    // Get tripcount from For loop extent and step
-    int64_t tripcount = 100; // default if not constant
-    const ForNode *for_node = ctrl->control.get();
-    PrimExpr loop_extent = for_node->extent;
-    PrimExpr loop_step = for_node->step.has_value()
-                             ? for_node->step.value()
-                             : IntImm(DataType::Int(32), 1);
-
-    if (const auto *extent_int = loop_extent.as<IntImmNode>()) {
-      if (const auto *step_int = loop_step.as<IntImmNode>()) {
-        // Calculate ceil(extent / step)
-        int64_t extent = extent_int->value;
-        int64_t step = step_int->value;
-        if (step > 0) {
-          // ceil(extent / step) = (extent + step - 1) / step
-          tripcount = (extent + step - 1) / step;
-        } else {
-          // Invalid step, use extent as fallback
-          tripcount = extent;
-        }
-      } else {
-        // Step is not constant, use 100 as default
-        tripcount = 100;
-      }
-    } else {
-      // Extent is not constant, use 100 as default
-      tripcount = 100;
+    int64_t overall_latency = 0;
+    for (size_t i = 0; i < sorted_nodes.size(); ++i) {
+      overall_latency =
+          std::max(overall_latency, sorted_start_times[i] + latencies[i]);
     }
-    int64_t overall_latency = ii * tripcount;
+    overall_latency += ii * (ctrl->GetTripCount() - 1);
 
     // Set II and latency on the ControlNode (which delegates to child)
     ctrl->SetII(overall_latency);

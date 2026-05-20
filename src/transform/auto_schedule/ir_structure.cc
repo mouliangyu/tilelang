@@ -209,8 +209,6 @@ std::shared_ptr<IRStructure> TaskNode::Clone() const {
   // Copy latency and II
   new_task->SetLatency(GetLatency());
   new_task->SetII(GetII());
-  // Copy start time
-  new_task->SetStartTime(GetStartTime());
   // Copy warpgroup id
   new_task->SetWarpgroupId(GetWarpgroupId());
   // Copy loop_break cache
@@ -315,6 +313,7 @@ std::shared_ptr<IRStructure> ScheduleUnit::Clone() const {
   // Copy latency and II
   new_unit->SetLatency(GetLatency());
   new_unit->SetII(GetII());
+  new_unit->SetStartTime(GetStartTime());
   return new_unit;
 }
 
@@ -332,7 +331,6 @@ std::shared_ptr<IRStructure> IfNode::Clone() const {
   }
   new_if->SetLatency(GetLatency());
   new_if->SetII(GetII());
-  new_if->SetStartTime(GetStartTime());
   return new_if;
 }
 
@@ -400,33 +398,7 @@ void CollectAllTaskNodesWithContext(IRStructure *node,
 
     // Calculate tripcount if inside a loop
     if (current_control_node) {
-      const ForNode *for_node = current_control_node->control.get();
-      PrimExpr loop_extent = for_node->extent;
-      PrimExpr loop_step = for_node->step.has_value()
-                               ? for_node->step.value()
-                               : IntImm(DataType::Int(32), 1);
-
-      // Try to convert loop_extent and loop_step to int64_t
-      if (const int64_t *extent_ptr = as_const_int(loop_extent)) {
-        if (const int64_t *step_ptr = as_const_int(loop_step)) {
-          // Calculate ceil(extent / step)
-          int64_t extent = *extent_ptr;
-          int64_t step = *step_ptr;
-          if (step > 0) {
-            // ceil(extent / step) = (extent + step - 1) / step
-            task_ctx.tripcount = (extent + step - 1) / step;
-          } else {
-            // Invalid step, use extent as fallback
-            task_ctx.tripcount = extent;
-          }
-        } else {
-          // Step is not constant, use 100 as default
-          task_ctx.tripcount = 100;
-        }
-      } else {
-        // Extent is not constant, use 100 as default (as requested)
-        task_ctx.tripcount = 100;
-      }
+      task_ctx.tripcount = current_control_node->GetTripCount();
     } else {
       task_ctx.tripcount = 1; // Not inside a loop
     }
@@ -468,19 +440,14 @@ void CollectAllTaskNodesWithContext(IRStructure *node,
 }
 
 // ============================================================================
-// CollectFirstAccessTasks / CollectLastAccessTasks implementations
+// CollectFirstAccessPoints / CollectLastAccessPoints implementations
 // ============================================================================
 
-static const IfNode *TryGetIfNode(const IRStructure *node) {
-  if (!node)
+static const IfNode *TryGetIfNode(const ScheduleUnit *unit) {
+  if (!unit || !unit->child)
     return nullptr;
-  if (node->IsIf())
-    return static_cast<const IfNode *>(node);
-  if (node->IsScheduleUnit()) {
-    auto *unit = static_cast<const ScheduleUnit *>(node);
-    if (unit->child && unit->child->IsIf())
-      return static_cast<const IfNode *>(unit->child.get());
-  }
+  if (unit->child->IsIf())
+    return static_cast<const IfNode *>(unit->child.get());
   return nullptr;
 }
 
@@ -516,10 +483,45 @@ static bool LoopMustExecute(const ControlNode *ctrl) {
   return false;
 }
 
+// Build synthetic ScheduleUnits wrapping the then/else branches of an
+// if-group so the recursive helper can treat them as a virtual sequence.
+// Each synthetic unit inherits the start_time of its enclosing if-statement
+// unit, so `base_offset + unit->GetStartTime()` lands on the correct absolute
+// timestamp during recursion. The `owners` vector keeps the synthetic units
+// alive for the duration of the caller; the parallel out-vector contains raw
+// pointers into it.
+static void
+WrapBranchesForIfGroup(const std::vector<const ScheduleUnit *> &nodes,
+                       int group_start, int group_end,
+                       std::vector<std::shared_ptr<ScheduleUnit>> &then_owners,
+                       std::vector<std::shared_ptr<ScheduleUnit>> &else_owners,
+                       std::vector<const ScheduleUnit *> &then_units,
+                       std::vector<const ScheduleUnit *> &else_units) {
+  for (int j = group_start; j <= group_end; ++j) {
+    const ScheduleUnit *unit_j = nodes[j];
+    const IfNode *cur_if = TryGetIfNode(unit_j);
+    ICHECK(cur_if);
+    auto wrap_branch = [&](const std::shared_ptr<IRStructure> &branch,
+                           std::vector<std::shared_ptr<ScheduleUnit>> &owners,
+                           std::vector<const ScheduleUnit *> &out) {
+      if (!branch)
+        return;
+      auto fresh = std::make_shared<ScheduleUnit>();
+      fresh->child = branch;
+      fresh->SetStartTime(unit_j->GetStartTime());
+      owners.push_back(fresh);
+      out.push_back(fresh.get());
+    };
+    wrap_branch(cur_if->then_child, then_owners, then_units);
+    wrap_branch(cur_if->else_child, else_owners, else_units);
+  }
+}
+
 static bool
-SequenceCollectFirstAccessTasks(const std::vector<const IRStructure *> &nodes,
-                                const Buffer &buffer, bool is_write, int wg_id,
-                                std::set<const TaskNode *> &result) {
+SequenceCollectFirstAccessPoints(const std::vector<const ScheduleUnit *> &nodes,
+                                 const Buffer &buffer, bool is_write, int wg_id,
+                                 std::set<BufferAccessPoint> &result,
+                                 int64_t base_offset) {
   int n = static_cast<int>(nodes.size());
   int break_idx = -1;
   for (int j = 0; j < n; ++j) {
@@ -530,19 +532,21 @@ SequenceCollectFirstAccessTasks(const std::vector<const IRStructure *> &nodes,
   }
   if (break_idx >= 0) {
     if (break_idx > 0) {
-      std::vector<const IRStructure *> before(nodes.begin(),
-                                              nodes.begin() + break_idx);
-      if (SequenceCollectFirstAccessTasks(before, buffer, is_write, wg_id,
-                                          result))
+      std::vector<const ScheduleUnit *> before(nodes.begin(),
+                                               nodes.begin() + break_idx);
+      if (SequenceCollectFirstAccessPoints(before, buffer, is_write, wg_id,
+                                           result, base_offset))
         return true;
     }
-    if (nodes[break_idx]->CollectFirstAccessTasks(buffer, is_write, wg_id,
-                                                  result))
+    if (nodes[break_idx]->CollectFirstAccessPoints(
+            buffer, is_write, wg_id, result,
+            base_offset + nodes[break_idx]->GetStartTime()))
       return true;
     if (break_idx + 1 < n) {
-      std::vector<const IRStructure *> after(nodes.begin() + break_idx + 1,
-                                             nodes.end());
-      SequenceCollectFirstAccessTasks(after, buffer, is_write, wg_id, result);
+      std::vector<const ScheduleUnit *> after(nodes.begin() + break_idx + 1,
+                                              nodes.end());
+      SequenceCollectFirstAccessPoints(after, buffer, is_write, wg_id, result,
+                                       base_offset);
     }
     return false;
   }
@@ -562,30 +566,28 @@ SequenceCollectFirstAccessTasks(const std::vector<const IRStructure *> &nodes,
       int group_end = i;
       ++i;
       if (if_node->task) {
-        if (if_node->task->CollectFirstAccessTasks(buffer, is_write, wg_id,
-                                                   result))
+        if (if_node->task->CollectFirstAccessPoints(
+                buffer, is_write, wg_id, result,
+                base_offset + nodes[group_start]->GetStartTime()))
           return true;
       }
-      std::vector<const IRStructure *> then_children, else_children;
-      for (int j = group_start; j <= group_end; ++j) {
-        const IfNode *cur_if = TryGetIfNode(nodes[j]);
-        ICHECK(cur_if);
-        if (cur_if->then_child)
-          then_children.push_back(cur_if->then_child.get());
-        if (cur_if->else_child)
-          else_children.push_back(cur_if->else_child.get());
-      }
+      std::vector<std::shared_ptr<ScheduleUnit>> then_owners, else_owners;
+      std::vector<const ScheduleUnit *> then_units, else_units;
+      WrapBranchesForIfGroup(nodes, group_start, group_end, then_owners,
+                             else_owners, then_units, else_units);
       bool then_must = false, else_must = false;
-      if (!then_children.empty())
-        then_must = SequenceCollectFirstAccessTasks(then_children, buffer,
-                                                    is_write, wg_id, result);
-      if (!else_children.empty())
-        else_must = SequenceCollectFirstAccessTasks(else_children, buffer,
-                                                    is_write, wg_id, result);
+      if (!then_units.empty())
+        then_must = SequenceCollectFirstAccessPoints(
+            then_units, buffer, is_write, wg_id, result, base_offset);
+      if (!else_units.empty())
+        else_must = SequenceCollectFirstAccessPoints(
+            else_units, buffer, is_write, wg_id, result, base_offset);
       if (then_must && else_must)
         return true;
     } else {
-      if (nodes[i]->CollectFirstAccessTasks(buffer, is_write, wg_id, result))
+      if (nodes[i]->CollectFirstAccessPoints(buffer, is_write, wg_id, result,
+                                             base_offset +
+                                                 nodes[i]->GetStartTime()))
         return true;
       ++i;
     }
@@ -594,9 +596,10 @@ SequenceCollectFirstAccessTasks(const std::vector<const IRStructure *> &nodes,
 }
 
 static bool
-SequenceCollectLastAccessTasks(const std::vector<const IRStructure *> &nodes,
-                               const Buffer &buffer, bool is_write, int wg_id,
-                               std::set<const TaskNode *> &result) {
+SequenceCollectLastAccessPoints(const std::vector<const ScheduleUnit *> &nodes,
+                                const Buffer &buffer, bool is_write, int wg_id,
+                                std::set<BufferAccessPoint> &result,
+                                int64_t base_offset) {
   int n = static_cast<int>(nodes.size());
   int break_idx = -1;
   for (int j = n - 1; j >= 0; --j) {
@@ -607,15 +610,19 @@ SequenceCollectLastAccessTasks(const std::vector<const IRStructure *> &nodes,
   }
   if (break_idx >= 0) {
     if (break_idx + 1 < n) {
-      std::vector<const IRStructure *> after(nodes.begin() + break_idx + 1,
-                                             nodes.end());
-      SequenceCollectLastAccessTasks(after, buffer, is_write, wg_id, result);
+      std::vector<const ScheduleUnit *> after(nodes.begin() + break_idx + 1,
+                                              nodes.end());
+      SequenceCollectLastAccessPoints(after, buffer, is_write, wg_id, result,
+                                      base_offset);
     }
-    nodes[break_idx]->CollectLastAccessTasks(buffer, is_write, wg_id, result);
+    nodes[break_idx]->CollectLastAccessPoints(
+        buffer, is_write, wg_id, result,
+        base_offset + nodes[break_idx]->GetStartTime());
     if (break_idx > 0) {
-      std::vector<const IRStructure *> before(nodes.begin(),
-                                              nodes.begin() + break_idx);
-      SequenceCollectLastAccessTasks(before, buffer, is_write, wg_id, result);
+      std::vector<const ScheduleUnit *> before(nodes.begin(),
+                                               nodes.begin() + break_idx);
+      SequenceCollectLastAccessPoints(before, buffer, is_write, wg_id, result,
+                                      base_offset);
     }
     return false;
   }
@@ -634,33 +641,31 @@ SequenceCollectLastAccessTasks(const std::vector<const IRStructure *> &nodes,
       }
       int group_start = i;
       --i;
-      std::vector<const IRStructure *> then_children, else_children;
-      for (int j = group_start; j <= group_end; ++j) {
-        const IfNode *cur_if = TryGetIfNode(nodes[j]);
-        ICHECK(cur_if);
-        if (cur_if->then_child)
-          then_children.push_back(cur_if->then_child.get());
-        if (cur_if->else_child)
-          else_children.push_back(cur_if->else_child.get());
-      }
+      std::vector<std::shared_ptr<ScheduleUnit>> then_owners, else_owners;
+      std::vector<const ScheduleUnit *> then_units, else_units;
+      WrapBranchesForIfGroup(nodes, group_start, group_end, then_owners,
+                             else_owners, then_units, else_units);
       bool then_must = false, else_must = false;
-      if (!then_children.empty())
-        then_must = SequenceCollectLastAccessTasks(then_children, buffer,
-                                                   is_write, wg_id, result);
-      if (!else_children.empty())
-        else_must = SequenceCollectLastAccessTasks(else_children, buffer,
-                                                   is_write, wg_id, result);
+      if (!then_units.empty())
+        then_must = SequenceCollectLastAccessPoints(
+            then_units, buffer, is_write, wg_id, result, base_offset);
+      if (!else_units.empty())
+        else_must = SequenceCollectLastAccessPoints(
+            else_units, buffer, is_write, wg_id, result, base_offset);
       if (then_must && else_must)
         return true;
       const IfNode *last_if = TryGetIfNode(nodes[group_end]);
       ICHECK(last_if);
       if (last_if->task) {
-        if (last_if->task->CollectLastAccessTasks(buffer, is_write, wg_id,
-                                                  result))
+        if (last_if->task->CollectLastAccessPoints(
+                buffer, is_write, wg_id, result,
+                base_offset + nodes[group_end]->GetStartTime()))
           return true;
       }
     } else {
-      if (nodes[i]->CollectLastAccessTasks(buffer, is_write, wg_id, result))
+      if (nodes[i]->CollectLastAccessPoints(buffer, is_write, wg_id, result,
+                                            base_offset +
+                                                nodes[i]->GetStartTime()))
         return true;
       --i;
     }
@@ -668,174 +673,215 @@ SequenceCollectLastAccessTasks(const std::vector<const IRStructure *> &nodes,
   return false;
 }
 
-bool TaskNode::CollectFirstAccessTasks(
-    const Buffer &buffer, bool is_write, int wg_id,
-    std::set<const TaskNode *> &result) const {
+bool TaskNode::CollectFirstAccessPoints(const Buffer &buffer, bool is_write,
+                                        int wg_id,
+                                        std::set<BufferAccessPoint> &result,
+                                        int64_t time_offset) const {
   if (TaskMatchesAccess(this, buffer, is_write, wg_id)) {
-    result.insert(this);
+    result.emplace(this, time_offset);
     return true;
   }
   return false;
 }
 
-bool TaskNode::CollectLastAccessTasks(
-    const Buffer &buffer, bool is_write, int wg_id,
-    std::set<const TaskNode *> &result) const {
+bool TaskNode::CollectLastAccessPoints(const Buffer &buffer, bool is_write,
+                                       int wg_id,
+                                       std::set<BufferAccessPoint> &result,
+                                       int64_t time_offset) const {
   if (TaskMatchesAccess(this, buffer, is_write, wg_id)) {
-    result.insert(this);
+    result.emplace(this, time_offset);
     return true;
   }
   return false;
 }
 
-bool ScheduleUnit::CollectFirstAccessTasks(
-    const Buffer &buffer, bool is_write, int wg_id,
-    std::set<const TaskNode *> &result) const {
+bool ScheduleUnit::CollectFirstAccessPoints(const Buffer &buffer, bool is_write,
+                                            int wg_id,
+                                            std::set<BufferAccessPoint> &result,
+                                            int64_t time_offset) const {
   if (child)
-    return child->CollectFirstAccessTasks(buffer, is_write, wg_id, result);
+    return child->CollectFirstAccessPoints(buffer, is_write, wg_id, result,
+                                           time_offset);
   return false;
 }
 
-bool ScheduleUnit::CollectLastAccessTasks(
-    const Buffer &buffer, bool is_write, int wg_id,
-    std::set<const TaskNode *> &result) const {
+bool ScheduleUnit::CollectLastAccessPoints(const Buffer &buffer, bool is_write,
+                                           int wg_id,
+                                           std::set<BufferAccessPoint> &result,
+                                           int64_t time_offset) const {
   if (child)
-    return child->CollectLastAccessTasks(buffer, is_write, wg_id, result);
+    return child->CollectLastAccessPoints(buffer, is_write, wg_id, result,
+                                          time_offset);
   return false;
 }
 
-bool WrapperNode::CollectFirstAccessTasks(
-    const Buffer &buffer, bool is_write, int wg_id,
-    std::set<const TaskNode *> &result) const {
+bool WrapperNode::CollectFirstAccessPoints(const Buffer &buffer, bool is_write,
+                                           int wg_id,
+                                           std::set<BufferAccessPoint> &result,
+                                           int64_t time_offset) const {
   if (task) {
-    if (task->CollectFirstAccessTasks(buffer, is_write, wg_id, result))
+    if (task->CollectFirstAccessPoints(buffer, is_write, wg_id, result,
+                                       time_offset))
       return true;
   }
   if (child) {
-    if (child->CollectFirstAccessTasks(buffer, is_write, wg_id, result))
+    if (child->CollectFirstAccessPoints(buffer, is_write, wg_id, result,
+                                        time_offset))
       return true;
   }
   return false;
 }
 
-bool WrapperNode::CollectLastAccessTasks(
-    const Buffer &buffer, bool is_write, int wg_id,
-    std::set<const TaskNode *> &result) const {
+bool WrapperNode::CollectLastAccessPoints(const Buffer &buffer, bool is_write,
+                                          int wg_id,
+                                          std::set<BufferAccessPoint> &result,
+                                          int64_t time_offset) const {
   if (child) {
-    if (child->CollectLastAccessTasks(buffer, is_write, wg_id, result))
+    if (child->CollectLastAccessPoints(buffer, is_write, wg_id, result,
+                                       time_offset))
       return true;
   }
   if (task) {
-    if (task->CollectLastAccessTasks(buffer, is_write, wg_id, result))
+    if (task->CollectLastAccessPoints(buffer, is_write, wg_id, result,
+                                      time_offset))
       return true;
   }
   return false;
 }
 
-bool IfNode::CollectFirstAccessTasks(const Buffer &buffer, bool is_write,
-                                     int wg_id,
-                                     std::set<const TaskNode *> &result) const {
+bool IfNode::CollectFirstAccessPoints(const Buffer &buffer, bool is_write,
+                                      int wg_id,
+                                      std::set<BufferAccessPoint> &result,
+                                      int64_t time_offset) const {
   if (task) {
-    if (task->CollectFirstAccessTasks(buffer, is_write, wg_id, result))
+    if (task->CollectFirstAccessPoints(buffer, is_write, wg_id, result,
+                                       time_offset))
       return true;
   }
   bool then_must = false, else_must = false;
   if (then_child)
-    then_must =
-        then_child->CollectFirstAccessTasks(buffer, is_write, wg_id, result);
+    then_must = then_child->CollectFirstAccessPoints(buffer, is_write, wg_id,
+                                                     result, time_offset);
   if (else_child)
-    else_must =
-        else_child->CollectFirstAccessTasks(buffer, is_write, wg_id, result);
+    else_must = else_child->CollectFirstAccessPoints(buffer, is_write, wg_id,
+                                                     result, time_offset);
   return then_must && else_must;
 }
 
-bool IfNode::CollectLastAccessTasks(const Buffer &buffer, bool is_write,
-                                    int wg_id,
-                                    std::set<const TaskNode *> &result) const {
+bool IfNode::CollectLastAccessPoints(const Buffer &buffer, bool is_write,
+                                     int wg_id,
+                                     std::set<BufferAccessPoint> &result,
+                                     int64_t time_offset) const {
   bool then_must = false, else_must = false;
   if (then_child)
-    then_must =
-        then_child->CollectLastAccessTasks(buffer, is_write, wg_id, result);
+    then_must = then_child->CollectLastAccessPoints(buffer, is_write, wg_id,
+                                                    result, time_offset);
   if (else_child)
-    else_must =
-        else_child->CollectLastAccessTasks(buffer, is_write, wg_id, result);
+    else_must = else_child->CollectLastAccessPoints(buffer, is_write, wg_id,
+                                                    result, time_offset);
   if (then_must && else_must)
     return true;
   if (task) {
-    if (task->CollectLastAccessTasks(buffer, is_write, wg_id, result))
+    if (task->CollectLastAccessPoints(buffer, is_write, wg_id, result,
+                                      time_offset))
       return true;
   }
   return false;
 }
 
-bool ControlNode::CollectFirstAccessTasks(
-    const Buffer &buffer, bool is_write, int wg_id,
-    std::set<const TaskNode *> &result) const {
+bool ControlNode::CollectFirstAccessPoints(const Buffer &buffer, bool is_write,
+                                           int wg_id,
+                                           std::set<BufferAccessPoint> &result,
+                                           int64_t time_offset) const {
   if (task) {
-    if (task->CollectFirstAccessTasks(buffer, is_write, wg_id, result))
+    if (task->CollectFirstAccessPoints(buffer, is_write, wg_id, result,
+                                       time_offset))
       return true;
   }
   bool body_must = false;
   if (child && child->IsSequence()) {
     auto *seq = static_cast<const SequenceNode *>(child.get());
-    std::vector<const IRStructure *> ordered;
+    std::vector<const ScheduleUnit *> ordered;
     ordered.reserve(seq->children.size());
-    for (const auto &c : seq->children)
-      ordered.push_back(c.get());
-    body_must = SequenceCollectFirstAccessTasks(ordered, buffer, is_write,
-                                                wg_id, result);
+    for (const auto &c : seq->children) {
+      ICHECK(c->IsScheduleUnit())
+          << "Sequence child must be a ScheduleUnit post-scheduling";
+      ordered.push_back(static_cast<const ScheduleUnit *>(c.get()));
+    }
+    body_must = SequenceCollectFirstAccessPoints(ordered, buffer, is_write,
+                                                 wg_id, result, time_offset);
   } else if (child) {
-    body_must = child->CollectFirstAccessTasks(buffer, is_write, wg_id, result);
+    body_must = child->CollectFirstAccessPoints(buffer, is_write, wg_id, result,
+                                                time_offset);
   }
   if (body_must && LoopMustExecute(this))
     return true;
   return false;
 }
 
-bool ControlNode::CollectLastAccessTasks(
-    const Buffer &buffer, bool is_write, int wg_id,
-    std::set<const TaskNode *> &result) const {
+bool ControlNode::CollectLastAccessPoints(const Buffer &buffer, bool is_write,
+                                          int wg_id,
+                                          std::set<BufferAccessPoint> &result,
+                                          int64_t time_offset) const {
+  int64_t trip_count = GetTripCount();
+  int64_t ii_per_iter = GetIIperIter();
+  int64_t last_iter_offset =
+      (trip_count > 0 ? (trip_count - 1) : 0) * ii_per_iter;
+  int64_t body_offset = time_offset + last_iter_offset;
   bool body_must = false;
   if (child && child->IsSequence()) {
     auto *seq = static_cast<const SequenceNode *>(child.get());
-    std::vector<const IRStructure *> ordered;
+    std::vector<const ScheduleUnit *> ordered;
     ordered.reserve(seq->children.size());
-    for (const auto &c : seq->children)
-      ordered.push_back(c.get());
-    body_must = SequenceCollectLastAccessTasks(ordered, buffer, is_write, wg_id,
-                                               result);
+    for (const auto &c : seq->children) {
+      ICHECK(c->IsScheduleUnit())
+          << "Sequence child must be a ScheduleUnit post-scheduling";
+      ordered.push_back(static_cast<const ScheduleUnit *>(c.get()));
+    }
+    body_must = SequenceCollectLastAccessPoints(ordered, buffer, is_write,
+                                                wg_id, result, body_offset);
   } else if (child) {
-    body_must = child->CollectLastAccessTasks(buffer, is_write, wg_id, result);
+    body_must = child->CollectLastAccessPoints(buffer, is_write, wg_id, result,
+                                               body_offset);
   }
   if (body_must && LoopMustExecute(this))
     return true;
   if (task) {
-    if (task->CollectLastAccessTasks(buffer, is_write, wg_id, result))
+    if (task->CollectLastAccessPoints(buffer, is_write, wg_id, result,
+                                      time_offset))
       return true;
   }
   return false;
 }
 
-bool SequenceNode::CollectFirstAccessTasks(
-    const Buffer &buffer, bool is_write, int wg_id,
-    std::set<const TaskNode *> &result) const {
-  std::vector<const IRStructure *> ordered;
+bool SequenceNode::CollectFirstAccessPoints(const Buffer &buffer, bool is_write,
+                                            int wg_id,
+                                            std::set<BufferAccessPoint> &result,
+                                            int64_t time_offset) const {
+  std::vector<const ScheduleUnit *> ordered;
   ordered.reserve(children.size());
-  for (const auto &c : children)
-    ordered.push_back(c.get());
-  return SequenceCollectFirstAccessTasks(ordered, buffer, is_write, wg_id,
-                                         result);
+  for (const auto &c : children) {
+    ICHECK(c->IsScheduleUnit())
+        << "Sequence child must be a ScheduleUnit post-scheduling";
+    ordered.push_back(static_cast<const ScheduleUnit *>(c.get()));
+  }
+  return SequenceCollectFirstAccessPoints(ordered, buffer, is_write, wg_id,
+                                          result, time_offset);
 }
 
-bool SequenceNode::CollectLastAccessTasks(
-    const Buffer &buffer, bool is_write, int wg_id,
-    std::set<const TaskNode *> &result) const {
-  std::vector<const IRStructure *> ordered;
+bool SequenceNode::CollectLastAccessPoints(const Buffer &buffer, bool is_write,
+                                           int wg_id,
+                                           std::set<BufferAccessPoint> &result,
+                                           int64_t time_offset) const {
+  std::vector<const ScheduleUnit *> ordered;
   ordered.reserve(children.size());
-  for (const auto &c : children)
-    ordered.push_back(c.get());
-  return SequenceCollectLastAccessTasks(ordered, buffer, is_write, wg_id,
-                                        result);
+  for (const auto &c : children) {
+    ICHECK(c->IsScheduleUnit())
+        << "Sequence child must be a ScheduleUnit post-scheduling";
+    ordered.push_back(static_cast<const ScheduleUnit *>(c.get()));
+  }
+  return SequenceCollectLastAccessPoints(ordered, buffer, is_write, wg_id,
+                                         result, time_offset);
 }
 
 } // namespace tl

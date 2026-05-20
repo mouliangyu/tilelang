@@ -494,9 +494,9 @@ GetSyncInfos(const std::vector<ScheduleUnit *> &units, int num_wgs,
       num_versions = it->second;
     }
     std::vector<ScheduleUnit *> last_read_unit(num_wgs, nullptr);
-    std::vector<std::set<const TaskNode *>> last_read_unit_tasks(num_wgs);
+    std::vector<std::set<BufferAccessPoint>> last_read_unit_tasks(num_wgs);
     ScheduleUnit *last_write_unit = nullptr;
-    std::vector<std::pair<int, std::set<const TaskNode *>>>
+    std::vector<std::pair<int, std::set<BufferAccessPoint>>>
         last_write_unit_wg_tasks;
     std::vector<bool> waited_write_wgs(num_wgs, false);
     for (int iter = 0; iter < (is_loop ? 2 : 1); ++iter) {
@@ -505,15 +505,17 @@ GetSyncInfos(const std::vector<ScheduleUnit *> &units, int num_wgs,
           int distance = iter ? num_versions : 0;
           // RAW: unit reads buffer, wait for last writer
           auto first_reads =
-              unit->GetFirstAccessTasks(buffer, /*is_write=*/false, wg_id);
+              unit->GetFirstAccessPoints(buffer, /*is_write=*/false, wg_id);
           if (!first_reads.empty() && last_write_unit != nullptr &&
               !waited_write_wgs[wg_id]) {
             if (last_write_unit == unit)
               continue;
-            for (auto *consumer : first_reads) {
+            for (const auto &consumer_pt : first_reads) {
+              const TaskNode *consumer = consumer_pt.task;
               for (const auto &[last_write_wg_id, last_write_unit_tasks] :
                    last_write_unit_wg_tasks) {
-                for (auto *producer : last_write_unit_tasks) {
+                for (const auto &producer_pt : last_write_unit_tasks) {
+                  const TaskNode *producer = producer_pt.task;
                   sync_infos[{last_write_unit, last_write_wg_id}][{unit, wg_id}]
                       .emplace(distance, buffer, producer, consumer,
                                num_versions);
@@ -524,7 +526,7 @@ GetSyncInfos(const std::vector<ScheduleUnit *> &units, int num_wgs,
           // WAR/WAW: unit writes buffer, wait for all last readers
           // if there are no last readers, wait for last writer
           auto first_writes =
-              unit->GetFirstAccessTasks(buffer, /*is_write=*/true, wg_id);
+              unit->GetFirstAccessPoints(buffer, /*is_write=*/true, wg_id);
           if (!first_writes.empty()) {
             bool has_last_read = false;
             for (int last_wg = 0; last_wg < num_wgs; ++last_wg) {
@@ -533,8 +535,10 @@ GetSyncInfos(const std::vector<ScheduleUnit *> &units, int num_wgs,
               has_last_read = true;
               if (last_read_unit[last_wg] == unit)
                 continue;
-              for (auto *consumer : first_writes) {
-                for (auto *producer : last_read_unit_tasks[last_wg]) {
+              for (const auto &consumer_pt : first_writes) {
+                const TaskNode *consumer = consumer_pt.task;
+                for (const auto &producer_pt : last_read_unit_tasks[last_wg]) {
+                  const TaskNode *producer = producer_pt.task;
                   sync_infos[{last_read_unit[last_wg], last_wg}][{unit, wg_id}]
                       .emplace(distance, buffer, producer, consumer,
                                num_versions);
@@ -543,10 +547,12 @@ GetSyncInfos(const std::vector<ScheduleUnit *> &units, int num_wgs,
             }
             if (!has_last_read && last_write_unit != nullptr &&
                 !waited_write_wgs[wg_id] && last_write_unit != unit) {
-              for (auto *consumer : first_writes) {
+              for (const auto &consumer_pt : first_writes) {
+                const TaskNode *consumer = consumer_pt.task;
                 for (const auto &[last_write_wg_id, last_write_unit_tasks] :
                      last_write_unit_wg_tasks) {
-                  for (auto *producer : last_write_unit_tasks) {
+                  for (const auto &producer_pt : last_write_unit_tasks) {
+                    const TaskNode *producer = producer_pt.task;
                     sync_infos[{last_write_unit, last_write_wg_id}]
                               [{unit, wg_id}]
                                   .emplace(distance, buffer, producer, consumer,
@@ -574,7 +580,7 @@ GetSyncInfos(const std::vector<ScheduleUnit *> &units, int num_wgs,
         if (iter == 0) {
           for (int wg = 0; wg < num_wgs; ++wg) {
             auto last_reads =
-                unit->GetLastAccessTasks(buffer, /*is_write=*/false, wg);
+                unit->GetLastAccessPoints(buffer, /*is_write=*/false, wg);
             if (!last_reads.empty()) {
               last_read_unit[wg] = unit;
               last_read_unit_tasks[wg] = std::move(last_reads);
@@ -594,7 +600,7 @@ GetSyncInfos(const std::vector<ScheduleUnit *> &units, int num_wgs,
               last_write_unit_wg_tasks.clear();
               for (int wg : write_wg_ids) {
                 auto last_writes =
-                    unit->GetLastAccessTasks(buffer, /*is_write=*/true, wg);
+                    unit->GetLastAccessPoints(buffer, /*is_write=*/true, wg);
                 if (!last_writes.empty())
                   last_write_unit_wg_tasks.emplace_back(wg,
                                                         std::move(last_writes));
