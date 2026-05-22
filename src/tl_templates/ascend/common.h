@@ -4,6 +4,9 @@
 
 #include "acl/acl.h"
 #include "kernel_operator.h"
+#include "simt_api/asc_bf16.h"
+#include "simt_api/asc_fp16.h"
+#include "simt_api/asc_fp8.h"
 #include "simt_api/asc_simt.h"
 #include "tl_templates/ascend/reduce.h"
 
