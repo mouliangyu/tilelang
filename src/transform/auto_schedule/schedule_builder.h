@@ -157,7 +157,7 @@ public:
             auto wb = origin_children[j]->GetFirstAccessPoints(buffer, true);
             auto update = [&](const BufferAccessPoint &a,
                               const BufferAccessPoint &b) {
-              int64_t l = a.timestamp + a.task->GetLatency() - b.timestamp;
+              int64_t l = a.timestamp + a.task()->GetLatency() - b.timestamp;
               ICHECK(l <= origin_children[i]->GetLatency());
               if (l < 0)
                 l = 0;
@@ -422,7 +422,7 @@ public:
           int64_t latency = -1;
           auto update = [&](const BufferAccessPoint &a,
                             const BufferAccessPoint &b) {
-            int64_t l = a.timestamp + a.task->GetLatency() - b.timestamp;
+            int64_t l = a.timestamp + a.task()->GetLatency() - b.timestamp;
             ICHECK(l <= nodes[i]->GetLatency());
             if (l < 0)
               l = 0;

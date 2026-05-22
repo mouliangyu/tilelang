@@ -69,19 +69,34 @@ struct BufferAccessInfo {
 };
 
 // Structure to represent a specific access to a buffer (used for ordering
-// accesses)
+// accesses). `path` records the chain of IRStructure nodes traversed from the
+// queried subtree's root down to (and including) the task — only real IR-tree
+// nodes; synthetic helpers introduced during traversal are excluded. The task
+// itself is always the last element of `path`.
 struct BufferAccessPoint {
-  const TaskNode *task; // The task where the access occurs
-  int64_t timestamp;    // The time at which the access occurs
+  int64_t timestamp; // The time at which the access occurs
+  std::vector<const IRStructure *> path;
 
-  BufferAccessPoint(const TaskNode *task, int64_t timestamp)
-      : task(task), timestamp(timestamp) {}
+  BufferAccessPoint(int64_t timestamp,
+                    std::vector<const IRStructure *> path = {})
+      : timestamp(timestamp), path(std::move(path)) {}
+
+  // The task where the access occurs (= path.back()).
+  const TaskNode *task() const;
 
   bool operator<(const BufferAccessPoint &other) const {
     if (timestamp != other.timestamp) {
       return timestamp < other.timestamp;
     }
-    return task < other.task;
+    return path < other.path;
+  }
+
+  bool operator==(const BufferAccessPoint &other) const {
+    return timestamp == other.timestamp && path == other.path;
+  }
+
+  bool operator!=(const BufferAccessPoint &other) const {
+    return !(*this == other);
   }
 };
 
@@ -166,28 +181,34 @@ public:
   // Collect tasks that could possibly be the first/last to access a specific
   // (buffer, is_write, wg_id) within this IR subtree, together with the
   // earliest (First) / latest (Last) possible task start time relative to this
-  // subtree's root (in cycles).
+  // subtree's root (in cycles). `path` is used as a stack: each impl pushes
+  // `this` before recursing into children and pops it on return; TaskNode
+  // copies the path (with itself appended) into the BufferAccessPoint.
   virtual bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write,
                                         int wg_id,
                                         std::set<BufferAccessPoint> &result,
+                                        std::vector<const IRStructure *> &path,
                                         int64_t time_offset = 0) const = 0;
   virtual bool CollectLastAccessPoints(const Buffer &buffer, bool is_write,
                                        int wg_id,
                                        std::set<BufferAccessPoint> &result,
+                                       std::vector<const IRStructure *> &path,
                                        int64_t time_offset = 0) const = 0;
 
   std::set<BufferAccessPoint> GetFirstAccessPoints(const Buffer &buffer,
                                                    bool is_write,
                                                    int wg_id = -1) const {
     std::set<BufferAccessPoint> result;
-    CollectFirstAccessPoints(buffer, is_write, wg_id, result);
+    std::vector<const IRStructure *> path;
+    CollectFirstAccessPoints(buffer, is_write, wg_id, result, path);
     return result;
   }
   std::set<BufferAccessPoint> GetLastAccessPoints(const Buffer &buffer,
                                                   bool is_write,
                                                   int wg_id = -1) const {
     std::set<BufferAccessPoint> result;
-    CollectLastAccessPoints(buffer, is_write, wg_id, result);
+    std::vector<const IRStructure *> path;
+    CollectLastAccessPoints(buffer, is_write, wg_id, result, path);
     return result;
   }
 
@@ -332,9 +353,11 @@ public:
 
   bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
                                 std::set<BufferAccessPoint> &result,
+                                std::vector<const IRStructure *> &path,
                                 int64_t time_offset = 0) const override;
   bool CollectLastAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
                                std::set<BufferAccessPoint> &result,
+                               std::vector<const IRStructure *> &path,
                                int64_t time_offset = 0) const override;
 
   bool containWarpgroupId(int id) const override {
@@ -469,9 +492,11 @@ public:
 
   bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
                                 std::set<BufferAccessPoint> &result,
+                                std::vector<const IRStructure *> &path,
                                 int64_t time_offset = 0) const override;
   bool CollectLastAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
                                std::set<BufferAccessPoint> &result,
+                               std::vector<const IRStructure *> &path,
                                int64_t time_offset = 0) const override;
 
   void SetIIperIter(int64_t ii) { ii_per_iter_ = ii; }
@@ -619,9 +644,11 @@ public:
 
   bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
                                 std::set<BufferAccessPoint> &result,
+                                std::vector<const IRStructure *> &path,
                                 int64_t time_offset = 0) const override;
   bool CollectLastAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
                                std::set<BufferAccessPoint> &result,
+                               std::vector<const IRStructure *> &path,
                                int64_t time_offset = 0) const override;
 
   // Clone method
@@ -763,9 +790,11 @@ public:
 
   bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
                                 std::set<BufferAccessPoint> &result,
+                                std::vector<const IRStructure *> &path,
                                 int64_t time_offset = 0) const override;
   bool CollectLastAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
                                std::set<BufferAccessPoint> &result,
+                               std::vector<const IRStructure *> &path,
                                int64_t time_offset = 0) const override;
 
   // Clone method
@@ -858,9 +887,11 @@ public:
 
   bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
                                 std::set<BufferAccessPoint> &result,
+                                std::vector<const IRStructure *> &path,
                                 int64_t time_offset = 0) const override;
   bool CollectLastAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
                                std::set<BufferAccessPoint> &result,
+                               std::vector<const IRStructure *> &path,
                                int64_t time_offset = 0) const override;
 
   bool isInnerTask() const { return child->IsTask(); }
@@ -934,9 +965,11 @@ public:
 
   bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
                                 std::set<BufferAccessPoint> &result,
+                                std::vector<const IRStructure *> &path,
                                 int64_t time_offset = 0) const override;
   bool CollectLastAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
                                std::set<BufferAccessPoint> &result,
+                               std::vector<const IRStructure *> &path,
                                int64_t time_offset = 0) const override;
 
   // Clone method

@@ -30,24 +30,24 @@ using ffi::Map;
 struct SyncInfo {
   int distance;
   Buffer buffer;
-  const TaskNode *producer;
-  const TaskNode *consumer;
+  BufferAccessPoint producer_pt;
+  BufferAccessPoint consumer_pt;
   int num_versions;
 
-  SyncInfo(int distance, Buffer buffer, const TaskNode *producer,
-           const TaskNode *consumer, int num_versions)
-      : distance(distance), buffer(buffer), producer(producer),
-        consumer(consumer), num_versions(num_versions) {}
+  SyncInfo(int distance, Buffer buffer, BufferAccessPoint producer_pt,
+           BufferAccessPoint consumer_pt, int num_versions)
+      : distance(distance), buffer(buffer), producer_pt(std::move(producer_pt)),
+        consumer_pt(std::move(consumer_pt)), num_versions(num_versions) {}
 
   bool operator<(const SyncInfo &other) const {
     if (distance != other.distance)
       return distance < other.distance;
     if (buffer != other.buffer)
       return buffer.get() < other.buffer.get();
-    if (producer != other.producer)
-      return producer < other.producer;
-    if (consumer != other.consumer)
-      return consumer < other.consumer;
+    if (producer_pt != other.producer_pt)
+      return producer_pt < other.producer_pt;
+    if (consumer_pt != other.consumer_pt)
+      return consumer_pt < other.consumer_pt;
     return num_versions < other.num_versions;
   }
 };
@@ -86,31 +86,6 @@ inline Buffer RewriteAllocBuffer(const Buffer &buffer, int num_versions) {
   }
 
   return Buffer(new_buffer);
-}
-
-// Create a barrier buffer allocation and return the Buffer object.
-// shape = (num_versions,) so that each pipeline stage has its own barrier slot,
-// accessed via BufferLoad(buffer, {stage_index}).
-static Buffer makeBarrierBuffer(const std::string &name, int num_versions,
-                                std::vector<Buffer> &barrier_buffers,
-                                Map<ObjectRef, ObjectRef> &barrier_map) {
-  Array<PrimExpr> shape = {num_versions};
-  DataType dtype = DataType::UInt(64);
-  Type ptr_type = PointerType(PrimType(dtype), "shared.barrier");
-  Var handle(name, ptr_type);
-  Buffer buffer =
-      Buffer(handle, dtype, shape, {}, PrimExpr(), name, 0, 0, kDefault);
-  barrier_buffers.push_back(buffer);
-  return buffer;
-}
-
-inline bool IsEvaluateZero(const tvm::tir::Stmt &stmt) {
-  if (const EvaluateNode *eval_node = stmt.as<EvaluateNode>()) {
-    if (is_const_int(eval_node->value, 0)) {
-      return true;
-    }
-  }
-  return false;
 }
 
 // Structure to store loop nesting information
@@ -176,26 +151,23 @@ enum class SyncType { PipeBarrier, CrossCore, IntraCore };
 struct SyncPoint {
   SyncType type;
   ScheduleUnit *prod_unit;
-  int prod_wg_id;
+  int prod_wg;
+  ScheduleUnit *prod_insertion_unit;
+  PrimExpr prod_guard;
+  int prod_idx;
   ScheduleUnit *cons_unit;
-  int cons_wg_id;
+  int cons_wg;
+  ScheduleUnit *cons_insertion_unit;
+  PrimExpr cons_guard;
+  int cons_idx;
+  int distance;
+  int num_versions;
+  std::set<SyncInfo> sync_info_set;
+  std::string hard_event;
   // CrossCore-specific
   std::string prod_pipe;
   std::string cons_pipe;
   int mode_id;
-  int cc_base_id;
-  // Shared
-  int num_versions;
-  int prod_idx;
-  int cons_idx;
-  int prod_wg;
-  // IntraCore-specific
-  std::string hard_event;
-  int base_id;
-  int distance;
-  PrimExpr event_id;
-  // Task-level sync info for barrier optimization
-  std::set<SyncInfo> sync_info_set;
 };
 
 // Barrier dependency analysis function declarations
@@ -211,21 +183,21 @@ struct FlagInfo {
 };
 using FlagInfoList = std::vector<FlagInfo>;
 
-static void AnalyzeAndInsertBarriers(
-    IRStructure *node, EventIdMap &event_id_map, FlagInfoList &flag_infos,
-    Var sid, std::vector<Buffer> &barrier_buffers,
-    Map<ObjectRef, ObjectRef> &barrier_map, LoopNestingInfo &loop_info,
-    std::vector<MultiVersionBufferInfo> &buffer_infos);
-static void AnalyzeSequenceNodeBarriers(
-    SequenceNode *seq, EventIdMap &event_id_map, FlagInfoList &flag_infos,
-    Var sid, std::vector<Buffer> &barrier_buffers,
-    Map<ObjectRef, ObjectRef> &barrier_map, LoopNestingInfo &loop_info,
-    std::vector<MultiVersionBufferInfo> &buffer_infos);
-static void AnalyzeControlNodeBarriers(
-    ControlNode *ctrl, EventIdMap &event_id_map, FlagInfoList &flag_infos,
-    Var sid, std::vector<Buffer> &barrier_buffers,
-    Map<ObjectRef, ObjectRef> &barrier_map, LoopNestingInfo &loop_info,
-    std::vector<MultiVersionBufferInfo> &buffer_infos);
+static void
+AnalyzeAndInsertBarriers(IRStructure *node, EventIdMap &event_id_map,
+                         FlagInfoList &flag_infos, Var sid,
+                         LoopNestingInfo &loop_info,
+                         std::vector<MultiVersionBufferInfo> &buffer_infos);
+static void
+AnalyzeSequenceNodeBarriers(SequenceNode *seq, EventIdMap &event_id_map,
+                            FlagInfoList &flag_infos, Var sid,
+                            LoopNestingInfo &loop_info,
+                            std::vector<MultiVersionBufferInfo> &buffer_infos);
+static void
+AnalyzeControlNodeBarriers(ControlNode *ctrl, EventIdMap &event_id_map,
+                           FlagInfoList &flag_infos, Var sid,
+                           LoopNestingInfo &loop_info,
+                           std::vector<MultiVersionBufferInfo> &buffer_infos);
 static std::vector<SyncPoint> CollectSyncPoints(
     const std::vector<ScheduleUnit *> &units,
     const std::map<std::pair<ScheduleUnit *, int>,
@@ -237,50 +209,6 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
                              LoopNestingInfo &loop_info);
 static std::vector<SyncPoint>
 OptimizeSyncPoints(const std::vector<SyncPoint> &sync_points);
-
-static bool IsRegularSharedScope(const String &scope) {
-  return scope == "shared" || scope == "shared.dyn";
-}
-
-static bool IsTmemScope(const String &scope) { return scope == "shared.tmem"; }
-
-static bool HasWriteReadDependencyByScope(
-    const IRStructure *producer, const IRStructure *consumer,
-    const std::function<bool(const String &)> &scope_matcher) {
-  if (!producer || !consumer) {
-    return false;
-  }
-
-  auto producer_writes = producer->GetWriteRegions();
-  auto consumer_reads = consumer->GetReadRegions();
-
-  for (const auto &write_region : producer_writes) {
-    const Buffer &write_buffer = write_region->buffer;
-    if (!scope_matcher(write_buffer.scope())) {
-      continue;
-    }
-    for (const auto &read_region : consumer_reads) {
-      if (write_buffer.same_as(read_region->buffer)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-static bool HasSharedWriteReadDependency(const IRStructure *producer,
-                                         const IRStructure *consumer) {
-  return HasWriteReadDependencyByScope(
-      producer, consumer,
-      [](const String &scope) { return IsRegularSharedScope(scope); });
-}
-
-static bool HasTmemWriteReadDependency(const IRStructure *producer,
-                                       const IRStructure *consumer) {
-  return HasWriteReadDependencyByScope(
-      producer, consumer,
-      [](const String &scope) { return IsTmemScope(scope); });
-}
 
 // StmtExprMutator to rewrite BufferLoad/BufferStore for multi-version buffers
 class MultiBufferAccessRewriter : public StmtExprMutator {
@@ -410,10 +338,15 @@ static void RewriteTaskNodeBuffers(
   }
 }
 
-// Helper function to insert a statement into ScheduleUnit's stmts
-static void InsertStatementIntoScheduleUnit(ScheduleUnit *task,
-                                            const Stmt &stmt, bool at_beginning,
-                                            int warpgroup_id) {
+// Helper function to insert a statement into ScheduleUnit's stmts.
+// If `guard` is defined, wraps the stmt in an IfThenElse before inserting.
+static void
+InsertStatementIntoScheduleUnit(ScheduleUnit *task, Stmt stmt,
+                                bool at_beginning, int warpgroup_id,
+                                const PrimExpr &guard = PrimExpr()) {
+  if (guard.defined()) {
+    stmt = IfThenElse(guard, stmt);
+  }
   if (at_beginning) {
     task->before[warpgroup_id].insert(task->before[warpgroup_id].begin(), stmt);
   } else {
@@ -422,38 +355,33 @@ static void InsertStatementIntoScheduleUnit(ScheduleUnit *task,
 }
 
 // Barrier dependency analysis implementation
-static void AnalyzeAndInsertBarriers(
-    IRStructure *node, EventIdMap &event_id_map, FlagInfoList &flag_infos,
-    Var sid, std::vector<Buffer> &barrier_buffers,
-    Map<ObjectRef, ObjectRef> &barrier_map, LoopNestingInfo &loop_info,
-    std::vector<MultiVersionBufferInfo> &buffer_infos) {
+static void
+AnalyzeAndInsertBarriers(IRStructure *node, EventIdMap &event_id_map,
+                         FlagInfoList &flag_infos, Var sid,
+                         LoopNestingInfo &loop_info,
+                         std::vector<MultiVersionBufferInfo> &buffer_infos) {
   if (!node)
     return;
 
   if (node->IsSequence()) {
     AnalyzeSequenceNodeBarriers(static_cast<SequenceNode *>(node), event_id_map,
-                                flag_infos, sid, barrier_buffers, barrier_map,
-                                loop_info, buffer_infos);
+                                flag_infos, sid, loop_info, buffer_infos);
   } else if (node->IsControl()) {
     AnalyzeControlNodeBarriers(static_cast<ControlNode *>(node), event_id_map,
-                               flag_infos, sid, barrier_buffers, barrier_map,
-                               loop_info, buffer_infos);
+                               flag_infos, sid, loop_info, buffer_infos);
   } else if (node->IsWrapper()) {
     auto wrapper = static_cast<WrapperNode *>(node);
     AnalyzeAndInsertBarriers(wrapper->child.get(), event_id_map, flag_infos,
-                             sid, barrier_buffers, barrier_map, loop_info,
-                             buffer_infos);
+                             sid, loop_info, buffer_infos);
   } else if (node->IsIf()) {
     auto if_node = static_cast<IfNode *>(node);
     if (if_node->then_child) {
       AnalyzeAndInsertBarriers(if_node->then_child.get(), event_id_map,
-                               flag_infos, sid, barrier_buffers, barrier_map,
-                               loop_info, buffer_infos);
+                               flag_infos, sid, loop_info, buffer_infos);
     }
     if (if_node->else_child) {
       AnalyzeAndInsertBarriers(if_node->else_child.get(), event_id_map,
-                               flag_infos, sid, barrier_buffers, barrier_map,
-                               loop_info, buffer_infos);
+                               flag_infos, sid, loop_info, buffer_infos);
     }
   } else if (node->IsTask()) {
     // For TaskNode, nothing to do at this level
@@ -511,13 +439,11 @@ GetSyncInfos(const std::vector<ScheduleUnit *> &units, int num_wgs,
             if (last_write_unit == unit)
               continue;
             for (const auto &consumer_pt : first_reads) {
-              const TaskNode *consumer = consumer_pt.task;
               for (const auto &[last_write_wg_id, last_write_unit_tasks] :
                    last_write_unit_wg_tasks) {
                 for (const auto &producer_pt : last_write_unit_tasks) {
-                  const TaskNode *producer = producer_pt.task;
                   sync_infos[{last_write_unit, last_write_wg_id}][{unit, wg_id}]
-                      .emplace(distance, buffer, producer, consumer,
+                      .emplace(distance, buffer, producer_pt, consumer_pt,
                                num_versions);
                 }
               }
@@ -536,11 +462,9 @@ GetSyncInfos(const std::vector<ScheduleUnit *> &units, int num_wgs,
               if (last_read_unit[last_wg] == unit)
                 continue;
               for (const auto &consumer_pt : first_writes) {
-                const TaskNode *consumer = consumer_pt.task;
                 for (const auto &producer_pt : last_read_unit_tasks[last_wg]) {
-                  const TaskNode *producer = producer_pt.task;
                   sync_infos[{last_read_unit[last_wg], last_wg}][{unit, wg_id}]
-                      .emplace(distance, buffer, producer, consumer,
+                      .emplace(distance, buffer, producer_pt, consumer_pt,
                                num_versions);
                 }
               }
@@ -548,15 +472,13 @@ GetSyncInfos(const std::vector<ScheduleUnit *> &units, int num_wgs,
             if (!has_last_read && last_write_unit != nullptr &&
                 !waited_write_wgs[wg_id] && last_write_unit != unit) {
               for (const auto &consumer_pt : first_writes) {
-                const TaskNode *consumer = consumer_pt.task;
                 for (const auto &[last_write_wg_id, last_write_unit_tasks] :
                      last_write_unit_wg_tasks) {
                   for (const auto &producer_pt : last_write_unit_tasks) {
-                    const TaskNode *producer = producer_pt.task;
                     sync_infos[{last_write_unit, last_write_wg_id}]
                               [{unit, wg_id}]
-                                  .emplace(distance, buffer, producer, consumer,
-                                           num_versions);
+                                  .emplace(distance, buffer, producer_pt,
+                                           consumer_pt, num_versions);
                   }
                 }
               }
@@ -664,6 +586,7 @@ static std::string GetPipeName(uint16_t mask) {
   if (mask & static_cast<uint16_t>(ResourcePipe::kScalar))
     return "S";
   LOG(FATAL) << "Unknown pipe";
+  return "UNKNOWN";
 }
 
 static std::string GetHardEvent(uint16_t producer_mask,
@@ -680,6 +603,79 @@ static std::string GetHardEvent(uint16_t producer_mask,
   return event;
 }
 
+using InsertionSite = std::pair<ScheduleUnit *, PrimExpr>;
+
+static std::vector<InsertionSite>
+CollectInsertCandidates(const BufferAccessPoint &pt, bool at_beginning) {
+  const auto &path = pt.path;
+  std::vector<InsertionSite> candidates;
+  PrimExpr accumulated_guard;
+
+  auto append_guard = [&](PrimExpr term) {
+    if (!accumulated_guard.defined()) {
+      accumulated_guard = term;
+    } else {
+      accumulated_guard = accumulated_guard && term;
+    }
+  };
+
+  for (auto node : path) {
+    if (node->IsScheduleUnit()) {
+      candidates.emplace_back(
+          const_cast<ScheduleUnit *>(static_cast<const ScheduleUnit *>(node)),
+          accumulated_guard);
+    } else if (node->IsIf()) {
+      return candidates;
+    } else if (node->IsControl()) {
+      const ControlNode *ctrl = static_cast<const ControlNode *>(node);
+      const ForNode *for_node = ctrl->control.get();
+      if (ctrl->child->ContainsLoopBreak()) {
+        return candidates;
+      }
+      PrimExpr loop_var = for_node->loop_var;
+      PrimExpr min = for_node->min;
+      PrimExpr extent = for_node->extent;
+      PrimExpr step = for_node->step.has_value() ? for_node->step.value()
+                                                 : IntImm(DataType::Int(32), 1);
+      PrimExpr term;
+      if (at_beginning) {
+        term = (loop_var == min);
+      } else {
+        term = (((loop_var - min) / step + 1) * step >= extent);
+      }
+      append_guard(term);
+    }
+  }
+  return candidates;
+}
+
+static InsertionSite
+CommonInsertionSite(const std::vector<std::vector<InsertionSite>> &chains) {
+  if (chains.empty()) {
+    return {nullptr, PrimExpr()};
+  }
+  size_t max_common = chains[0].size();
+  for (const auto &c : chains) {
+    max_common = std::min(max_common, c.size());
+  }
+  size_t common = 0;
+  for (size_t i = 0; i < max_common; ++i) {
+    ScheduleUnit *u = chains[0][i].first;
+    bool all_match = true;
+    for (const auto &c : chains) {
+      if (c[i].first != u) {
+        all_match = false;
+        break;
+      }
+    }
+    if (!all_match)
+      break;
+    common = i + 1;
+  }
+  ICHECK_GT(common, 0u);
+  return chains[0][common - 1];
+}
+
 static std::vector<SyncPoint> CollectSyncPoints(
     const std::vector<ScheduleUnit *> &units,
     const std::map<std::pair<ScheduleUnit *, int>,
@@ -692,63 +688,62 @@ static std::vector<SyncPoint> CollectSyncPoints(
 
   std::vector<SyncPoint> sync_points;
 
-  for (auto unit : units) {
-    for (int wg_id = 0; wg_id < 2; ++wg_id) {
-      auto sync_it = sync_infos.find({unit, wg_id});
+  for (auto prod_unit : units) {
+    for (int prod_wg = 0; prod_wg < 2; ++prod_wg) {
+      auto sync_it = sync_infos.find({prod_unit, prod_wg});
       if (sync_it == sync_infos.end())
         continue;
       const auto &wait_map = sync_it->second;
+      for (const auto &[cons_unit_info, sync_info_set] : wait_map) {
+        auto [cons_unit, cons_wg] = cons_unit_info;
 
-      for (const auto &[waiting_unit_info, sync_info_set] : wait_map) {
-        auto [waiting_unit, waiting_wg_id] = waiting_unit_info;
+        if (sync_info_set.empty())
+          continue;
 
-        // Compute num_versions and distance from SyncInfo
-        int num_versions = 1;
-        int distance = 0;
+        int min_distance = std::numeric_limits<int>::max();
         for (const auto &si : sync_info_set) {
-          num_versions = std::max(num_versions, si.num_versions);
-          distance = std::max(distance, si.distance);
+          min_distance = std::min(min_distance, si.distance);
+        }
+        std::set<SyncInfo> kept;
+        for (const auto &si : sync_info_set) {
+          if (si.distance == min_distance) {
+            kept.insert(si);
+          }
         }
 
-        int prod_wg = -1;
-        int cons_wg = -1;
-
+        int num_versions = 1;
         std::set<std::string> all_event;
-        for (auto &si : sync_info_set) {
-          all_event.insert(GetHardEvent(si.producer->GetPipeMask(),
-                                        si.consumer->GetPipeMask()));
-          ICHECK(prod_wg == -1 || prod_wg == si.producer->GetWarpgroupId());
-          ICHECK(cons_wg == -1 || cons_wg == si.consumer->GetWarpgroupId());
-          prod_wg = si.producer->GetWarpgroupId();
-          cons_wg = si.consumer->GetWarpgroupId();
+        std::vector<std::vector<InsertionSite>> prod_chains;
+        std::vector<std::vector<InsertionSite>> cons_chains;
+        for (const auto &si : kept) {
+          const TaskNode *producer = si.producer_pt.task();
+          const TaskNode *consumer = si.consumer_pt.task();
+          num_versions = std::max(num_versions, si.num_versions);
+          all_event.insert(
+              GetHardEvent(producer->GetPipeMask(), consumer->GetPipeMask()));
+          prod_chains.push_back(CollectInsertCandidates(si.producer_pt, false));
+          cons_chains.push_back(CollectInsertCandidates(si.consumer_pt, true));
         }
+
+        InsertionSite prod_site = CommonInsertionSite(prod_chains);
+        InsertionSite cons_site = CommonInsertionSite(cons_chains);
+        ICHECK(prod_site.first != nullptr);
+        ICHECK(cons_site.first != nullptr);
+
+        int prod_idx = unit_index[prod_unit];
+        int cons_idx = unit_index[cons_unit];
+        int distance = min_distance;
 
         if (all_event.size() > 1) {
           ICHECK(prod_wg == cons_wg);
-          sync_points.push_back({SyncType::PipeBarrier,
-                                 unit,
-                                 wg_id,
-                                 waiting_unit,
-                                 waiting_wg_id,
-                                 {},
-                                 {},
-                                 0,
-                                 0,
-                                 num_versions,
-                                 0,
-                                 0,
-                                 0,
-                                 {},
-                                 0,
-                                 0,
-                                 PrimExpr(),
-                                 sync_info_set});
+          sync_points.push_back({SyncType::PipeBarrier, prod_unit, prod_wg,
+                                 prod_unit, PrimExpr(), prod_idx, cons_unit,
+                                 cons_wg, cons_unit, PrimExpr(), cons_idx,
+                                 distance, num_versions, kept});
           continue;
         }
 
         std::string hard_event = *all_event.begin();
-        int prod_idx = unit_index[unit];
-        int cons_idx = unit_index[waiting_unit];
 
         if (prod_wg != cons_wg) {
           size_t pos = hard_event.find('_');
@@ -756,54 +751,99 @@ static std::vector<SyncPoint> CollectSyncPoints(
           std::string cons_pipe = "PIPE_" + hard_event.substr(pos + 1);
           int mode_id = 4;
 
-          sync_points.push_back({SyncType::CrossCore,
-                                 unit,
-                                 wg_id,
-                                 waiting_unit,
-                                 waiting_wg_id,
-                                 prod_pipe,
-                                 cons_pipe,
-                                 mode_id,
-                                 0,
-                                 num_versions,
-                                 prod_idx,
-                                 cons_idx,
-                                 prod_wg,
-                                 {},
-                                 0,
-                                 distance,
-                                 PrimExpr(),
-                                 sync_info_set});
+          sync_points.push_back(
+              {SyncType::CrossCore, prod_unit, prod_wg, prod_site.first,
+               prod_site.second, prod_idx, cons_unit, cons_wg, cons_site.first,
+               cons_site.second, cons_idx, distance, num_versions, kept,
+               hard_event, prod_pipe, cons_pipe, mode_id});
           continue;
         }
 
         // Intra-core sync: use ascend_set_flag / wait_flag
-        sync_points.push_back({SyncType::IntraCore,
-                               unit,
-                               wg_id,
-                               waiting_unit,
-                               waiting_wg_id,
-                               {},
-                               {},
-                               0,
-                               0,
-                               num_versions,
-                               prod_idx,
-                               cons_idx,
-                               prod_wg,
-                               hard_event,
-                               0,
-                               distance,
-                               PrimExpr(),
-                               sync_info_set});
+        sync_points.push_back({SyncType::IntraCore, prod_unit, prod_wg,
+                               prod_site.first, prod_site.second, prod_idx,
+                               cons_unit, cons_wg, cons_site.first,
+                               cons_site.second, cons_idx, distance,
+                               num_versions, kept, hard_event});
       }
     }
   }
   return sync_points;
 }
 
+using UnitChain =
+    std::vector<std::pair<const SequenceNode *, const ScheduleUnit *>>;
+
+static UnitChain
+BuildChainFromPath(const std::vector<const IRStructure *> &path,
+                   const ScheduleUnit *target_unit) {
+  UnitChain out;
+  const SequenceNode *cur_parent = nullptr;
+  for (const IRStructure *node : path) {
+    if (!node)
+      continue;
+    if (node->IsSequence()) {
+      cur_parent = static_cast<const SequenceNode *>(node);
+    } else if (node->IsScheduleUnit()) {
+      const ScheduleUnit *u = static_cast<const ScheduleUnit *>(node);
+      out.emplace_back(cur_parent, u);
+      if (u == target_unit)
+        break;
+    }
+  }
+  return out;
+}
+
+static int CompareChainPos(const UnitChain &a, const UnitChain &b,
+                           bool at_beginning) {
+  auto get_idx =
+      [](std::pair<const SequenceNode *, const ScheduleUnit *> p) -> size_t {
+    const SequenceNode *parent = p.first;
+    const ScheduleUnit *child = p.second;
+    for (size_t i = 0; i < parent->children.size(); ++i) {
+      if (parent->children[i].get() == child)
+        return i;
+    }
+    LOG(FATAL) << "Child not found in parent";
+    return 0;
+  };
+  size_t n = std::min(a.size(), b.size());
+  for (size_t i = 0; i < n; ++i) {
+    if (a[i].first != b[i].first) {
+      return 0;
+    }
+    if (a[i].second != b[i].second) {
+      int64_t ta = a[i].second->GetStartTime();
+      int64_t tb = b[i].second->GetStartTime();
+      if (ta != tb)
+        return ta < tb ? -1 : +1;
+      return get_idx(a[i]) < get_idx(b[i]) ? -1 : +1;
+    }
+  }
+  if (a.size() == b.size())
+    return 0;
+  if (at_beginning) {
+    return a.size() < b.size() ? -1 : +1;
+  } else {
+    return a.size() < b.size() ? +1 : -1;
+  }
+}
+
 static std::vector<SyncPoint>
 OptimizeSyncPoints(const std::vector<SyncPoint> &sync_points) {
+  // Derive insertion chains from the SyncPoint's own sync_info_set — any
+  // representative SyncInfo works because the insertion_unit is on the LCA
+  // common prefix of every SyncInfo's path in the group.
+  auto chain_for = [](const SyncPoint &sp, const ScheduleUnit *unit,
+                      bool is_producer) -> UnitChain {
+    if (sp.sync_info_set.empty() || unit == nullptr)
+      return {};
+    const SyncInfo &rep = *sp.sync_info_set.begin();
+    const auto &path =
+        is_producer ? rep.producer_pt.path : rep.consumer_pt.path;
+    return BuildChainFromPath(path, unit);
+  };
+
   std::vector<bool> keep(sync_points.size(), true);
 
   for (size_t i = 0; i < sync_points.size(); ++i) {
@@ -835,9 +875,28 @@ OptimizeSyncPoints(const std::vector<SyncPoint> &sync_points) {
       if (!same_group)
         continue;
 
-      if (a.prod_idx >= b.prod_idx && a.cons_idx <= b.cons_idx) {
+      UnitChain a_prod = chain_for(a, a.prod_insertion_unit, true);
+      UnitChain a_cons = chain_for(a, a.cons_insertion_unit, false);
+      UnitChain b_prod = chain_for(b, b.prod_insertion_unit, true);
+      UnitChain b_cons = chain_for(b, b.cons_insertion_unit, false);
+      if (a_prod.empty() || a_cons.empty() || b_prod.empty() || b_cons.empty())
+        continue;
+
+      auto dominates = [&](const SyncPoint &x, const SyncPoint &y,
+                           const UnitChain &xp, const UnitChain &yp,
+                           const UnitChain &xc, const UnitChain &yc) {
+        if (x.distance < y.distance)
+          return false;
+        if (CompareChainPos(xp, yp, false) < 0)
+          return false;
+        if (CompareChainPos(xc, yc, true) > 0)
+          return false;
+        return true;
+      };
+
+      if (dominates(a, b, a_prod, b_prod, a_cons, b_cons)) {
         keep[j] = false;
-      } else if (b.prod_idx >= a.prod_idx && b.cons_idx <= a.cons_idx) {
+      } else if (dominates(b, a, b_prod, a_prod, b_cons, a_cons)) {
         keep[i] = false;
         break;
       }
@@ -859,8 +918,8 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
   for (const auto &sp : sync_points) {
     if (sp.type == SyncType::PipeBarrier) {
       Stmt barrier = makeAscendPipeBarrier("PIPE_ALL");
-      InsertStatementIntoScheduleUnit(sp.cons_unit, barrier, true,
-                                      sp.cons_wg_id);
+      InsertStatementIntoScheduleUnit(sp.cons_insertion_unit, barrier, true,
+                                      sp.cons_wg, sp.cons_guard);
     } else if (sp.type == SyncType::CrossCore) {
       auto cc_id = event_id_map.find("Cube-Vector");
       if (cc_id == event_id_map.end()) {
@@ -904,15 +963,15 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
       if (!sp.prod_wg) {
         Stmt set_stmt =
             makeAscendCrossCoreSetFlag(sp.mode_id, sp.prod_pipe, cc_event_id);
-        InsertStatementIntoScheduleUnit(sp.prod_unit, set_stmt, false,
-                                        sp.prod_wg_id);
+        InsertStatementIntoScheduleUnit(sp.prod_insertion_unit, set_stmt, false,
+                                        sp.prod_wg, sp.prod_guard);
         for (unsigned s = 0; s != 2; ++s) {
           Stmt wait_stmt = makeAscendCrossCoreWaitFlag(
               sp.mode_id, sp.cons_pipe,
               indexmod(iteration, Integer(sp.num_versions)) +
                   Integer(cc_base_id + 16 * s));
-          InsertStatementIntoScheduleUnit(sp.cons_unit, wait_stmt, true,
-                                          sp.cons_wg_id);
+          InsertStatementIntoScheduleUnit(sp.cons_insertion_unit, wait_stmt,
+                                          true, sp.cons_wg, sp.cons_guard);
         }
       } else {
         for (unsigned s = 0; s != 2; ++s) {
@@ -920,13 +979,13 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
               sp.mode_id, sp.prod_pipe,
               indexmod(iteration, Integer(sp.num_versions)) +
                   Integer(cc_base_id + 16 * s));
-          InsertStatementIntoScheduleUnit(sp.prod_unit, set_stmt, false,
-                                          sp.prod_wg_id);
+          InsertStatementIntoScheduleUnit(sp.prod_insertion_unit, set_stmt,
+                                          false, sp.prod_wg, sp.prod_guard);
         }
         Stmt wait_stmt =
             makeAscendCrossCoreWaitFlag(sp.mode_id, sp.cons_pipe, cc_event_id);
-        InsertStatementIntoScheduleUnit(sp.cons_unit, wait_stmt, true,
-                                        sp.cons_wg_id);
+        InsertStatementIntoScheduleUnit(sp.cons_insertion_unit, wait_stmt, true,
+                                        sp.cons_wg, sp.cons_guard);
       }
     } else if (sp.type == SyncType::IntraCore) {
       // When producer and consumer share the same pipe, insert a pipe_barrier
@@ -937,8 +996,8 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
         std::string cons_pipe = sp.hard_event.substr(pos + 1);
         if (prod_pipe == cons_pipe) {
           Stmt barrier = makeAscendPipeBarrier("PIPE_" + prod_pipe);
-          InsertStatementIntoScheduleUnit(sp.cons_unit, barrier, true,
-                                          sp.cons_wg_id);
+          InsertStatementIntoScheduleUnit(sp.cons_insertion_unit, barrier, true,
+                                          sp.cons_wg, sp.cons_guard);
           continue;
         }
       }
@@ -963,21 +1022,21 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
       }
 
       Stmt set_stmt = makeAscendSetFlag(sp.hard_event, event_id);
-      InsertStatementIntoScheduleUnit(sp.prod_unit, set_stmt, false,
-                                      sp.prod_wg_id);
+      InsertStatementIntoScheduleUnit(sp.prod_insertion_unit, set_stmt, false,
+                                      sp.prod_wg, sp.prod_guard);
 
       Stmt wait_stmt = makeAscendWaitFlag(sp.hard_event, event_id);
-      InsertStatementIntoScheduleUnit(sp.cons_unit, wait_stmt, true,
-                                      sp.cons_wg_id);
+      InsertStatementIntoScheduleUnit(sp.cons_insertion_unit, wait_stmt, true,
+                                      sp.cons_wg, sp.cons_guard);
     }
   }
 }
 
-static void AnalyzeSequenceNodeBarriers(
-    SequenceNode *seq, EventIdMap &event_id_map, FlagInfoList &flag_infos,
-    Var sid, std::vector<Buffer> &barrier_buffers,
-    Map<ObjectRef, ObjectRef> &barrier_map, LoopNestingInfo &loop_info,
-    std::vector<MultiVersionBufferInfo> &buffer_infos) {
+static void
+AnalyzeSequenceNodeBarriers(SequenceNode *seq, EventIdMap &event_id_map,
+                            FlagInfoList &flag_infos, Var sid,
+                            LoopNestingInfo &loop_info,
+                            std::vector<MultiVersionBufferInfo> &buffer_infos) {
   if (!seq)
     return;
 
@@ -996,8 +1055,7 @@ static void AnalyzeSequenceNodeBarriers(
       // If child is SequenceNode, ControlNode, or IfNode, recursively analyze
       // it
       AnalyzeAndInsertBarriers(unit->child.get(), event_id_map, flag_infos, sid,
-                               barrier_buffers, barrier_map, loop_info,
-                               buffer_infos);
+                               loop_info, buffer_infos);
     }
   }
 
@@ -1008,11 +1066,11 @@ static void AnalyzeSequenceNodeBarriers(
   InsertSyncPoints(sync_points, flag_infos, sid, event_id_map, loop_info);
 }
 
-static void AnalyzeControlNodeBarriers(
-    ControlNode *ctrl, EventIdMap &event_id_map, FlagInfoList &flag_infos,
-    Var sid, std::vector<Buffer> &barrier_buffers,
-    Map<ObjectRef, ObjectRef> &barrier_map, LoopNestingInfo &loop_info,
-    std::vector<MultiVersionBufferInfo> &buffer_infos) {
+static void
+AnalyzeControlNodeBarriers(ControlNode *ctrl, EventIdMap &event_id_map,
+                           FlagInfoList &flag_infos, Var sid,
+                           LoopNestingInfo &loop_info,
+                           std::vector<MultiVersionBufferInfo> &buffer_infos) {
   if (!ctrl || !ctrl->child)
     return;
 
@@ -1041,8 +1099,7 @@ static void AnalyzeControlNodeBarriers(
       // If child is SequenceNode, ControlNode, or IfNode, recursively analyze
       // it
       AnalyzeAndInsertBarriers(unit->child.get(), event_id_map, flag_infos, sid,
-                               barrier_buffers, barrier_map, loop_info,
-                               buffer_infos);
+                               loop_info, buffer_infos);
     }
   }
 

@@ -578,8 +578,6 @@ Stmt ReNestLetStmts(const Stmt &stmt);
 // Result of scheduling a single kernel segment
 struct ScheduledKernelResult {
   Stmt scheduled_body;
-  std::vector<Buffer> barrier_buffers;
-  Map<ObjectRef, ObjectRef> barrier_map;
   std::vector<MultiVersionBufferInfo> buffer_infos;
 };
 
@@ -662,7 +660,6 @@ static ScheduledKernelResult ScheduleSingleKernel(
   LoopNestingInfo loop_info;
   Var sid("sid", DataType::Int(32));
   AnalyzeAndInsertBarriers(ir_structure.get(), event_id_map, flag_infos, sid,
-                           result.barrier_buffers, result.barrier_map,
                            loop_info, result.buffer_infos);
 
   Stmt wg0_body = Evaluate(0);
