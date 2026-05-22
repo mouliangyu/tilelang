@@ -8,6 +8,10 @@ from typing import Callable, Literal
 
 import torch
 
+from tilelang.utils.device import Event, device_synchronize, get_current_device
+
+device = get_current_device()
+
 
 class suppress_stdout_stderr:
     """Context manager to suppress stdout and stderr output.
@@ -56,11 +60,6 @@ class suppress_stdout_stderr:
         self.errnull_file.close()
 
 
-IS_CUDA = torch.cuda.is_available()
-device = "cuda:0" if IS_CUDA else "mps:0"
-Event = torch.cuda.Event if IS_CUDA else torch.mps.Event
-
-
 def do_bench(
     fn: Callable,
     warmup: float = 25,
@@ -88,7 +87,7 @@ def do_bench(
         _n_repeat: Manual override for benchmark iterations (default: 0 = auto)
         quantiles: Performance percentiles to compute (e.g., [0.5, 0.95])
         fast_flush: Use faster L2 cache flush with int32 vs int8 (default: True)
-        backend: Profiler backend - "event" (CUDA events), "cupti", or "cudagraph" (default: "event")
+        backend: Profiler backend - "event", "cupti", or "cudagraph" (default: "event")
         return_mode: Result aggregation method - "mean", "median", "min", or "max"
 
     Returns:
@@ -98,17 +97,17 @@ def do_bench(
 
     # Initial function call and synchronization
     fn()
-    torch.cuda.synchronize()
+    device_synchronize()
 
     # Create L2 cache flush buffer (256 MB)
     # Fast flush uses int32 (4 bytes), regular uses int8 (1 byte)
     cache_size = int(256e6 // 4) if fast_flush else int(256e6)
     cache_dtype = torch.int if fast_flush else torch.int8
-    cache = torch.empty(cache_size, dtype=cache_dtype, device="cuda")
+    cache = torch.empty(cache_size, dtype=cache_dtype, device=device)
 
     # Estimate kernel runtime with 5 iterations
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
+    start_event = Event(enable_timing=True)
+    end_event = Event(enable_timing=True)
     start_event.record()
     for _ in range(5):
         cache.zero_()
@@ -144,10 +143,10 @@ def _bench_with_cuda_events(
     quantiles: list[float] | None,
     return_mode: str,
 ) -> float | list[float]:
-    """Benchmark using CUDA events for timing."""
+    """Benchmark using device events for timing."""
     # Create timing events
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(n_repeat)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(n_repeat)]
+    start_events = [Event(enable_timing=True) for _ in range(n_repeat)]
+    end_events = [Event(enable_timing=True) for _ in range(n_repeat)]
 
     # Run benchmark iterations
     for i in range(n_repeat):
@@ -157,7 +156,7 @@ def _bench_with_cuda_events(
         end_events[i].record()
 
     # Synchronize and collect timings
-    torch.cuda.synchronize()
+    device_synchronize()
     times = torch.tensor(
         [s.elapsed_time(e) for s, e in zip(start_events, end_events)],
         dtype=torch.float,
