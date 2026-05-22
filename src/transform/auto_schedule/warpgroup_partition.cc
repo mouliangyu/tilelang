@@ -648,6 +648,48 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure, Var sid) {
               Array<PrimExpr> new_args = {src_call, new_dst};
               auto new_call = Call(call->dtype, copy_op, new_args, new_ann);
               return Evaluate(new_call);
+            } else if (IsGlobalBuffer(cp->src) &&
+                       cp->annotations.Get("dual_dst_ctl")) {
+              int dual_ctl = cp->GetDualDstCtl();
+              auto &src_r = cp->src_range;
+              int src_split_dim =
+                  static_cast<int>(src_r.size()) - 2 + (dual_ctl == 1 ? 0 : 1);
+              PrimExpr half_ext =
+                  floordiv(src_r[src_split_dim]->extent, Integer(2));
+              // Strip dual_dst_ctl and unit_flag_ctl from annotations
+              Map<String, ObjectRef> new_ann;
+              for (auto &kv : call->annotations) {
+                if (kv.first != "dual_dst_ctl" && kv.first != "unit_flag_ctl")
+                  new_ann.Set(kv.first, kv.second);
+              }
+              PrimExpr off = sid * half_ext;
+              auto src_call = Downcast<Call>(call->args[0]);
+              auto dst_call = Downcast<Call>(call->args[1]);
+              // Rebuild src (GM) region: half extent, sid-based offset
+              RegionOp src_rop(src_call->args);
+              int src_mask = src_rop->GetAccessMask();
+              auto src_ranges = src_rop->GetRanges();
+              auto src_buf = src_rop->GetBuffer();
+              Array<PrimExpr> src_indices;
+              for (size_t d = 0; d < src_ranges.size(); ++d) {
+                if (static_cast<int>(d) == src_split_dim)
+                  src_indices.push_back(src_ranges[d]->min + off);
+                else
+                  src_indices.push_back(src_ranges[d]->min);
+              }
+              auto src_load = BufferLoad(src_buf, src_indices);
+              Array<PrimExpr> src_args = {src_load, Integer(src_mask)};
+              for (size_t d = 0; d < src_ranges.size(); ++d) {
+                if (static_cast<int>(d) == src_split_dim)
+                  src_args.push_back(half_ext);
+                else
+                  src_args.push_back(src_ranges[d]->extent);
+              }
+              auto new_src =
+                  Call(DataType::Handle(), RegionOp::Get(), src_args);
+              Array<PrimExpr> new_args = {new_src, dst_call};
+              auto new_call = Call(call->dtype, copy_op, new_args, new_ann);
+              return Evaluate(new_call);
             }
           }
         }
