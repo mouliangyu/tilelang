@@ -83,13 +83,15 @@ public:
   // fallback paths that bypass the Z3 scheduler.
   static std::vector<std::shared_ptr<IRStructure>>
   WrapAsScheduleUnits(const std::vector<std::shared_ptr<IRStructure>> &children,
-                      const std::vector<int64_t> &start_times) {
+                      const std::vector<int64_t> &start_times = {}) {
     std::vector<std::shared_ptr<IRStructure>> wrapped;
     wrapped.reserve(children.size());
     for (size_t i = 0; i < children.size(); ++i) {
       auto unit = std::make_shared<ScheduleUnit>();
       unit->child = children[i];
       unit->SetStartTime(i < start_times.size() ? start_times[i] : 0);
+      unit->SetLatency(unit->child->GetLatency());
+      unit->SetII(unit->child->GetII());
       wrapped.push_back(std::move(unit));
     }
     return wrapped;
@@ -104,8 +106,7 @@ public:
       const std::vector<std::shared_ptr<IRStructure>> &origin_children) {
     size_t n = origin_children.size();
     if (n <= 1) {
-      std::vector<int64_t> zero_times(n, 0);
-      return WrapAsScheduleUnits(origin_children, zero_times);
+      return WrapAsScheduleUnits(origin_children);
     }
 
     try {
@@ -115,8 +116,7 @@ public:
       if (!z3_schedule_func.has_value()) {
         LOG(WARNING) << "Python Z3 scheduler not registered, falling back to "
                         "topological sort";
-        std::vector<int64_t> zero_times(n, 0);
-        return WrapAsScheduleUnits(origin_children, zero_times);
+        return WrapAsScheduleUnits(origin_children);
       }
 
       // Prepare input data
@@ -258,6 +258,8 @@ public:
         auto unit = std::make_shared<ScheduleUnit>();
         unit->child = origin_children[p.second];
         unit->SetStartTime(p.first);
+        unit->SetLatency(unit->child->GetLatency());
+        unit->SetII(unit->child->GetII());
         sorted_units.push_back(std::move(unit));
       }
       return sorted_units;
@@ -265,13 +267,11 @@ public:
     } catch (const std::exception &e) {
       LOG(WARNING) << "Python Z3 scheduler failed with exception: " << e.what()
                    << ", falling back to topological sort";
-      std::vector<int64_t> zero_times(n, 0);
-      return WrapAsScheduleUnits(origin_children, zero_times);
+      return WrapAsScheduleUnits(origin_children);
     } catch (...) {
       LOG(WARNING) << "Python Z3 scheduler failed with unknown exception, "
                       "falling back to topological sort";
-      std::vector<int64_t> zero_times(n, 0);
-      return WrapAsScheduleUnits(origin_children, zero_times);
+      return WrapAsScheduleUnits(origin_children);
     }
   }
 
@@ -726,14 +726,17 @@ public:
       auto it = start_time_map.find(child_ptr);
       unit->SetStartTime(it != start_time_map.end() ? it->second : 0);
       unit->child = std::move(seq_body->children[k]);
+      unit->SetLatency(unit->child->GetLatency());
+      unit->SetII(unit->child->GetII());
       seq_body->children[k] = std::move(unit);
     }
 
     // Estimate overall latency: II * tripcount
     int64_t overall_latency = 0;
-    for (size_t i = 0; i < sorted_nodes.size(); ++i) {
+    for (const auto &child : seq_body->children) {
+      auto unit = static_cast<ScheduleUnit *>(child.get());
       overall_latency =
-          std::max(overall_latency, sorted_start_times[i] + latencies[i]);
+          std::max(overall_latency, unit->GetStartTime() + unit->GetLatency());
     }
     overall_latency += ii * (ctrl->GetTripCount() - 1);
 
