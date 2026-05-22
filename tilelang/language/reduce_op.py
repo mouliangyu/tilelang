@@ -5,6 +5,7 @@ from typing import Literal
 from tilelang._typing import BufferLikeType
 from tvm import tir
 from tilelang.language import copy, macro, alloc_shared, alloc_fragment
+from tilelang.language.vf import inside_simdvf
 from tilelang.utils.language import to_buffer_region, retrieve_shape, _get_buffer
 from tilelang.utils.language import is_shared, is_fragment
 from tvm.script.ir_builder import IRBuilder
@@ -55,27 +56,39 @@ def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: ReduceKind, dim: in
         out_scope = _get_buffer(out).scope()
 
         if is_shared(buffer) and is_shared(out):
-            red_frag_in = alloc_fragment(buf_shape, buf_dtype)
-            red_frag_out = alloc_fragment(out_shape, out_dtype)
+            if inside_simdvf():
+                # Inside SimdVF: reduce directly on shared buffers (no fragment wrapping)
+                tir.call_intrin(
+                    "handle",
+                    tir.op.Op.get(_REDUCE_OP_KEY),
+                    to_buffer_region(buffer, access_type="r"),
+                    to_buffer_region(out, access_type="w"),
+                    reduce_type,
+                    dim,
+                    clear,
+                )
+            else:
+                red_frag_in = alloc_fragment(buf_shape, buf_dtype)
+                red_frag_out = alloc_fragment(out_shape, out_dtype)
 
-            # rename buffers
-            IRBuilder.name(buf_name + "_frag", red_frag_in)
-            IRBuilder.name(out_name + "_frag", red_frag_out)
+                # rename buffers
+                IRBuilder.name(buf_name + "_frag", red_frag_in)
+                IRBuilder.name(out_name + "_frag", red_frag_out)
 
-            if not clear:
-                copy(out, red_frag_out)
+                if not clear:
+                    copy(out, red_frag_out)
 
-            copy(buffer, red_frag_in)
-            tir.call_intrin(
-                "handle",
-                tir.op.Op.get(_REDUCE_OP_KEY),
-                to_buffer_region(red_frag_in, access_type="r"),
-                to_buffer_region(red_frag_out, access_type="w"),
-                reduce_type,
-                dim,
-                clear,
-            )
-            copy(red_frag_out, out)
+                copy(buffer, red_frag_in)
+                tir.call_intrin(
+                    "handle",
+                    tir.op.Op.get(_REDUCE_OP_KEY),
+                    to_buffer_region(red_frag_in, access_type="r"),
+                    to_buffer_region(red_frag_out, access_type="w"),
+                    reduce_type,
+                    dim,
+                    clear,
+                )
+                copy(red_frag_out, out)
         elif is_shared(buffer) and is_fragment(out):
             red_frag_in = alloc_fragment(buf_shape, buf_dtype)
             IRBuilder.name(buf_name + "_frag", red_frag_in)

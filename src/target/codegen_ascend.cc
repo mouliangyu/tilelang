@@ -1139,7 +1139,9 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   else if (op->op.same_as(tl::ascend_simd_add()) ||
            op->op.same_as(tl::ascend_simd_sub()) ||
            op->op.same_as(tl::ascend_simd_mul()) ||
-           op->op.same_as(tl::ascend_simd_div())) {
+           op->op.same_as(tl::ascend_simd_div()) ||
+           op->op.same_as(tl::ascend_simd_max()) ||
+           op->op.same_as(tl::ascend_simd_min())) {
     ICHECK_EQ(op->args.size(), 4);
     const char *name = nullptr;
     if (op->op.same_as(tl::ascend_simd_add()))
@@ -1148,6 +1150,10 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       name = "Sub";
     else if (op->op.same_as(tl::ascend_simd_mul()))
       name = "Mul";
+    else if (op->op.same_as(tl::ascend_simd_max()))
+      name = "Max";
+    else if (op->op.same_as(tl::ascend_simd_min()))
+      name = "Min";
     else
       name = "Div";
     this->PrintIndent();
@@ -1166,7 +1172,9 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
            op->op.same_as(tl::ascend_simd_rsqrt()) ||
            op->op.same_as(tl::ascend_simd_abs()) ||
            op->op.same_as(tl::ascend_simd_neg()) ||
-           op->op.same_as(tl::ascend_simd_duplicate())) {
+           op->op.same_as(tl::ascend_simd_duplicate()) ||
+           op->op.same_as(tl::ascend_simd_reduce_max()) ||
+           op->op.same_as(tl::ascend_simd_reduce_sum())) {
     ICHECK_EQ(op->args.size(), 3);
     const char *name = nullptr;
     if (op->op.same_as(tl::ascend_simd_exp()))
@@ -1181,6 +1189,10 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       name = "Abs";
     else if (op->op.same_as(tl::ascend_simd_duplicate()))
       name = "Duplicate";
+    else if (op->op.same_as(tl::ascend_simd_reduce_max()))
+      name = "Reduce<AscendC::MicroAPI::ReduceType::MAX>";
+    else if (op->op.same_as(tl::ascend_simd_reduce_sum()))
+      name = "Reduce<AscendC::MicroAPI::ReduceType::SUM>";
     else
       name = "Neg";
     this->PrintIndent();
@@ -1262,6 +1274,20 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     this->stream << ");\n";
   }
+  // --- SimdVF store_pack: StoreAlign<dtype, DIST_PACK_B32>(ptr, src, mask) ---
+  else if (op->op.same_as(tl::ascend_simd_store_pack())) {
+    ICHECK_EQ(op->args.size(), 4);
+    std::string dtype_str = Downcast<StringImm>(op->args[0])->value;
+    this->PrintIndent();
+    this->stream << "AscendC::MicroAPI::StoreAlign<" << dtype_str
+                 << ", AscendC::MicroAPI::StoreDist::DIST_PACK_B32>(";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[2], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[3], this->stream);
+    this->stream << ");\n";
+  }
   // --- SimdVF create_addr_reg: (dtype_str, idx0, stride0, ...) → expression
   // ---
   else if (op->op.same_as(tl::ascend_simd_create_addr_reg())) {
@@ -1281,6 +1307,32 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::string dtype_str = Downcast<StringImm>(op->args[0])->value;
     os << "AscendC::MicroAPI::UpdateMask<" << dtype_str << ">((uint32_t)";
     this->PrintExpr(op->args[1], os);
+    os << ")";
+  } else if (op->op.same_as(tl::ascend_simd_dup())) {
+    os << "AscendC::MicroAPI::Duplicate(";
+    this->PrintExpr(op->args[0], os);
+    os << ", ";
+    this->PrintExpr(op->args[1], os);
+    os << ")";
+  } else if (op->op.same_as(tl::ascend_simd_create_mask())) {
+    std::string dtype_str = Downcast<StringImm>(op->args[0])->value;
+    os << "AscendC::MicroAPI::CreateMask<" << dtype_str << ">()";
+  } else if (op->op.same_as(tl::ascend_simd_cast())) {
+    ICHECK_EQ(op->args.size(), 5);
+    std::string to_dtype = Downcast<StringImm>(op->args[0])->value;
+    std::string from_dtype = Downcast<StringImm>(op->args[1])->value;
+    // Use predefined AscendC cast traits based on direction.
+    // B32ToB16 covers both bfloat16_t and half_t (32-bit → 16-bit).
+    const char *trait = (from_dtype == "float")
+                            ? "AscendC::Internal::castTraitB32ToB16"
+                            : "AscendC::Internal::castTraitB16ToB32";
+    os << "AscendC::MicroAPI::Cast<" << to_dtype << ", " << from_dtype << ", "
+       << trait << ">(";
+    this->PrintExpr(op->args[2], os);
+    os << ", ";
+    this->PrintExpr(op->args[3], os);
+    os << ", ";
+    this->PrintExpr(op->args[4], os);
     os << ")";
   } else if (op->op.same_as(tl::loop_break())) {
     this->PrintIndent();

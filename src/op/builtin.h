@@ -540,6 +540,11 @@ TVM_DLL const Op &ascend_simd_add();
 TVM_DLL const Op &ascend_simd_sub();
 TVM_DLL const Op &ascend_simd_mul();
 TVM_DLL const Op &ascend_simd_div();
+TVM_DLL const Op &ascend_simd_max();
+TVM_DLL const Op &ascend_simd_min();
+// SimdVF reduce: (dst_reg, src_reg, mask) → scalar in lane 0
+TVM_DLL const Op &ascend_simd_reduce_max();
+TVM_DLL const Op &ascend_simd_reduce_sum();
 // SimdVF unary: (dst_reg, src_reg, mask)
 TVM_DLL const Op &ascend_simd_exp();
 TVM_DLL const Op &ascend_simd_ln();
@@ -548,15 +553,19 @@ TVM_DLL const Op &ascend_simd_rsqrt();
 TVM_DLL const Op &ascend_simd_abs();
 TVM_DLL const Op &ascend_simd_neg();
 TVM_DLL const Op &ascend_simd_duplicate();
+TVM_DLL const Op &ascend_simd_dup();
+TVM_DLL const Op &ascend_simd_cast();
 // SimdVF memory: (dtype_str, dst, src [, addr_reg] [, mask])
 TVM_DLL const Op &ascend_simd_load();
 TVM_DLL const Op &ascend_simd_load_single();
 TVM_DLL const Op &ascend_simd_store();
+TVM_DLL const Op &ascend_simd_store_pack();
 // SimdVF addr: (dtype_str, idx0, stride0, ...) → AddrReg handle
 TVM_DLL const Op &ascend_simd_create_addr_reg();
 // SimdVF mask
 TVM_DLL const Op &ascend_simd_update_mask();
 TVM_DLL const Op &ascend_init_mask();
+TVM_DLL const Op &ascend_simd_create_mask();
 
 /*!
  * \brief Ascend SetFlag intrinsic for pipeline synchronization.

@@ -79,11 +79,22 @@ class SimdVFFrame(TIRFrame):
     """
 
     def __enter__(self):
+        _inside_simdvf[0] += 1
         super().__enter__()
         return self
 
     def __exit__(self, ptype, value, trace):
         super().__exit__(ptype, value, trace)
+        _inside_simdvf[0] -= 1
+
+
+# Thread-local counter for nested SimdVF context
+_inside_simdvf = [0]
+
+
+def inside_simdvf() -> bool:
+    """Return True if currently inside a SimdVF region."""
+    return _inside_simdvf[0] > 0
 
 
 def SimdVF() -> SimdVFFrame:

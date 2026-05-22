@@ -20,6 +20,7 @@
 #include <tvm/tir/transform.h>
 
 #include "../op/builtin.h"
+#include "../op/utils.h"
 
 #include <functional>
 #include <unordered_map>
@@ -59,6 +60,7 @@ private:
   std::vector<Buffer> new_fragments_;
   int frag_counter_{0};
   std::string dtype_str_;
+  std::vector<Stmt> scalar_loads_;
 
   //-----------------------------------------------------------------------
   // VReg / type helpers
@@ -68,6 +70,8 @@ private:
   }
 
   static std::string DTypeToAscendStr(DataType dtype) {
+    if (dtype.is_bfloat16())
+      return "bfloat16_t";
     if (dtype.is_float())
       return (dtype.bits() == 16) ? "half_t" : "float";
     if (dtype.is_int())
@@ -214,10 +218,39 @@ private:
   Var DecomposeExpr(const PrimExpr &expr, DataType dtype, Array<Stmt> *stmts) {
     if (const auto *load = expr.as<BufferLoadNode>()) {
       Buffer reg = AllocFragmentReg(dtype);
-      stmts->push_back(
-          Evaluate(Call(DataType::Void(), ascend_simd_load(),
-                        {StringImm(dtype_str_), reg->data,
-                         MakeAddressOf(load->buffer, load->indices)})));
+
+      // Check if any index depends on the VReg variable
+      bool depends_on_vreg = false;
+      if (parallel_var_) {
+        for (const auto &idx : load->indices) {
+          if (GetVarStride(idx, parallel_var_) != 0) {
+            depends_on_vreg = true;
+            break;
+          }
+        }
+      }
+
+      if (!depends_on_vreg && outer_parallel_var_) {
+        // Scalar load in 2D context: use load_single to broadcast
+        // Put the load in scalar_loads_ to be hoisted outside the VReg chunk
+        // loop
+        PrimExpr addr = MakeAddressOf(load->buffer, load->indices);
+        scalar_loads_.push_back(
+            Evaluate(Call(DataType::Void(), ascend_simd_load_single(),
+                          {StringImm(dtype_str_), reg->data, addr})));
+      } else if (!depends_on_vreg) {
+        // Scalar load in 1D context: use load_single in-place
+        PrimExpr addr = MakeAddressOf(load->buffer, load->indices);
+        stmts->push_back(
+            Evaluate(Call(DataType::Void(), ascend_simd_load_single(),
+                          {StringImm(dtype_str_), reg->data, addr})));
+      } else {
+        // Vector load: full LoadAlign
+        stmts->push_back(
+            Evaluate(Call(DataType::Void(), ascend_simd_load(),
+                          {StringImm(dtype_str_), reg->data,
+                           MakeAddressOf(load->buffer, load->indices)})));
+      }
       return reg->data;
     }
 
@@ -264,6 +297,14 @@ private:
     if (const auto *sub = expr.as<SubNode>())
       if (is_zero(sub->a))
         return EmitUnary(sub->b, ascend_simd_neg());
+
+    // Scalar constants: broadcast via Duplicate
+    if (expr.as<FloatImmNode>() || expr.as<IntImmNode>()) {
+      Buffer reg = AllocFragmentReg(dtype);
+      stmts->push_back(Evaluate(
+          Call(DataType::Void(), ascend_simd_dup(), {reg->data, expr})));
+      return reg->data;
+    }
 
     LOG(FATAL) << "AscendSimdVFLowerParallel: unsupported expr: " << expr;
     return Var();
@@ -364,117 +405,517 @@ private:
       if (auto *t = inner->body.as<ForNode>())
         if (t->kind == ForKind::kParallel)
           LOG(FATAL) << "3D+ parallel not supported";
-      return Lower2DParallel(op, inner);
-    }
 
-    if (!CanLowerBody(op->body))
-      return StmtExprMutator::VisitStmt_(op);
-    return Lower1DParallel(op);
-  }
+      if (!CanLowerBody(inner->body))
+        return StmtExprMutator::VisitStmt_(op);
 
-  //-----------------------------------------------------------------------
-  // 1D Parallel
-  //-----------------------------------------------------------------------
-  Stmt Lower1DParallel(const ForNode *op) {
-    int64_t extent = Downcast<IntImm>(op->extent)->value;
-    DataType dtype = InferDType(op->body);
-    vreg_size_ = ComputeVRegSize(dtype);
-    dtype_str_ = DTypeToAscendStr(dtype);
-    ICHECK_EQ(extent % vreg_size_, 0)
-        << "Extent " << extent << " not divisible by VReg size " << vreg_size_;
-    int64_t nchunks = extent / vreg_size_;
+      // Pick stride=1 dim as VReg, other as serial
+      int64_t outer_stride = GetStrideInStore(inner->body, op->loop_var.get());
+      int64_t inner_stride =
+          GetStrideInStore(inner->body, inner->loop_var.get());
 
-    auto saved_pv = parallel_var_, saved_ov = outer_parallel_var_;
-    parallel_var_ = op->loop_var.get();
-    outer_parallel_var_ = nullptr;
+      if (inner_stride == 1)
+        return LowerParallel(inner, op);
+      if (outer_stride == 1)
+        return LowerParallel(op, inner);
 
-    chunk_var_ = Var("vchunk", DataType::Int(32));
-    mask_cnt_var_ = Var("mask_cnt", DataType::Handle());
-    mask_var_ = Var("mask", DataType::Handle());
-
-    PrimExpr im = Call(DataType::Handle(), ascend_init_mask(),
-                       {IntImm(DataType::Int(32), extent)});
-    PrimExpr um = Call(DataType::Handle(), ascend_simd_update_mask(),
-                       {StringImm(dtype_str_), mask_cnt_var_});
-
-    Stmt body = LowerParallelBody(op->body, dtype);
-    Stmt ml = LetStmt(mask_var_, um, body);
-    Stmt loop = For(chunk_var_, IntImm(DataType::Int(32), 0),
-                    IntImm(DataType::Int(32), nchunks), ForKind::kSerial, ml);
-    Stmt result = LetStmt(mask_cnt_var_, im, loop);
-
-    parallel_var_ = saved_pv;
-    outer_parallel_var_ = saved_ov;
-    return result;
-  }
-
-  //-----------------------------------------------------------------------
-  // 2D Parallel: pick stride=1 var as VReg, other as serial
-  //-----------------------------------------------------------------------
-  Stmt Lower2DParallel(const ForNode *outer, const ForNode *inner) {
-    if (!CanLowerBody(inner->body))
-      return StmtExprMutator::VisitStmt_(outer);
-
-    int64_t outer_ext = Downcast<IntImm>(outer->extent)->value;
-    int64_t inner_ext = Downcast<IntImm>(inner->extent)->value;
-
-    DataType dtype = InferDType(inner->body);
-    vreg_size_ = ComputeVRegSize(dtype);
-    dtype_str_ = DTypeToAscendStr(dtype);
-
-    // Determine which var has stride=1 → that's the VReg dimension
-    int64_t outer_stride = GetStrideInStore(inner->body, outer->loop_var.get());
-    int64_t inner_stride = GetStrideInStore(inner->body, inner->loop_var.get());
-
-    const ForNode *vreg_for;
-    const ForNode *serial_for;
-    int64_t vreg_extent, serial_extent;
-
-    if (inner_stride == 1) {
-      vreg_for = inner;
-      serial_for = outer;
-      vreg_extent = inner_ext;
-      serial_extent = outer_ext;
-    } else if (outer_stride == 1) {
-      vreg_for = outer;
-      serial_for = inner;
-      vreg_extent = outer_ext;
-      serial_extent = inner_ext;
-    } else {
       LOG(FATAL) << "2D parallel requires one dimension with stride=1, got "
                  << "outer stride=" << outer_stride
                  << " inner stride=" << inner_stride;
     }
 
-    ICHECK_EQ(vreg_extent % vreg_size_, 0)
-        << "VReg extent " << vreg_extent << " not divisible by " << vreg_size_;
-    int64_t nchunks = vreg_extent / vreg_size_;
+    // 1D parallel
+    if (!CanLowerBody(op->body))
+      return StmtExprMutator::VisitStmt_(op);
+    return LowerParallel(op, nullptr);
+  }
+
+  Stmt VisitStmt_(const EvaluateNode *op) override {
+    if (!inside_simdvf_)
+      return StmtExprMutator::VisitStmt_(op);
+
+    const auto *call = op->value.as<CallNode>();
+    if (!call)
+      return StmtExprMutator::VisitStmt_(op);
+
+    // Check if it's a tl.tileop.fill or tl.tileop.copy call
+    if (const auto *opnode = call->op.as<OpNode>()) {
+      if (opnode->name == "tl.tileop.fill")
+        return LowerFill(call);
+      if (opnode->name == "tl.tileop.copy")
+        return LowerCopy(call);
+      if (opnode->name == "tl.tileop.reduce")
+        return LowerReduce(call);
+      return StmtExprMutator::VisitStmt_(op);
+    } else {
+      return StmtExprMutator::VisitStmt_(op);
+    }
+  }
+
+  //-----------------------------------------------------------------------
+  // Fill lowering: T.fill(buf, value) → Duplicate + StoreAlign loop
+  //-----------------------------------------------------------------------
+  Stmt LowerFill(const CallNode *call) {
+    BufferRegion buf_region = NormalizeToBufferRegion(call->args[0]);
+    Buffer buf = buf_region->buffer;
+    Array<Range> ranges = buf_region->region;
+    PrimExpr value = call->args[1];
+    DataType dtype = buf->dtype;
+
+    if (value->dtype != dtype)
+      value = Cast(dtype, value);
+
+    int ndim = ranges.size();
+    vreg_size_ = ComputeVRegSize(dtype);
+    dtype_str_ = DTypeToAscendStr(dtype);
+
+    // Check if this is a full-buffer fill (all mins=0, all extents=buf shape).
+    // For full-buffer fills the elements are always contiguous in row-major.
+    bool is_full = true;
+    int64_t total = 1;
+    for (int i = 0; i < ndim; i++) {
+      const auto *min_imm = ranges[i]->min.as<IntImmNode>();
+      const auto *ext_imm = ranges[i]->extent.as<IntImmNode>();
+      const auto *shape_imm = buf->shape[i].as<IntImmNode>();
+      if (!min_imm || !ext_imm || !shape_imm) {
+        is_full = false;
+        break;
+      }
+      if (min_imm->value != 0 || ext_imm->value != shape_imm->value) {
+        is_full = false;
+        break;
+      }
+      total *= ext_imm->value;
+    }
+
+    ICHECK(is_full) << "T.fill inside SimdVF requires full-buffer regions";
+    ICHECK_EQ(total % vreg_size_, 0)
+        << "T.fill inside SimdVF requires extent divisible by VReg size ("
+        << vreg_size_ << "), got " << total;
+
+    int64_t nchunks = total / vreg_size_;
+
+    // One fragment holds the broadcast value
+    Buffer frag = AllocFragmentReg(dtype);
+
+    // CreateMask<dtype>()
+    Var mask_var("mask", DataType::Handle());
+    PrimExpr create_mask = Call(DataType::Handle(), ascend_simd_create_mask(),
+                                {StringImm(dtype_str_)});
+
+    // Duplicate(frag, scalar)
+    Stmt dup_stmt = Evaluate(
+        Call(DataType::Void(), ascend_simd_dup(), {frag->data, value}));
+
+    // StoreAlign<dtype>(buf + i*VL, frag, mask)
+    // Use flat 1D addressing: index = chunk * VL + 0 (base=0 for full-buffer
+    // fill)
+    Var chunk_var("vchunk", DataType::Int(32));
+    PrimExpr flat_idx = chunk_var * IntImm(DataType::Int(32), vreg_size_);
+
+    // Build per-dimension indices from flat_index
+    // For ND buffer, flat_index = i0*N1*N2*.. + i1*N2*.. + ... + i_{d-1}
+    // Since we're using base=0, we can just use flat index for 1D
+    // For ND, convert flat → multi-dim indices
+    Array<PrimExpr> idxs;
+    if (ndim == 1) {
+      idxs.push_back(flat_idx);
+    } else {
+      // Convert flat_index back to multi-dim indices for the BufferLoad
+      PrimExpr remaining = flat_idx;
+      for (int i = ndim - 1; i >= 1; i--) {
+        idxs.insert(idxs.begin(), FloorMod(remaining, buf->shape[i]));
+        remaining = FloorDiv(remaining, buf->shape[i]);
+      }
+      idxs.insert(idxs.begin(), remaining);
+    }
+
+    PrimExpr addr = Call(DataType::Handle(), builtin::address_of(),
+                         {BufferLoad(buf, idxs)});
+    Stmt store =
+        Evaluate(Call(DataType::Void(), ascend_simd_store(),
+                      {StringImm(dtype_str_), addr, frag->data, mask_var}));
+
+    Stmt loop =
+        For(chunk_var, IntImm(DataType::Int(32), 0),
+            IntImm(DataType::Int(32), nchunks), ForKind::kSerial, store);
+
+    return LetStmt(mask_var, create_mask, SeqStmt({dup_stmt, loop}));
+  }
+
+  //-----------------------------------------------------------------------
+  // Copy lowering: T.copy(src, dst) → LoadAlign + StoreAlign loop
+  //-----------------------------------------------------------------------
+  Stmt LowerCopy(const CallNode *call) {
+    BufferRegion src_region = NormalizeToBufferRegion(call->args[0]);
+    BufferRegion dst_region = NormalizeToBufferRegion(call->args[1]);
+    Buffer src_buf = src_region->buffer;
+    Buffer dst_buf = dst_region->buffer;
+    Array<Range> src_ranges = src_region->region;
+    Array<Range> dst_ranges = dst_region->region;
+    DataType src_dtype = src_buf->dtype;
+    DataType dst_dtype = dst_buf->dtype;
+    bool is_cast = (dst_dtype != src_dtype);
+
+    // For cast copy, support f32→bf16 and f32→half (32→16 bit)
+    ICHECK(!is_cast || (src_dtype.is_float() &&
+                        (dst_dtype.is_float16() || dst_dtype.is_bfloat16())))
+        << "T.copy inside SimdVF: cast copy only supports f32→bf16 or f32→half";
+
+    vreg_size_ = ComputeVRegSize(src_dtype);
+    std::string src_dtype_str = DTypeToAscendStr(src_dtype);
+    std::string dst_dtype_str = DTypeToAscendStr(dst_dtype);
+
+    // Validate both are full-buffer regions with same element count
+    auto is_full = [](const Array<Range> &ranges, const Array<PrimExpr> &shape,
+                      int64_t *total) -> bool {
+      *total = 1;
+      for (size_t i = 0; i < ranges.size(); i++) {
+        const auto *mi = ranges[i]->min.as<IntImmNode>();
+        const auto *ei = ranges[i]->extent.as<IntImmNode>();
+        const auto *si = shape[i].as<IntImmNode>();
+        if (!mi || !ei || !si)
+          return false;
+        if (mi->value != 0 || ei->value != si->value)
+          return false;
+        *total *= ei->value;
+      }
+      return true;
+    };
+
+    int64_t src_total = 0, dst_total = 0;
+    ICHECK(is_full(src_ranges, src_buf->shape, &src_total) &&
+           is_full(dst_ranges, dst_buf->shape, &dst_total))
+        << "T.copy inside SimdVF requires full-buffer regions";
+
+    ICHECK(src_total == dst_total) << "T.copy inside SimdVF requires src and "
+                                      "dst to have same element count";
+
+    int64_t total = src_total;
+    ICHECK(total % vreg_size_ == 0) << "T.copy inside SimdVF requires total "
+                                       "elements divisible by VReg size ("
+                                    << vreg_size_ << "), got " << total;
+
+    int64_t nchunks = total / vreg_size_;
+
+    // Load fragment (src dtype), cast fragment (dst dtype for cast copies)
+    Buffer load_frag = AllocFragmentReg(src_dtype);
+    Buffer cast_frag;
+    if (is_cast)
+      cast_frag = AllocFragmentReg(dst_dtype);
+
+    Var chunk_var("vchunk", DataType::Int(32));
+    mask_cnt_var_ = Var("mask_cnt", DataType::Handle());
+    mask_var_ = Var("mask", DataType::Handle());
+
+    PrimExpr im = Call(DataType::Handle(), ascend_init_mask(),
+                       {IntImm(DataType::Int(32), total)});
+    PrimExpr um = Call(
+        DataType::Handle(), ascend_simd_update_mask(),
+        {StringImm(is_cast ? dst_dtype_str : src_dtype_str), mask_cnt_var_});
+
+    auto flat_addr = [&](const Buffer &buf, int ndim) -> PrimExpr {
+      PrimExpr flat_idx = chunk_var * IntImm(DataType::Int(32), vreg_size_);
+      Array<PrimExpr> idxs;
+      if (ndim == 1) {
+        idxs.push_back(flat_idx);
+      } else {
+        PrimExpr r = flat_idx;
+        for (int i = ndim - 1; i >= 1; i--) {
+          idxs.insert(idxs.begin(), FloorMod(r, buf->shape[i]));
+          r = FloorDiv(r, buf->shape[i]);
+        }
+        idxs.insert(idxs.begin(), r);
+      }
+      return Call(DataType::Handle(), builtin::address_of(),
+                  {BufferLoad(buf, idxs)});
+    };
+
+    PrimExpr src_addr = flat_addr(src_buf, src_ranges.size());
+    PrimExpr dst_addr = flat_addr(dst_buf, dst_ranges.size());
+
+    // LoadAlign from source
+    Stmt load =
+        Evaluate(Call(DataType::Void(), ascend_simd_load(),
+                      {StringImm(src_dtype_str), load_frag->data, src_addr}));
+
+    Stmt store;
+    Array<Stmt> body_stmts;
+    body_stmts.push_back(load);
+
+    if (is_cast) {
+      // Cast f32→bf16, then StoreAlign with DIST_PACK_B32
+      Stmt cast =
+          Evaluate(Call(DataType::Void(), ascend_simd_cast(),
+                        {StringImm(dst_dtype_str), StringImm(src_dtype_str),
+                         cast_frag->data, load_frag->data, mask_var_}));
+      body_stmts.push_back(cast);
+      store = Evaluate(Call(
+          DataType::Void(), ascend_simd_store_pack(),
+          {StringImm(dst_dtype_str), dst_addr, cast_frag->data, mask_var_}));
+    } else {
+      store = Evaluate(Call(
+          DataType::Void(), ascend_simd_store(),
+          {StringImm(src_dtype_str), dst_addr, load_frag->data, mask_var_}));
+    }
+    body_stmts.push_back(store);
+
+    Stmt body = SeqStmt(body_stmts);
+    Stmt ml = LetStmt(mask_var_, um, body);
+    Stmt loop = For(chunk_var, IntImm(DataType::Int(32), 0),
+                    IntImm(DataType::Int(32), nchunks), ForKind::kSerial, ml);
+
+    return LetStmt(mask_cnt_var_, im, loop);
+  }
+
+  //-----------------------------------------------------------------------
+  // Reduce lowering: T.reduce_max/sum(src, dst, dim)
+  //
+  // dim=0: reduce across rows → element-wise Max loop, no Reduce<MAX>
+  // dim=1: reduce across columns → Max per chunk, then Reduce<MAX> final
+  //-----------------------------------------------------------------------
+  Stmt LowerReduce(const CallNode *call) {
+    BufferRegion src_region = NormalizeToBufferRegion(call->args[0]);
+    BufferRegion dst_region = NormalizeToBufferRegion(call->args[1]);
+    Buffer src = src_region->buffer, dst = dst_region->buffer;
+    Array<Range> sr = src_region->region, dr = dst_region->region;
+
+    std::string rtype = call->args[2].as<StringImmNode>()->value;
+    int dim = (int)call->args[3].as<IntImmNode>()->value;
+    bool clear = call->args[4].as<Bool>().value();
+
+    DataType dtype = src->dtype;
+    vreg_size_ = ComputeVRegSize(dtype);
+    dtype_str_ = DTypeToAscendStr(dtype);
+
+    ICHECK(sr.size() == 2 && dr.size() == 1 && (dim == 0 || dim == 1))
+        << "T.reduce inside SimdVF requires 2D src → 1D dst, dim=0 or 1";
+
+    auto is_full = [](const Array<Range> &r, const Array<PrimExpr> &sh,
+                      int64_t *t) -> bool {
+      *t = 1;
+      for (size_t i = 0; i < r.size(); i++) {
+        auto *mi = r[i]->min.as<IntImmNode>();
+        auto *ei = r[i]->extent.as<IntImmNode>();
+        auto *si = sh[i].as<IntImmNode>();
+        if (!mi || !ei || !si || mi->value || ei->value != si->value)
+          return false;
+        *t *= ei->value;
+      }
+      return true;
+    };
+    int64_t st, dt;
+    ICHECK(is_full(sr, src->shape, &st) && is_full(dr, dst->shape, &dt))
+        << "T.reduce inside SimdVF requires full-buffer regions";
+
+    int64_t de = Downcast<IntImm>(sr[dim]->extent)->value;
+    int64_t oe = Downcast<IntImm>(sr[1 - dim]->extent)->value;
+    ICHECK_EQ(de % vreg_size_, 0)
+        << "T.reduce requires dim extent multiple of VReg (" << vreg_size_
+        << "), got " << de;
+    int64_t nc = de / vreg_size_;
+
+    const Op &eop = (rtype == "sum") ? ascend_simd_add() : ascend_simd_max();
+    const Op &rop =
+        (rtype == "sum") ? ascend_simd_reduce_sum() : ascend_simd_reduce_max();
+    PrimExpr ival = (rtype == "sum") ? PrimExpr(FloatImm(dtype, 0.0))
+                                     : PrimExpr(FloatImm(dtype, -3.402823e+38));
+
+    Buffer a = AllocFragmentReg(dtype), b = AllocFragmentReg(dtype);
+
+    mask_cnt_var_ = Var("mask_cnt", DataType::Handle());
+    PrimExpr mi = Call(DataType::Handle(), ascend_init_mask(),
+                       {IntImm(DataType::Int(32), de)});
+    PrimExpr mu = Call(DataType::Handle(), ascend_simd_update_mask(),
+                       {StringImm(dtype_str_), mask_cnt_var_});
+    mask_var_ = Var("mask", DataType::Handle());
+
+    auto i32 = [](int64_t v) { return IntImm(DataType::Int(32), v); };
+    auto a1d = [&](const Buffer &buf, const PrimExpr &i0) {
+      return Call(DataType::Handle(), builtin::address_of(),
+                  {BufferLoad(buf, {i0})});
+    };
+    auto a2d = [&](const Buffer &buf, const PrimExpr &i0, const PrimExpr &i1) {
+      return Call(DataType::Handle(), builtin::address_of(),
+                  {BufferLoad(buf, {i0, i1})});
+    };
+    Var rep("vrepeat", DataType::Int(32));
+
+    // === dim=1, single VReg: ReduceVF ===
+    // Store at VReg-aligned address (rep * vreg_size), full mask → 32B aligned
+    if (dim == 1 && nc == 1) {
+      Stmt L = Evaluate(
+          Call(DataType::Void(), ascend_simd_load(),
+               {StringImm(dtype_str_), a->data, a2d(src, rep, i32(0))}));
+      Stmt R =
+          Evaluate(Call(DataType::Void(), rop, {a->data, a->data, mask_var_}));
+      Stmt S =
+          Evaluate(Call(DataType::Void(), ascend_simd_store(),
+                        {StringImm(dtype_str_), a1d(dst, rep * i32(vreg_size_)),
+                         a->data, mask_var_}));
+
+      PrimExpr dst_off = rep * i32(vreg_size_);
+      Stmt row_body;
+      if (!clear) {
+        Stmt LP =
+            Evaluate(Call(DataType::Void(), ascend_simd_load_single(),
+                          {StringImm(dtype_str_), b->data, a1d(dst, dst_off)}));
+        Stmt MP = Evaluate(Call(DataType::Void(), eop,
+                                {a->data, a->data, b->data, mask_var_}));
+        row_body = LetStmt(mask_var_, mu, SeqStmt({L, R, LP, MP, S}));
+      } else {
+        row_body = LetStmt(mask_var_, mu, SeqStmt({L, R, S}));
+      }
+      return LetStmt(mask_cnt_var_, mi,
+                     For(rep, i32(0), i32(oe), ForKind::kSerial, row_body));
+    }
+
+    // === dim=1, multi-VReg: per-chunk Reduce<MAX> + Max-accumulate ===
+    if (dim == 1) {
+      Stmt DI =
+          Evaluate(Call(DataType::Void(), ascend_simd_dup(), {a->data, ival}));
+      Var ck("vchunk", DataType::Int(32));
+      PrimExpr co = ck * i32(vreg_size_);
+      Stmt LK =
+          Evaluate(Call(DataType::Void(), ascend_simd_load(),
+                        {StringImm(dtype_str_), b->data, a2d(src, rep, co)}));
+      Stmt RK =
+          Evaluate(Call(DataType::Void(), rop, {b->data, b->data, mask_var_}));
+      Stmt MA = Evaluate(
+          Call(DataType::Void(), eop, {a->data, a->data, b->data, mask_var_}));
+      Stmt CB = LetStmt(mask_var_, mu, SeqStmt({LK, RK, MA}));
+
+      PrimExpr dst_off = rep * i32(vreg_size_);
+      Stmt S = Evaluate(
+          Call(DataType::Void(), ascend_simd_store(),
+               {StringImm(dtype_str_), a1d(dst, dst_off), a->data, mask_var_}));
+
+      // Fresh mask for post-loop store (inner loop consumed mask_cnt_var_)
+      Var mask_cnt2("mask_cnt2", DataType::Handle());
+      PrimExpr mi2 = Call(DataType::Handle(), ascend_init_mask(),
+                          {IntImm(DataType::Int(32), vreg_size_)});
+      PrimExpr mu2 = Call(DataType::Handle(), ascend_simd_update_mask(),
+                          {StringImm(dtype_str_), mask_cnt2});
+      Var mask2("mask2", DataType::Handle());
+
+      Array<Stmt> rb = {DI, For(ck, i32(0), i32(nc), ForKind::kSerial, CB)};
+      if (!clear) {
+        Stmt LP =
+            Evaluate(Call(DataType::Void(), ascend_simd_load_single(),
+                          {StringImm(dtype_str_), b->data, a1d(dst, dst_off)}));
+        Stmt MP = Evaluate(
+            Call(DataType::Void(), eop, {a->data, a->data, b->data, mask2}));
+        Stmt store2 = Evaluate(
+            Call(DataType::Void(), ascend_simd_store(),
+                 {StringImm(dtype_str_), a1d(dst, dst_off), a->data, mask2}));
+        rb.push_back(LetStmt(mask_cnt2, mi2,
+                             LetStmt(mask2, mu2, SeqStmt({LP, MP, store2}))));
+      } else {
+        Stmt store2 = Evaluate(
+            Call(DataType::Void(), ascend_simd_store(),
+                 {StringImm(dtype_str_), a1d(dst, dst_off), a->data, mask2}));
+        rb.push_back(LetStmt(mask_cnt2, mi2, LetStmt(mask2, mu2, store2)));
+      }
+      return LetStmt(mask_cnt_var_, mi,
+                     For(rep, i32(0), i32(oe), ForKind::kSerial, SeqStmt(rb)));
+    }
+
+    // === dim=0: rows NOT contiguous → element-wise Max per column chunk ===
+    Var ck("vchunk", DataType::Int(32)), rv("vrow", DataType::Int(32));
+    int64_t N = Downcast<IntImm>(src->shape[1])->value;
+    PrimExpr co = ck * i32(vreg_size_);
+
+    Stmt L0 =
+        Evaluate(Call(DataType::Void(), ascend_simd_load(),
+                      {StringImm(dtype_str_), a->data, a2d(src, i32(0), co)}));
+    Stmt LK =
+        Evaluate(Call(DataType::Void(), ascend_simd_load(),
+                      {StringImm(dtype_str_), b->data, a2d(src, rv, co)}));
+    Stmt EA = Evaluate(
+        Call(DataType::Void(), eop, {a->data, a->data, b->data, mask_var_}));
+    Stmt SK = Evaluate(
+        Call(DataType::Void(), ascend_simd_store(),
+             {StringImm(dtype_str_), a1d(dst, co), a->data, mask_var_}));
+
+    Array<Stmt> cb;
+    if (oe == 1)
+      cb.push_back(L0);
+    else {
+      cb.push_back(LetStmt(mask_var_, mu, L0));
+      cb.push_back(For(rv, i32(1), i32(oe), ForKind::kSerial,
+                       LetStmt(mask_var_, mu, SeqStmt({LK, EA}))));
+    }
+    cb.push_back(LetStmt(mask_var_, mu, SK));
+    return LetStmt(mask_cnt_var_, mi,
+                   For(ck, i32(0), i32(nc), ForKind::kSerial, SeqStmt(cb)));
+  }
+
+  //-----------------------------------------------------------------------
+  // LowerParallel: unified 1D / 2D parallel lowering
+  //
+  // vreg_for  — the parallel loop whose extent is the VReg dimension
+  // serial_for — (nullable) the outer serial loop for 2D parallel
+  //-----------------------------------------------------------------------
+  Stmt LowerParallel(const ForNode *vreg_for, const ForNode *serial_for) {
+    int64_t vreg_ext = Downcast<IntImm>(vreg_for->extent)->value;
+    int64_t serial_ext =
+        serial_for ? Downcast<IntImm>(serial_for->extent)->value : 1;
+
+    DataType dtype = InferDType(vreg_for->body);
+    vreg_size_ = ComputeVRegSize(dtype);
+    dtype_str_ = DTypeToAscendStr(dtype);
+    ICHECK_EQ(vreg_ext % vreg_size_, 0)
+        << "T.Parallel inside SimdVF requires VReg extent divisible by VReg "
+           "size ("
+        << vreg_size_ << "), got " << vreg_ext;
+    int64_t nchunks = vreg_ext / vreg_size_;
 
     auto saved_pv = parallel_var_, saved_ov = outer_parallel_var_;
     parallel_var_ = vreg_for->loop_var.get();
-    parallel_extent_ = vreg_extent;
-    outer_parallel_var_ = serial_for->loop_var.get();
-    outer_serial_var_ = Var("vserial", DataType::Int(32));
+    parallel_extent_ = vreg_ext;
+    if (serial_for) {
+      outer_parallel_var_ = serial_for->loop_var.get();
+      outer_serial_var_ = Var("vserial", DataType::Int(32));
+    } else {
+      outer_parallel_var_ = nullptr;
+    }
 
     chunk_var_ = Var("vchunk", DataType::Int(32));
     mask_cnt_var_ = Var("mask_cnt", DataType::Handle());
     mask_var_ = Var("mask", DataType::Handle());
+    scalar_loads_.clear();
 
-    PrimExpr im =
-        Call(DataType::Handle(), ascend_init_mask(),
-             {IntImm(DataType::Int(32), vreg_extent * serial_extent)});
+    PrimExpr im = Call(DataType::Handle(), ascend_init_mask(),
+                       {IntImm(DataType::Int(32), vreg_ext)});
     PrimExpr um = Call(DataType::Handle(), ascend_simd_update_mask(),
                        {StringImm(dtype_str_), mask_cnt_var_});
 
-    Stmt body = LowerParallelBody(inner->body, dtype);
+    Stmt body = LowerParallelBody(vreg_for->body, dtype);
     Stmt ml = LetStmt(mask_var_, um, body);
     Stmt inner_loop =
         For(chunk_var_, IntImm(DataType::Int(32), 0),
             IntImm(DataType::Int(32), nchunks), ForKind::kSerial, ml);
-    Stmt outer_loop = For(outer_serial_var_, IntImm(DataType::Int(32), 0),
-                          IntImm(DataType::Int(32), serial_extent),
-                          ForKind::kSerial, inner_loop);
-    Stmt result = LetStmt(mask_cnt_var_, im, outer_loop);
+
+    // Per-iteration body: scalar loads + mask_cnt init + VReg chunk loop
+    Stmt per_iter_body = inner_loop;
+    if (!scalar_loads_.empty()) {
+      Array<Stmt> seq;
+      for (const Stmt &s : scalar_loads_)
+        seq.push_back(s);
+      seq.push_back(per_iter_body);
+      per_iter_body = SeqStmt(seq);
+      scalar_loads_.clear();
+    }
+    per_iter_body = LetStmt(mask_cnt_var_, im, per_iter_body);
+
+    Stmt result;
+    if (serial_for) {
+      result = For(outer_serial_var_, IntImm(DataType::Int(32), 0),
+                   IntImm(DataType::Int(32), serial_ext), ForKind::kSerial,
+                   per_iter_body);
+    } else {
+      result = per_iter_body;
+    }
 
     parallel_var_ = saved_pv;
     outer_parallel_var_ = saved_ov;

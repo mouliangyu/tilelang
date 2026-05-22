@@ -355,6 +355,26 @@ TIR_DEFINE_TL_BUILTIN(ascend_simd_div)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(ascend_simd_max)
+    .set_num_inputs(4)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(ascend_simd_min)
+    .set_num_inputs(4)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(ascend_simd_reduce_max)
+    .set_num_inputs(3)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(ascend_simd_reduce_sum)
+    .set_num_inputs(3)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(ascend_simd_exp)
     .set_num_inputs(3)
     .set_attr<TCallEffectKind>("TCallEffectKind",
@@ -390,6 +410,16 @@ TIR_DEFINE_TL_BUILTIN(ascend_simd_duplicate)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(ascend_simd_dup)
+    .set_num_inputs(2)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(ascend_simd_cast)
+    .set_num_inputs(5)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(ascend_simd_load)
     .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
@@ -405,6 +435,11 @@ TIR_DEFINE_TL_BUILTIN(ascend_simd_store)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(ascend_simd_store_pack)
+    .set_num_inputs(4)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(ascend_simd_create_addr_reg)
     .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
@@ -416,6 +451,11 @@ TIR_DEFINE_TL_BUILTIN(ascend_simd_update_mask)
                                Integer(CallEffectKind::kPure));
 
 TIR_DEFINE_TL_BUILTIN(ascend_init_mask)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kPure));
+
+TIR_DEFINE_TL_BUILTIN(ascend_simd_create_mask)
     .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kPure));

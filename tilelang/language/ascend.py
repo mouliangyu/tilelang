@@ -403,6 +403,26 @@ def ascend_simd_div(dst, src0, src1, mask) -> None:
     return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_div"), dst, src0, src1, mask)
 
 
+def ascend_simd_max(dst, src0, src1, mask) -> None:
+    """MicroAPI::Max(dst, src0, src1, mask)"""
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_max"), dst, src0, src1, mask)
+
+
+def ascend_simd_min(dst, src0, src1, mask) -> None:
+    """MicroAPI::Min(dst, src0, src1, mask)"""
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_min"), dst, src0, src1, mask)
+
+
+def ascend_simd_reduce_max(dst, src, mask) -> None:
+    """MicroAPI::Reduce<ReduceType::MAX>(dst, src, mask)"""
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_reduce_max"), dst, src, mask)
+
+
+def ascend_simd_reduce_sum(dst, src, mask) -> None:
+    """MicroAPI::Reduce<ReduceType::SUM>(dst, src, mask)"""
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_reduce_sum"), dst, src, mask)
+
+
 def ascend_simd_exp(dst, src, mask) -> None:
     """MicroAPI::Exp(dst, src, mask)"""
     return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_exp"), dst, src, mask)
@@ -449,6 +469,42 @@ def ascend_simd_duplicate(dst, src, mask) -> None:
         Mask register controlling active lanes.
     """
     return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_duplicate"), dst, src, mask)
+
+
+def ascend_simd_dup(dst, scalar) -> None:
+    """Ascend SimdVF MicroAPI Duplicate (scalar): broadcast scalar to all lanes.
+
+    Generates: AscendC::MicroAPI::Duplicate(dst, scalar)
+
+    Parameters
+    ----------
+    dst : Var
+        Destination fragment register (data field).
+    scalar : PrimExpr
+        Scalar value to broadcast to all lanes.
+    """
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_dup"), dst, scalar)
+
+
+def ascend_simd_cast(dst, src, mask, to_dtype="bfloat16_t", from_dtype="float") -> None:
+    """Ascend SimdVF MicroAPI Cast: type convert between fragment registers.
+
+    Generates: AscendC::MicroAPI::Cast<to_dtype, from_dtype, castTrait>(dst, src, mask)
+
+    Parameters
+    ----------
+    dst : Var
+        Destination fragment register.
+    src : Var
+        Source fragment register.
+    mask : PrimExpr
+        Mask register controlling active lanes.
+    to_dtype : str
+        Destination C++ type (e.g. "bfloat16_t").
+    from_dtype : str
+        Source C++ type (e.g. "float").
+    """
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_cast"), to_dtype, from_dtype, dst, src, mask)
 
 
 def ascend_simd_create_addr_reg(*args, dtype="float"):
@@ -507,6 +563,16 @@ def ascend_simd_store(dst_ptr, src_frag, mask, addr_reg=None, dtype="float") -> 
     if addr_reg is not None:
         return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_store"), dtype, dst_ptr, src_frag, addr_reg, mask)
     return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_store"), dtype, dst_ptr, src_frag, mask)
+
+
+def ascend_simd_store_pack(dst_ptr, src_frag, mask, dtype="bfloat16_t") -> None:
+    """Ascend SimdVF MicroAPI StoreAlign with DIST_PACK_B32.
+
+    Generates: AscendC::MicroAPI::StoreAlign<dtype, StoreDist::DIST_PACK_B32>(dst, src, mask)
+
+    Used after f32→bf16 cast to compact bf16 values from 32-bit slots into contiguous 16-bit memory.
+    """
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_simd_store_pack"), dtype, dst_ptr, src_frag, mask)
 
 
 def ascend_simd_update_mask(count, dtype="float"):
@@ -599,6 +665,24 @@ def ascend_init_mask(count):
     if isinstance(count, int):
         count = tir.IntImm("int32", count)
     return tir.call_intrin("handle", tir.op.Op.get("tl.ascend_init_mask"), count)
+
+
+def ascend_simd_create_mask(dtype="float"):
+    """Create a full mask register with all lanes active.
+
+    Generates: AscendC::MicroAPI::CreateMask<dtype>()
+
+    Parameters
+    ----------
+    dtype : str
+        The data type string for the mask (e.g. "float", "half_t").
+
+    Returns
+    -------
+    PrimExpr
+        Opaque handle representing the MaskReg.
+    """
+    return tir.call_intrin("handle", tir.op.Op.get("tl.ascend_simd_create_mask"), dtype)
 
 
 def set_hf32_mode(mode=None):
