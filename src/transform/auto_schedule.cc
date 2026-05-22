@@ -43,6 +43,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -85,7 +86,7 @@ public:
       if (ann_val.has_value()) {
         auto *map_obj = ann_val.value().as<ffi::MapObj>();
         if (map_obj) {
-          for (auto it : *map_obj) {
+          for (const auto &it : *map_obj) {
             if (auto *var = it.first.as<VarNode>()) {
               if (auto imm = it.second.as<int>()) {
                 buffer_versions_overrides[var->name_hint] = imm.value();
@@ -606,6 +607,335 @@ static bool HasWarpgroupId(IRStructure *node, int wg_id) {
   return false;
 }
 
+// Collect register buffers read by all broadcast tasks in the IR tree.
+static void CollectBroadcastRegisterReads(
+    IRStructure *node, std::unordered_set<const BufferNode *> &reg_bufs) {
+  if (!node)
+    return;
+  auto collect_from_leaf_task = [&](const TaskNode *task) {
+    if (!task)
+      return;
+    int wg_id = task->GetWarpgroupId();
+    if (!IsWarpgroupBroadcast(wg_id) && wg_id != kWarpgroupUnassigned)
+      return;
+    for (const auto &region : task->GetReadRegions()) {
+      if (IsRegisterRegion(region)) {
+        reg_bufs.insert(region->buffer.get());
+      }
+    }
+  };
+  auto collect_from_structural_task = [&](const TaskNode *task) {
+    if (!task)
+      return;
+    for (const auto &region : task->GetReadRegions()) {
+      if (IsRegisterRegion(region)) {
+        reg_bufs.insert(region->buffer.get());
+      }
+    }
+  };
+
+  if (node->IsTask()) {
+    collect_from_leaf_task(static_cast<TaskNode *>(node));
+  } else if (node->IsControl()) {
+    auto ctrl = static_cast<ControlNode *>(node);
+    if (ctrl->task)
+      collect_from_structural_task(ctrl->task.get());
+    CollectBroadcastRegisterReads(ctrl->child.get(), reg_bufs);
+  } else if (node->IsWrapper()) {
+    auto wrapper = static_cast<WrapperNode *>(node);
+    if (wrapper->task)
+      collect_from_structural_task(wrapper->task.get());
+    CollectBroadcastRegisterReads(wrapper->child.get(), reg_bufs);
+  } else if (node->IsSequence()) {
+    auto seq = static_cast<SequenceNode *>(node);
+    for (auto &child : seq->children) {
+      CollectBroadcastRegisterReads(child.get(), reg_bufs);
+    }
+  } else if (node->IsScheduleUnit()) {
+    auto unit = static_cast<ScheduleUnit *>(node);
+    CollectBroadcastRegisterReads(unit->child.get(), reg_bufs);
+  } else if (node->IsIf()) {
+    auto if_node = static_cast<IfNode *>(node);
+    if (if_node->task)
+      collect_from_structural_task(if_node->task.get());
+    CollectBroadcastRegisterReads(if_node->then_child.get(), reg_bufs);
+    if (if_node->else_child)
+      CollectBroadcastRegisterReads(if_node->else_child.get(), reg_bufs);
+  }
+}
+
+// Propagate broadcast: if a broadcast task reads a register buffer,
+// any leaf task that writes that register buffer must also be broadcast
+// (because each wg needs its own initialized copy).
+static void PropagateBroadcastWarpgroupId(IRStructure *root) {
+  std::vector<TaskNodeWithContext> all_tasks;
+  CollectAllTaskNodesWithContext(root, all_tasks);
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    // 1. Collect register buffers read by all current broadcast tasks
+    std::unordered_set<const BufferNode *> broadcast_reg_reads;
+    CollectBroadcastRegisterReads(root, broadcast_reg_reads);
+    // Also collect from leaf broadcast tasks
+    for (auto &task_ctx : all_tasks) {
+      TaskNode *task = task_ctx.task;
+      if (!IsWarpgroupBroadcast(task->GetWarpgroupId()))
+        continue;
+      for (const auto &region : task->GetReadRegions()) {
+        if (IsRegisterRegion(region)) {
+          broadcast_reg_reads.insert(region->buffer.get());
+        }
+      }
+    }
+    // 2. Mark leaf tasks that write these register buffers as broadcast
+    if (!broadcast_reg_reads.empty()) {
+      for (auto &task_ctx : all_tasks) {
+        TaskNode *task = task_ctx.task;
+        if (IsWarpgroupBroadcast(task->GetWarpgroupId()))
+          continue;
+        for (const auto &region : task->GetWriteRegions()) {
+          if (IsRegisterRegion(region) &&
+              broadcast_reg_reads.count(region->buffer.get())) {
+            task->SetWarpgroupId(kWarpgroupBroadcast);
+            changed = true;
+            break;
+          }
+        }
+      }
+    }
+
+    // 3. Detect cross-warpgroup register buffer / scalar-var accesses
+    constexpr int kReaderAnyWg = std::numeric_limits<int>::min();
+    std::unordered_map<const BufferNode *, std::unordered_set<int>>
+        buffer_reader_wgs;
+    std::unordered_map<const BufferNode *, std::unordered_set<int>>
+        buffer_writer_wgs;
+    std::unordered_map<const VarNode *, std::unordered_set<int>> var_reader_wgs;
+    std::unordered_map<const VarNode *, std::unordered_set<int>> var_writer_wgs;
+
+    auto add_accesses = [&](const TaskNode *task, int reader_key, int wg_id) {
+      for (const auto &region : task->GetReadRegions()) {
+        if (IsRegisterRegion(region)) {
+          buffer_reader_wgs[region->buffer.get()].insert(reader_key);
+        }
+      }
+      if (wg_id >= 0) {
+        for (const auto &region : task->GetWriteRegions()) {
+          if (IsRegisterRegion(region)) {
+            buffer_writer_wgs[region->buffer.get()].insert(wg_id);
+          }
+        }
+      }
+      for (const auto &v : task->GetReadVars()) {
+        var_reader_wgs[v.get()].insert(reader_key);
+      }
+      if (wg_id >= 0) {
+        for (const auto &v : task->GetWriteVars()) {
+          var_writer_wgs[v.get()].insert(wg_id);
+        }
+      }
+    };
+
+    for (auto &task_ctx : all_tasks) {
+      TaskNode *task = task_ctx.task;
+      int wg_id = task->GetWarpgroupId();
+      int reader_key = (wg_id >= 0) ? wg_id : kReaderAnyWg;
+      add_accesses(task, reader_key, wg_id);
+    }
+    // Also include structural tasks
+    std::function<void(IRStructure *)> walk_structural =
+        [&](IRStructure *node) {
+          if (!node)
+            return;
+          auto add_struct = [&](const TaskNode *t) {
+            if (!t)
+              return;
+            int wg = t->GetWarpgroupId();
+            int key = (wg >= 0) ? wg : kReaderAnyWg;
+            if (IsWarpgroupBroadcast(wg))
+              key = kReaderAnyWg;
+            add_accesses(t, key, -1);
+          };
+          if (node->IsControl()) {
+            auto *c = static_cast<ControlNode *>(node);
+            add_struct(c->task.get());
+            walk_structural(c->child.get());
+          } else if (node->IsWrapper()) {
+            auto *w = static_cast<WrapperNode *>(node);
+            add_struct(w->task.get());
+            walk_structural(w->child.get());
+          } else if (node->IsIf()) {
+            auto *i = static_cast<IfNode *>(node);
+            add_struct(i->task.get());
+            walk_structural(i->then_child.get());
+            walk_structural(i->else_child.get());
+          } else if (node->IsSequence()) {
+            auto *s = static_cast<SequenceNode *>(node);
+            for (auto &c : s->children)
+              walk_structural(c.get());
+          } else if (node->IsScheduleUnit()) {
+            auto *u = static_cast<ScheduleUnit *>(node);
+            walk_structural(u->child.get());
+          }
+        };
+    walk_structural(root);
+
+    std::unordered_set<const BufferNode *> cross_wg_buffers;
+    for (const auto &kv : buffer_reader_wgs) {
+      const auto *buf = kv.first;
+      const auto &reader_wgs = kv.second;
+      const auto &writer_wgs = buffer_writer_wgs[buf];
+      for (int rwg : reader_wgs) {
+        if (writer_wgs.find(rwg) == writer_wgs.end()) {
+          cross_wg_buffers.insert(buf);
+          break;
+        }
+      }
+    }
+
+    std::unordered_set<const VarNode *> cross_wg_vars;
+    for (const auto &kv : var_reader_wgs) {
+      const auto *v = kv.first;
+      const auto &reader_wgs = kv.second;
+      auto it_w = var_writer_wgs.find(v);
+      if (it_w == var_writer_wgs.end())
+        continue;
+      const auto &writer_wgs = it_w->second;
+      for (int rwg : reader_wgs) {
+        if (writer_wgs.find(rwg) == writer_wgs.end()) {
+          cross_wg_vars.insert(v);
+          break;
+        }
+      }
+    }
+
+    if (!cross_wg_buffers.empty() || !cross_wg_vars.empty()) {
+      for (auto &task_ctx : all_tasks) {
+        TaskNode *task = task_ctx.task;
+        if (IsWarpgroupBroadcast(task->GetWarpgroupId()))
+          continue;
+        bool should_broadcast = false;
+        for (const auto &region : task->GetWriteRegions()) {
+          if (IsRegisterRegion(region) &&
+              cross_wg_buffers.count(region->buffer.get())) {
+            should_broadcast = true;
+            break;
+          }
+        }
+        if (!should_broadcast) {
+          for (const auto &v : task->GetWriteVars()) {
+            if (cross_wg_vars.count(v.get())) {
+              should_broadcast = true;
+              break;
+            }
+          }
+        }
+        if (should_broadcast) {
+          task->SetWarpgroupId(kWarpgroupBroadcast);
+          changed = true;
+        }
+      }
+    }
+  }
+}
+
+// Local enumerator for PropagateReadRegions: in addition to leaf TaskNodes,
+// also include TaskNodes that live as WrapperNode::task (i.e. LetDecl /
+// AttrDecl tasks built by IRStructureBuilder::VisitStmt_(LetStmtNode*) and
+// VisitStmt_(AttrStmtNode*)). The shared CollectAllTaskNodesWithContext
+// helper deliberately skips these wrapped tasks; other callers rely on that
+// behavior, so we do the collection locally here.
+static void CollectTaskNodesForPropagation(IRStructure *node,
+                                           std::vector<TaskNode *> &out) {
+  if (!node)
+    return;
+  if (node->IsTask()) {
+    out.push_back(static_cast<TaskNode *>(node));
+  } else if (node->IsSequence()) {
+    auto seq = static_cast<const SequenceNode *>(node);
+    for (const auto &child : seq->children)
+      CollectTaskNodesForPropagation(child.get(), out);
+  } else if (node->IsControl()) {
+    auto ctrl = static_cast<const ControlNode *>(node);
+    CollectTaskNodesForPropagation(ctrl->child.get(), out);
+  } else if (node->IsWrapper()) {
+    auto wrapper = static_cast<const WrapperNode *>(node);
+    if (wrapper->task)
+      out.push_back(wrapper->task.get());
+    CollectTaskNodesForPropagation(wrapper->child.get(), out);
+  } else if (node->IsScheduleUnit()) {
+    auto unit = static_cast<const ScheduleUnit *>(node);
+    CollectTaskNodesForPropagation(unit->child.get(), out);
+  } else if (node->IsIf()) {
+    auto if_node = static_cast<const IfNode *>(node);
+    CollectTaskNodesForPropagation(if_node->then_child.get(), out);
+    if (if_node->else_child)
+      CollectTaskNodesForPropagation(if_node->else_child.get(), out);
+  } else {
+    LOG(FATAL) << "Unknown IRStructure kind in "
+                  "CollectTaskNodesForPropagation";
+  }
+}
+
+// Propagate read regions from LetDecl tasks to their consumers via scalar vars.
+// When a task reads a scalar var that was defined by a LetDecl (e.g.
+// m_tile_3 = buf[0]), the LetDecl's read_regions are added to the task so that
+// register buffer dependencies become visible to barrier analysis.
+static void PropagateReadRegions(IRStructure *root) {
+  std::vector<TaskNode *> all_tasks;
+  CollectTaskNodesForPropagation(root, all_tasks);
+
+  // Build mapping: var → the LetDecl TaskNode that defines it
+  std::unordered_map<const VarNode *, TaskNode *> var_to_let_decl;
+  for (TaskNode *task : all_tasks) {
+    if (IsLetDeclTask(task)) {
+      const auto *let = task->stmts[0].as<LetStmtNode>();
+      var_to_let_decl[let->var.get()] = task;
+    }
+  }
+
+  if (var_to_let_decl.empty())
+    return;
+
+  // Iterate until no new read regions or read vars are added.
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    // Count total regions before this round
+    size_t count_before = 0;
+    for (TaskNode *task : all_tasks)
+      count_before += task->GetReadRegions().size();
+
+    for (TaskNode *task : all_tasks) {
+      if (IsLetDeclTask(task))
+        continue;
+
+      // Snapshot current read vars (may grow during propagation)
+      std::vector<Var> read_vars = task->GetReadVars();
+      for (const auto &var : read_vars) {
+        auto it = var_to_let_decl.find(var.get());
+        if (it == var_to_let_decl.end())
+          continue;
+        TaskNode *def = it->second;
+        // Propagate the defining LetDecl's read_regions
+        for (const auto &region : def->GetReadRegions())
+          task->AddReadRegion(region);
+        // Also propagate the LetDecl's own read_vars (transitive)
+        for (const auto &v : def->GetReadVars())
+          task->AddReadVar(v);
+      }
+    }
+
+    // Check if any new regions appeared
+    size_t count_after = 0;
+    for (TaskNode *task : all_tasks)
+      count_after += task->GetReadRegions().size();
+    if (count_after > count_before)
+      changed = true;
+  }
+}
+
 // Handles IRStructure building, Z3 scheduling (with Ascend sync insertion),
 // and Stmt conversion.
 static ScheduledKernelResult ScheduleSingleKernel(
@@ -617,6 +947,11 @@ static ScheduledKernelResult ScheduleSingleKernel(
   auto ir_structure = builder.Build(kernel_body, target);
 
   ICHECK(ir_structure) << "IRStructure is null (empty body?)";
+
+  // Propagate read regions through scalar var dependencies so that register
+  // buffers accessed indirectly (e.g. m_tile → m_tile_3 → MTE copy) are visible
+  // to barrier analysis.
+  PropagateReadRegions(ir_structure.get());
 
   // Build ScheduleUnits from IRStructure (Z3 scheduling + Ascend sync)
   ScheduleUnitBuilder unit_builder;
@@ -651,9 +986,16 @@ static ScheduledKernelResult ScheduleSingleKernel(
           }
         }
         t->SetWarpgroupId(to_l1 ? 1 : 0);
+      } else if (m == 0) {
+        // Scalar-only tasks (e.g. swizzle arithmetic): broadcast to all wgs.
+        t->SetWarpgroupId(kWarpgroupBroadcast);
       }
     }
   }
+
+  // Propagate broadcast warpgroup IDs for register buffers accessed
+  // across warp groups.
+  PropagateBroadcastWarpgroupId(ir_structure.get());
 
   EventIdMap event_id_map;
   FlagInfoList flag_infos;

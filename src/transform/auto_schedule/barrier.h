@@ -1062,7 +1062,7 @@ AnalyzeSequenceNodeBarriers(SequenceNode *seq, EventIdMap &event_id_map,
   // Analyze dependencies and insert synchronization
   auto sync_infos = GetSyncInfos(units, 2);
   auto sync_points = CollectSyncPoints(units, sync_infos);
-  sync_points = OptimizeSyncPoints(sync_points);
+  // sync_points = OptimizeSyncPoints(sync_points);
   InsertSyncPoints(sync_points, flag_infos, sid, event_id_map, loop_info);
 }
 
@@ -1103,6 +1103,12 @@ AnalyzeControlNodeBarriers(ControlNode *ctrl, EventIdMap &event_id_map,
     }
   }
 
+  // Sort units by stage (largest first) to match SW-pipelining order — the
+  // latest stage produces a value first across iterations.
+  std::stable_sort(
+      units.begin(), units.end(),
+      [](ScheduleUnit *a, ScheduleUnit *b) { return a->stage > b->stage; });
+
   // Create new buffers for multi-buffer
   std::unordered_map<Buffer, Buffer, ObjectPtrHash, ObjectPtrEqual>
       multi_buffer;
@@ -1131,7 +1137,7 @@ AnalyzeControlNodeBarriers(ControlNode *ctrl, EventIdMap &event_id_map,
   // Analyze dependencies and insert synchronization
   auto sync_infos = GetSyncInfos(units, 2, ctrl->buffer_num_versions, true);
   auto sync_points = CollectSyncPoints(units, sync_infos);
-  sync_points = OptimizeSyncPoints(sync_points);
+  // sync_points = OptimizeSyncPoints(sync_points);
   InsertSyncPoints(sync_points, flag_infos, sid, event_id_map, loop_info);
 
   // Remove this loop from nesting info when exiting

@@ -522,7 +522,7 @@ public:
 
     // Extract results
     // Python function returns (start_times, buffer_versions, best_ii) as a
-    // tuple
+    // 3-tuple. Stages are computed in C++ from start_times and II — see below.
     auto return_val =
         z3_schedule_loop_func
             .value()(num_stages, tvm_latencies, tvm_iis, tvm_resource_flags,
@@ -536,10 +536,47 @@ public:
     ii = return_val.get<2>();
 
     // Sort children by start_time (with original index as tie-breaker).
+    // Derive a per-task stage from (start_time / ii). Z3 schedules
+    // `start = k * ii + r` so `start_time / ii` recovers k. Producers (low k,
+    // earliest in z3's absolute time) get stage 0; later tasks get NEGATIVE
+    // stages.
+    //
+    // Downstream (warpgroup_partition.cc) emits the body with
+    // `shift = (max_stage - stage) * step`. With max_stage == 0:
+    //   - producer (stage 0)         → shift 0   → processes iter k at
+    //                                              physical iter k (runs
+    //                                              first in the pipeline)
+    //   - consumer (stage -D)        → shift D   → processes iter k-D at
+    //                                              physical iter k (runs D
+    //                                              iters delayed)
+    // which matches SW-pipeline semantics: producer at the "early" stage
+    // writes for the current iter, consumer at the "late" stage reads
+    // producer's output D iters later.
+    std::map<IRStructure *, int> stage_map;
+    std::map<IRStructure *, int64_t> start_time_map;
+    std::vector<int> raw_k(n, 0);
+    int min_k_raw = std::numeric_limits<int>::max();
+    for (size_t i = 0; i < n; ++i) {
+      start_time_map[nodes[i]] = start_times[i];
+      // ii is the inner-loop II just returned by z3. Guard the num_stages==1
+      // path where ii may not represent a modulo II — every task then lands
+      // on stage 0 and we fall back to the non-pipelined emitter.
+      int k = (ii > 0) ? static_cast<int>(start_times[i] / ii) : 0;
+      raw_k[i] = k;
+      min_k_raw = std::min(min_k_raw, k);
+    }
+    if (min_k_raw == std::numeric_limits<int>::max())
+      min_k_raw = 0;
+    for (size_t i = 0; i < n; ++i) {
+      // Producer (smallest k) maps to stage 0; later tasks get negative
+      // stages whose magnitude is their delay relative to the producer.
+      stage_map[nodes[i]] = min_k_raw - raw_k[i];
+    }
     std::vector<std::pair<int64_t, size_t>> start_time_with_idx;
     start_time_with_idx.reserve(n);
     for (size_t i = 0; i < n; ++i) {
-      start_time_with_idx.emplace_back(start_times[i], i);
+      int stage = stage_map[nodes[i]];
+      start_time_with_idx.emplace_back(start_times[i] + stage * ii, i);
     }
 
     // Sort by start_time, then by original index
@@ -604,11 +641,91 @@ public:
       }
       return false;
     };
+    auto SolveConflictVar = [&]() -> bool {
+      auto HasVarRawDep = [](const IRStructure *producer,
+                             const IRStructure *consumer) -> bool {
+        for (const auto &w : producer->GetWriteVars()) {
+          for (const auto &r : consumer->GetReadVars()) {
+            if (SameVar(w, r))
+              return true;
+          }
+        }
+        return false;
+      };
+      for (size_t i = 0; i < n; ++i)
+        if (IsVarDecl(seq_body->children[i].get())) {
+          for (size_t j = 0; j < n; ++j) {
+            if (i == j)
+              continue;
+
+            auto node_i = seq_body->children[i].get();
+            auto node_j = seq_body->children[j].get();
+            int rem_stage_j = stage_map[node_j];
+
+            if (!HasVarRawDep(node_i, node_j))
+              continue;
+
+            if (stage_map[node_j] == stage_map[node_i])
+              continue;
+
+            auto node_i_task = static_cast<TaskNode *>(node_i);
+            auto node_i_let_stmt = node_i_task->stmts[0].as<LetStmtNode>();
+
+            auto cloned_value = node_i_let_stmt->value;
+            auto cloned_let_stmt =
+                LetStmt(node_i_let_stmt->var.copy_with_suffix(""), cloned_value,
+                        Evaluate(0));
+            auto cloned_task = std::make_shared<TaskNode>();
+            cloned_task->stmts.push_back(cloned_let_stmt);
+            cloned_task->SetReadRegions(node_i_task->GetReadRegions());
+            cloned_task->SetWriteRegions(node_i_task->GetWriteRegions());
+            cloned_task->SetReadVars(node_i_task->GetReadVars());
+            {
+              auto write_vars = node_i_task->GetWriteVars();
+              for (auto &v : write_vars) {
+                if (v.same_as(node_i_let_stmt->var)) {
+                  v = cloned_let_stmt->var;
+                }
+              }
+              cloned_task->SetWriteVars(write_vars);
+            }
+            cloned_task->SetLatency(node_i_task->GetLatency());
+            cloned_task->SetII(node_i_task->GetII());
+            cloned_task->SetPipeMask(node_i_task->GetPipeMask());
+            stage_map[cloned_task.get()] = rem_stage_j;
+
+            for (size_t k = j; k < n; ++k) {
+              auto node_k = seq_body->children[k].get();
+              if (rem_stage_j != stage_map[node_k])
+                continue;
+              if (HasVarRawDep(node_i, node_k)) {
+                node_k->SubstituteVar(node_i_let_stmt->var,
+                                      cloned_let_stmt->var);
+                stage_map[node_k] = rem_stage_j;
+              }
+            }
+
+            seq_body->children.insert(seq_body->children.begin() + j,
+                                      std::move(cloned_task));
+            n += 1;
+            return true; // Conflict resolved, restart the loop
+          }
+        }
+      return false;
+    };
+    // Resolve conflicts until no more conflicts exist or max iterations
+    // reached (to avoid infinite loop)
+    int conflict_count = 0;
+    while (SolveConflictVar() && ++conflict_count < 100)
+      ;
 
     for (size_t k = 0; k < seq_body->children.size(); ++k) {
       auto unit = std::make_shared<ScheduleUnit>();
+      auto *child_ptr = seq_body->children[k].get();
+      unit->stage = stage_map[child_ptr];
+      auto it = start_time_map.find(child_ptr);
+      unit->SetStartTime(it != start_time_map.end() ? it->second : 0);
       unit->child = std::move(seq_body->children[k]);
-      unit->SetStartTime(sorted_start_times[k]);
       seq_body->children[k] = std::move(unit);
     }
 

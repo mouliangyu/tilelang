@@ -289,6 +289,7 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
     auto new_unit = std::make_shared<ScheduleUnit>();
     new_unit->child = CloneIRStructureWithWarpgroupFilter(
         unit->child.get(), warpgroup_id, var_remap);
+    new_unit->stage = unit->stage;
 
     if (!child_is_let_decl) {
       // Copy before/after for the target warp group
@@ -502,6 +503,7 @@ RemoveUnusedLetDecls(std::shared_ptr<IRStructure> root) {
       auto new_unit = std::make_shared<ScheduleUnit>();
       new_unit->before = unit->before;
       new_unit->after = unit->after;
+      new_unit->stage = unit->stage;
       new_unit->child = filter_tree(unit->child);
       if (!new_unit->child)
         return nullptr;
@@ -521,6 +523,17 @@ RemoveUnusedLetDecls(std::shared_ptr<IRStructure> root) {
   };
 
   return filter_tree(root);
+}
+
+// Wrap a single stmt in an if-guard. For SimtVF / SimdVF blocks this leaves
+// the block (and its alloc_buffers / launch_thread attrs) intact under the
+// IfThenElse — codegen's IfThenElseNode handler then naturally emits the
+// `if (cond) { asc_vf_call<...>(...) }` pattern around the call site while
+// the helper function definition stays at file scope. This avoids pushing
+// the guard into the helper body (which made every thread evaluate the
+// per-iteration condition redundantly).
+static Stmt GuardWithIf(const Stmt &body, const PrimExpr &condition) {
+  return IfThenElse(condition, body);
 }
 
 Stmt ConvertIRStructureToStmt(IRStructure *structure, Var sid) {
@@ -671,25 +684,24 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure, Var sid) {
     PrimExpr loop_step = ctrl->control->step.has_value()
                              ? ctrl->control->step.value()
                              : IntImm(DataType::Int(32), 1);
-    std::vector<Stmt> stmts;
-    if (ctrl->child->IsScheduleUnit()) {
-      auto unit = static_cast<ScheduleUnit *>(ctrl->child.get());
-      for (auto &[_, before] : unit->before) {
-        for (auto &stmt : before) {
-          stmts.push_back(stmt);
-        }
-      }
-      stmts.push_back(ConvertIRStructureToStmt(unit->child.get(), sid));
-      for (auto &[_, after] : unit->after) {
-        for (auto &stmt : after) {
-          stmts.push_back(stmt);
-        }
-      }
-    } else if (ctrl->child->IsSequence()) {
+    int min_stages = 100, max_stages = -1;
+    if (ctrl->child->IsSequence()) {
       auto seq = static_cast<SequenceNode *>(ctrl->child.get());
       for (auto &child : seq->children) {
-        ICHECK(child->IsScheduleUnit());
         auto unit = static_cast<ScheduleUnit *>(child.get());
+        min_stages = std::min(min_stages, unit->stage);
+        max_stages = std::max(max_stages, unit->stage);
+      }
+    }
+    // Stage-aware prologue/epilogue emission: substitute loop_var and wrap
+    // each task in an `if (cond)` guard so that within a single extended
+    // loop the right stages run for each iteration. Separate unrolled
+    // prologue/epilogue blocks are disabled for now (enable_pro/enable_epi
+    // forced to false).
+    if (!ctrl->child->IsSequence() || min_stages == max_stages) {
+      std::vector<Stmt> stmts;
+      if (ctrl->child->IsScheduleUnit()) {
+        auto unit = static_cast<ScheduleUnit *>(ctrl->child.get());
         for (auto &[_, before] : unit->before) {
           for (auto &stmt : before) {
             stmts.push_back(stmt);
@@ -701,20 +713,109 @@ Stmt ConvertIRStructureToStmt(IRStructure *structure, Var sid) {
             stmts.push_back(stmt);
           }
         }
+      } else if (ctrl->child->IsSequence()) {
+        auto seq = static_cast<SequenceNode *>(ctrl->child.get());
+        for (auto &child : seq->children) {
+          ICHECK(child->IsScheduleUnit());
+          auto unit = static_cast<ScheduleUnit *>(child.get());
+          for (auto &[_, before] : unit->before) {
+            for (auto &stmt : before) {
+              stmts.push_back(stmt);
+            }
+          }
+          stmts.push_back(ConvertIRStructureToStmt(unit->child.get(), sid));
+          for (auto &[_, after] : unit->after) {
+            for (auto &stmt : after) {
+              stmts.push_back(stmt);
+            }
+          }
+        }
+      } else if (ctrl->child->IsTask()) {
+        auto task = static_cast<TaskNode *>(ctrl->child.get());
+        stmts.push_back(ConvertIRStructureToStmt(task, sid));
+      } else {
+        LOG(FATAL);
       }
-    } else if (ctrl->child->IsTask()) {
-      auto task = static_cast<TaskNode *>(ctrl->child.get());
-      stmts.push_back(ConvertIRStructureToStmt(task, sid));
-    } else {
-      LOG(FATAL);
+      Stmt body = SeqStmt::Flatten(stmts);
+      // Filter out scheduling-only annotations now that AutoSchedule is done.
+      Map<String, Any> filtered_annotations = ctrl->control->annotations;
+      filtered_annotations.erase("num_stages");
+      filtered_annotations.erase("multi_buffer_eligible");
+      return For(loop_var, loop_start, loop_extent, ctrl->control->kind, body,
+                 ctrl->control->thread_binding, filtered_annotations);
     }
-    Stmt body = SeqStmt::Flatten(stmts);
+    // Stage-aware single-loop body: substitute loop_var per task and wrap
+    // each task in a stage-appropriate `if (cond)` guard. Separate
+    // prologue/epilogue unrolled blocks are intentionally NOT emitted.
+    auto seq = static_cast<SequenceNode *>(ctrl->child.get());
+    std::vector<Stmt> steady;
+    for (auto &child : seq->children) {
+      auto unit = static_cast<ScheduleUnit *>(child.get());
+      Map<Var, PrimExpr> substitution, substitution_cond;
+      substitution.Set(loop_var,
+                       loop_var - loop_step * (max_stages - unit->stage));
+      substitution_cond.Set(
+          loop_var, Max(loop_start, Min(loop_start + loop_extent - loop_step,
+                                        loop_var - loop_step * (max_stages -
+                                                                unit->stage))));
+      PrimExpr condition =
+          And(loop_var < loop_start + loop_extent, loop_var >= loop_start);
+      if (unit->stage == min_stages) {
+        condition = loop_var >= loop_start;
+      }
+      if (unit->stage == max_stages) {
+        condition = loop_var < loop_start + loop_extent;
+      }
+      if (IsLetDeclNode(unit->child.get())) {
+        std::vector<Stmt> guarded;
+        for (const auto &[_, before] : unit->before) {
+          for (const auto &stmt : before) {
+            guarded.push_back(
+                Substitute(IfThenElse(condition, stmt), substitution));
+          }
+        }
+        guarded.push_back(
+            Substitute(ConvertIRStructureToStmt(unit->child.get(), sid),
+                       substitution_cond));
+        for (const auto &[_, after] : unit->after) {
+          for (const auto &stmt : after) {
+            guarded.push_back(
+                Substitute(IfThenElse(condition, stmt), substitution));
+          }
+        }
+        steady.push_back(SeqStmt::Flatten(guarded));
+      } else {
+        std::vector<Stmt> stmts;
+        for (const auto &[_, before] : unit->before) {
+          for (const auto &stmt : before) {
+            stmts.push_back(GuardWithIf(stmt, condition));
+          }
+        }
+        stmts.push_back(GuardWithIf(
+            ConvertIRStructureToStmt(unit->child.get(), sid), condition));
+        for (const auto &[_, after] : unit->after) {
+          for (const auto &stmt : after) {
+            stmts.push_back(GuardWithIf(stmt, condition));
+          }
+        }
+        Stmt stmt = SeqStmt::Flatten(stmts);
+        steady.push_back(Substitute(stmt, substitution));
+      }
+    }
+    Stmt new_body = SeqStmt::Flatten(steady);
+    auto new_var = loop_var.copy_with_suffix("");
     // Filter out scheduling-only annotations now that AutoSchedule is done.
     Map<String, Any> filtered_annotations = ctrl->control->annotations;
     filtered_annotations.erase("num_stages");
     filtered_annotations.erase("multi_buffer_eligible");
-    return For(loop_var, loop_start, loop_extent, ctrl->control->kind, body,
-               ctrl->control->thread_binding, filtered_annotations);
+    Map<Var, PrimExpr> sub_var;
+    sub_var.Set(loop_var, new_var);
+    For for_op =
+        For(new_var, loop_start,
+            ctrl->control->extent + loop_step * (max_stages - min_stages),
+            ctrl->control->kind, Substitute(new_body, sub_var),
+            ctrl->control->thread_binding, filtered_annotations);
+    return for_op;
   } else if (structure->IsWrapper()) {
     auto wrapper = static_cast<const WrapperNode *>(structure);
     Stmt body = Evaluate(0);

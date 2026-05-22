@@ -409,10 +409,10 @@ private:
   void VisitExpr_(const CallNode *op) final {
     static const auto region_op = Op::Get("tl.tileop.region");
     static const auto access_ptr_op = Op::Get("tl.access_ptr");
-    if (op->op.same_as(region_op) && op->args.size() >= 1) {
+    if (op->op.same_as(region_op) && !op->args.empty()) {
       if (const auto *bl = op->args[0].as<BufferLoadNode>())
         touched.insert(bl->buffer);
-    } else if (op->op.same_as(access_ptr_op) && op->args.size() >= 1) {
+    } else if (op->op.same_as(access_ptr_op) && !op->args.empty()) {
       if (const auto *bl = op->args[0].as<BufferLoadNode>())
         touched.insert(bl->buffer);
     }

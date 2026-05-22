@@ -226,24 +226,28 @@ std::shared_ptr<IRStructure> TaskNode::Clone() const {
 void TaskNode::CollectBufferAccessInfo(
     int num_wgs, std::set<BufferAccessInfo> &result) const {
   int wg_id = GetWarpgroupId();
-  // Collect write buffers
-  for (const auto &region : GetWriteRegions()) {
-    if (wg_id != -1) {
-      result.emplace(region->buffer, true, wg_id);
-    } else {
+  // Pre-warpgroup-assignment (unassigned) tasks are also treated as broadcast
+  // here, because Z3SchedulePythonLoop calls GetBufferAccessInfo before
+  // warpgroup ids are assigned (see auto_schedule.cc::ScheduleSingleKernel).
+  if (wg_id == kWarpgroupUnassigned || IsWarpgroupBroadcast(wg_id)) {
+    // Broadcast: shared across wgs — emit for all
+    for (const auto &region : GetWriteRegions()) {
       for (int i = 0; i < num_wgs; ++i) {
         result.emplace(region->buffer, true, i);
       }
     }
-  }
-  // Collect read buffers
-  for (const auto &region : GetReadRegions()) {
-    if (wg_id != -1) {
-      result.emplace(region->buffer, false, wg_id);
-    } else {
+    for (const auto &region : GetReadRegions()) {
       for (int i = 0; i < num_wgs; ++i) {
         result.emplace(region->buffer, false, i);
       }
+    }
+  } else {
+    // Normal assigned warpgroup
+    for (const auto &region : GetWriteRegions()) {
+      result.emplace(region->buffer, true, wg_id);
+    }
+    for (const auto &region : GetReadRegions()) {
+      result.emplace(region->buffer, false, wg_id);
     }
   }
 }
@@ -321,6 +325,7 @@ std::shared_ptr<IRStructure> ScheduleUnit::Clone() const {
   new_unit->SetLatency(GetLatency());
   new_unit->SetII(GetII());
   new_unit->SetStartTime(GetStartTime());
+  new_unit->stage = stage;
   return new_unit;
 }
 
