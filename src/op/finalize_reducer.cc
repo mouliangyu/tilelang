@@ -160,7 +160,9 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
 LayoutMap FinalizeReducerOpNode::InferLayout(const LayoutInferArgs &T,
                                              InferLevel level) const {
   LayoutMap layout_map;
-  layout_map.Set(reducer, T.layout_map.Get(reducer).value());
+  if (auto opt = T.layout_map.Get(reducer); opt.has_value()) {
+    layout_map.Set(reducer, opt.value());
+  }
   return layout_map;
 }
 

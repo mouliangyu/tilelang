@@ -768,6 +768,22 @@ private:
       // SimtVF is a control-style TileOperator wrapper. Visit body first so
       // nested TileOps (e.g. Parallel) are still collected normally.
       IRVisitorWithAnalyzer::VisitStmt(op->body);
+      // Post-load kLayoutMap from the SimtVF block annotation so that reducer
+      // layouts (set by LayoutReducer) are available during InferLayout.
+      // Must happen after visiting body so buffer_data_to_buffers_ is
+      // populated.
+      if (op->annotations.count(attr::kLayoutMap)) {
+        auto map = op->annotations.Get(attr::kLayoutMap)
+                       ->as<Map<Var, Layout>>()
+                       .value();
+        for (const auto &[var, layout] : map) {
+          if (buffer_data_to_buffers_.count(var)) {
+            for (const auto &buffer : buffer_data_to_buffers_[var]) {
+              annotated_layout_map_.Set(buffer, layout);
+            }
+          }
+        }
+      }
       auto infer = SimtVFOp(tvm::ffi::GetRef<Block>(op));
       infer_list_stmt_.push_back(tvm::ffi::GetRef<ObjectRef>(op));
       infer_list_.push_back(std::move(infer));
