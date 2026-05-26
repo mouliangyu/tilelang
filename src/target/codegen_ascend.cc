@@ -174,8 +174,7 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   }
 
   // Pre-scan body to determine kernel mode (Mix / Vector / Cube)
-  bool has_cube = false, has_vector = false, has_simtvf = false,
-       has_simdvf = false;
+  bool has_cube = false, has_vector = false;
   int vector_count = 2;
   tir::PostOrderVisit(f->body, [&](const ObjectRef &n) {
     if (const auto *block = n.as<tir::BlockNode>()) {
@@ -188,10 +187,7 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
             vector_count = imm->value;
           }
         }
-      } else if (block->name_hint == "SIMT_VF")
-        has_simtvf = true;
-      else if (block->name_hint == "SIMD_VF")
-        has_simdvf = true;
+      }
     }
     if (const auto *call = n.as<tir::CallNode>()) {
       if (call->op.same_as(tl::ascend_gemm_l1())) {
@@ -261,12 +257,6 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   if (has_nd2nz_copy_ && !has_nd2nz_copy_included_) {
     decl_stream << "#include <tl_templates/ascend/nd2nz_copy.h>\n";
     has_nd2nz_copy_included_ = true;
-  }
-
-  // Conditionally include micro_api header when SimdVF or nd2nz_copy is used
-  if ((has_simdvf || has_nd2nz_copy_) && !has_simdvf_included_) {
-    decl_stream << "#include <micro_api/kernel_micro_intf.h>\n";
-    has_simdvf_included_ = true;
   }
 
   if (has_cube && has_vector) {
@@ -701,8 +691,8 @@ void CodeGenTileLangAscend::VisitExpr_(const BroadcastNode *op,
 
 void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   if (op->op.same_as(tl::ascend_pipe_barrier())) {
-    ICHECK_EQ(op->args.size(), 1)
-        << "tl.ascend_pipe_barrier expects exactly 1 argument (pipe_t string)";
+    ICHECK_EQ(op->args.size(), 1) << "tl.ascend_pipe_barrier expects exactly "
+                                     "1 argument (pipe_t string)";
     std::string pipe_t_str = Downcast<StringImm>(op->args[0])->value;
     this->PrintIndent();
     this->stream << "AscendC::PipeBarrier<pipe_t::" << pipe_t_str << ">();\n";
@@ -815,7 +805,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     ICHECK_EQ(op->args.size(), 8)
         << "tl.ascend_copy_ubuf_to_gm expects exactly 8 arguments";
     this->PrintIndent();
-    this->stream << "bisheng::cce::copy_ubuf_to_gm_align_v2((__gm__ void*)(";
+    this->stream << "copy_ubuf_to_gm_align_v2((__gm__ void*)(";
     this->PrintExpr(op->args[0], this->stream);
     this->stream << "), (__ubuf__ void*)(";
     this->PrintExpr(op->args[1], this->stream);
@@ -853,8 +843,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       // ceil(height/16)*16 For dn2nz: height=inner_elems(K), width=n_rows(N);
       // dstNzC0Stride = ceil(width/16)*16 nd2nz [n_rows, d]: dstNzC0Stride =
       // ceil(n_rows/16)*16  (C0 tiles the row dimension) dn2nz [n_rows, d]:
-      // dstNzC0Stride = ceil(d/16)*16      (C0 tiles the col=N dimension after
-      // transpose)
+      // dstNzC0Stride = ceil(d/16)*16      (C0 tiles the col=N dimension
+      // after transpose)
       //   SDK: dn2nz dValue=height(=n_rows/K), dstNzC0Stride=Ceil(width=d/N,
       //   16)*16
       // dstNzC0Stride = Ceil(nValue, 16) * 16
@@ -863,13 +853,13 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       // dstNzC0Stride = Ceil(nValue, 16) * 16.
       int nz_c0_stride = ((n_rows_val + 15) / 16) * 16;
       this->PrintIndent();
-      this->stream << "bisheng::cce::set_mte2_nz_para("
+      this->stream << "set_mte2_nz_para("
                    << "uint64_t(1) | (uint64_t(1) << 16) | (uint64_t("
                    << nz_c0_stride << ") << 32));\n";
     }
     this->PrintIndent();
-    this->stream << (use_dn2nz ? "bisheng::cce::copy_gm_to_cbuf_multi_dn2nz("
-                               : "bisheng::cce::copy_gm_to_cbuf_multi_nd2nz(");
+    this->stream << (use_dn2nz ? "copy_gm_to_cbuf_multi_dn2nz("
+                               : "copy_gm_to_cbuf_multi_nd2nz(");
     this->PrintExpr(op->args[0], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[1], this->stream);
@@ -884,7 +874,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     ICHECK_EQ(op->args.size(), 9)
         << "tl.ascend_load_cbuf_to_ca expects exactly 9 arguments";
     this->PrintIndent();
-    this->stream << "bisheng::cce::load_cbuf_to_ca(";
+    this->stream << "load_cbuf_to_ca(";
     this->PrintExpr(op->args[0], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[1], this->stream);
@@ -899,7 +889,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     ICHECK_EQ(op->args.size(), 9)
         << "tl.ascend_load_cbuf_to_cb expects exactly 9 arguments";
     this->PrintIndent();
-    this->stream << "bisheng::cce::load_cbuf_to_cb(";
+    this->stream << "load_cbuf_to_cb(";
     this->PrintExpr(op->args[0], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[1], this->stream);
@@ -928,12 +918,12 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::ascend_copy_matrix_cc_to_gm())) {
     ICHECK_EQ(op->args.size(), 25)
         << "tl.ascend_copy_matrix_cc_to_gm expects exactly 25 arguments";
-    // Emit set_loop3_para: configure LOOP3_PARA for L0C→GM NZ-to-ND conversion
-    // ndNum=1, srcNdStride=0, dstNdStride=0 (single ND block)
+    // Emit set_loop3_para: configure LOOP3_PARA for L0C→GM NZ-to-ND
+    // conversion ndNum=1, srcNdStride=0, dstNdStride=0 (single ND block)
     this->PrintIndent();
-    this->stream << "bisheng::cce::set_loop3_para(uint64_t(1));\n";
+    this->stream << "set_loop3_para(uint64_t(1));\n";
     this->PrintIndent();
-    this->stream << "bisheng::cce::copy_matrix_cc_to_gm(";
+    this->stream << "copy_matrix_cc_to_gm(";
     this->PrintExpr(op->args[0], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[1], this->stream);
@@ -988,8 +978,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     //                        dst_dtype_str)
     // For multi-fractal: src_ub is the NZ tmp buffer produced by the scatter
     // — emit per-D-group copy_ubuf_to_cbuf with sid correction.
-    // For single-fractal (rows<=16 && cols<=16): src_ub is the raw ND source —
-    // emit one direct copy (ND == NZ in this case).
+    // For single-fractal (rows<=16 && cols<=16): src_ub is the raw ND source
+    // — emit one direct copy (ND == NZ in this case).
     ICHECK_EQ(op->args.size(), 6)
         << "tl.ascend_nd2nz_post_copy expects exactly 6 arguments";
     int rows = op->args[2].as<IntImmNode>()->value;
@@ -1068,7 +1058,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     ICHECK_EQ(op->args.size(), 10)
         << "tl.ascend_mad expects exactly 10 arguments";
     this->PrintIndent();
-    this->stream << "bisheng::cce::mad(";
+    this->stream << "mad(";
     this->PrintExpr(op->args[0], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[1], this->stream);
@@ -1274,7 +1264,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     this->stream << ");\n";
   }
-  // --- SimdVF store_pack: StoreAlign<dtype, DIST_PACK_B32>(ptr, src, mask) ---
+  // --- SimdVF store_pack: StoreAlign<dtype, DIST_PACK_B32>(ptr, src, mask)
+  // ---
   else if (op->op.same_as(tl::ascend_simd_store_pack())) {
     ICHECK_EQ(op->args.size(), 4);
     std::string dtype_str = Downcast<StringImm>(op->args[0])->value;
@@ -1351,9 +1342,9 @@ void CodeGenTileLangAscend::VisitStmt_(const ForNode *op) {
 }
 
 void CodeGenTileLangAscend::VisitStmt_(const AttrStmtNode *op) {
-  // Ascend text-only backend currently does not lower thread binding attrs into
-  // executable launch semantics. Keep generating the enclosed body instead of
-  // failing in the generic C backend.
+  // Ascend text-only backend currently does not lower thread binding attrs
+  // into executable launch semantics. Keep generating the enclosed body
+  // instead of failing in the generic C backend.
   if (op->attr_key == tir::attr::thread_extent ||
       op->attr_key == tir::attr::virtual_thread) {
     if (const auto *iv = op->node.as<IterVarNode>()) {
@@ -1418,10 +1409,10 @@ void CodeGenTileLangAscend::VisitStmt_(const AllocateNode *op) {
   std::string scope = GetPtrStorageScope(op->buffer_var);
 
   if (scope == "shared") {
-    LOG(FATAL)
-        << "Static shared memory (scope='shared') is not supported on Ascend. "
-        << "Use dynamic shared memory (scope='shared.dyn') with "
-           "T.alloc_shared.";
+    LOG(FATAL) << "Static shared memory (scope='shared') is not supported on "
+                  "Ascend. "
+               << "Use dynamic shared memory (scope='shared.dyn') with "
+                  "T.alloc_shared.";
   }
 
   // SimdVF: emit MicroAPI::RegTensor<T> for fragment buffers
@@ -1474,8 +1465,8 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::LetStmtNode *op) {
         return;
       }
       // ascend_simd_update_mask(dtype, count) → auto vid =
-      // UpdateMask<dtype>(count); When count is a Var (from ascend_init_mask),
-      // use it directly as lvalue.
+      // UpdateMask<dtype>(count); When count is a Var (from
+      // ascend_init_mask), use it directly as lvalue.
       if (call->op.same_as(tl::ascend_simd_update_mask())) {
         std::string dtype_str = Downcast<StringImm>(call->args[0])->value;
         if (call->args[1].as<VarNode>()) {
@@ -1666,8 +1657,8 @@ void CodeGenTileLangAscend::PrintCallExtern(Type ret_type,
                                             std::ostream &os) {
   DataType ret_dtype = GetRuntimeDataType(ret_type);
   if (ret_dtype.is_fixed_length_vector()) {
-    // Scalarize: for each lane, extract scalar args, call the scalar function,
-    // store result into the result vector lane.
+    // Scalarize: for each lane, extract scalar args, call the scalar
+    // function, store result into the result vector lane.
     std::string sret = name_supply_->FreshName("_");
     this->PrintIndent();
     this->PrintType(ret_dtype, stream);

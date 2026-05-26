@@ -222,7 +222,7 @@ def ascend_copy_gm_to_ubuf(dst, src, sid, n_burst, len_burst, src_stride, dst_st
 def ascend_copy_ubuf_to_gm(dst, src, sid, burst_num, burst_len, l2_cache_ctl, burst_dst_stride, burst_src_stride) -> None:
     """Insert an Ascend DMA copy from UBuf to GM.
 
-    Generates: bisheng::cce::copy_ubuf_to_gm_align_v2(dst, src, sid, burst_num, burst_len, l2_cache_ctl, burst_dst_stride, burst_src_stride);
+    Generates: copy_ubuf_to_gm_align_v2(dst, src, sid, burst_num, burst_len, l2_cache_ctl, burst_dst_stride, burst_src_stride);
 
     Parameters
     ----------
@@ -276,7 +276,7 @@ def _to_int32(v):
 def ascend_copy_gm_to_cbuf(dst, src, sid, loop1_src_stride, l2_cache_ctrl, n_value, d_value, loop4_src_stride, smallc0_en) -> None:
     """Ascend DMA copy from GM to CBuf (L1).
 
-    Generates: bisheng::cce::copy_gm_to_cbuf_multi_nd2nz(dst, src, sid,
+    Generates: copy_gm_to_cbuf_multi_nd2nz(dst, src, sid,
     loop1_src_stride, l2_cache_ctrl, n_value, d_value, loop4_src_stride, smallc0_en);
     """
     args = [dst, src] + [_to_int32(a) for a in [sid, loop1_src_stride, l2_cache_ctrl, n_value, d_value, loop4_src_stride, smallc0_en]]
@@ -286,7 +286,7 @@ def ascend_copy_gm_to_cbuf(dst, src, sid, loop1_src_stride, l2_cache_ctrl, n_val
 def ascend_load_cbuf_to_ca(dst, src, m_start, k_start, m_step, k_step, src_stride, dst_stride, transpose) -> None:
     """Ascend load from CBuf (L1) to CA (L0A).
 
-    Generates: bisheng::cce::load_cbuf_to_ca(dst, src, mStartPosition,
+    Generates: load_cbuf_to_ca(dst, src, mStartPosition,
     kStartPosition, mStep, kStep, srcStride, dstStride, transpose);
     """
     args = [dst, src] + [_to_int32(a) for a in [m_start, k_start, m_step, k_step, src_stride, dst_stride, transpose]]
@@ -296,7 +296,7 @@ def ascend_load_cbuf_to_ca(dst, src, m_start, k_start, m_step, k_step, src_strid
 def ascend_load_cbuf_to_cb(dst, src, m_start, k_start, m_step, k_step, src_stride, dst_stride, transpose) -> None:
     """Ascend load from CBuf (L1) to CB (L0B).
 
-    Generates: bisheng::cce::load_cbuf_to_cb(dst, src, mStartPosition,
+    Generates: load_cbuf_to_cb(dst, src, mStartPosition,
     kStartPosition, mStep, kStep, srcStride, dstStride, transpose);
     """
     args = [dst, src] + [_to_int32(a) for a in [m_start, k_start, m_step, k_step, src_stride, dst_stride, transpose]]

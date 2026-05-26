@@ -64,37 +64,34 @@ ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
 
   for (int sk = 0; sk < SUB_K; ++sk) {
     get_buf(PIPE_MTE1, buf_offset + (sk & 1), false);
-    bisheng::cce::load_cbuf_to_ca((__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)),
-                                  cbuf_a_ptr, 0, (sk * kStep), mStepA, kStep,
-                                  mStepA, mStepA, 0);
+    load_cbuf_to_ca((__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)), cbuf_a_ptr, 0,
+                    (sk * kStep), mStepA, kStep, mStepA, mStepA, 0);
     if constexpr (TRANS_B) {
       // NT case: W[N,K] in L1, cb transpose=false (ZZ)
       // rows=N, cols=K → sub-K along cols (kStart)
       // mStep=N/16 (nBlk), kStep=TILE_K_SUB/C0 (nGroups in K)
-      bisheng::cce::load_cbuf_to_cb(
-          (__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), cbuf_b_ptr, 0,
-          (sk * kStep), mStepB, kStep, mStepB, mStepB, 0);
+      load_cbuf_to_cb((__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), cbuf_b_ptr,
+                      0, (sk * kStep), mStepB, kStep, mStepB, mStepB, 0);
     } else {
       // NN case: B[K,N] in L1, cb transpose=true (ZN).
       // ⚠️ transpose=true in load_cbuf_to_cb only works for b16 types;
       //    fp32 NN matmul MUST use the NT path (transpose during GM→L1).
       // rows=K, cols=N → sub-K along rows (mStart)
       constexpr int srcStrideNN = K / C0; // nBlk in L1
-      bisheng::cce::load_cbuf_to_cb(
-          (__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), cbuf_b_ptr,
-          (sk * kStep), // mStartPosition: sub-K row offset
-          0,            // kStartPosition: start from col 0
-          kStep,        // mStep: TILE_K_SUB/C0 K-row fractals
-          mStepB,       // kStep: N/FRAC_N N-col fractals
-          srcStrideNN,  // srcStride: K/C0 (nBlk in L1)
-          kStep,        // dstStride: mStep
-          1);
+      load_cbuf_to_cb((__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), cbuf_b_ptr,
+                      (sk * kStep), // mStartPosition: sub-K row offset
+                      0,            // kStartPosition: start from col 0
+                      kStep,        // mStep: TILE_K_SUB/C0 K-row fractals
+                      mStepB,       // kStep: N/FRAC_N N-col fractals
+                      srcStrideNN,  // srcStride: K/C0 (nBlk in L1)
+                      kStep,        // dstStride: mStep
+                      1);
     }
     rls_buf(PIPE_MTE1, buf_offset + (sk & 1), false);
     get_buf(PIPE_M, buf_offset + (sk & 1), false);
-    bisheng::cce::mad(cc_ptr, (__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)),
-                      (__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), M,
-                      TILE_K_SUB, N, 0, 0, 0, clear_accum && (sk == 0));
+    mad(cc_ptr, (__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)),
+        (__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), M, TILE_K_SUB, N, 0, 0, 0,
+        clear_accum && (sk == 0));
     rls_buf(PIPE_M, buf_offset + (sk & 1), false);
   }
 }

@@ -52,7 +52,6 @@ private:
   bool has_gemm_l1_included_{false};
   bool has_nd2nz_copy_{false};
   bool has_nd2nz_copy_included_{false};
-  bool has_simdvf_included_{false};
   bool has_limits_included_{false};
   bool has_bf16_cast_{false};
   bool has_bf16_cast_included_{false};
