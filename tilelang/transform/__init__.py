@@ -9,6 +9,7 @@ from tvm.ir.transform import PassContext  # noqa: F401
 from .add_bufstore_wrapper import AddWrapperForSingleBufStore  # noqa: F401
 from .hoist_broadcast_values import HoistBroadcastValues  # noqa: F401
 from .decouple_type_cast import DecoupleTypeCast  # noqa: F401
+from .normalize_mixed_kernel_sid import NormalizeMixedKernelSid  # noqa: F401
 from . import z3_scheduler  # noqa: F401
 
 

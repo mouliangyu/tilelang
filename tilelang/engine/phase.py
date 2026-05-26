@@ -210,6 +210,7 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.AnnotateMultiBufferEligible()(mod)
         mod = tilelang.transform.IfConditionExtract()(mod)
         mod = tilelang.transform.AutoSchedule()(mod)
+        mod = tilelang.transform.NormalizeMixedKernelSid()(mod)
         mod = tilelang.transform.Simplify()(mod)
     # Lower T.Parallel inside SimdVF to MicroAPI vector ops (before layout passes)
     mod = tilelang.transform.AscendSimdVFLowerParallel()(mod)

@@ -371,6 +371,63 @@ def Kernel(
     return _ffi_api.KernelLaunch(blocks, normalized_threads, attrs)
 
 
+def MixedKernel(
+    *blocks: int | tir.PrimExpr,
+    sids: int = 2,
+    prelude: str | None = None,
+):
+    """Construct an Ascend NPU Mixed-kernel launch frame with sub-kernel ID binding.
+
+    Parameters
+    ----------
+    blocks : int
+        Number of blocks in the 1-D grid (blockIdx.x extent).
+    sids : int
+        Number of AIV sub-cores (1 or 2). Default is 2.
+        Binds as ``sid`` via ``get_subblockid()`` in generated code.
+    prelude : str, optional
+        Import C code injected before the generated kernel.
+
+    Returns
+    -------
+    res : KernelLaunchFrame
+        The resulting frame providing ``(bx, sid)`` variable bindings.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        with T.MixedKernel(NUM_BLOCKS, sids=2) as (bx, sid):
+            with T.Cube():
+                # AIC code using bx
+                ...
+            with T.Vector():
+                # AIV code using both bx and sid
+                ...
+    """
+    from tilelang.language.eager.builder import Builder
+
+    if Builder.current() is None:
+        raise JITNoBuilderError("T.MixedKernel() can only be used inside @tilelang.jit or @T.prim_func context. No Builder is available.")
+
+    if not check_ascend_availability():
+        raise RuntimeError("T.MixedKernel() requires an Ascend NPU environment (torch.npu.is_available() must return True).")
+
+    if len(blocks) != 1:
+        raise ValueError(f"T.MixedKernel() only supports 1-D block grid. Got {len(blocks)}-D: {blocks}")
+
+    if sids not in (1, 2):
+        raise ValueError(f"T.MixedKernel() sids must be 1 or 2. Got {sids}")
+
+    attrs: dict = {}
+    attrs["tilelang.is_npu_kernel_frame"] = True
+
+    if prelude is not None:
+        attrs["pragma_import_c"] = prelude
+
+    return _ffi_api.MixedKernelLaunch(blocks, sids, attrs)
+
+
 def get_thread_binding(dim: int = 0) -> Var:
     """Returns the thread binding for the given dimension."""
     simtvf = _get_current_simtvf()

@@ -348,6 +348,31 @@ KernelLaunchFrame KernelLaunch(const Array<PrimExpr> &grid_size,
   return KernelLaunchFrame(n);
 }
 
+KernelLaunchFrame MixedKernelLaunch(const Array<PrimExpr> &grid_size,
+                                    PrimExpr cthread_extent,
+                                    const Map<String, ffi::Any> &attrs) {
+  ObjectPtr<KernelLaunchFrameNode> n =
+      tvm::ffi::make_object<KernelLaunchFrameNode>();
+
+  ICHECK_EQ(grid_size.size(), 1) << "MixedKernel only supports 1-D grid";
+
+  // Frame 0: bx = blockIdx.x
+  n->frames.push_back(LaunchThread(
+      CreateEnvThread("bx", "blockIdx.x", grid_size[0].dtype()), grid_size[0]));
+
+  // Frame 1: sid = get_subblockid() via cthread
+  n->frames.push_back(
+      LaunchThread(CreateEnvThread("sid", "cthread", cthread_extent.dtype()),
+                   cthread_extent));
+
+  // Frame 2: MainBlock with NPU marker
+  auto main_block = tvm::script::ir_builder::tir::Block(MainBlockName);
+  main_block->annotations = attrs;
+  n->frames.push_back(main_block);
+
+  return KernelLaunchFrame(n);
+}
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef()
@@ -355,7 +380,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def("tl.SimtVF", SimtVF)
       .def("tl.Pipelined", PipelinedFor)
       .def("tl.Persistent", PersistentFor)
-      .def("tl.KernelLaunch", KernelLaunch);
+      .def("tl.KernelLaunch", KernelLaunch)
+      .def("tl.MixedKernelLaunch", MixedKernelLaunch);
 }
 
 /**

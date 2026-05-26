@@ -78,6 +78,7 @@ class TilelangRootBodyExtractor : public StmtVisitor {
 public:
   Stmt body;
   std::map<std::string, int64_t> buffer_versions_overrides;
+  Optional<Var> sid;
 
   void VisitStmt_(const BlockNode *op) override {
     if (op->name_hint == "tilelang_root") {
@@ -96,6 +97,16 @@ public:
         }
       }
       return; // Don't visit children
+    }
+    StmtVisitor::VisitStmt_(op);
+  }
+  void VisitStmt_(const AttrStmtNode *op) override {
+    if (op->attr_key == tir::attr::thread_extent) {
+      if (const auto *iv = op->node.as<IterVarNode>()) {
+        if (iv->thread_tag == "cthread") {
+          sid = iv->var;
+        }
+      }
     }
     StmtVisitor::VisitStmt_(op);
   }
@@ -940,7 +951,8 @@ static void PropagateReadRegions(IRStructure *root) {
 // and Stmt conversion.
 static ScheduledKernelResult ScheduleSingleKernel(
     const Stmt &kernel_body, Target target,
-    const std::map<std::string, int64_t> &buffer_versions_overrides = {}) {
+    const std::map<std::string, int64_t> &buffer_versions_overrides = {},
+    Optional<Var> external_sid = {}) {
   // Build IRStructure from the body to schedule
   ScheduledKernelResult result;
   IRStructureBuilder builder;
@@ -1000,7 +1012,12 @@ static ScheduledKernelResult ScheduleSingleKernel(
   EventIdMap event_id_map;
   FlagInfoList flag_infos;
   LoopNestingInfo loop_info;
-  Var sid("sid", DataType::Int(32));
+  Var sid;
+  if (external_sid.has_value()) {
+    sid = external_sid.value();
+  } else {
+    sid = Var("sid", DataType::Int(32));
+  }
   AnalyzeAndInsertBarriers(ir_structure.get(), event_id_map, flag_infos, sid,
                            loop_info, result.buffer_infos);
 
@@ -1054,12 +1071,19 @@ static ScheduledKernelResult ScheduleSingleKernel(
         Block({}, {}, {}, "CUBE", wg1_body, std::nullopt, {}, {}, {}));
     Map<String, ObjectRef> vec_annotations;
     vec_annotations.Set("vector_count", Integer(2));
-    IterVar sid_thread(Range(0, 2), sid, IterVarType::kThreadIndex, "cthread");
-    Stmt vec_body =
-        AttrStmt(sid_thread, tir::attr::thread_extent, Integer(2), wg0_body);
-    blocks.push_back(Block({}, {}, {}, "VECTOR", vec_body, std::nullopt, {}, {},
-                           vec_annotations));
-    result.scheduled_body = SeqStmt(blocks);
+    if (external_sid.has_value()) {
+      blocks.push_back(Block({}, {}, {}, "VECTOR", wg0_body, std::nullopt, {},
+                             {}, vec_annotations));
+      result.scheduled_body = SeqStmt(blocks);
+    } else {
+      IterVar sid_thread(Range(0, 2), sid, IterVarType::kThreadIndex,
+                         "cthread");
+      Stmt vec_body =
+          AttrStmt(sid_thread, tir::attr::thread_extent, Integer(2), wg0_body);
+      blocks.push_back(Block({}, {}, {}, "VECTOR", vec_body, std::nullopt, {},
+                             {}, vec_annotations));
+      result.scheduled_body = SeqStmt(blocks);
+    }
   } else if (has_wg0) {
     result.scheduled_body = wg0_body;
   } else {
@@ -1101,7 +1125,8 @@ tvm::transform::Pass AutoSchedule() {
       }
 
       auto overrides = extractor.buffer_versions_overrides;
-      auto kr = ScheduleSingleKernel(body_to_schedule, target, overrides);
+      auto kr = ScheduleSingleKernel(body_to_schedule, target, overrides,
+                                     extractor.sid);
 
       TilelangRootBodyReplacer replacer(kr.scheduled_body);
       Stmt final_body = replacer(func->body);
@@ -1137,7 +1162,8 @@ tvm::transform::Pass AutoSchedule() {
       Stmt body_to_schedule = extractor.body;
 
       auto overrides = extractor.buffer_versions_overrides;
-      auto result = ScheduleSingleKernel(body_to_schedule, target, overrides);
+      auto result = ScheduleSingleKernel(body_to_schedule, target, overrides,
+                                         extractor.sid);
       Stmt scheduled_body = result.scheduled_body;
 
       TilelangRootBodyReplacer replacer(scheduled_body);
