@@ -10,8 +10,6 @@ import torch
 
 from tilelang.utils.device import Event, device_synchronize, get_current_device
 
-device = get_current_device()
-
 
 class suppress_stdout_stderr:
     """Context manager to suppress stdout and stderr output.
@@ -94,6 +92,8 @@ def do_bench(
         Runtime in milliseconds (float) or list of quantile values if quantiles specified
     """
     assert return_mode in ["min", "max", "mean", "median"], f"Invalid return_mode: {return_mode}"
+
+    device = get_current_device()
 
     # Initial function call and synchronization
     fn()
