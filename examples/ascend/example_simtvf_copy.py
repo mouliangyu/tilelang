@@ -70,7 +70,7 @@ if __name__ == "__main__":
     # Create and compile kernel
     print(f"Compiling ubuf_multi kernel (N={N})...")
     program = ubuf_multi(N)
-    kernel = tilelang.compile(program, out_idx=-1)
+    kernel = tilelang.compile(program, out_idx=-1, pass_configs={tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False})
     print("Compilation succeeded!")
 
     # Create test data

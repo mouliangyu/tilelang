@@ -8,7 +8,11 @@ from example_simtvf_copy import ref_program, ubuf_multi
 
 def test_simtvf_copy():
     N = 1024
-    kernel = tilelang.compile(ubuf_multi(N), out_idx=-1)
+    kernel = tilelang.compile(
+        ubuf_multi(N),
+        out_idx=-1,
+        pass_configs={tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False},
+    )
     device = torch.device("npu")
     a = torch.randn(N, dtype=torch.float32, device=device)
     b = torch.randn(N, dtype=torch.float32, device=device)
