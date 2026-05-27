@@ -62,6 +62,7 @@
 #include "../target/utils.h"
 #include "./common/attr.h"
 #include "./common/collector.h"
+#include "./common/constr_visitor.h"
 #include "auto_schedule.h"
 #include "runtime/thread_storage_scope.h"
 #include "tir/transforms/ir_utils.h"
@@ -230,7 +231,18 @@ private:
 };
 
 // Visitor to build IRStructure from TIR statements
-class IRStructureBuilder : public StmtVisitor {
+//
+// Inherits `ConstrVisitor` so the constraint stack (For ranges, LetStmt
+// bindings, AttrStmt thread_extent/virtual_thread/tilelang_assume,
+// IfThenElse branch guards) is maintained automatically. Whenever a fresh
+// TaskNode is constructed, `StampCtx` snapshots `GetConstrSet()` onto it
+// for later use by RegionPartition::MayOverlap.
+//
+// Caveat: each VisitStmt_ override below replaces ConstrVisitor's default —
+// for nodes that introduce a scope (For, LetStmt, AttrStmt, IfThenElse),
+// the override must manually call `MakeGuard(...)` around the body
+// recursion to keep the stack accurate.
+class IRStructureBuilder : public ConstrVisitor {
 public:
   std::shared_ptr<IRStructure> Build(const Stmt &stmt,
                                      Target target = Target()) {
@@ -249,6 +261,12 @@ public:
   }
 
 protected:
+  // Stamp the current ConstrVisitor stack snapshot onto a freshly-built
+  // TaskNode, so RegionPartition::MayOverlap later sees the symbol
+  // environment (ancestor For ranges, Let bindings, thread_extents,
+  // tilelang_assume, branch guards) the region was written under.
+  void StampCtx(TaskNode *task) { task->outer_ctx = GetConstrSet(); }
+
   void VisitStmt_(const SeqStmtNode *op) override {
     auto seq_node = std::make_shared<SequenceNode>();
 
@@ -277,9 +295,15 @@ protected:
       if (op->step.defined())
         AnalyzeResourceUsage(Evaluate(GetRef<PrimExpr>(op->step.get())),
                              control_node->task.get(), true);
+      // Stamp the ctx outside the loop scope onto the loop's own task.
+      StampCtx(control_node->task.get());
 
-      // Process the loop body
-      VisitStmt(op->body);
+      // Process the loop body inside the loop scope (push loop_var range).
+      {
+        auto guard =
+            MakeGuard(op->loop_var, Range::FromMinExtent(op->min, op->extent));
+        VisitStmt(op->body);
+      }
       if (root_) {
         control_node->child = std::move(root_);
       } else {
@@ -298,6 +322,7 @@ protected:
       if (op->step.defined())
         AnalyzeResourceUsage(Evaluate(GetRef<PrimExpr>(op->step.get())),
                              task_node.get(), true);
+      StampCtx(task_node.get());
 
       root_ = std::move(task_node);
     }
@@ -310,6 +335,7 @@ protected:
 
     // Analyze the expression for resource usage
     AnalyzeResourceUsage(GetRef<Stmt>(op), task_node.get());
+    StampCtx(task_node.get());
 
     root_ = std::move(task_node);
   }
@@ -319,6 +345,7 @@ protected:
     task_node->stmts.push_back(GetRef<Stmt>(op));
 
     AnalyzeResourceUsage(GetRef<Stmt>(op), task_node.get());
+    StampCtx(task_node.get());
 
     root_ = std::move(task_node);
   }
@@ -331,18 +358,22 @@ protected:
     // Create task for condition expression resource analysis
     auto cond_task = std::make_shared<TaskNode>();
     cond_task->stmts.push_back(Evaluate(op->condition));
-    AnalyzeMemoryExpr(op->condition, cond_task.get());
     AnalyzeResourceUsage(Evaluate(op->condition), cond_task.get(), true);
+    StampCtx(cond_task.get());
     if_node->task = std::move(cond_task);
 
-    // Recursively build then branch
-    VisitStmt(op->then_case);
+    // Recursively build then branch under the positive guard.
+    {
+      auto guard = MakeGuard(op->condition);
+      VisitStmt(op->then_case);
+    }
     if (root_) {
       if_node->then_child = std::move(root_);
     }
 
-    // Recursively build else branch (if present)
+    // Recursively build else branch (if present) under the negated guard.
     if (op->else_case) {
+      auto guard = MakeGuard(tir::Not(op->condition));
       VisitStmt(op->else_case.value());
       if (root_) {
         if_node->else_child = std::move(root_);
@@ -359,10 +390,14 @@ protected:
     auto task_node = std::make_shared<TaskNode>();
     task_node->stmts.push_back(GetLetDecl(op));
     AnalyzeResourceUsage(GetLetDecl(op), task_node.get());
+    StampCtx(task_node.get());
     wrapper_node->task = std::move(task_node);
 
-    // Process the wrapperbody
-    VisitStmt(op->body);
+    // Process the wrapper body under the let binding.
+    {
+      auto guard = MakeGuard(op->var, op->value);
+      VisitStmt(op->body);
+    }
     if (root_) {
       wrapper_node->child = std::move(root_);
     }
@@ -377,12 +412,30 @@ protected:
     auto task_node = std::make_shared<TaskNode>();
     task_node->stmts.push_back(GetAttrDecl(op));
     AnalyzeResourceUsage(GetAttrDecl(op), task_node.get());
+    StampCtx(task_node.get());
     wrapper_node->task = std::move(task_node);
 
-    // Process the wrapperbody
-    VisitStmt(op->body);
-    if (root_) {
-      wrapper_node->child = std::move(root_);
+    // Push thread_extent / virtual_thread / tilelang_assume into the ctx
+    // stack for the wrapper body — other AttrStmt kinds carry no
+    // prover-relevant constraint, so we just recurse without a guard.
+    auto recurse = [&]() {
+      VisitStmt(op->body);
+      if (root_) {
+        wrapper_node->child = std::move(root_);
+      }
+    };
+    if (op->attr_key == tir::attr::thread_extent ||
+        op->attr_key == tir::attr::virtual_thread) {
+      auto iv = Downcast<IterVar>(op->node);
+      Range dom = Range::FromMinExtent(make_zero(op->value.dtype()), op->value);
+      auto guard = MakeGuard(iv->var, dom);
+      recurse();
+    } else if (op->attr_key == tir::attr::tilelang_assume) {
+      auto expr = Downcast<PrimExpr>(op->node);
+      auto guard = MakeGuard(expr, true);
+      recurse();
+    } else {
+      recurse();
     }
 
     root_ = std::move(wrapper_node);
@@ -395,6 +448,7 @@ protected:
     // Analyze condition and body for resource usage
     AnalyzeResourceUsage(Evaluate(op->condition), task_node.get());
     AnalyzeResourceUsage(op->body, task_node.get());
+    StampCtx(task_node.get());
 
     root_ = std::move(task_node);
   }
@@ -408,6 +462,7 @@ protected:
     auto task_node = std::make_shared<TaskNode>();
     task_node->stmts.push_back(GetRef<Stmt>(op));
     AnalyzeResourceUsage(GetRef<Stmt>(op), task_node.get());
+    StampCtx(task_node.get());
     root_ = std::move(task_node);
   }
 
@@ -556,27 +611,6 @@ private:
 
     for (const auto &var : write_vars) {
       task_node->AddWriteVar(var);
-    }
-
-    // Estimate latency and initiation interval for this task
-    LatencyEstimator latency_estimator(target_);
-    latency_estimator.Estimate(task_node);
-  }
-
-  void AnalyzeMemoryExpr(const PrimExpr &expr, TaskNode *task_node) {
-    // Analyze memory access regions
-    MemoryAccessDetector memory_detector;
-    memory_detector.Analyze(expr);
-    std::vector<BufferRegion> read_regions = memory_detector.GetReadRegions();
-    std::vector<BufferRegion> write_regions = memory_detector.GetWriteRegions();
-
-    // Merge with existing regions (avoid duplicates)
-    for (const auto &region : read_regions) {
-      task_node->AddReadRegion(region);
-    }
-
-    for (const auto &region : write_regions) {
-      task_node->AddWriteRegion(region);
     }
 
     // Estimate latency and initiation interval for this task

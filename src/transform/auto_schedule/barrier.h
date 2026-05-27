@@ -400,22 +400,56 @@ static TaskNode *GetInnerTask(ScheduleUnit *unit) {
   }
 }
 
+// Enumerate (region_group_id, is_write, wg_id) accesses by every TaskNode
+// under the given `unit`, derived from the partition's entry table.
+// Broadcast tasks are expanded across [0, num_wgs).
+static std::set<std::tuple<int, bool, int>>
+GetUnitRegionGroupAccesses(IRStructure *unit, const RegionPartition &partition,
+                           int num_wgs) {
+  std::set<std::tuple<int, bool, int>> result;
+  const auto &entries = partition.GetEntries();
+  const auto &gids = partition.GetEntryGroupIds();
+  for (size_t i = 0; i < entries.size(); ++i) {
+    if (entries[i].unit != unit)
+      continue;
+    int rg = gids[i];
+    int task_wg = entries[i].task->GetWarpgroupId();
+    if (IsWarpgroupBroadcast(task_wg)) {
+      for (int w = 0; w < num_wgs; ++w)
+        result.emplace(rg, entries[i].is_write, w);
+    } else {
+      result.emplace(rg, entries[i].is_write, task_wg);
+    }
+  }
+  return result;
+}
+
 static auto
 GetSyncInfos(const std::vector<ScheduleUnit *> &units, int num_wgs,
+             const RegionPartition &partition,
              const std::map<Buffer, int64_t> &buffer_num_versions = {},
              bool is_loop = false) {
-  std::set<Buffer> buffers;
+  // Collect the region groups we need to track. Skip groups whose
+  // representative buffer is register/local — sync between those is handled
+  // by the warpgroup-broadcast mechanism, not by this pass.
+  std::set<int> rg_set;
   for (auto *unit : units) {
-    for (const auto &buffer_access : unit->GetBufferAccessInfo(num_wgs)) {
-      if (IsLocalBuffer(buffer_access.buffer, true))
+    const auto &entries = partition.GetEntries();
+    const auto &gids = partition.GetEntryGroupIds();
+    for (size_t i = 0; i < entries.size(); ++i) {
+      if (entries[i].unit != unit)
         continue;
-      buffers.insert(buffer_access.buffer);
+      int rg = gids[i];
+      if (IsLocalBuffer(partition.GetRepresentativeBuffer(rg), true))
+        continue;
+      rg_set.insert(rg);
     }
   }
   std::map<std::pair<ScheduleUnit *, int>,
            std::map<std::pair<ScheduleUnit *, int>, std::set<SyncInfo>>>
       sync_infos;
-  for (const auto &buffer : buffers) {
+  for (int rg : rg_set) {
+    Buffer buffer = partition.GetRepresentativeBuffer(rg);
     int num_versions = 1;
     auto it = buffer_num_versions.find(buffer);
     if (it != buffer_num_versions.end()) {
@@ -429,11 +463,14 @@ GetSyncInfos(const std::vector<ScheduleUnit *> &units, int num_wgs,
     std::vector<bool> waited_write_wgs(num_wgs, false);
     for (int iter = 0; iter < (is_loop ? 2 : 1); ++iter) {
       for (ScheduleUnit *unit : units) {
+        // Region-group accesses of this unit (rg, is_write, wg_id).
+        auto unit_accesses =
+            GetUnitRegionGroupAccesses(unit, partition, num_wgs);
         for (int wg_id = 0; wg_id < num_wgs; ++wg_id) {
           int distance = iter ? num_versions : 0;
-          // RAW: unit reads buffer, wait for last writer
-          auto first_reads =
-              unit->GetFirstAccessPoints(buffer, /*is_write=*/false, wg_id);
+          // RAW: unit reads rg, wait for last writer
+          auto first_reads = unit->GetFirstAccessPoints(
+              rg, partition, /*is_write=*/false, wg_id);
           if (!first_reads.empty() && last_write_unit != nullptr &&
               !waited_write_wgs[wg_id]) {
             if (last_write_unit == unit)
@@ -449,10 +486,10 @@ GetSyncInfos(const std::vector<ScheduleUnit *> &units, int num_wgs,
               }
             }
           }
-          // WAR/WAW: unit writes buffer, wait for all last readers
+          // WAR/WAW: unit writes rg, wait for all last readers
           // if there are no last readers, wait for last writer
-          auto first_writes =
-              unit->GetFirstAccessPoints(buffer, /*is_write=*/true, wg_id);
+          auto first_writes = unit->GetFirstAccessPoints(
+              rg, partition, /*is_write=*/true, wg_id);
           if (!first_writes.empty()) {
             bool has_last_read = false;
             for (int last_wg = 0; last_wg < num_wgs; ++last_wg) {
@@ -485,24 +522,24 @@ GetSyncInfos(const std::vector<ScheduleUnit *> &units, int num_wgs,
             }
           }
         }
-        for (const auto &buffer_access : unit->GetBufferAccessInfo(num_wgs)) {
-          int wg_id = buffer_access.warpgroup_id;
-          if (buffer_access.buffer != buffer)
+        // Update state machine from this unit's accesses to `rg`.
+        for (const auto &[a_rg, a_is_write, a_wg] : unit_accesses) {
+          if (a_rg != rg)
             continue;
-          if (!buffer_access.is_write) {
-            waited_write_wgs[wg_id] = true;
-            last_read_unit[wg_id] = nullptr;
+          if (!a_is_write) {
+            waited_write_wgs[a_wg] = true;
+            last_read_unit[a_wg] = nullptr;
           } else {
-            for (int wg_id = 0; wg_id < num_wgs; ++wg_id) {
-              last_read_unit[wg_id] = nullptr;
+            for (int w = 0; w < num_wgs; ++w) {
+              last_read_unit[w] = nullptr;
             }
             last_write_unit = nullptr;
           }
         }
         if (iter == 0) {
           for (int wg = 0; wg < num_wgs; ++wg) {
-            auto last_reads =
-                unit->GetLastAccessPoints(buffer, /*is_write=*/false, wg);
+            auto last_reads = unit->GetLastAccessPoints(rg, partition,
+                                                        /*is_write=*/false, wg);
             if (!last_reads.empty()) {
               last_read_unit[wg] = unit;
               last_read_unit_tasks[wg] = std::move(last_reads);
@@ -510,19 +547,19 @@ GetSyncInfos(const std::vector<ScheduleUnit *> &units, int num_wgs,
           }
           {
             std::vector<int> write_wg_ids;
-            for (const auto &ba : unit->GetBufferAccessInfo(num_wgs)) {
-              if (ba.buffer == buffer && ba.is_write) {
-                if (std::find(write_wg_ids.begin(), write_wg_ids.end(),
-                              ba.warpgroup_id) == write_wg_ids.end())
-                  write_wg_ids.push_back(ba.warpgroup_id);
+            for (const auto &[a_rg, a_is_write, a_wg] : unit_accesses) {
+              if (a_rg == rg && a_is_write) {
+                if (std::find(write_wg_ids.begin(), write_wg_ids.end(), a_wg) ==
+                    write_wg_ids.end())
+                  write_wg_ids.push_back(a_wg);
               }
             }
             if (!write_wg_ids.empty()) {
               last_write_unit = unit;
               last_write_unit_wg_tasks.clear();
               for (int wg : write_wg_ids) {
-                auto last_writes =
-                    unit->GetLastAccessPoints(buffer, /*is_write=*/true, wg);
+                auto last_writes = unit->GetLastAccessPoints(
+                    rg, partition, /*is_write=*/true, wg);
                 if (!last_writes.empty())
                   last_write_unit_wg_tasks.emplace_back(wg,
                                                         std::move(last_writes));
@@ -1059,8 +1096,14 @@ AnalyzeSequenceNodeBarriers(SequenceNode *seq, EventIdMap &event_id_map,
     }
   }
 
+  // Reuse the RegionPartition built during scheduling. Z3SchedulePython is
+  // guaranteed to have stashed it on the SequenceNode.
+  ICHECK(seq->region_partition)
+      << "SequenceNode missing region_partition cached by schedule_builder";
+  const RegionPartition &partition = *seq->region_partition;
+
   // Analyze dependencies and insert synchronization
-  auto sync_infos = GetSyncInfos(units, 2);
+  auto sync_infos = GetSyncInfos(units, 2, partition);
   auto sync_points = CollectSyncPoints(units, sync_infos);
   // sync_points = OptimizeSyncPoints(sync_points);
   InsertSyncPoints(sync_points, flag_infos, sid, event_id_map, loop_info);
@@ -1134,8 +1177,15 @@ AnalyzeControlNodeBarriers(ControlNode *ctrl, EventIdMap &event_id_map,
   // Recursively rewrite all TaskNode stmts
   RewriteTaskNodeBuffers(ctrl, multi_buffer, iteration);
 
+  // Reuse the RegionPartition built during scheduling. Z3SchedulePythonLoop
+  // is guaranteed to have stashed it on the body SequenceNode.
+  ICHECK(seq->region_partition)
+      << "SequenceNode missing region_partition cached by schedule_builder";
+  const RegionPartition &partition = *seq->region_partition;
+
   // Analyze dependencies and insert synchronization
-  auto sync_infos = GetSyncInfos(units, 2, ctrl->buffer_num_versions, true);
+  auto sync_infos =
+      GetSyncInfos(units, 2, partition, ctrl->buffer_num_versions, true);
   auto sync_points = CollectSyncPoints(units, sync_infos);
   // sync_points = OptimizeSyncPoints(sync_points);
   InsertSyncPoints(sync_points, flag_infos, sid, event_id_map, loop_info);

@@ -8,6 +8,7 @@
 #include <tvm/tir/stmt.h>
 
 #include "../../op/gemm.h"
+#include "../common/constr_visitor.h"
 #include "tvm/tir/stmt_functor.h"
 
 #include <cstdint>
@@ -44,29 +45,6 @@ enum class ResourcePipe : uint16_t {
   kVector = 1 << 4,  // V pipe: SimtVF / SimdVF / Reduce / Fill / arithmetic
   kFixpipe = 1 << 5, // L0C -> UB / L0C -> GM
   kScalar = 1 << 6,  // S pipe: scalar ops, set_flag / wait_flag
-};
-
-// Structure to store buffer access information
-struct BufferAccessInfo {
-  Buffer buffer;
-  bool is_write;    // true for write, false for read
-  int warpgroup_id; // warpgroup id of the innermost TaskNode
-
-  BufferAccessInfo(Buffer buffer, bool is_write, int warpgroup_id)
-      : buffer(buffer), is_write(is_write), warpgroup_id(warpgroup_id) {}
-
-  bool operator<(const BufferAccessInfo &other) const {
-    if (buffer != other.buffer) {
-      return buffer.get() < other.buffer.get();
-    }
-    if (is_write != other.is_write) {
-      return is_write < other.is_write;
-    }
-    if (warpgroup_id != other.warpgroup_id) {
-      return warpgroup_id < other.warpgroup_id;
-    }
-    return false;
-  }
 };
 
 // Structure to represent a specific access to a buffer (used for ordering
@@ -133,6 +111,27 @@ inline bool IsWarpgroupBroadcast(int wg_id) {
   return wg_id == kWarpgroupBroadcast;
 }
 
+// Forward declaration — defined at the bottom of this header.
+class RegionPartition;
+
+// Predicate the Collect*AccessPoints walks use to decide whether a leaf
+// TaskNode "matches": pred(task) returns true if the task has a matching
+// access. The (is_write, wg_id) filter is baked in by the factory below.
+//
+// Concrete predicates are produced by:
+//   - MakeBufferAccessPredicate(buffer, is_write, wg_id)
+//   - MakeRegionGroupAccessPredicate(region_group_id, partition, is_write,
+//   wg_id)
+class TaskNode;
+using TaskAccessPredicate = std::function<bool(const TaskNode *task)>;
+
+TaskAccessPredicate MakeBufferAccessPredicate(const Buffer &buffer,
+                                              bool is_write, int wg_id);
+TaskAccessPredicate
+MakeRegionGroupAccessPredicate(int region_group_id,
+                               const RegionPartition &partition, bool is_write,
+                               int wg_id);
+
 // Base class for all IR nodes in scheduling
 class IRStructure {
 public:
@@ -178,48 +177,66 @@ public:
   virtual void SetLatency(int64_t latency) = 0;
   virtual void SetII(int64_t ii) = 0;
 
-  // Recursive buffer collection method
-  virtual void
-  CollectBufferAccessInfo(int num_wgs,
-                          std::set<BufferAccessInfo> &result) const = 0;
-
-  std::vector<BufferAccessInfo> GetBufferAccessInfo(int num_wgs = 1) const {
-    std::set<BufferAccessInfo> result;
-    CollectBufferAccessInfo(num_wgs, result);
-    return std::vector<BufferAccessInfo>(result.begin(), result.end());
-  }
-
-  // Collect tasks that could possibly be the first/last to access a specific
-  // (buffer, is_write, wg_id) within this IR subtree, together with the
-  // earliest (First) / latest (Last) possible task start time relative to this
+  // Collect tasks that could possibly be the first/last to access something
+  // matching `pred` within this IR subtree, together with the earliest
+  // (First) / latest (Last) possible task start time relative to this
   // subtree's root (in cycles). `path` is used as a stack: each impl pushes
   // `this` before recursing into children and pops it on return; TaskNode
   // copies the path (with itself appended) into the BufferAccessPoint.
-  virtual bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write,
-                                        int wg_id,
+  //
+  // `pred(task)` returns true if the task has a matching access (the factory
+  // bakes is_write / wg_id into the predicate). Use
+  // `MakeBufferAccessPredicate(buffer, is_write, wg_id)` for buffer-keyed
+  // queries or `MakeRegionGroupAccessPredicate(rg_id, partition, is_write,
+  // wg_id)` for region-group-keyed queries.
+  virtual bool CollectFirstAccessPoints(const TaskAccessPredicate &pred,
                                         std::set<BufferAccessPoint> &result,
                                         std::vector<const IRStructure *> &path,
                                         int64_t time_offset = 0) const = 0;
-  virtual bool CollectLastAccessPoints(const Buffer &buffer, bool is_write,
-                                       int wg_id,
+  virtual bool CollectLastAccessPoints(const TaskAccessPredicate &pred,
                                        std::set<BufferAccessPoint> &result,
                                        std::vector<const IRStructure *> &path,
                                        int64_t time_offset = 0) const = 0;
 
-  std::set<BufferAccessPoint> GetFirstAccessPoints(const Buffer &buffer,
-                                                   bool is_write,
-                                                   int wg_id = -1) const {
+  // Convenience wrappers — buffer-keyed.
+  std::set<BufferAccessPoint>
+  GetFirstAccessPoints(const Buffer &buffer, bool is_write,
+                       int wg_id = kWarpgroupBroadcast) const {
     std::set<BufferAccessPoint> result;
     std::vector<const IRStructure *> path;
-    CollectFirstAccessPoints(buffer, is_write, wg_id, result, path);
+    CollectFirstAccessPoints(MakeBufferAccessPredicate(buffer, is_write, wg_id),
+                             result, path);
     return result;
   }
-  std::set<BufferAccessPoint> GetLastAccessPoints(const Buffer &buffer,
-                                                  bool is_write,
-                                                  int wg_id = -1) const {
+  std::set<BufferAccessPoint>
+  GetLastAccessPoints(const Buffer &buffer, bool is_write,
+                      int wg_id = kWarpgroupBroadcast) const {
     std::set<BufferAccessPoint> result;
     std::vector<const IRStructure *> path;
-    CollectLastAccessPoints(buffer, is_write, wg_id, result, path);
+    CollectLastAccessPoints(MakeBufferAccessPredicate(buffer, is_write, wg_id),
+                            result, path);
+    return result;
+  }
+
+  // Convenience wrappers — region-group-keyed.
+  std::set<BufferAccessPoint>
+  GetFirstAccessPoints(int region_group_id, const RegionPartition &partition,
+                       bool is_write, int wg_id = kWarpgroupBroadcast) const {
+    std::set<BufferAccessPoint> result;
+    std::vector<const IRStructure *> path;
+    CollectFirstAccessPoints(MakeRegionGroupAccessPredicate(
+                                 region_group_id, partition, is_write, wg_id),
+                             result, path);
+    return result;
+  }
+  std::set<BufferAccessPoint>
+  GetLastAccessPoints(int region_group_id, const RegionPartition &partition,
+                      bool is_write, int wg_id = kWarpgroupBroadcast) const {
+    std::set<BufferAccessPoint> result;
+    std::vector<const IRStructure *> path;
+    CollectLastAccessPoints(MakeRegionGroupAccessPredicate(
+                                region_group_id, partition, is_write, wg_id),
+                            result, path);
     return result;
   }
 
@@ -239,6 +256,15 @@ public:
 class TaskNode : public IRStructure {
 public:
   std::vector<Stmt> stmts;
+
+  // Snapshot of the surrounding-scope ConstrSet at the moment this task was
+  // built. Captures ancestor For ranges, LetStmt bindings, kernel-block
+  // thread_extent / virtual_thread iter ranges, tilelang_assume, and
+  // IfThenElse / Select branch guards. Populated by IRStructureBuilder in
+  // auto_schedule.cc when the TaskNode is constructed; consumed by
+  // RegionPartition::MayOverlap so the prover sees the symbol environment
+  // each region was written under.
+  ConstrSet outer_ctx;
 
   Kind GetKind() const override { return Kind::kTask; }
 
@@ -370,15 +396,11 @@ public:
     write_vars_.push_back(var);
   }
 
-  void
-  CollectBufferAccessInfo(int num_wgs,
-                          std::set<BufferAccessInfo> &result) const override;
-
-  bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+  bool CollectFirstAccessPoints(const TaskAccessPredicate &pred,
                                 std::set<BufferAccessPoint> &result,
                                 std::vector<const IRStructure *> &path,
                                 int64_t time_offset = 0) const override;
-  bool CollectLastAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+  bool CollectLastAccessPoints(const TaskAccessPredicate &pred,
                                std::set<BufferAccessPoint> &result,
                                std::vector<const IRStructure *> &path,
                                int64_t time_offset = 0) const override;
@@ -510,15 +532,11 @@ public:
   void SetLatency(int64_t latency) override { latency_ = latency; }
   void SetII(int64_t ii) override { ii_ = ii; }
 
-  void
-  CollectBufferAccessInfo(int num_wgs,
-                          std::set<BufferAccessInfo> &result) const override;
-
-  bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+  bool CollectFirstAccessPoints(const TaskAccessPredicate &pred,
                                 std::set<BufferAccessPoint> &result,
                                 std::vector<const IRStructure *> &path,
                                 int64_t time_offset = 0) const override;
-  bool CollectLastAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+  bool CollectLastAccessPoints(const TaskAccessPredicate &pred,
                                std::set<BufferAccessPoint> &result,
                                std::vector<const IRStructure *> &path,
                                int64_t time_offset = 0) const override;
@@ -662,15 +680,11 @@ public:
   void SetLatency(int64_t latency) override { latency_ = latency; }
   void SetII(int64_t ii) override { ii_ = ii; }
 
-  void
-  CollectBufferAccessInfo(int num_wgs,
-                          std::set<BufferAccessInfo> &result) const override;
-
-  bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+  bool CollectFirstAccessPoints(const TaskAccessPredicate &pred,
                                 std::set<BufferAccessPoint> &result,
                                 std::vector<const IRStructure *> &path,
                                 int64_t time_offset = 0) const override;
-  bool CollectLastAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+  bool CollectLastAccessPoints(const TaskAccessPredicate &pred,
                                std::set<BufferAccessPoint> &result,
                                std::vector<const IRStructure *> &path,
                                int64_t time_offset = 0) const override;
@@ -808,15 +822,11 @@ public:
   void SetLatency(int64_t latency) override { latency_ = latency; }
   void SetII(int64_t ii) override { ii_ = ii; }
 
-  void
-  CollectBufferAccessInfo(int num_wgs,
-                          std::set<BufferAccessInfo> &result) const override;
-
-  bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+  bool CollectFirstAccessPoints(const TaskAccessPredicate &pred,
                                 std::set<BufferAccessPoint> &result,
                                 std::vector<const IRStructure *> &path,
                                 int64_t time_offset = 0) const override;
-  bool CollectLastAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+  bool CollectLastAccessPoints(const TaskAccessPredicate &pred,
                                std::set<BufferAccessPoint> &result,
                                std::vector<const IRStructure *> &path,
                                int64_t time_offset = 0) const override;
@@ -908,15 +918,11 @@ public:
   void SetLatency(int64_t latency) override { latency_ = latency; }
   void SetII(int64_t ii) override { ii_ = ii; }
 
-  void
-  CollectBufferAccessInfo(int num_wgs,
-                          std::set<BufferAccessInfo> &result) const override;
-
-  bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+  bool CollectFirstAccessPoints(const TaskAccessPredicate &pred,
                                 std::set<BufferAccessPoint> &result,
                                 std::vector<const IRStructure *> &path,
                                 int64_t time_offset = 0) const override;
-  bool CollectLastAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+  bool CollectLastAccessPoints(const TaskAccessPredicate &pred,
                                std::set<BufferAccessPoint> &result,
                                std::vector<const IRStructure *> &path,
                                int64_t time_offset = 0) const override;
@@ -986,15 +992,11 @@ public:
   void SetLatency(int64_t latency) override;
   void SetII(int64_t ii) override;
 
-  void
-  CollectBufferAccessInfo(int num_wgs,
-                          std::set<BufferAccessInfo> &result) const override;
-
-  bool CollectFirstAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+  bool CollectFirstAccessPoints(const TaskAccessPredicate &pred,
                                 std::set<BufferAccessPoint> &result,
                                 std::vector<const IRStructure *> &path,
                                 int64_t time_offset = 0) const override;
-  bool CollectLastAccessPoints(const Buffer &buffer, bool is_write, int wg_id,
+  bool CollectLastAccessPoints(const TaskAccessPredicate &pred,
                                std::set<BufferAccessPoint> &result,
                                std::vector<const IRStructure *> &path,
                                int64_t time_offset = 0) const override;
@@ -1024,6 +1026,15 @@ private:
   // Latency estimation
   int64_t latency_{0}; // Estimated latency in cycles
   int64_t ii_{0};      // Initiation interval in cycles
+
+public:
+  // RegionPartition built by the schedule_builder over this sequence's
+  // ScheduleUnit children, consumed later by the barrier pass. Populated
+  // only after scheduling; before that it is null. Guaranteed by the
+  // post-schedule IR shape that this SequenceNode's children are all
+  // ScheduleUnits, so the partition's per-entry `unit` pointers are valid
+  // ScheduleUnit*.
+  std::unique_ptr<RegionPartition> region_partition;
 };
 
 // Structure to store TaskNode with its loop context information
@@ -1420,6 +1431,108 @@ inline void PrintIRStructure(const IRStructure *node, int indent = 0) {
     if (if_node->else_child) {
       LOG(INFO) << indent_str << "  Else:";
       PrintIRStructure(if_node->else_child.get(), indent + 2);
+    }
+  }
+}
+
+// ============================================================================
+// RegionPartition — region-level dependency partition
+// ============================================================================
+//
+// At each scheduling level (a SequenceNode/ControlNode body), build once.
+// Groups every (unit, task, region, is_write) entry into "region groups" via
+// pairwise prover-based overlap detection (lifted from
+// thread_storage_sync.cc:1493-1639) + union-find. Two entries are merged when
+// arith::Analyzer cannot prove their index intervals disjoint.
+//
+// Conservative by construction: if the prover fails or returns nothing, the
+// entries end up in the same group → same behavior as today's
+// buffer-name-only dependency analysis. The win is when same-buffer accesses
+// hit provably-disjoint sub-regions (e.g. C[..., 0:128] vs C[..., 128:256]).
+
+struct RegionEntry {
+  // The top-level "owner" at the current scheduling level. Treated as an
+  // opaque identifier for grouping accesses by owning sibling. For
+  // post-schedule calls it is a ScheduleUnit*; for pre-schedule (gathering
+  // children before wrapping) it is just an IRStructure*.
+  IRStructure *unit;
+  const TaskNode *task; // leaf task that performed the access
+  BufferRegion region;
+  bool is_write;
+};
+
+class RegionPartition {
+public:
+  // current_loop: present iff the level is a ControlNode body. The loop
+  //             var is replaced on both sides by fresh Vars `lv_a`, `lv_b`,
+  //             each bound to `[min, min+extent)`. The prover then tests
+  //             "disjoint for ALL (lv_a, lv_b) in the iteration space",
+  //             which covers same-iter and any cross-iter distance in one
+  //             shot.
+  //
+  // Per-task surrounding ConstrSet is read off each entry's TaskNode (set
+  // at IRStructure-build time), so callers don't need to thread `outer_ctx`
+  // here.
+  static RegionPartition Build(const std::vector<IRStructure *> &units,
+                               std::optional<For> current_loop);
+
+  int NumRegionGroups() const { return num_groups_; }
+
+  // Look up the region group of the given (task, region). Returns -1 if the
+  // entry was not registered (e.g. region from a task not in this level).
+  int LookupRegionGroup(const TaskNode *task, const BufferRegion &region) const;
+
+  // The representative Buffer of a group — all entries in a group share the
+  // same Buffer (groups never merge across buffers).
+  Buffer GetRepresentativeBuffer(int region_group_id) const;
+
+  // Debug accessors.
+  const std::vector<RegionEntry> &GetEntries() const { return entries_; }
+  const std::vector<int> &GetEntryGroupIds() const { return entry_group_; }
+
+  // Replace each entry's `unit` pointer via the provided map. Used by the
+  // schedule builder to migrate from pre-wrap IRStructure* keys to the
+  // post-wrap ScheduleUnit* keys that the barrier pass will see.
+  void RemapUnits(
+      const std::unordered_map<IRStructure *, IRStructure *> &old_to_new);
+
+private:
+  std::vector<RegionEntry> entries_;
+  std::vector<int> entry_group_;     // entries_.size() == entry_group_.size()
+  std::vector<Buffer> group_buffer_; // size == num_groups_
+  int num_groups_ = 0;
+  // (task ptr, BufferRegionNode ptr) -> entry index
+  std::unordered_map<const TaskNode *,
+                     std::unordered_map<const BufferRegionNode *, int>>
+      lookup_;
+};
+
+// Pretty-print all groups + their entries. Mirrors PrintIRStructure's style.
+inline void PrintRegionPartition(const RegionPartition &partition,
+                                 int indent = 0) {
+  std::string indent_str(indent * 2, ' ');
+  const auto &entries = partition.GetEntries();
+  const auto &gids = partition.GetEntryGroupIds();
+  LOG(INFO) << indent_str << "RegionPartition: " << partition.NumRegionGroups()
+            << " groups, " << entries.size() << " entries";
+  for (int g = 0; g < partition.NumRegionGroups(); ++g) {
+    LOG(INFO) << indent_str << "  Group " << g
+              << " buffer=" << partition.GetRepresentativeBuffer(g)->name;
+    for (size_t i = 0; i < entries.size(); ++i) {
+      if (gids[i] != g)
+        continue;
+      std::ostringstream rs;
+      rs << "[";
+      for (size_t d = 0; d < entries[i].region->region.size(); ++d) {
+        if (d)
+          rs << ", ";
+        const auto &rng = entries[i].region->region[d];
+        rs << rng->min << " : " << (rng->min + rng->extent);
+      }
+      rs << "]";
+      LOG(INFO) << indent_str << "    " << (entries[i].is_write ? "W " : "R ")
+                << "unit=" << entries[i].unit << " task=" << entries[i].task
+                << " " << rs.str();
     }
   }
 }

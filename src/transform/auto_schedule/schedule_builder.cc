@@ -144,6 +144,46 @@ std::set<Buffer> GetBufferDependencies(const IRStructure *a,
   return deps;
 }
 
+// Region-group-keyed dependency between two units. Returns the set of region
+// group ids `g` such that both units touch group `g` and at least one side is
+// a write — i.e. RAW, WAW, or WAR through any region in group `g`.
+// Read-after-read is excluded.
+//
+// Two regions land in the same group when the prover cannot rule out overlap
+// (see RegionPartition::Build). Compared to GetBufferDependencies above, this
+// suppresses edges for same-buffer provably-disjoint slices.
+std::set<int> GetRegionGroupDependencies(const IRStructure *a,
+                                         const IRStructure *b,
+                                         const RegionPartition &partition) {
+  // For each unit, collect a (group_id -> access mask) where bit 0 = saw
+  // read, bit 1 = saw write.
+  auto collect_unit_masks = [&](const IRStructure *u, std::map<int, int> &out) {
+    const auto &entries = partition.GetEntries();
+    const auto &gids = partition.GetEntryGroupIds();
+    for (size_t i = 0; i < entries.size(); ++i) {
+      if (entries[i].unit != u)
+        continue;
+      int g = gids[i];
+      out[g] |= entries[i].is_write ? 0x2 : 0x1;
+    }
+  };
+  std::map<int, int> mask_a, mask_b;
+  collect_unit_masks(a, mask_a);
+  collect_unit_masks(b, mask_b);
+  std::set<int> deps;
+  for (const auto &[g, ma] : mask_a) {
+    auto it = mask_b.find(g);
+    if (it == mask_b.end())
+      continue;
+    int mb = it->second;
+    bool a_w = (ma & 0x2) != 0;
+    bool b_w = (mb & 0x2) != 0;
+    if (a_w || b_w)
+      deps.insert(g);
+  }
+  return deps;
+}
+
 bool HasRegisterRegion(const IRStructure *node) {
   return CountRegisterRegions(node) > 0;
 }
@@ -175,7 +215,7 @@ void ScheduleUnitBuilder::ScheduleRecursive(
       ScheduleRecursive(child);
     }
 
-    seq->children = Z3SchedulePython(origin_children);
+    seq->children = Z3SchedulePython(origin_children, seq);
     int64_t overall_latency = 0;
     for (const auto &child : seq->children) {
       overall_latency += child->GetLatency();
@@ -221,7 +261,7 @@ void ScheduleUnitBuilder::ScheduleRecursive(
       ScheduleRecursive(child);
     }
     auto seq_node = std::make_shared<SequenceNode>();
-    seq_node->children = Z3SchedulePython(origin_children);
+    seq_node->children = Z3SchedulePython(origin_children, seq_node.get());
     int64_t overall_latency = 0;
     for (const auto &child : seq_node->children) {
       overall_latency += child->GetLatency();

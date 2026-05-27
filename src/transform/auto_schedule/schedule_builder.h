@@ -63,6 +63,12 @@ bool HasNormalDependency(const IRStructure *a, const IRStructure *b);
 std::set<Buffer> GetBufferDependencies(const IRStructure *a,
                                        const IRStructure *b);
 
+// Get region-group dependencies between two IRStructures using a
+// pre-computed RegionPartition. Excludes read-after-read.
+std::set<int> GetRegionGroupDependencies(const IRStructure *a,
+                                         const IRStructure *b,
+                                         const RegionPartition &partition);
+
 // Check if an IRStructure has any register region
 bool HasRegisterRegion(const IRStructure *node);
 
@@ -79,34 +85,44 @@ public:
   // Directly schedules the entire IRStructure tree recursively in place
   void ScheduleRecursive(std::shared_ptr<IRStructure> &node);
 
-  // Helper: wrap each child in a ScheduleUnit (start_time=0). Used for
-  // fallback paths that bypass the Z3 scheduler.
-  static std::vector<std::shared_ptr<IRStructure>>
-  WrapAsScheduleUnits(const std::vector<std::shared_ptr<IRStructure>> &children,
-                      const std::vector<int64_t> &start_times = {}) {
-    std::vector<std::shared_ptr<IRStructure>> wrapped;
-    wrapped.reserve(children.size());
-    for (size_t i = 0; i < children.size(); ++i) {
-      auto unit = std::make_shared<ScheduleUnit>();
-      unit->child = children[i];
-      unit->SetStartTime(i < start_times.size() ? start_times[i] : 0);
-      unit->SetLatency(unit->child->GetLatency());
-      unit->SetII(unit->child->GetII());
-      wrapped.push_back(std::move(unit));
-    }
-    return wrapped;
-  }
-
   // Z3-based scheduler that calls Python implementation via FFI.
   // Wraps each scheduled child in a ScheduleUnit carrying its start_time and
   // returns the units (as shared_ptr<IRStructure>) in start_time order (ties
   // broken by original index). Callers can assign the result directly to a
-  // SequenceNode's children.
-  std::vector<std::shared_ptr<IRStructure>> Z3SchedulePython(
-      const std::vector<std::shared_ptr<IRStructure>> &origin_children) {
-    size_t n = origin_children.size();
+  // SequenceNode's children. If `target_seq` is provided, the resulting
+  // RegionPartition (keyed on the wrapped ScheduleUnits) is stashed onto it
+  // for later consumption by the barrier pass.
+  std::vector<std::shared_ptr<IRStructure>>
+  Z3SchedulePython(const std::vector<std::shared_ptr<IRStructure>> &nodes,
+                   SequenceNode *target_seq = nullptr) {
+    size_t n = nodes.size();
+
+    auto fallback = [&]() {
+      std::vector<std::shared_ptr<IRStructure>> wrapped;
+      wrapped.reserve(nodes.size());
+      for (size_t i = 0; i < nodes.size(); ++i) {
+        auto unit = std::make_shared<ScheduleUnit>();
+        unit->child = nodes[i];
+        unit->SetStartTime(0);
+        unit->SetLatency(unit->child->GetLatency());
+        unit->SetII(unit->child->GetII());
+        wrapped.push_back(std::move(unit));
+      }
+      if (target_seq != nullptr) {
+        std::vector<IRStructure *> units_for_partition;
+        units_for_partition.reserve(wrapped.size());
+        for (const auto &u : wrapped)
+          units_for_partition.push_back(u.get());
+        auto p = RegionPartition::Build(units_for_partition,
+                                        /*current_loop=*/std::nullopt);
+        target_seq->region_partition =
+            std::make_unique<RegionPartition>(std::move(p));
+      }
+      return wrapped;
+    };
+
     if (n <= 1) {
-      return WrapAsScheduleUnits(origin_children);
+      return fallback();
     }
 
     try {
@@ -116,7 +132,7 @@ public:
       if (!z3_schedule_func.has_value()) {
         LOG(WARNING) << "Python Z3 scheduler not registered, falling back to "
                         "topological sort";
-        return WrapAsScheduleUnits(origin_children);
+        return fallback();
       }
 
       // Prepare input data
@@ -131,7 +147,7 @@ public:
       resource_flags.reserve(n);
 
       for (size_t i = 0; i < n; ++i) {
-        const IRStructure *node = origin_children[i].get();
+        const IRStructure *node = nodes[i].get();
         latencies.push_back(node->GetLatency());
         iis.push_back(node->GetII());
 
@@ -139,26 +155,35 @@ public:
         resource_flags.push_back(static_cast<int64_t>(node->GetPipeMask()));
       }
 
+      // Build region partition once for this sequence level (no enclosing
+      // loop). Drives the dependency edges below.
+      std::vector<IRStructure *> units_for_partition;
+      units_for_partition.reserve(n);
+      for (const auto &child : nodes) {
+        units_for_partition.push_back(child.get());
+      }
+      RegionPartition partition = RegionPartition::Build(
+          units_for_partition, /*current_loop=*/std::nullopt);
+
       // Collect data dependencies
       for (size_t i = 0; i < n; ++i) {
         for (size_t j = i + 1; j < n; ++j) {
-          if (HasNormalDependency(origin_children[i].get(),
-                                  origin_children[j].get())) {
+          if (HasNormalDependency(nodes[i].get(), nodes[j].get())) {
             data_deps.emplace_back(i, j, latencies[i]);
             continue;
           }
-          auto &&buffers = GetBufferDependencies(origin_children[i].get(),
-                                                 origin_children[j].get());
+          auto &&rgs = GetRegionGroupDependencies(nodes[i].get(),
+                                                  nodes[j].get(), partition);
           int64_t latency = -1;
-          for (auto buffer : buffers) {
-            auto ra = origin_children[i]->GetLastAccessPoints(buffer, false);
-            auto wa = origin_children[i]->GetLastAccessPoints(buffer, true);
-            auto rb = origin_children[j]->GetFirstAccessPoints(buffer, false);
-            auto wb = origin_children[j]->GetFirstAccessPoints(buffer, true);
+          for (int rg : rgs) {
+            auto ra = nodes[i]->GetLastAccessPoints(rg, partition, false);
+            auto wa = nodes[i]->GetLastAccessPoints(rg, partition, true);
+            auto rb = nodes[j]->GetFirstAccessPoints(rg, partition, false);
+            auto wb = nodes[j]->GetFirstAccessPoints(rg, partition, true);
             auto update = [&](const BufferAccessPoint &a,
                               const BufferAccessPoint &b) {
               int64_t l = a.timestamp + a.task()->GetLatency() - b.timestamp;
-              ICHECK(l <= origin_children[i]->GetLatency());
+              ICHECK(l <= nodes[i]->GetLatency());
               if (l < 0)
                 l = 0;
               if (l > latency)
@@ -184,8 +209,7 @@ public:
       // Collect resource dependencies
       for (size_t i = 0; i < n; ++i) {
         for (size_t j = i + 1; j < n; ++j) {
-          if (HasResourceDependency(origin_children[i].get(),
-                                    origin_children[j].get())) {
+          if (HasResourceDependency(nodes[i].get(), nodes[j].get())) {
             resource_deps.emplace_back(i, j);
           }
         }
@@ -233,8 +257,7 @@ public:
       if (start_times.size() != n) {
         LOG(WARNING) << "Python Z3 scheduler returned invalid results (size "
                         "mismatch), falling back to topological sort";
-        std::vector<int64_t> zero_times(n, 0);
-        return WrapAsScheduleUnits(origin_children, zero_times);
+        return fallback();
       }
 
       // Sort by start_time, then by original index
@@ -254,24 +277,32 @@ public:
       // Wrap each child in a ScheduleUnit with its start_time, in sorted order.
       std::vector<std::shared_ptr<IRStructure>> sorted_units;
       sorted_units.reserve(n);
+      std::unordered_map<IRStructure *, IRStructure *> remap;
+      remap.reserve(n);
       for (const auto &p : start_time_with_idx) {
         auto unit = std::make_shared<ScheduleUnit>();
-        unit->child = origin_children[p.second];
+        unit->child = nodes[p.second];
         unit->SetStartTime(p.first);
         unit->SetLatency(unit->child->GetLatency());
         unit->SetII(unit->child->GetII());
+        remap[nodes[p.second].get()] = unit.get();
         sorted_units.push_back(std::move(unit));
+      }
+      if (target_seq != nullptr) {
+        partition.RemapUnits(remap);
+        target_seq->region_partition =
+            std::make_unique<RegionPartition>(std::move(partition));
       }
       return sorted_units;
 
     } catch (const std::exception &e) {
       LOG(WARNING) << "Python Z3 scheduler failed with exception: " << e.what()
                    << ", falling back to topological sort";
-      return WrapAsScheduleUnits(origin_children);
+      return fallback();
     } catch (...) {
       LOG(WARNING) << "Python Z3 scheduler failed with unknown exception, "
                       "falling back to topological sort";
-      return WrapAsScheduleUnits(origin_children);
+      return fallback();
     }
   }
 
@@ -371,14 +402,19 @@ public:
       }
     }
     std::map<Buffer, int64_t> annotated_buffer_versions;
-    for (const auto &buffer_access : ctrl->GetBufferAccessInfo()) {
-      const auto &buffer = buffer_access.buffer;
+    auto enumerate_buffers = [&](auto &&visit) {
+      for (const auto &r : ctrl->GetReadRegions())
+        visit(r->buffer);
+      for (const auto &r : ctrl->GetWriteRegions())
+        visit(r->buffer);
+    };
+    enumerate_buffers([&](const Buffer &buffer) {
       if (!IsSharedBuffer(buffer) && !IsL1Buffer(buffer) &&
           !IsL0CBuffer(buffer)) {
-        continue; // Only consider on-chip buffers for multi-buffer
+        return; // Only consider on-chip buffers for multi-buffer
       }
       if (visited_buffers.count(buffer)) {
-        continue;
+        return;
       }
       visited_buffers.insert(buffer);
       std::string scope = IsL1Buffer(buffer)
@@ -404,7 +440,20 @@ public:
           buffer_sizes.push_back(GetBufferSize(buffer));
         }
       }
+    });
+
+    // Build region partition once for this loop body. `MayOverlap`
+    // substitutes the loop var with two fresh Vars (each Bound to the loop
+    // range), giving a single test that subsumes same-iter and any
+    // cross-iter distance.
+    std::vector<IRStructure *> units_for_partition;
+    units_for_partition.reserve(n);
+    for (auto *node : nodes) {
+      units_for_partition.push_back(node);
     }
+    RegionPartition partition =
+        RegionPartition::Build(units_for_partition,
+                               /*current_loop=*/ctrl->control);
 
     // Collect data dependencies with distance
     for (size_t i = 0; i < n; ++i) {
@@ -413,12 +462,13 @@ public:
           data_deps.emplace_back(i, j, 0, latencies[i]);
           continue;
         }
-        auto &&buffers = GetBufferDependencies(nodes[i], nodes[j]);
-        for (auto buffer : buffers) {
-          auto ra = nodes[i]->GetLastAccessPoints(buffer, false);
-          auto wa = nodes[i]->GetLastAccessPoints(buffer, true);
-          auto rb = nodes[j]->GetFirstAccessPoints(buffer, false);
-          auto wb = nodes[j]->GetFirstAccessPoints(buffer, true);
+        auto &&rgs = GetRegionGroupDependencies(nodes[i], nodes[j], partition);
+        for (int rg : rgs) {
+          Buffer buffer = partition.GetRepresentativeBuffer(rg);
+          auto ra = nodes[i]->GetLastAccessPoints(rg, partition, false);
+          auto wa = nodes[i]->GetLastAccessPoints(rg, partition, true);
+          auto rb = nodes[j]->GetFirstAccessPoints(rg, partition, false);
+          auto wb = nodes[j]->GetFirstAccessPoints(rg, partition, true);
           int64_t latency = -1;
           auto update = [&](const BufferAccessPoint &a,
                             const BufferAccessPoint &b) {
@@ -719,6 +769,8 @@ public:
     while (SolveConflictVar() && ++conflict_count < 100)
       ;
 
+    std::unordered_map<IRStructure *, IRStructure *> remap;
+    remap.reserve(seq_body->children.size());
     for (size_t k = 0; k < seq_body->children.size(); ++k) {
       auto unit = std::make_shared<ScheduleUnit>();
       auto *child_ptr = seq_body->children[k].get();
@@ -728,8 +780,12 @@ public:
       unit->child = std::move(seq_body->children[k]);
       unit->SetLatency(unit->child->GetLatency());
       unit->SetII(unit->child->GetII());
+      remap[child_ptr] = unit.get();
       seq_body->children[k] = std::move(unit);
     }
+    partition.RemapUnits(remap);
+    seq_body->region_partition =
+        std::make_unique<RegionPartition>(std::move(partition));
 
     // Estimate overall latency: II * tripcount
     int64_t overall_latency = 0;

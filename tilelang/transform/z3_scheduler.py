@@ -4,6 +4,8 @@ This module provides a Python implementation of the Z3 scheduler that can be
 called from C++ via TVM FFI.
 """
 
+from __future__ import annotations
+
 import tvm_ffi
 import os
 import json
@@ -171,7 +173,7 @@ def z3_schedule_python(
                 print(
                     f"[Python Z3]   Task {idx}: start_time={start_times[idx]}, "
                     f"latency={latencies[idx]}, II={iis[idx]}, "
-                    f"resource_flags={resource_flags[idx]:03b}"
+                    f"resource_flags={resource_flags[idx]:07b}"
                 )
 
         return start_times, task_indices
@@ -225,6 +227,7 @@ def z3_schedule_loop_python(
     memory_groups: list[list[int]],  # [[capacity, idx0, idx1, ...], ...]
     recalculate_buffer_versions: bool = True,
     verbose: bool = False,
+    seed: int | None = None,
 ) -> tuple[list[int], list[int], int]:
     """Z3-based scheduler for loops with distance-aware dependencies.
 
@@ -298,6 +301,9 @@ def z3_schedule_loop_python(
 
         # Create solver for feasibility check
         solver = z3.Solver()
+        if seed is not None:
+            solver.set("random_seed", seed)
+            solver.set("smt.random_seed", seed)
         solver.set("timeout", 10000)
 
         if num_stages == 1:
@@ -440,7 +446,7 @@ def z3_schedule_loop_python(
             print(
                 f"[Python Z3 Loop]   Task {idx}: start_time={start_times[idx]}, "
                 f"latency={latencies[idx]}, II={iis[idx]}, "
-                f"resource_flags={resource_flags[idx]:03b}"
+                f"resource_flags={resource_flags[idx]:07b}"
             )
     if verbose:
         for i in range(len(buffer_sizes)):
@@ -468,6 +474,8 @@ def z3_schedule_loop_python(
                 "sorted_indices": task_indices,
                 "timestamp": time.time(),
             }
+            if seed is not None:
+                schedule_info["random_seed"] = seed
 
             # Save as JSON
             info_file = schedule_dir / "schedule_info.json"
