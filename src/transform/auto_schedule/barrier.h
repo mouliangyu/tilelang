@@ -204,8 +204,7 @@ static std::vector<SyncPoint> CollectSyncPoints(
                    std::map<std::pair<ScheduleUnit *, int>, std::set<SyncInfo>>>
         &sync_infos);
 static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
-                             FlagInfoList &flag_infos, Var sid,
-                             EventIdMap &event_id_map,
+                             FlagInfoList &flag_infos, EventIdMap &event_id_map,
                              LoopNestingInfo &loop_info);
 static std::vector<SyncPoint>
 OptimizeSyncPoints(const std::vector<SyncPoint> &sync_points);
@@ -949,8 +948,7 @@ OptimizeSyncPoints(const std::vector<SyncPoint> &sync_points) {
 }
 
 static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
-                             FlagInfoList &flag_infos, Var sid,
-                             EventIdMap &event_id_map,
+                             FlagInfoList &flag_infos, EventIdMap &event_id_map,
                              LoopNestingInfo &loop_info) {
   for (const auto &sp : sync_points) {
     if (sp.type == SyncType::PipeBarrier) {
@@ -970,7 +968,7 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
         if (!sp.prod_wg) {
           for (int base = 0; base < sp.num_versions; ++base) {
             flag_infos.push_back(
-                FlagInfo{0, cc_base_id + sid * 16 + base, sp.prod_pipe, 1});
+                FlagInfo{0, cc_base_id + base, sp.prod_pipe, 1});
           }
           for (unsigned s = 0; s != 2; ++s) {
             for (int base = 0; base < sp.num_versions; ++base) {
@@ -987,7 +985,7 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
           }
           for (int base = 0; base < sp.num_versions; ++base) {
             flag_infos.push_back(
-                FlagInfo{0, cc_base_id + sid * 16 + base, sp.prod_pipe, 2});
+                FlagInfo{0, cc_base_id + base, sp.prod_pipe, 2});
           }
         }
       }
@@ -995,7 +993,7 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
       PrimExpr iteration =
           loop_info.CalculateIterationCount() - Integer(sp.distance);
       PrimExpr cc_event_id =
-          indexmod(iteration, Integer(sp.num_versions)) + cc_base_id + sid * 16;
+          indexmod(iteration, Integer(sp.num_versions)) + cc_base_id;
 
       if (!sp.prod_wg) {
         Stmt set_stmt =
@@ -1106,7 +1104,7 @@ AnalyzeSequenceNodeBarriers(SequenceNode *seq, EventIdMap &event_id_map,
   auto sync_infos = GetSyncInfos(units, 2, partition);
   auto sync_points = CollectSyncPoints(units, sync_infos);
   // sync_points = OptimizeSyncPoints(sync_points);
-  InsertSyncPoints(sync_points, flag_infos, sid, event_id_map, loop_info);
+  InsertSyncPoints(sync_points, flag_infos, event_id_map, loop_info);
 }
 
 static void
@@ -1188,7 +1186,7 @@ AnalyzeControlNodeBarriers(ControlNode *ctrl, EventIdMap &event_id_map,
       GetSyncInfos(units, 2, partition, ctrl->buffer_num_versions, true);
   auto sync_points = CollectSyncPoints(units, sync_infos);
   // sync_points = OptimizeSyncPoints(sync_points);
-  InsertSyncPoints(sync_points, flag_infos, sid, event_id_map, loop_info);
+  InsertSyncPoints(sync_points, flag_infos, event_id_map, loop_info);
 
   // Remove this loop from nesting info when exiting
   loop_info.PopLoop();
