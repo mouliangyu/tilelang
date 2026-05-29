@@ -763,7 +763,7 @@ private:
       } else {
         row_body = LetStmt(mask_var_, mu, SeqStmt({L, R, S}));
       }
-      return For(rep, i32(0), i32(oe), ForKind::kSerial, row_body));
+      return For(rep, i32(0), i32(oe), ForKind::kSerial, row_body);
     }
 
     // === dim=1, multi-VReg: per-chunk Reduce<MAX> + Max-accumulate ===
