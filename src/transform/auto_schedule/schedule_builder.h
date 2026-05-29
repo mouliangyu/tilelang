@@ -742,6 +742,17 @@ public:
             cloned_task->SetLatency(node_i_task->GetLatency());
             cloned_task->SetII(node_i_task->GetII());
             cloned_task->SetPipeMask(node_i_task->GetPipeMask());
+            for (size_t s = 0; s < node_i_task->GetTensorCoreShapeCount();
+                 ++s) {
+              const auto &shape = node_i_task->GetTensorCoreShape(s);
+              cloned_task->AddTensorCoreShape(shape.m, shape.n, shape.k,
+                                              shape.input_dtype,
+                                              shape.accum_dtype);
+            }
+            for (const auto &info : node_i_task->GetCopyInfos()) {
+              cloned_task->AddCopyInfo(info.src_scope, info.dst_scope,
+                                       info.dtype, info.bytes, info.pipe_mask);
+            }
             stage_map[cloned_task.get()] = rem_stage_j;
 
             for (size_t k = j; k < n; ++k) {

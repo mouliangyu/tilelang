@@ -105,7 +105,8 @@ ForFrame ParallelFor(const Array<PrimExpr> &extents,
   return ForFrame(n);
 }
 
-SimtVFFrame SimtVF(const Array<PrimExpr> &thread_extents);
+SimtVFFrame SimtVF(const Array<PrimExpr> &thread_extents,
+                   int64_t vf_latency = 0);
 
 ForFrame PipelinedFor(PrimExpr start, const PrimExpr &stop, int num_stages,
                       const Array<PrimExpr> &order,
@@ -445,6 +446,7 @@ public:
   Array<PrimExpr> thread_extents;
   Array<tvm::tir::Var> thread_vars;
   size_t parent_alloc_count_{0};
+  int64_t vf_latency_{0};
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
@@ -495,8 +497,13 @@ public:
     body = make_thread_extent(thread_vars[0], "threadIdx.x", thread_extents[0],
                               std::move(body));
 
+    ffi::Map<ffi::String, ffi::Any> simtvf_annotations;
+    if (vf_latency_ > 0) {
+      simtvf_annotations.Set("tl.vf_latency",
+                             IntImm(DataType::Int(64), vf_latency_));
+    }
     Stmt stmt = tvm::tir::Block({}, {}, {}, "SIMT_VF", body, std::nullopt,
-                                stolen_bufs, {}, {});
+                                stolen_bufs, {}, simtvf_annotations);
 
     script::ir_builder::IRBuilder builder =
         script::ir_builder::IRBuilder::Current();
@@ -525,7 +532,7 @@ public:
                                                 SimtVFFrameNode);
 };
 
-SimtVFFrame SimtVF(const Array<PrimExpr> &thread_extents) {
+SimtVFFrame SimtVF(const Array<PrimExpr> &thread_extents, int64_t vf_latency) {
   ICHECK_EQ(thread_extents.size(), 3)
       << "SimtVF requires exactly 3 thread extents [tx, ty, tz]";
   ObjectPtr<SimtVFFrameNode> n = tvm::ffi::make_object<SimtVFFrameNode>();
@@ -536,12 +543,14 @@ SimtVFFrame SimtVF(const Array<PrimExpr> &thread_extents) {
       tvm::tir::Var("simtvf_ty", dtype),
       tvm::tir::Var("simtvf_tz", dtype),
   };
+  n->vf_latency_ = vf_latency;
   return SimtVFFrame(n);
 }
 
 class SimdVFFrameNode : public TIRFrameNode {
 public:
   size_t parent_alloc_count_{0};
+  int64_t vf_latency_{0};
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
@@ -572,8 +581,13 @@ public:
 
     // No thread extent AttrStmts — SimdVF has no thread dimensions.
 
+    ffi::Map<ffi::String, ffi::Any> simdvf_annotations;
+    if (vf_latency_ > 0) {
+      simdvf_annotations.Set("tl.vf_latency",
+                             IntImm(DataType::Int(64), vf_latency_));
+    }
     Stmt stmt = tvm::tir::Block({}, {}, {}, "SIMD_VF", body, std::nullopt,
-                                stolen_bufs, {}, {});
+                                stolen_bufs, {}, simdvf_annotations);
 
     script::ir_builder::IRBuilder builder =
         script::ir_builder::IRBuilder::Current();
@@ -602,8 +616,9 @@ public:
                                                 SimdVFFrameNode);
 };
 
-SimdVFFrame SimdVF() {
+SimdVFFrame SimdVF(int64_t vf_latency = 0) {
   ObjectPtr<SimdVFFrameNode> n = tvm::ffi::make_object<SimdVFFrameNode>();
+  n->vf_latency_ = vf_latency;
   return SimdVFFrame(n);
 }
 

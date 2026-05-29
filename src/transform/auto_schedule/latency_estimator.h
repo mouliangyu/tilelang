@@ -3,19 +3,13 @@
 #include <tvm/runtime/logging.h>
 #include <tvm/target/target.h>
 #include <tvm/tir/buffer.h>
-#include <tvm/tir/builtin.h>
 #include <tvm/tir/expr.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt.h>
 #include <tvm/tir/stmt_functor.h>
 
-#include "../../op/builtin.h"
 #include "../../target/utils.h"
 #include "./ir_structure.h"
-#include <functional>
-#include <memory>
-#include <optional>
-#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -84,6 +78,438 @@ public:
     int64_t special_func_throughput =
         1; // Special functions throughput (ops/cycle, exp2, log2, sin, cos,
            // etc.)
+
+    // ------------------------------------------------------------------
+    // Ascend-only fields (ignored on CUDA/HIP targets, default 0 = "unused").
+    // Populated by AscendParams below. The Estimate() body does not consume
+    // them yet — they exist so the consumer pass (latency / II calculation)
+    // can be rewritten incrementally without re-touching every target.
+    // ------------------------------------------------------------------
+
+    // Per-pipe issue latency (cycles) and steady-state bandwidth (bytes/cycle).
+    // These cover Ascend's physically-distinct DMA channels; the legacy
+    // global_memory_* / shared_memory_* fields stay as a coarse fallback for
+    // code paths that have not been refactored yet.
+    //
+    // The `mte*_bandwidth` fields are the *headline* per-pipe number (= the
+    // fastest sub-path that pipe drives, typically L0A/L0B for MTE1 and
+    // UB<->GM for MTE2/MTE3). When a task's actual src/dst scope is known,
+    // the more precise per-path fields below should be preferred.
+    int64_t mte1_base_latency = 0;    // L1 -> L0A/L0B issue latency
+    int64_t mte1_bandwidth = 0;       // headline (L0A/L0B path)
+    int64_t mte2_base_latency = 0;    // GM -> UB / GM -> L1 issue latency
+    int64_t mte2_bandwidth = 0;       // headline (AIC GM->L1 path)
+    int64_t mte3_base_latency = 0;    // UB -> GM / UB -> L1 issue latency
+    int64_t mte3_bandwidth = 0;       // headline (UB->GM path, per AIV)
+    int64_t fixpipe_base_latency = 0; // L0C -> UB / L0C -> GM issue latency
+    int64_t fixpipe_bandwidth = 0;    // Fixpipe egress bandwidth
+
+    // Per-destination MTE1 paths (AIC). All four destinations are independent
+    // physical ports on the L1 Buffer; aggregate read bandwidth when all
+    // ports fire concurrently is the sum.
+    int64_t l1_to_l0a_bandwidth = 0;    // L1 -> L0A (MTE1)
+    int64_t l1_to_l0b_bandwidth = 0;    // L1 -> L0B (MTE1)
+    int64_t l1_to_bt_bandwidth = 0;     // L1 -> BT (bias table, MTE1)
+    int64_t l1_to_fp_buf_bandwidth = 0; // L1 -> FP Buf (MTE1)
+
+    // MTE2 sub-paths. AIC and AIV each have an MTE2 with different bandwidths
+    // against HBM/L2. Whether they share an HBM port (in which case aggregate
+    // is the smaller of the two, not the sum) is hardware-dependent — see
+    // `aic_aiv_share_hbm_port` below.
+    int64_t aic_mte2_to_l1_bandwidth = 0; // AIC: GM -> L1 Buffer
+    int64_t aiv_mte2_to_ub_bandwidth = 0; // AIV: GM -> UB (per AIV)
+
+    // MTE3 sub-paths (AIV-initiated, three independent destinations).
+    int64_t aiv_mte3_to_gm_bandwidth = 0;         // UB -> Out (per AIV)
+    int64_t aiv_mte3_to_aic_l1_bandwidth = 0;     // UB -> AIC L1 (per AIV)
+    int64_t aiv_mte3_to_aic_fp_buf_bandwidth = 0; // UB -> AIC FP Buf (per AIV)
+
+    // VRF -> VALU consumption rate on AIV (bytes/cycle). dtype-agnostic — to
+    // convert into ops/cycle, divide by element size (fp32 = 4, fp16/bf16 = 2,
+    // int8 = 1).
+    int64_t valu_bandwidth = 0;
+
+    // Scalar L1 D-Cache <-> Out bandwidth (separate from the L1 Buffer above;
+    // both AIC and AIV have this same 32 B/cycle path).
+    int64_t scalar_dcache_bandwidth = 0;
+
+    // Whether AIC MTE2 and AIV MTE2 share the same HBM port. If true, the
+    // aggregate GM read bandwidth is bounded by the larger of the two; if
+    // false they sum. TODO(ascend): confirm.
+    bool aic_aiv_share_hbm_port = false;
+
+    // On-chip buffer bandwidths (bytes/cycle). UB bandwidth is the legacy
+    // shared_memory_bandwidth; these split L1/L0A/L0B/L0C off as their own
+    // ports. Note these are *port* bandwidths (fill or drain rate from the
+    // associated pipe), not internal banking limits.
+    int64_t l1_bandwidth = 0;  // L1 Buffer access bandwidth (aggregate)
+    int64_t l0a_bandwidth = 0; // L0A fill rate from L1 via MTE1
+    int64_t l0b_bandwidth = 0; // L0B fill rate from L1 via MTE1
+    int64_t l0c_bandwidth = 0; // L0C drain rate via FixPipe
+
+    // Cube unit (single mad) shape — typically the smallest mad granularity
+    // emitted by codegen (e.g. 16x16x16 fp16 on dav-3510). Used to refine the
+    // tile-based II formula that is currently commented out around :271-315.
+    int64_t cube_unit_m = 0;
+    int64_t cube_unit_k = 0;
+    int64_t cube_unit_n = 0;
+
+    // Per-dtype Cube throughput (MACs/cycle). tensor_core_throughput is the
+    // generic fallback; these let the estimator pick the right number once
+    // TaskNode carries dtype info.
+    int64_t cube_throughput_fp16 = 0;
+    int64_t cube_throughput_bf16 = 0;
+    int64_t cube_throughput_fp32 = 0;
+
+    // Core clocks (Hz). Bandwidth fields above are bytes/cycle at the
+    // associated pipe's clock; convert via B/s = B/cycle * Hz. Two distinct
+    // clocks because AIC (Cube) and AIV (Vector) run independently.
+    double aic_frequency_hz = 0.0;
+    double aiv_frequency_hz = 0.0;
+
+    // HBM / L2 / on-chip memory capacities (bytes) and raw bandwidths.
+    int64_t hbm_bandwidth = 0;     // bytes/cycle, per AI Core's share
+    int64_t hbm_latency = 0;       // cycles, raw DRAM access
+    int64_t l2_capacity_bytes = 0; // shared L2 size
+    int64_t l2_bandwidth = 0;      // bytes/cycle
+    int64_t l2_hit_latency = 0;    // cycles
+    int64_t l1_capacity_bytes = 0; // AIC L1 Buffer size
+    int64_t ub_capacity_bytes = 0; // AIV Unified Buffer size
+    int64_t l0a_capacity_bytes = 0;
+    int64_t l0b_capacity_bytes = 0;
+    int64_t l0c_capacity_bytes = 0;
+    int64_t bt_capacity_bytes = 0;        // Bias Table
+    int64_t fp_buf_capacity_bytes = 0;    // FP Buffer (AIC)
+    int64_t ss_buffer_capacity_bytes = 0; // SSBuffer (scalar)
+
+    // Per-pipe issue queue depth (max in-flight ops the pipe can hold). Used
+    // to bound effective II under back-to-back issue.
+    int64_t mte1_queue_depth = 0;
+    int64_t mte2_queue_depth = 0;
+    int64_t mte3_queue_depth = 0;
+    int64_t cube_queue_depth = 0;
+    int64_t fixpipe_queue_depth = 0;
+    int64_t vector_queue_depth = 0;
+    int64_t scalar_queue_depth = 0;
+
+    // Cube MMAD pipeline depth (cycles between consecutive MMAD issues to
+    // reach steady state). unit_flag enables back-to-back mads without
+    // explicit set/wait — depth bounds how many can be in flight.
+    int64_t cube_pipeline_depth = 0;
+    int64_t cube_unit_flag_depth = 0;
+
+    // BT / FP buffer line depths (number of independent banks/lines).
+    int64_t bt_buffer_depth = 0;
+    int64_t fp_buffer_depth = 0;
+
+    // Additional Cube dtype throughputs (MACs/cycle). 0 means "use the
+    // generic tensor_core_throughput fallback".
+    int64_t cube_throughput_fp8 = 0;
+    int64_t cube_throughput_mxfp8 = 0;
+    int64_t cube_throughput_mxfp4 = 0;
+    int64_t cube_throughput_int8 = 0;
+    int64_t cube_throughput_int4 = 0;
+
+    // Per-dtype VALU throughput (ops/cycle). When 0, derive from
+    // valu_bandwidth / dtype.bytes(). These let the estimator account for
+    // narrow-dtype speedups (fp16 ≈ 2× fp32 on most lanes).
+    int64_t valu_throughput_fp32 = 0;
+    int64_t valu_throughput_fp16 = 0;
+    int64_t valu_throughput_bf16 = 0;
+    int64_t valu_throughput_int32 = 0;
+    int64_t valu_throughput_int16 = 0;
+    int64_t valu_throughput_int8 = 0;
+
+    // Special function throughput on AIV (exp/ln/sqrt/rsqrt). Separate from
+    // the generic special_func_throughput so we can model per-instr cost.
+    int64_t valu_special_func_throughput = 0;
+
+    // Scalar pipe op throughput. Distinct from cuda_core_operation because
+    // Ascend's S pipe has its own issue width and ALU shape.
+    int64_t scalar_op_throughput = 0;
+
+    // Front-end / control-flow penalties on the scalar pipe.
+    int64_t branch_mispredict_cycles = 0;
+    int64_t icache_miss_cycles = 0;
+    int64_t scalar_load_use_cycles = 0;
+
+    // MTE descriptor issue overhead (cycles charged once per copy command on
+    // top of the bandwidth-limited bulk transfer time).
+    int64_t mte_descriptor_cycles = 0;
+  };
+
+  // Ascend NPU parameters (dav-3510 / Ascend 950 / A5).
+  //
+  // Every field is explicitly assigned `= 0`. Values must be measured /
+  // confirmed from the architecture document before the estimator is
+  // trustworthy on Ascend. The formula bodies in EstimateAscend() are
+  // already written against these fields — once any field gets a real
+  // number, the formulas immediately consume it.
+  //
+  // Convention: bandwidth = bytes/cycle (at the pipe's clock), latency =
+  // cycles. Cube/Vector throughput = ops/cycle (MACs/cycle for Cube).
+  struct AscendParams : GPUParams {
+    AscendParams() {
+      // ================================================================
+      // Coarse legacy fields. The Ascend estimator does NOT consume these
+      // (it routes through the per-path fields below), so they stay at 0
+      // to avoid leaking H100 numbers via the generic Estimate() if we
+      // ever fall through to it.
+      // ================================================================
+      global_memory_read = 0;
+      global_memory_write = 0;
+      shared_memory_read = 0;
+      shared_memory_write = 0;
+      register_access = 0;
+      cuda_core_operation = 0;
+      tma_operation = 0;
+      tmem_read = 0;
+      tmem_write = 0;
+      tmem_bandwidth = 0;
+      global_memory_bandwidth = 0;
+      shared_memory_bandwidth = 0;
+      max_memory_ops_per_cycle = 0;
+
+      // ================================================================
+      // Cube (MMAD) — generic / legacy fields.
+      // tensor_core_throughput is the FALLBACK consulted by
+      // CubeThroughputFor() when the dtype-specific field is 0.
+      // We seed it with the FP16/BF16 number (8192 MACs/cycle) since
+      // that is the most common operand on Ascend GEMMs.
+      // ================================================================
+      tensor_core_base_latency =
+          8; // TODO(ascend): microbench MMAD issue -> L0C-ready
+      tensor_core_per_element_latency = 0;
+      tensor_core_throughput = 8192; // = FP16/BF16 (16x16x16x2)
+      tensor_core_min_ii = 1;        // single MMAD per cycle (back-to-back)
+      tensor_core_ii_per_tile = 0;
+      tensor_core_max_parallel_tiles = 0;
+      wgmma_base_latency = 0; // N/A on Ascend
+      wgmma_per_tile_latency = 0;
+
+      // ================================================================
+      // VALU / scalar throughputs (ops/cycle).
+      // TODO(ascend): microbench per-op / per-dtype VALU throughput. These
+      // conservative defaults use the fp32 bandwidth-derived rate for common
+      // ops and lower rates for div/mod/special functions.
+      // ================================================================
+      add_throughput = 64;
+      sub_throughput = 64;
+      mul_throughput = 64;
+      div_throughput = 16;
+      mod_throughput = 16;
+      min_max_throughput = 64;
+      cmp_throughput = 64;
+      logic_throughput = 64;
+      bitwise_throughput = 64;
+      shift_throughput = 64;
+      special_func_throughput = 8;
+
+      // ================================================================
+      // Per-pipe headline bandwidths (B/cycle).
+      // Source: A5 PDF p.4 davinci data path table + p.5 AIC diagram.
+      // The "headline" number is the fastest sub-path the pipe drives;
+      // EstimateAscend uses BandwidthForPath() to pick the precise
+      // per-port number when scope info is available.
+      //   MTE1 headline = L1->L0A/L0B = 256
+      //   MTE2 headline = AIC GM->L1  = 256
+      //   MTE3 headline = UB->GM      = 128 per AIV
+      //   FixPipe       = L0C->{UB,L1,GM} = 128
+      // ================================================================
+      mte1_base_latency = 0; // TODO(ascend): microbench MTE1 issue cycles
+      mte1_bandwidth = 256;
+      mte2_base_latency = 0; // TODO(ascend): microbench
+      mte2_bandwidth = 256;
+      mte3_base_latency = 0; // TODO(ascend): microbench
+      mte3_bandwidth = 128;
+      fixpipe_base_latency = 0; // TODO(ascend): microbench
+      fixpipe_bandwidth = 128;
+
+      // ================================================================
+      // MTE1 per-destination ports (AIC: L1 -> Cube input buffers).
+      // Source: A5 PDF p.4 davinci column.
+      //   L1 -> L0A     : 256 B/cycle
+      //   L1 -> L0B     : 256 B/cycle
+      //   L1 -> BT      :  32 B/cycle (combined "BT+FP buf" line)
+      //   L1 -> FP Buf  :  32 B/cycle
+      // ================================================================
+      l1_to_l0a_bandwidth = 256;
+      l1_to_l0b_bandwidth = 256;
+      l1_to_bt_bandwidth = 32;
+      l1_to_fp_buf_bandwidth = 32;
+
+      // ================================================================
+      // MTE2 per-source (GM -> on-chip). Source: A5 PDF p.4.
+      //   AIC OUT->L1   : 256 B/cycle
+      //   AIV OUT->UB   : 128 B/cycle per AIV (×2 AIV = 256 total per Core)
+      // aic_aiv_share_hbm_port: A5 has separate L2 ports for AIC and AIV
+      // (see p.4 path table — both rows count concurrently); the L2->HBM
+      // contention happens one level higher and is not modelled here.
+      // ================================================================
+      aic_mte2_to_l1_bandwidth = 256;
+      aiv_mte2_to_ub_bandwidth = 128;
+      aic_aiv_share_hbm_port = false;
+
+      // ================================================================
+      // MTE3 per-destination (AIV: UB -> off-AIV). Source: A5 PDF p.4.
+      //   UB -> Out (L2/GM)    : 128 B/cycle per AIV
+      //   UB -> AIC L1         : 128 B/cycle per AIV (A5-only path)
+      //   UB -> AIC FP Buf     : 128 B/cycle per AIV (A5-only path)
+      // ================================================================
+      aiv_mte3_to_gm_bandwidth = 128;
+      aiv_mte3_to_aic_l1_bandwidth = 128;
+      aiv_mte3_to_aic_fp_buf_bandwidth = 128;
+
+      // ================================================================
+      // VALU / scalar bandwidth (B/cycle). Source: A5 PDF p.8 AIV diagram.
+      //   VRF <-> UB       : 256 B/cycle (the "256B/cycle" arrow under VALU)
+      //   Scalar L1 DCache : 32 B/cycle (S pipe, both AIC and AIV)
+      // ================================================================
+      valu_bandwidth = 256;
+      scalar_dcache_bandwidth = 32;
+
+      // ================================================================
+      // On-chip buffer aggregate / port bandwidths.
+      // L1 aggregate = sum of concurrent egress ports
+      //              = L0A(256) + L0B(256) + BT(32) + FP(32) + UB(128)
+      //              = 704 B/cycle worst-case fan-out.
+      // L0A/L0B fill rate = matching MTE1 port = 256 B/cycle.
+      // L0C drain rate = FixPipe out = 128 B/cycle.
+      // ================================================================
+      l1_bandwidth = 704;
+      l0a_bandwidth = 256;
+      l0b_bandwidth = 256;
+      l0c_bandwidth = 128;
+
+      // ================================================================
+      // Cube physical mad granularity. Source: A5 PDF p.7.
+      //   FP16/BF16 mad = 16 x 16 x 16 (one cycle per mad pair).
+      // ================================================================
+      cube_unit_m = 16;
+      cube_unit_k = 16;
+      cube_unit_n = 16;
+
+      // ================================================================
+      // Per-dtype Cube throughput (MACs/cycle). Source: A5 PDF p.7.
+      //   FP16/BF16          : 16 x 16 x 16 x 2 = 8192
+      //   HiF8/FP8/MXFP8     : 16 x 32 x 16 x 2 = 16384
+      //   MXFP4              : 16 x 64 x 16 x 2 = 32768
+      //   FP32 / INT8 / INT4 : not documented for A5; leave at 0 so the
+      //                        fallback (tensor_core_throughput) kicks in.
+      // ================================================================
+      cube_throughput_fp16 = 8192;
+      cube_throughput_bf16 = 8192;
+      cube_throughput_fp32 =
+          0; // TODO(ascend): A5 likely lacks native fp32 MMAD
+      cube_throughput_fp8 = 16384;
+      cube_throughput_mxfp8 = 16384;
+      cube_throughput_mxfp4 = 32768;
+      cube_throughput_int8 = 0; // TODO(ascend): confirm INT8 support on A5
+      cube_throughput_int4 = 0; // TODO(ascend): confirm INT4 support on A5
+
+      // ================================================================
+      // Core clocks (Hz). White paper page 13 says AIC/AIV share clock
+      // but TFLOPS-derived numbers disagree (AIC ~1.65 GHz, AIV ~3.3 GHz
+      // assuming half AIVs do scalar). Leave 0 = "do not convert to s/B"
+      // until confirmed.
+      // ================================================================
+      aic_frequency_hz = 0.0;
+      aiv_frequency_hz = 0.0;
+
+      // ================================================================
+      // HBM / L2 / on-chip capacities (bytes). Sources:
+      //   A5 PDF p.5 (AIC diagram): L1=512KB, L0A=L0B=64KB, BT=FP=4KB,
+      //                              L0C=256KB.
+      //   A5 PDF p.8 (AIV diagram): UB = 256 KB per AIV. Each AI Core
+      //                              has 2 AIVs => 512 KB UB per Core,
+      //                              but the field is per-AIV.
+      //   A5 PDF p.4 (overview):    SSBuffer = 3 KB.
+      //   White paper:              L2/HBM size & bandwidth — TODO.
+      // ================================================================
+      hbm_bandwidth = 0;     // TODO(ascend): from white paper
+      hbm_latency = 0;       // TODO(ascend): microbench
+      l2_capacity_bytes = 0; // TODO(ascend): from white paper
+      l2_bandwidth = 0;      // TODO(ascend): from white paper
+      l2_hit_latency = 0;    // TODO(ascend): microbench
+      l1_capacity_bytes = 512 * 1024;
+      ub_capacity_bytes = 256 * 1024; // per AIV
+      l0a_capacity_bytes = 64 * 1024;
+      l0b_capacity_bytes = 64 * 1024;
+      l0c_capacity_bytes = 256 * 1024;
+      bt_capacity_bytes = 4 * 1024;
+      fp_buf_capacity_bytes = 4 * 1024;
+      ss_buffer_capacity_bytes = 3 * 1024;
+
+      // ================================================================
+      // Per-pipe queue depths. Only one is documented:
+      //   A5 PDF p.8: AIV MTE3 Queue = 16 entry.
+      // The AIC diagram (p.5) shows MTE2/MTE1/Cube/FixPipe queues as
+      // boxes with no entry counts. Leaving the rest at 0 means
+      // queue_bound() in EstimateAscend() returns 0 for that pipe (no
+      // floor) — same effect as "infinite queue".
+      // ================================================================
+      mte1_queue_depth =
+          16; // TODO(ascend): not in A5 diagram; default estimate
+      mte2_queue_depth =
+          16; // TODO(ascend): not in A5 diagram; default estimate
+      mte3_queue_depth = 16;
+      cube_queue_depth =
+          16; // TODO(ascend): not in A5 diagram; default estimate
+      fixpipe_queue_depth =
+          16; // TODO(ascend): not in A5 diagram; default estimate
+      vector_queue_depth =
+          16; // TODO(ascend): not in A5 diagram; default estimate
+      scalar_queue_depth =
+          4; // TODO(ascend): not in A5 diagram; default estimate
+
+      // ================================================================
+      // Cube pipeline / buffer depths. All TODO — needs microbench.
+      // ================================================================
+      cube_pipeline_depth =
+          1; // TODO(ascend): microbench MMAD steady-state issue depth
+      cube_unit_flag_depth =
+          16; // TODO(ascend): microbench unit_flag in-flight depth
+      bt_buffer_depth = 0;
+      fp_buffer_depth = 0;
+
+      // ================================================================
+      // Per-dtype VALU throughputs. Derive from valu_bandwidth lazily
+      // via ValuThroughputFor() when these are 0; explicit numbers
+      // would come from microbench of A5 SimdVF / SimtVF kernels.
+      //   fp32 (4B): 256/4 = 64 ops/cycle  per AIV
+      //   fp16 (2B): 256/2 = 128
+      //   bf16 (2B): 256/2 = 128
+      //   int32(4B): 256/4 = 64
+      //   int16(2B): 256/2 = 128
+      //   int8 (1B): 256/1 = 256
+      // (lazy fallback already does this; explicit values below let us
+      //  override per-dtype if VALU has narrow-int speedups beyond pure
+      //  bandwidth — currently we trust the lazy path.)
+      // ================================================================
+      valu_throughput_fp32 = 0;         // lazy fallback => 64
+      valu_throughput_fp16 = 0;         // lazy fallback => 128
+      valu_throughput_bf16 = 0;         // lazy fallback => 128
+      valu_throughput_int32 = 0;        // lazy fallback => 64
+      valu_throughput_int16 = 0;        // lazy fallback => 128
+      valu_throughput_int8 = 0;         // lazy fallback => 256
+      valu_special_func_throughput = 8; // TODO(ascend): exp/ln/rsqrt microbench
+
+      // ================================================================
+      // Scalar pipe specifics. Front-end constants from A5 PDF p.5
+      // (AIC) / p.8 (AIV) headers, but these are entry counts not
+      // cycle costs — penalties below need microbench.
+      // ================================================================
+      scalar_op_throughput = 1; // TODO(ascend): S pipe issue width
+      branch_mispredict_cycles = 0;
+      icache_miss_cycles = 0;
+      scalar_load_use_cycles = 0;
+
+      // ================================================================
+      // MTE descriptor overhead. Charged once per copy command on top
+      // of the bandwidth-limited bulk transfer. TODO(ascend): bench.
+      // ================================================================
+      mte_descriptor_cycles = 0;
+    }
   };
 
   struct B200Params : GPUParams {
@@ -114,7 +540,10 @@ public:
   };
 
   explicit LatencyEstimator(Target target = Target()) {
-    if (target.defined() && TargetIsSm100(target)) {
+    if (target.defined() && TargetIsAscend(target)) {
+      params_ = AscendParams();
+      is_ascend_ = true;
+    } else if (target.defined() && TargetIsSm100(target)) {
       params_ = B200Params();
     }
   }
@@ -124,6 +553,10 @@ public:
 
   // Estimate latency for a TaskNode
   void Estimate(TaskNode *task) {
+    if (is_ascend_) {
+      EstimateAscend(task);
+      return;
+    }
     int64_t total_latency = 0;
     int64_t memory_latency = 0;
     int64_t compute_latency = 0;
@@ -358,6 +791,478 @@ public:
 private:
   GPUParams params_;
   int64_t thread_count_ = 1; // Default to 1 (no parallelism)
+  bool is_ascend_ = false;
+
+  // ====================================================================
+  // Ascend-specific estimator.
+  //
+  // The formulas below are written in full against the (currently zero)
+  // AscendParams fields. Every divisor is guarded with `safe_div(a, b)` so
+  // that an unfilled (= 0) bandwidth/throughput parameter degenerates to a
+  // zero contribution rather than a divide-by-zero. Once a parameter gets
+  // a real value, the formula immediately starts producing a real number.
+  //
+  // The estimator is structured by physical resource:
+  //   1. Memory latency: walk read/write regions, classify (src,dst) scope
+  //      pair to a physical path, charge `base + bytes/bandwidth`.
+  //   2. Compute latency:
+  //        Cube   -> (M*K*N) / cube_throughput_<dtype> + base
+  //        Vector -> max(op-count via OperationCounter,
+  //                      bytes / valu_bandwidth)
+  //        Scalar -> op count / scalar_op_throughput
+  //   3. II by pipe: take the max of:
+  //        - bandwidth-limited II per physical port
+  //        - latency-limited II (= total_latency when pipe can't overlap)
+  //        - queue-depth-limited II (= ops / queue_depth)
+  //   4. Total latency = memory_latency + compute_latency
+  //      under sequential assumption; pipeline overlap is handled by the
+  //      scheduler (Z3) via the II we emit.
+  // ====================================================================
+
+  static int64_t safe_div_ceil(int64_t numer, int64_t denom) {
+    return denom > 0 ? (numer + denom - 1) / denom : 0;
+  }
+  static int64_t safe_div(int64_t numer, int64_t denom) {
+    return denom > 0 ? numer / denom : 0;
+  }
+
+  // Read `tl.vf_latency` annotation from SIMT_VF / SIMD_VF Block nodes within
+  // the task. Returns 0 when no annotation is present.
+  static int64_t ReadVFLatencyFromBlocks(const TaskNode *task) {
+    struct VFLatencyReader : public StmtVisitor {
+      void VisitStmt_(const BlockNode *op) override {
+        if (op->name_hint == "SIMT_VF" || op->name_hint == "SIMD_VF") {
+          auto it = op->annotations.find("tl.vf_latency");
+          if (it != op->annotations.end()) {
+            if (auto *imm = (*it).second.as<IntImmNode>()) {
+              latency = std::max(latency, imm->value);
+            }
+          }
+        }
+        StmtVisitor::VisitStmt_(op);
+      }
+      int64_t latency{0};
+    };
+
+    VFLatencyReader reader;
+    for (const auto &stmt : task->stmts) {
+      reader(stmt);
+    }
+    return reader.latency;
+  }
+
+  // Classification of (scope -> scope) for an MTE-style copy. Matches the
+  // PipeMask the IRStructureBuilder will have set on the task, but lets
+  // EstimateAscend pick the *specific* physical port (e.g. L1->L0A vs
+  // L1->L0B) from the region's buffer.
+  enum class AscendPath {
+    kUnknown,
+    kGmToL1,    // MTE2 (AIC)
+    kGmToUb,    // MTE2 (AIV)
+    kUbToGm,    // MTE3
+    kUbToL1,    // MTE3 (cross-core)
+    kUbToFpBuf, // MTE3 (cross-core)
+    kL1ToL0a,   // MTE1
+    kL1ToL0b,   // MTE1
+    kL1ToBt,    // MTE1
+    kL1ToFpBuf, // MTE1
+    kL0cToUb,   // Fixpipe
+    kL0cToGm,   // Fixpipe
+  };
+
+  // Pick the bandwidth (bytes/cycle) for a physical path. Returns 0 when
+  // the path or the parameter is unknown — `safe_div` then collapses that
+  // term to zero in the formulas below.
+  int64_t BandwidthForPath(AscendPath path) const {
+    switch (path) {
+    case AscendPath::kGmToL1:
+      return params_.aic_mte2_to_l1_bandwidth;
+    case AscendPath::kGmToUb:
+      return params_.aiv_mte2_to_ub_bandwidth;
+    case AscendPath::kUbToGm:
+      return params_.aiv_mte3_to_gm_bandwidth;
+    case AscendPath::kUbToL1:
+      return params_.aiv_mte3_to_aic_l1_bandwidth;
+    case AscendPath::kUbToFpBuf:
+      return params_.aiv_mte3_to_aic_fp_buf_bandwidth;
+    case AscendPath::kL1ToL0a:
+      return params_.l1_to_l0a_bandwidth;
+    case AscendPath::kL1ToL0b:
+      return params_.l1_to_l0b_bandwidth;
+    case AscendPath::kL1ToBt:
+      return params_.l1_to_bt_bandwidth;
+    case AscendPath::kL1ToFpBuf:
+      return params_.l1_to_fp_buf_bandwidth;
+    case AscendPath::kL0cToUb:
+      return params_.fixpipe_bandwidth;
+    case AscendPath::kL0cToGm:
+      return params_.fixpipe_bandwidth;
+    default:
+      return 0;
+    }
+  }
+
+  int64_t BaseLatencyForPath(AscendPath path) const {
+    switch (path) {
+    case AscendPath::kGmToL1:
+    case AscendPath::kGmToUb:
+      return params_.mte2_base_latency;
+    case AscendPath::kUbToGm:
+    case AscendPath::kUbToL1:
+    case AscendPath::kUbToFpBuf:
+      return params_.mte3_base_latency;
+    case AscendPath::kL1ToL0a:
+    case AscendPath::kL1ToL0b:
+    case AscendPath::kL1ToBt:
+    case AscendPath::kL1ToFpBuf:
+      return params_.mte1_base_latency;
+    case AscendPath::kL0cToUb:
+    case AscendPath::kL0cToGm:
+      return params_.fixpipe_base_latency;
+    default:
+      return 0;
+    }
+  }
+
+  // Best-effort classification of a single region into an AscendPath from
+  // its buffer scope. For reads, `path = ? -> dst_of_pipe`; for writes,
+  // `path = src_of_pipe -> ?`. The task's pipe mask narrows it further.
+  AscendPath ClassifyRegion(const String &scope, uint16_t pipe_mask,
+                            bool is_read) const {
+    bool has_mte1 = pipe_mask & static_cast<uint16_t>(ResourcePipe::kMTE1);
+    bool has_mte2 = pipe_mask & static_cast<uint16_t>(ResourcePipe::kMTE2);
+    bool has_mte3 = pipe_mask & static_cast<uint16_t>(ResourcePipe::kMTE3);
+    bool has_fix = pipe_mask & static_cast<uint16_t>(ResourcePipe::kFixpipe);
+
+    std::string s = scope.operator std::string();
+    if (has_mte2) {
+      if (s == "global" && !is_read)
+        return AscendPath::kUnknown;
+      if (s == "global" && is_read)
+        return AscendPath::kGmToUb; // default
+      if (s == "shared.l1")
+        return AscendPath::kGmToL1;
+      if (s == "shared" || s == "shared.dyn")
+        return AscendPath::kGmToUb;
+    }
+    if (has_mte3) {
+      if (s == "global")
+        return AscendPath::kUbToGm;
+      if (s == "shared.l1")
+        return AscendPath::kUbToL1;
+    }
+    if (has_mte1) {
+      if (s == "shared.l0a")
+        return AscendPath::kL1ToL0a;
+      if (s == "shared.l0b")
+        return AscendPath::kL1ToL0b;
+      if (s == "shared.bt")
+        return AscendPath::kL1ToBt;
+    }
+    if (has_fix) {
+      if (s == "shared.l0c" && is_read) {
+        // L0C is the source; dest scope comes from the *other* region.
+        return AscendPath::kL0cToUb; // refined by paired region below
+      }
+      if (s == "global")
+        return AscendPath::kL0cToGm;
+      if (s == "shared" || s == "shared.dyn")
+        return AscendPath::kL0cToUb;
+    }
+    return AscendPath::kUnknown;
+  }
+
+  AscendPath ClassifyCopy(const String &src_scope,
+                          const String &dst_scope) const {
+    std::string src = src_scope.operator std::string();
+    std::string dst = dst_scope.operator std::string();
+    if (src == "global" && dst == "shared.l1")
+      return AscendPath::kGmToL1;
+    if (src == "global" && (dst == "shared" || dst == "shared.dyn"))
+      return AscendPath::kGmToUb;
+    if ((src == "shared" || src == "shared.dyn") && dst == "global")
+      return AscendPath::kUbToGm;
+    if ((src == "shared" || src == "shared.dyn") && dst == "shared.l1")
+      return AscendPath::kUbToL1;
+    if (src == "shared.l1" && dst == "shared.l0a")
+      return AscendPath::kL1ToL0a;
+    if (src == "shared.l1" && dst == "shared.l0b")
+      return AscendPath::kL1ToL0b;
+    if (src == "shared.l1" && dst == "shared.bt")
+      return AscendPath::kL1ToBt;
+    if (src == "shared.l1" && dst == "shared.fp")
+      return AscendPath::kL1ToFpBuf;
+    if (src == "shared.l0c" && (dst == "shared" || dst == "shared.dyn"))
+      return AscendPath::kL0cToUb;
+    if (src == "shared.l0c" && dst == "global")
+      return AscendPath::kL0cToGm;
+    return AscendPath::kUnknown;
+  }
+
+  // Per-dtype Cube throughput (MACs/cycle). Falls back to the generic
+  // tensor_core_throughput when no dtype-specific number is available.
+  int64_t CubeThroughputFor(DataType dtype) const {
+    if (dtype.is_float16())
+      return params_.cube_throughput_fp16 ? params_.cube_throughput_fp16
+                                          : params_.tensor_core_throughput;
+    if (dtype.is_bfloat16())
+      return params_.cube_throughput_bf16 ? params_.cube_throughput_bf16
+                                          : params_.tensor_core_throughput;
+    if (dtype.is_float() && dtype.bits() == 32)
+      return params_.cube_throughput_fp32 ? params_.cube_throughput_fp32
+                                          : params_.tensor_core_throughput;
+    if (dtype.is_float8() || (dtype.is_float() && dtype.bits() == 8))
+      return params_.cube_throughput_fp8 ? params_.cube_throughput_fp8
+                                         : params_.tensor_core_throughput;
+    if (dtype.is_int() && dtype.bits() == 8)
+      return params_.cube_throughput_int8 ? params_.cube_throughput_int8
+                                          : params_.tensor_core_throughput;
+    return params_.tensor_core_throughput;
+  }
+
+  // Per-dtype VALU throughput (ops/cycle). When the dtype-specific field is
+  // 0, fall back to valu_bandwidth / dtype.bytes() if known, then to 0.
+  int64_t ValuThroughputFor(DataType dtype) const {
+    int64_t per_dtype = 0;
+    if (dtype.is_float() && dtype.bits() == 32)
+      per_dtype = params_.valu_throughput_fp32;
+    else if (dtype.is_float16())
+      per_dtype = params_.valu_throughput_fp16;
+    else if (dtype.is_bfloat16())
+      per_dtype = params_.valu_throughput_bf16;
+    else if (dtype.is_int() && dtype.bits() == 32)
+      per_dtype = params_.valu_throughput_int32;
+    else if (dtype.is_int() && dtype.bits() == 16)
+      per_dtype = params_.valu_throughput_int16;
+    else if (dtype.is_int() && dtype.bits() == 8)
+      per_dtype = params_.valu_throughput_int8;
+    if (per_dtype > 0)
+      return per_dtype;
+    int64_t bytes = dtype.bytes();
+    return bytes > 0 ? safe_div(params_.valu_bandwidth, bytes) : 0;
+  }
+
+  // The Ascend latency / II estimation entry point. Mirrors the structure
+  // of the generic Estimate() but consults the per-path / per-dtype fields.
+  void EstimateAscend(TaskNode *task) {
+    uint16_t pipe_mask = task->GetPipeMask();
+    bool has_mte1 = pipe_mask & static_cast<uint16_t>(ResourcePipe::kMTE1);
+    bool has_mte2 = pipe_mask & static_cast<uint16_t>(ResourcePipe::kMTE2);
+    bool has_mte3 = pipe_mask & static_cast<uint16_t>(ResourcePipe::kMTE3);
+    bool has_fix = pipe_mask & static_cast<uint16_t>(ResourcePipe::kFixpipe);
+    bool has_cube = pipe_mask & static_cast<uint16_t>(ResourcePipe::kCube);
+    bool has_vec = pipe_mask & static_cast<uint16_t>(ResourcePipe::kVector);
+    bool has_scl = pipe_mask & static_cast<uint16_t>(ResourcePipe::kScalar);
+    bool has_dma = has_mte1 || has_mte2 || has_mte3 || has_fix;
+    int64_t measured_vf_latency = ReadVFLatencyFromBlocks(task);
+
+    // -----------------------------------------------------------------
+    // 1. Memory latency: per-physical-path, base + bytes / bandwidth.
+    //    Bytes are aggregated per path for the II step.
+    // -----------------------------------------------------------------
+    std::unordered_map<int, int64_t> bytes_per_path;
+    int64_t memory_latency = 0;
+
+    auto add_memory_access = [&](AscendPath path, int64_t bytes) {
+      int64_t bw = BandwidthForPath(path);
+      int64_t base = BaseLatencyForPath(path);
+      // latency(region) = descriptor_overhead + base + bytes / bandwidth
+      int64_t lat =
+          params_.mte_descriptor_cycles + base + safe_div_ceil(bytes, bw);
+      memory_latency += lat;
+      bytes_per_path[static_cast<int>(path)] += bytes;
+    };
+
+    if (task->HasCopyInfo()) {
+      for (const auto &info : task->GetCopyInfos()) {
+        add_memory_access(ClassifyCopy(info.src_scope, info.dst_scope),
+                          info.bytes);
+      }
+    } else {
+      auto visit_region = [&](const BufferRegion &region, bool is_read) {
+        const Buffer &buffer = region->buffer;
+        String scope = buffer.scope();
+        AscendPath path = ClassifyRegion(scope, pipe_mask, is_read);
+        int64_t bytes = CalculateAccessBytes(region);
+        add_memory_access(path, bytes);
+      };
+      for (const auto &r : task->GetReadRegions())
+        visit_region(r, /*is_read=*/true);
+      for (const auto &r : task->GetWriteRegions())
+        visit_region(r, /*is_read=*/false);
+    }
+
+    // -----------------------------------------------------------------
+    // 2. Compute latency.
+    // -----------------------------------------------------------------
+    int64_t compute_latency = 0;
+    int64_t vector_latency = 0;
+    int64_t cube_latency = 0;
+    int64_t scalar_latency = 0;
+
+    if (has_vec) {
+      if (measured_vf_latency > 0) {
+        // User-annotated latency — use it directly, skip model estimation.
+        vector_latency = measured_vf_latency;
+      } else {
+        // Op-count path (TIR visitor).
+        OperationCounter counter(thread_count_, &params_);
+        for (const auto &stmt : task->stmts)
+          counter(stmt);
+        int64_t op_count_latency = counter.GetEstimatedLatency();
+
+        // Bandwidth-bound path: total bytes the VALU consumes / valu_bandwidth.
+        int64_t valu_bytes = 0;
+        for (const auto &r : task->GetReadRegions()) {
+          String scope = r->buffer.scope();
+          if (scope == "local" || scope == "local.fragment" ||
+              scope == "shared" || scope == "shared.dyn") {
+            valu_bytes += CalculateAccessBytes(r);
+          }
+        }
+        int64_t bw_latency = safe_div_ceil(valu_bytes, params_.valu_bandwidth);
+
+        vector_latency = std::max(op_count_latency, bw_latency);
+      }
+      compute_latency = std::max(compute_latency, vector_latency);
+    }
+
+    if (has_cube) {
+      // matmul latency = base + total_MACs / per-dtype throughput.
+      // total_MACs comes from TaskNode if HasTensorCoreShape(); else fall
+      // back to a single unit-mad.
+      int64_t matmul_latency = params_.tensor_core_base_latency;
+      if (task->HasTensorCoreShape()) {
+        matmul_latency = params_.tensor_core_base_latency;
+        for (size_t i = 0; i < task->GetTensorCoreShapeCount(); ++i) {
+          const auto &shape = task->GetTensorCoreShape(i);
+          int64_t ops = shape.m * shape.n * shape.k * 2;
+          int64_t throughput = CubeThroughputFor(shape.input_dtype);
+          matmul_latency += safe_div_ceil(ops, throughput);
+        }
+        matmul_latency =
+            std::max(matmul_latency, params_.tensor_core_base_latency);
+      } else if (params_.cube_unit_m > 0 && params_.cube_unit_k > 0 &&
+                 params_.cube_unit_n > 0) {
+        // Single unit mad fallback.
+        int64_t unit_ops =
+            params_.cube_unit_m * params_.cube_unit_k * params_.cube_unit_n;
+        int64_t throughput = CubeThroughputFor(DataType::Float(16));
+        matmul_latency = params_.tensor_core_base_latency +
+                         safe_div_ceil(unit_ops, throughput);
+      }
+      cube_latency = matmul_latency;
+      compute_latency = std::max(compute_latency, cube_latency);
+    }
+
+    if (has_scl && !has_vec) {
+      // Pure scalar tasks (set/wait_flag bodies, address compute). Charge
+      // a flat per-stmt cost — scalar pipe throughput is the divisor.
+      int64_t scalar_ops = static_cast<int64_t>(task->stmts.size());
+      scalar_latency =
+          params_.scalar_op_throughput > 0
+              ? safe_div_ceil(scalar_ops, params_.scalar_op_throughput)
+              : scalar_ops;
+      compute_latency = std::max(compute_latency, scalar_latency);
+    }
+
+    int64_t total_latency = memory_latency + compute_latency;
+
+    // -----------------------------------------------------------------
+    // 4. II: per-pipe analysis. Take the max across all active pipes.
+    // -----------------------------------------------------------------
+    int64_t ii = 1;
+    int64_t memory_ii = 1;
+    for (const auto &kv : bytes_per_path) {
+      AscendPath path = static_cast<AscendPath>(kv.first);
+      int64_t bw = BandwidthForPath(path);
+      memory_ii = std::max(memory_ii, safe_div_ceil(kv.second, bw));
+    }
+
+    int64_t cube_ii = params_.tensor_core_min_ii;
+    if (has_cube) {
+      if (task->HasTensorCoreShape()) {
+        cube_ii = params_.tensor_core_min_ii;
+        for (size_t i = 0; i < task->GetTensorCoreShapeCount(); ++i) {
+          const auto &shape = task->GetTensorCoreShape(i);
+          int64_t ops = shape.m * shape.n * shape.k * 2;
+          int64_t throughput = CubeThroughputFor(shape.input_dtype);
+          cube_ii = std::max(cube_ii, safe_div_ceil(ops, throughput));
+        }
+      }
+      cube_ii = std::max(cube_ii, params_.cube_pipeline_depth);
+    }
+
+    int64_t vector_ii = 1;
+    if (has_vec) {
+      if (measured_vf_latency > 0) {
+        vector_ii = measured_vf_latency;
+      } else {
+        int64_t denom =
+            params_.vector_queue_depth > 0 ? params_.vector_queue_depth : 1;
+        vector_ii = std::max(vector_ii, safe_div_ceil(vector_latency, denom));
+      }
+    }
+
+    int64_t scalar_ii = 1;
+    if (has_scl) {
+      int64_t denom =
+          params_.scalar_queue_depth > 0 ? params_.scalar_queue_depth : 1;
+      scalar_ii = std::max(scalar_ii, safe_div_ceil(scalar_latency, denom));
+    }
+
+    if (has_dma && !has_cube && !has_vec) {
+      // DMA-only: II = max bandwidth-limited II across active paths.
+      ii = std::max(ii, memory_ii);
+    } else if (has_cube && !has_dma && !has_vec) {
+      // Cube-only: II = max(cube_pipeline_depth, total_macs / throughput,
+      //                     tensor_core_min_ii).
+      ii = std::max(ii, cube_ii);
+    } else if (has_vec && !has_dma && !has_cube) {
+      // Vector-only: II = compute_latency / vector_queue_depth (fallback to
+      // compute_latency when queue depth is unknown).
+      ii = std::max(ii, vector_ii);
+    } else {
+      // Mixed / fallback: keep task granularity, but bound II by the slowest
+      // active pipe instead of forcing it to the full sequential latency.
+      if (has_dma)
+        ii = std::max(ii, memory_ii);
+      if (has_cube)
+        ii = std::max(ii, cube_ii);
+      if (has_vec)
+        ii = std::max(ii, vector_ii);
+      if (has_scl)
+        ii = std::max(ii, scalar_ii);
+    }
+
+    // Queue-depth-limited floor: a pipe with finite queue depth can never
+    // issue faster than ops/queue_depth. Approximate "ops" by number of
+    // stmts on that pipe — coarse but at least monotone in workload.
+    auto queue_bound = [&](int64_t depth, int64_t ops) {
+      return depth > 0 ? safe_div_ceil(ops, depth) : 0;
+    };
+    int64_t num_stmts = static_cast<int64_t>(task->stmts.size());
+    if (has_mte1)
+      ii = std::max(ii, queue_bound(params_.mte1_queue_depth, num_stmts));
+    if (has_mte2)
+      ii = std::max(ii, queue_bound(params_.mte2_queue_depth, num_stmts));
+    if (has_mte3)
+      ii = std::max(ii, queue_bound(params_.mte3_queue_depth, num_stmts));
+    if (has_fix)
+      ii = std::max(ii, queue_bound(params_.fixpipe_queue_depth, num_stmts));
+    if (has_cube)
+      ii = std::max(ii, queue_bound(params_.cube_queue_depth, num_stmts));
+    if (has_vec)
+      ii = std::max(ii, queue_bound(params_.vector_queue_depth, num_stmts));
+    if (has_scl)
+      ii = std::max(ii, queue_bound(params_.scalar_queue_depth, num_stmts));
+
+    if (ii < 1)
+      ii = 1;
+
+    task->SetLatency(total_latency);
+    task->SetII(ii);
+  }
 
   // Operation counter visitor with latency estimation
   class OperationCounter : public StmtExprVisitor {
@@ -722,10 +1627,19 @@ private:
 
     // Calculate total number of elements
     int64_t total_elements = 1;
-    for (const auto &range : ranges) {
+    for (size_t i = 0; i < ranges.size(); ++i) {
+      const auto &range = ranges[i];
       // Try to get constant extent if possible
       if (const auto *extent_int = range->extent.as<IntImmNode>()) {
         total_elements *= extent_int->value;
+      } else if (i < buffer->shape.size()) {
+        // TODO(ascend): use arith bounds from loop context for symbolic
+        // extents. Buffer shape is a better task-level fallback than 1.
+        if (const int64_t *shape_extent = as_const_int(buffer->shape[i])) {
+          total_elements *= *shape_extent;
+        } else {
+          total_elements *= 1;
+        }
       } else {
         // For non-constant extents, use a conservative estimate
         // Assume at least 1 element per dimension

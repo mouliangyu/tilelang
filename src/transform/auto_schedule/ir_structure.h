@@ -321,11 +321,20 @@ public:
     int64_t m;
     int64_t n;
     int64_t k;
-    TensorCoreShape(int64_t m = 0, int64_t n = 0, int64_t k = 0)
-        : m(m), n(n), k(k) {}
+    DataType input_dtype;
+    DataType accum_dtype;
+    TensorCoreShape(int64_t m = 0, int64_t n = 0, int64_t k = 0,
+                    DataType input_dtype = DataType::Float(16),
+                    DataType accum_dtype = DataType::Float(16))
+        : m(m), n(n), k(k), input_dtype(input_dtype), accum_dtype(accum_dtype) {
+    }
   };
   void AddTensorCoreShape(int64_t m, int64_t n, int64_t k) {
     tensor_core_shapes_.emplace_back(m, n, k);
+  }
+  void AddTensorCoreShape(int64_t m, int64_t n, int64_t k, DataType input_dtype,
+                          DataType accum_dtype) {
+    tensor_core_shapes_.emplace_back(m, n, k, input_dtype, accum_dtype);
   }
 
   // Get shape information
@@ -345,6 +354,28 @@ public:
     return tensor_core_shapes_.empty() ? 0 : tensor_core_shapes_[0].k;
   }
   bool HasTensorCoreShape() const { return !tensor_core_shapes_.empty(); }
+
+  // Task-level copy information collected from tl.copy calls. Ascend latency
+  // estimation uses this instead of re-deriving copy direction from read/write
+  // regions, which avoids double-counting source and destination regions.
+  struct CopyInfo {
+    String src_scope;
+    String dst_scope;
+    DataType dtype;
+    int64_t bytes;
+    uint16_t pipe_mask;
+    CopyInfo(String src_scope = String(""), String dst_scope = String(""),
+             DataType dtype = DataType::Float(16), int64_t bytes = 0,
+             uint16_t pipe_mask = 0)
+        : src_scope(src_scope), dst_scope(dst_scope), dtype(dtype),
+          bytes(bytes), pipe_mask(pipe_mask) {}
+  };
+  void AddCopyInfo(String src_scope, String dst_scope, DataType dtype,
+                   int64_t bytes, uint16_t pipe_mask) {
+    copy_infos_.emplace_back(src_scope, dst_scope, dtype, bytes, pipe_mask);
+  }
+  const std::vector<CopyInfo> &GetCopyInfos() const { return copy_infos_; }
+  bool HasCopyInfo() const { return !copy_infos_.empty(); }
 
   // Get aggregated shape information for II estimation
   int64_t GetTotalTensorCoreOps() const {
@@ -438,6 +469,7 @@ private:
   // All gemm operations within a single task must use the same instruction.
   GemmInst gemm_inst_{GemmInst::kMMA};
   bool has_gemm_inst_{false};
+  std::vector<CopyInfo> copy_infos_;
 
   // Cached flag for loop_break detection
   mutable std::optional<bool> contains_loop_break_cache_;

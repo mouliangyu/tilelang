@@ -483,10 +483,16 @@ private:
         int64_t m;
         int64_t n;
         int64_t k;
-        TensorCoreShape(int64_t m = 0, int64_t n = 0, int64_t k = 0)
-            : m(m), n(n), k(k) {}
+        DataType input_dtype;
+        DataType accum_dtype;
+        TensorCoreShape(int64_t m = 0, int64_t n = 0, int64_t k = 0,
+                        DataType input_dtype = DataType::Float(16),
+                        DataType accum_dtype = DataType::Float(16))
+            : m(m), n(n), k(k), input_dtype(input_dtype),
+              accum_dtype(accum_dtype) {}
       };
       std::vector<TensorCoreShape> tensor_core_shapes;
+      std::vector<TaskNode::CopyInfo> copy_infos;
 
       // Target and block_size for GemmInst determination
       Target target;
@@ -518,6 +524,28 @@ private:
         return static_cast<uint16_t>(ResourcePipe::kMTE2);
       }
 
+      static int64_t CalculateCopyBytes(const CopyNode *copy) {
+        int64_t elements = 1;
+        for (size_t i = 0; i < copy->dst_range.size(); ++i) {
+          const auto &range = copy->dst_range[i];
+          if (const int64_t *extent = as_const_int(range->extent)) {
+            elements *= *extent;
+          } else if (i < copy->dst->shape.size()) {
+            // TODO(ascend): use arith bounds from loop context for symbolic
+            // extents. Buffer shape is a better task-level fallback than 1.
+            if (const int64_t *shape_extent =
+                    as_const_int(copy->dst->shape[i])) {
+              elements *= *shape_extent;
+            } else {
+              elements *= 1;
+            }
+          } else {
+            elements *= 1;
+          }
+        }
+        return elements * DataType(copy->dst->dtype).bytes();
+      }
+
       void VisitExpr_(const CallNode *op) override {
         // Check for specific TileLang operations
         static const auto copy_op = Op::Get("tl.tileop.copy");
@@ -527,7 +555,11 @@ private:
         if (op->op.same_as(copy_op)) {
           Copy copy_obj(op->args, op->annotations);
           const CopyNode *copy = copy_obj.get();
-          pipe_mask |= GetCopyPipeMask(copy->src, copy->dst);
+          uint16_t copy_pipe = GetCopyPipeMask(copy->src, copy->dst);
+          pipe_mask |= copy_pipe;
+          copy_infos.emplace_back(copy->src.scope(), copy->dst.scope(),
+                                  DataType(copy->dst->dtype),
+                                  CalculateCopyBytes(copy), copy_pipe);
         } else if (op->op.same_as(tl::ascend_nd2nz_scatter())) {
           // SimdVF MicroAPI scatter writing into a UB tmp.
           pipe_mask |= static_cast<uint16_t>(ResourcePipe::kVector);
@@ -537,8 +569,9 @@ private:
         } else if (op->op.same_as(gemm_py_op) || op->op.same_as(gemm_op)) {
           pipe_mask |= static_cast<uint16_t>(ResourcePipe::kCube);
           GemmPy gemm_py(op->args);
-          tensor_core_shapes.emplace_back(gemm_py->m_, gemm_py->n_,
-                                          gemm_py->k_);
+          tensor_core_shapes.emplace_back(gemm_py->m_, gemm_py->n_, gemm_py->k_,
+                                          gemm_py->a_->dtype,
+                                          gemm_py->c_->dtype);
         } else if (op->op.same_as(builtin::call_extern())) {
           if (auto sym = op->args[0].as<StringImmNode>()) {
             const std::string &name = sym->value;
@@ -583,8 +616,13 @@ private:
       // Set Tensor Core shape information if available
       for (const auto &shape : analyzer.tensor_core_shapes) {
         if (shape.m > 0 && shape.n > 0 && shape.k > 0) {
-          task_node->AddTensorCoreShape(shape.m, shape.n, shape.k);
+          task_node->AddTensorCoreShape(shape.m, shape.n, shape.k,
+                                        shape.input_dtype, shape.accum_dtype);
         }
+      }
+      for (const auto &info : analyzer.copy_infos) {
+        task_node->AddCopyInfo(info.src_scope, info.dst_scope, info.dtype,
+                               info.bytes, info.pipe_mask);
       }
     }
 

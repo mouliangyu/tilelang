@@ -34,7 +34,7 @@ class SimtVFFrame(TIRFrame):
         super().__exit__(ptype, value, trace)
 
 
-def SimtVF(threads: int | list[int] | tuple = 128) -> SimtVFFrame:
+def SimtVF(threads: int | list[int] | tuple = 128, latency: int = 0) -> SimtVFFrame:
     """Construct a dedicated SIMT vector-fragment region frame.
 
     Parameters
@@ -44,6 +44,11 @@ def SimtVF(threads: int | list[int] | tuple = 128) -> SimtVFFrame:
         Can be a single int (threadIdx.x only), or a list/tuple of up to 3
         integers for (threadIdx.x, threadIdx.y, threadIdx.z).
         Missing dimensions default to 1.
+    latency : int
+        Measured SimtVF latency in cycles. When non-zero, this value is
+        attached to the generated SIMT_VF Block as a ``tl.vf_latency``
+        annotation so the auto-schedule latency estimator can use it
+        instead of the generic vector model. Default: 0 (use model).
 
     Returns
     -------
@@ -66,7 +71,7 @@ def SimtVF(threads: int | list[int] | tuple = 128) -> SimtVFFrame:
     if any(t <= 0 for t in normalized):
         raise ValueError("SimtVF requires all thread dimensions > 0")
 
-    return _ffi_api.SimtVF(normalized)  # type: ignore[attr-defined] # pylint: disable=no-member
+    return _ffi_api.SimtVF(normalized, int(latency))  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
 @register_object("tl.SimdVFFrame")
@@ -97,16 +102,22 @@ def inside_simdvf() -> bool:
     return _inside_simdvf[0] > 0
 
 
-def SimdVF() -> SimdVFFrame:
+def SimdVF(latency: int = 0) -> SimdVFFrame:
     """Construct a SimdVF region for Ascend NPU MicroAPI operations.
 
     Inside this region, the AscendLowerParallelToVector pass will lower
     T.Parallel loops into MicroAPI register-level SIMD operations.
     The region is emitted as a __simd_vf__ helper function and called inline.
 
+    latency : int
+        Measured SimdVF latency in cycles. When non-zero, this value is
+        attached to the generated SIMD_VF Block as a ``tl.vf_latency``
+        annotation so the auto-schedule latency estimator can use it
+        instead of the generic vector model. Default: 0 (use model).
+
     Returns
     -------
     res : SimdVFFrame
         The SimdVFFrame used to denote a SimdVF region.
     """
-    return _ffi_api.SimdVF()  # type: ignore[attr-defined] # pylint: disable=no-member
+    return _ffi_api.SimdVF(int(latency))  # type: ignore[attr-defined] # pylint: disable=no-member
