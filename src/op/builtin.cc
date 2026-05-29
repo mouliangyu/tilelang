@@ -52,7 +52,8 @@ DataType cuTensorMapType() { return DataType::UInt(8, 128); }
     static const Op &op = Op::Get("tl." #OpName);                              \
     return op;                                                                 \
   }                                                                            \
-  TVM_REGISTER_OP("tl." #OpName)
+  TVM_REGISTER_OP("tl." #OpName)                                               \
+      .set_attr<TScriptPrinterName>("TScriptPrinterName", #OpName)
 
 #define TIR_DEFINE_TL_SIMD_BUILTIN(Name)                                       \
   const Op &simd_##Name() {                                                    \
