@@ -6,26 +6,14 @@ Function names match the underlying CCE intrinsics directly.
 from tvm import tir
 from tvm.tir import BufferLoad
 
+from tilelang.language.builtin import access_ptr
+
 _Op = tir.op.Op.get
 
 
 def _vreg_extent(dtype) -> int:
     """Compute VReg extent in elements for a given DataType."""
     return 8 * 32 // (dtype.bits // 8)
-
-
-def _auto_tvm_access_ptr(expr, rw_mask: int):
-    """If expr is a BufferLoad, auto-wrap it as tvm_access_ptr(base, offset, extent, rw_mask)."""
-    if not isinstance(expr, BufferLoad):
-        return expr
-    buf = expr.buffer
-    dtype = buf.dtype
-    extent = _vreg_extent(dtype)
-    offset = expr.indices[0]
-    for i in range(1, len(expr.indices)):
-        offset = offset * buf.shape[i] + expr.indices[i]
-    ptype = tir.type_annotation(dtype)
-    return tir.tvm_access_ptr(ptype, buf.data, offset, extent, rw_mask)
 
 
 def alloc(dtype: str):
@@ -64,9 +52,10 @@ def pset(elem_width: int, dist: str = "PAT_ALL"):
 def vld(dst, addr, dist="NORM", off=None):
     """Vector load: vld(dst, base, off, dist).
 
-    addr can be a BufferLoad (e.g. temp[i*64]) auto-wrapped as tvm_access_ptr.
+    addr can be a BufferLoad (e.g. temp[i*64]) auto-wrapped as tl.access_ptr.
     """
-    addr = _auto_tvm_access_ptr(addr, rw_mask=1)
+    if isinstance(addr, BufferLoad):
+        addr = access_ptr(addr, "r", extent=_vreg_extent(addr.buffer.dtype))
     args = [dst, addr, dist]
     if off is not None:
         args.append(off)
@@ -76,9 +65,10 @@ def vld(dst, addr, dist="NORM", off=None):
 def vsts(addr, src, mask, dist="NORM_B32", off=None):
     """Vector store: vsts(src, base, off, dist, mask).
 
-    addr can be a BufferLoad auto-wrapped as tvm_access_ptr.
+    addr can be a BufferLoad auto-wrapped as tl.access_ptr.
     """
-    addr = _auto_tvm_access_ptr(addr, rw_mask=3)
+    if isinstance(addr, BufferLoad):
+        addr = access_ptr(addr, "rw", extent=_vreg_extent(addr.buffer.dtype))
     args = [addr, src, mask, dist]
     if off is not None:
         args.append(off)

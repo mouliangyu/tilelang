@@ -1103,7 +1103,7 @@ AnalyzeSequenceNodeBarriers(SequenceNode *seq, EventIdMap &event_id_map,
   // Analyze dependencies and insert synchronization
   auto sync_infos = GetSyncInfos(units, 2, partition);
   auto sync_points = CollectSyncPoints(units, sync_infos);
-  // sync_points = OptimizeSyncPoints(sync_points);
+  sync_points = OptimizeSyncPoints(sync_points);
   InsertSyncPoints(sync_points, flag_infos, event_id_map, loop_info);
 }
 
@@ -1185,7 +1185,7 @@ AnalyzeControlNodeBarriers(ControlNode *ctrl, EventIdMap &event_id_map,
   auto sync_infos =
       GetSyncInfos(units, 2, partition, ctrl->buffer_num_versions, true);
   auto sync_points = CollectSyncPoints(units, sync_infos);
-  // sync_points = OptimizeSyncPoints(sync_points);
+  sync_points = OptimizeSyncPoints(sync_points);
   InsertSyncPoints(sync_points, flag_infos, event_id_map, loop_info);
 
   // Remove this loop from nesting info when exiting
