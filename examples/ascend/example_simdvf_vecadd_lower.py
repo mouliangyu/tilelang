@@ -56,15 +56,14 @@ def vector_add(N):
                 T.ascend_wait_flag("MTE2_V", stage)
                 T.ascend_wait_flag("MTE3_V", stage)
                 with T.SimdVF():
-                    r0 = T.alloc_fragment((64), "float32")
-                    r1 = T.alloc_fragment((64), "float32")
-                    mask_cnt = T.ascend_init_mask(TILE)
+                    r0 = T.simd.alloc("float32")
+                    r1 = T.simd.alloc("float32")
+                    mask = T.simd.pset(32)
                     for i in range(TILE // 64):
-                        mask = T.ascend_simd_update_mask(mask_cnt)
-                        T.ascend_simd_load(r0.data, T.address_of(temp1[stage, i * 64]))
-                        T.ascend_simd_load(r1.data, T.address_of(temp2[stage, i * 64]))
-                        T.ascend_simd_add(r0.data, r0.data, r1.data, mask)
-                        T.ascend_simd_store(T.address_of(temp3[stage, i * 64]), r0.data, mask)
+                        T.simd.vld(r0, temp1[stage, i * 64])
+                        T.simd.vld(r1, temp2[stage, i * 64])
+                        T.simd.vadd(r0, r0, r1, mask)
+                        T.simd.vsts(temp3[stage, i * 64], r0, mask)
                 T.ascend_set_flag("V_MTE3", stage)
                 T.ascend_set_flag("V_MTE2", stage)
 

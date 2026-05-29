@@ -12,6 +12,7 @@ public:
   void AddFunction(const PrimFunc &f);
   void PrintFuncPrefix(std::ostream &os) final;
   void PrintType(DataType t, std::ostream &os) final;
+  void PrintCCEVectorSuffix(DataType t, std::ostream &os);
   void VisitStmt_(const tir::BlockNode *op) final;
   void VisitStmt_(const ForNode *op) final;
   void VisitStmt_(const AttrStmtNode *op) final;
@@ -47,6 +48,7 @@ private:
   bool inside_simtvf_body_{false};
   int simdvf_helper_counter_{0};
   bool inside_simdvf_body_{false};
+
   bool has_gemm_l0_{false};
   bool has_gemm_l1_{false};
   bool has_gemm_l1_included_{false};

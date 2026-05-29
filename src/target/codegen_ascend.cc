@@ -39,8 +39,43 @@ static std::string FixIndent(const std::string &body) {
   return oss.str();
 }
 
+// Map a TVM DataType to the Ascend CCE vector type suffix (e.g. Float32 ->
+// "f32").
+static std::string CCEVectorSuffix(tvm::DataType dtype) {
+  if (dtype.is_float())
+    return (dtype.bits() == 16) ? "f16" : "f32";
+  if (dtype.is_bfloat16())
+    return "bf16";
+  if (dtype.is_int())
+    return "s" + std::to_string(dtype.bits());
+  if (dtype.is_uint())
+    return "u" + std::to_string(dtype.bits());
+  return "f32";
+}
+
+// Get element width in bits for choosing b8/b16/b32 predicate/load/store
+// variants.
+static int CCEElemWidthBits(tvm::DataType dtype) { return dtype.bits(); }
+
+// Map DataType to the C++ type name used in __ubuf__ pointer casts.
+static std::string CCEUBufType(tvm::DataType dtype) {
+  if (dtype.is_float())
+    return (dtype.bits() == 16) ? "half" : "float";
+  if (dtype.is_bfloat16())
+    return "bfloat16_t";
+  if (dtype.is_int())
+    return "int" + std::to_string(dtype.bits()) + "_t";
+  if (dtype.is_uint())
+    return "uint" + std::to_string(dtype.bits()) + "_t";
+  return "float";
+}
+
 namespace tvm {
 namespace codegen {
+
+void CodeGenTileLangAscend::PrintCCEVectorSuffix(DataType t, std::ostream &os) {
+  os << CCEVectorSuffix(t);
+}
 
 void CodeGenTileLangAscend::Init(bool output_ssa) {
   CodeGenC::Init(output_ssa);
@@ -55,6 +90,17 @@ void CodeGenTileLangAscend::PrintType(DataType t, std::ostream &os) {
   if (t.is_handle()) {
     ICHECK_EQ(lanes, 1) << "does not support vector types for handles";
     os << "void*";
+    return;
+  }
+  // CCE predicate register: boolx256 = vector_bool
+  if (t.is_bool() && t.lanes() == 256) {
+    os << "vector_bool";
+    return;
+  }
+  // CCE vector register: high lane counts map to vector_<T>
+  if (lanes >= 32) {
+    DataType elem = t.element_of();
+    os << "vector_" << CCEVectorSuffix(elem);
     return;
   }
   if (t.is_void()) {
@@ -704,6 +750,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << "AscendC::SetFlag<AscendC::HardEvent::" << hard_event_str
                  << ">(";
     this->PrintExpr(op->args[1], this->stream);
+    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_wait_flag())) {
     ICHECK_EQ(op->args.size(), 2) << "tl.ascend_wait_flag expects exactly 2 "
@@ -713,6 +761,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << "AscendC::WaitFlag<AscendC::HardEvent::" << hard_event_str
                  << ">(";
     this->PrintExpr(op->args[1], this->stream);
+    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_threadfence())) {
     ICHECK_EQ(op->args.size(), 0)
@@ -770,6 +820,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << "AscendC::CrossCoreSetFlag<" << mode_id << ", " << pipe_str
                  << ">(";
     this->PrintExpr(op->args[2], this->stream);
+    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_cross_core_wait_flag())) {
     ICHECK_EQ(op->args.size(), 3)
@@ -781,6 +833,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << "AscendC::CrossCoreWaitFlag<" << mode_id << ", " << pipe_str
                  << ">(";
     this->PrintExpr(op->args[2], this->stream);
+    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_gm_to_ubuf())) {
     ICHECK_EQ(op->args.size(), 7)
@@ -800,6 +854,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[5], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[6], this->stream);
+    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_ubuf_to_gm())) {
     ICHECK_EQ(op->args.size(), 8)
@@ -821,6 +877,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[6], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[7], this->stream);
+    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_gm_to_cbuf())) {
     ICHECK_EQ(op->args.size(), 10)
@@ -869,6 +927,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
+    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_load_cbuf_to_ca())) {
     ICHECK_EQ(op->args.size(), 9)
@@ -884,6 +944,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
+    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_load_cbuf_to_cb())) {
     ICHECK_EQ(op->args.size(), 9)
@@ -899,6 +961,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
+    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_matrix_cc_to_ub())) {
     ICHECK_EQ(op->args.size(), 26)
@@ -914,6 +978,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
+    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_matrix_cc_to_gm())) {
     ICHECK_EQ(op->args.size(), 25)
@@ -933,6 +999,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
+    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_ubuf_to_cbuf())) {
     ICHECK_EQ(op->args.size(), 7)
@@ -948,6 +1016,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
+    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_nd2nz_scatter())) {
     // ascend_nd2nz_scatter(src_ub, tmp_ub, rows, cols, fuse_cast,
@@ -1070,6 +1140,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
+    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_gemm_l1())) {
     // ascend_gemm_l1(cc_ptr, cbuf_a_ptr, cbuf_b_ptr, M, K, N, tile_k_sub,
@@ -1096,6 +1168,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[8], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[10], this->stream);
+    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tir::builtin::address_of())) {
     const auto *load = op->args[0].as<tir::BufferLoadNode>();
@@ -1126,205 +1200,207 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
   }
   // --- SimdVF binary ops: (dst, src0, src1, mask) ---
-  else if (op->op.same_as(tl::ascend_simd_add()) ||
-           op->op.same_as(tl::ascend_simd_sub()) ||
-           op->op.same_as(tl::ascend_simd_mul()) ||
-           op->op.same_as(tl::ascend_simd_div()) ||
-           op->op.same_as(tl::ascend_simd_max()) ||
-           op->op.same_as(tl::ascend_simd_min())) {
-    ICHECK_EQ(op->args.size(), 4);
+  else if (op->op.same_as(tl::simd_vadd()) || op->op.same_as(tl::simd_vsub()) ||
+           op->op.same_as(tl::simd_vmul()) || op->op.same_as(tl::simd_vdiv()) ||
+           op->op.same_as(tl::simd_vmax()) || op->op.same_as(tl::simd_vmin())) {
+    ICHECK(op->args.size() >= 4 && op->args.size() <= 5);
     const char *name = nullptr;
-    if (op->op.same_as(tl::ascend_simd_add()))
-      name = "Add";
-    else if (op->op.same_as(tl::ascend_simd_sub()))
-      name = "Sub";
-    else if (op->op.same_as(tl::ascend_simd_mul()))
-      name = "Mul";
-    else if (op->op.same_as(tl::ascend_simd_max()))
-      name = "Max";
-    else if (op->op.same_as(tl::ascend_simd_min()))
-      name = "Min";
+    if (op->op.same_as(tl::simd_vadd()))
+      name = "vadd";
+    else if (op->op.same_as(tl::simd_vsub()))
+      name = "vsub";
+    else if (op->op.same_as(tl::simd_vmul()))
+      name = "vmul";
+    else if (op->op.same_as(tl::simd_vmax()))
+      name = "vmax";
+    else if (op->op.same_as(tl::simd_vmin()))
+      name = "vmin";
     else
-      name = "Div";
+      name = "vdiv";
     this->PrintIndent();
-    this->stream << "AscendC::MicroAPI::" << name << "(";
+    this->stream << name << "(";
     this->PrintExpr(op->args[0], this->stream);
     for (int i = 1; i < 4; ++i) {
       this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
+    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
+    this->stream << ");\n";
+  }
+  // --- SimdVF bitwise: (dst, src0, src1, mask) ---
+  else if (op->op.same_as(tl::simd_vand()) || op->op.same_as(tl::simd_vor())) {
+    ICHECK(op->args.size() >= 4 && op->args.size() <= 5);
+    const char *name = op->op.same_as(tl::simd_vand()) ? "vand" : "vor";
+    this->PrintIndent();
+    this->stream << name << "(";
+    this->PrintExpr(op->args[0], this->stream);
+    for (int i = 1; i < 4; ++i) {
+      this->stream << ", ";
+      this->PrintExpr(op->args[i], this->stream);
+    }
+    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   }
   // --- SimdVF unary ops: (dst, src, mask) ---
-  else if (op->op.same_as(tl::ascend_simd_exp()) ||
-           op->op.same_as(tl::ascend_simd_ln()) ||
-           op->op.same_as(tl::ascend_simd_sqrt()) ||
-           op->op.same_as(tl::ascend_simd_rsqrt()) ||
-           op->op.same_as(tl::ascend_simd_abs()) ||
-           op->op.same_as(tl::ascend_simd_neg()) ||
-           op->op.same_as(tl::ascend_simd_duplicate()) ||
-           op->op.same_as(tl::ascend_simd_reduce_max()) ||
-           op->op.same_as(tl::ascend_simd_reduce_sum())) {
-    ICHECK_EQ(op->args.size(), 3);
+  else if (op->op.same_as(tl::simd_vexp()) || op->op.same_as(tl::simd_vln()) ||
+           op->op.same_as(tl::simd_vsqrt()) ||
+           op->op.same_as(tl::simd_vrsqrt()) ||
+           op->op.same_as(tl::simd_vabs()) || op->op.same_as(tl::simd_vneg()) ||
+           op->op.same_as(tl::simd_vrelu()) ||
+           op->op.same_as(tl::simd_vrec()) || op->op.same_as(tl::simd_vdup())) {
+    ICHECK(op->args.size() >= 3 && op->args.size() <= 4);
     const char *name = nullptr;
-    if (op->op.same_as(tl::ascend_simd_exp()))
-      name = "Exp";
-    else if (op->op.same_as(tl::ascend_simd_ln()))
-      name = "Ln";
-    else if (op->op.same_as(tl::ascend_simd_sqrt()))
-      name = "Sqrt";
-    else if (op->op.same_as(tl::ascend_simd_rsqrt()))
-      name = "Rsqrt";
-    else if (op->op.same_as(tl::ascend_simd_abs()))
-      name = "Abs";
-    else if (op->op.same_as(tl::ascend_simd_duplicate()))
-      name = "Duplicate";
-    else if (op->op.same_as(tl::ascend_simd_reduce_max()))
-      name = "Reduce<AscendC::MicroAPI::ReduceType::MAX>";
-    else if (op->op.same_as(tl::ascend_simd_reduce_sum()))
-      name = "Reduce<AscendC::MicroAPI::ReduceType::SUM>";
+    if (op->op.same_as(tl::simd_vexp()))
+      name = "vexp";
+    else if (op->op.same_as(tl::simd_vln()))
+      name = "vln";
+    else if (op->op.same_as(tl::simd_vsqrt()))
+      name = "vsqrt";
+    else if (op->op.same_as(tl::simd_vrsqrt()))
+      name = "vrsqrt";
+    else if (op->op.same_as(tl::simd_vabs()))
+      name = "vabs";
+    else if (op->op.same_as(tl::simd_vrelu()))
+      name = "vrelu";
+    else if (op->op.same_as(tl::simd_vrec()))
+      name = "vrec";
+    else if (op->op.same_as(tl::simd_vdup()))
+      name = "vdup";
     else
-      name = "Neg";
+      name = "vneg";
     this->PrintIndent();
-    this->stream << "AscendC::MicroAPI::" << name << "(";
+    this->stream << name << "(";
     this->PrintExpr(op->args[0], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[1], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[2], this->stream);
+    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   }
-  // --- SimdVF load: 3 args (simple) or 4 args (with AddrReg) ---
-  else if (op->op.same_as(tl::ascend_simd_load())) {
-    ICHECK(op->args.size() == 3 || op->args.size() == 4);
-    std::string dtype_str = Downcast<StringImm>(op->args[0])->value;
+  // --- SimdVF cross-lane reduce: (dst, src, mask) ---
+  else if (op->op.same_as(tl::simd_vcmax()) ||
+           op->op.same_as(tl::simd_vcadd())) {
+    ICHECK(op->args.size() >= 3 && op->args.size() <= 4);
+    const char *name = op->op.same_as(tl::simd_vcmax()) ? "vcmax" : "vcadd";
     this->PrintIndent();
-    this->stream << "AscendC::MicroAPI::LoadAlign<" << dtype_str << ">(";
+    this->stream << name << "(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << ", ";
     this->PrintExpr(op->args[1], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[2], this->stream);
-    if (op->args.size() == 4) {
-      this->stream << ", ";
-      this->PrintExpr(op->args[3], this->stream);
-    }
+    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   }
-  // --- SimdVF load_single: (dtype_str, dst, src) ---
-  else if (op->op.same_as(tl::ascend_simd_load_single())) {
-    ICHECK_EQ(op->args.size(), 3);
-    std::string dtype_str = Downcast<StringImm>(op->args[0])->value;
-    // Infer LoadDist bit width from dtype:
-    //   float, int32/uint32 → 4 bytes → DIST_BRC_B32
-    //   half_t, bfloat16_t, int16/uint16 → 2 bytes → DIST_BRC_B16
-    //   int8/uint8 → 1 byte → DIST_BRC_B8
-    int bit_width = 32;
-    if (dtype_str == "float") {
-      bit_width = 32;
-    } else if (dtype_str == "half_t" || dtype_str == "bfloat16_t") {
-      bit_width = 16;
+  // --- SimdVF load: (dst, addr, dist [, offset]) ---
+  //  dist is a StringImm (e.g. "NORM", "BRC_B32"), default "NORM"
+  else if (op->op.same_as(tl::simd_vld())) {
+    ICHECK(op->args.size() >= 2 && op->args.size() <= 4);
+    DataType dtype = op->args[0].dtype().element_of();
+    std::string dist = (op->args.size() >= 3 && op->args[2].as<StringImmNode>())
+                           ? Downcast<StringImm>(op->args[2])->value
+                           : "NORM";
+    bool has_off = (op->args.size() == 4);
+    int off_idx =
+        (op->args.size() == 4 && op->args[2].as<StringImmNode>()) ? 3 : -1;
+    this->PrintIndent();
+    this->stream << "vld(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << ", (__ubuf__ " << CCEUBufType(dtype) << "*)";
+    this->PrintExpr(op->args[1], this->stream);
+    if (has_off) {
+      this->stream << ", ";
+      this->PrintExpr(op->args[off_idx], this->stream);
+    }
+    this->stream << ", " << dist << ");\n";
+  }
+  // --- SimdVF store: (addr, src, mask, dist [, offset]) ---
+  //  dist is a StringImm (e.g. "NORM_B32", "PK_B32"), default "NORM_B32"
+  else if (op->op.same_as(tl::simd_vsts())) {
+    ICHECK(op->args.size() >= 3 && op->args.size() <= 5);
+    DataType dtype = op->args[1].dtype().element_of();
+    int n = op->args.size();
+    std::string dist = "NORM_B32";
+    int off_idx = -1;
+    if (n >= 4 && op->args[3].as<StringImmNode>()) {
+      dist = Downcast<StringImm>(op->args[3])->value;
+      if (n == 5)
+        off_idx = 4;
+    } else if (n == 4 && !op->args[3].as<StringImmNode>()) {
+      off_idx = 3;
+    }
+    this->PrintIndent();
+    this->stream << "vsts(";
+    this->PrintExpr(op->args[1], this->stream); // src
+    this->stream << ", (__ubuf__ " << CCEUBufType(dtype) << "*)";
+    this->PrintExpr(op->args[0], this->stream); // addr
+    if (off_idx >= 0) {
+      this->stream << ", ";
+      this->PrintExpr(op->args[off_idx], this->stream);
     } else {
-      // Parse "intN_t" / "uintN_t" → extract N
-      auto pos = dtype_str.find_first_of("0123456789");
-      if (pos != std::string::npos)
-        bit_width = std::stoi(dtype_str.substr(pos));
+      this->stream << ", 0";
     }
-    int dist_val = bit_width / 8; // 4, 2, or 1
-    const char *dist_str = nullptr;
-    switch (dist_val) {
-    case 1:
-      dist_str = "AscendC::MicroAPI::LoadDist::DIST_BRC_B8";
-      break;
-    case 2:
-      dist_str = "AscendC::MicroAPI::LoadDist::DIST_BRC_B16";
-      break;
-    case 4:
-      dist_str = "AscendC::MicroAPI::LoadDist::DIST_BRC_B32";
-      break;
-    default:
-      LOG(FATAL) << "Unsupported bit width for load_single: " << bit_width;
-    }
-    this->PrintIndent();
-    this->stream << "AscendC::MicroAPI::LoadAlign<" << dtype_str << ", "
-                 << dist_str << ">(";
-    this->PrintExpr(op->args[1], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[2], this->stream);
+    this->stream << ", " << dist << ", ";
+    this->PrintExpr(op->args[2], this->stream); // mask
+    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   }
-  // --- SimdVF store: 4 args (simple) or 5 args (with AddrReg) ---
-  else if (op->op.same_as(tl::ascend_simd_store())) {
-    ICHECK(op->args.size() == 4 || op->args.size() == 5);
-    std::string dtype_str = Downcast<StringImm>(op->args[0])->value;
-    this->PrintIndent();
-    this->stream << "AscendC::MicroAPI::StoreAlign<" << dtype_str << ">(";
-    this->PrintExpr(op->args[1], this->stream);
-    for (size_t i = 2; i < op->args.size(); ++i) {
-      this->stream << ", ";
-      this->PrintExpr(op->args[i], this->stream);
-    }
-    this->stream << ");\n";
-  }
-  // --- SimdVF store_pack: StoreAlign<dtype, DIST_PACK_B32>(ptr, src, mask)
-  // ---
-  else if (op->op.same_as(tl::ascend_simd_store_pack())) {
-    ICHECK_EQ(op->args.size(), 4);
-    std::string dtype_str = Downcast<StringImm>(op->args[0])->value;
-    this->PrintIndent();
-    this->stream << "AscendC::MicroAPI::StoreAlign<" << dtype_str
-                 << ", AscendC::MicroAPI::StoreDist::DIST_PACK_B32>(";
-    this->PrintExpr(op->args[1], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[2], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[3], this->stream);
-    this->stream << ");\n";
-  }
-  // --- SimdVF create_addr_reg: (dtype_str, idx0, stride0, ...) → expression
-  // ---
-  else if (op->op.same_as(tl::ascend_simd_create_addr_reg())) {
-    ICHECK_GE(op->args.size(), 3);
-    std::string dtype_str = Downcast<StringImm>(op->args[0])->value;
-    os << "AscendC::MicroAPI::CreateAddrReg<" << dtype_str << ">(";
-    for (size_t i = 1; i < op->args.size(); ++i) {
-      if (i > 1)
-        os << ", ";
-      this->PrintExpr(op->args[i], os);
-    }
-    os << ")";
-  }
-  // --- SimdVF update_mask: (dtype_str, count) → expression ---
-  else if (op->op.same_as(tl::ascend_simd_update_mask())) {
+  // --- SimdVF dup: (dst, scalar) ---
+  else if (op->op.same_as(tl::simd_vdupi())) {
     ICHECK_EQ(op->args.size(), 2);
-    std::string dtype_str = Downcast<StringImm>(op->args[0])->value;
-    os << "AscendC::MicroAPI::UpdateMask<" << dtype_str << ">((uint32_t)";
-    this->PrintExpr(op->args[1], os);
-    os << ")";
-  } else if (op->op.same_as(tl::ascend_simd_dup())) {
-    os << "AscendC::MicroAPI::Duplicate(";
+    os << "vdupi(";
     this->PrintExpr(op->args[0], os);
     os << ", ";
     this->PrintExpr(op->args[1], os);
     os << ")";
-  } else if (op->op.same_as(tl::ascend_simd_create_mask())) {
-    std::string dtype_str = Downcast<StringImm>(op->args[0])->value;
-    os << "AscendC::MicroAPI::CreateMask<" << dtype_str << ">()";
-  } else if (op->op.same_as(tl::ascend_simd_cast())) {
-    ICHECK_EQ(op->args.size(), 5);
-    std::string to_dtype = Downcast<StringImm>(op->args[0])->value;
-    std::string from_dtype = Downcast<StringImm>(op->args[1])->value;
-    // Use predefined AscendC cast traits based on direction.
-    // B32ToB16 covers both bfloat16_t and half_t (32-bit → 16-bit).
-    const char *trait = (from_dtype == "float")
-                            ? "AscendC::Internal::castTraitB32ToB16"
-                            : "AscendC::Internal::castTraitB16ToB32";
-    os << "AscendC::MicroAPI::Cast<" << to_dtype << ", " << from_dtype << ", "
-       << trait << ">(";
-    this->PrintExpr(op->args[2], os);
+  }
+  // --- SimdVF cast_narrow: (dst, src, mask, round, part) ---
+  else if (op->op.same_as(tl::simd_vfcvt_narrow())) {
+    ICHECK(op->args.size() >= 5 && op->args.size() <= 6);
+    int rnd = (int)Downcast<IntImm>(op->args[3])->value;
+    int part = (int)Downcast<IntImm>(op->args[4])->value;
+    static const char *round_names[] = {"ROUND_R", "ROUND_A", "ROUND_F",
+                                        "ROUND_C", "ROUND_Z", "ROUND_O",
+                                        "ROUND_H"};
+    os << "vfcvt(";
+    this->PrintExpr(op->args[0], os);
     os << ", ";
-    this->PrintExpr(op->args[3], os);
+    this->PrintExpr(op->args[1], os);
+    std::string mode = (op->args.size() >= 6 && op->args[5].as<StringImmNode>())
+                           ? Downcast<StringImm>(op->args[5])->value
+                           : "MODE_MERGING";
+    os << ", " << round_names[rnd] << ", "
+       << (part == 0 ? "PART_EVEN" : "PART_ODD") << ", " << mode << ")";
+  }
+  // --- SimdVF cast_widen: (dst, src, part) ---
+  else if (op->op.same_as(tl::simd_vfcvt_widen())) {
+    ICHECK(op->args.size() >= 3 && op->args.size() <= 4);
+    int part = (int)Downcast<IntImm>(op->args[2])->value;
+    os << "vfcvt(";
+    this->PrintExpr(op->args[0], os);
     os << ", ";
-    this->PrintExpr(op->args[4], os);
-    os << ")";
+    this->PrintExpr(op->args[1], os);
+    os << ", " << (part == 0 ? "PART_EVEN" : "PART_ODD") << ")";
+  }
+  // --- SimdVF sel: (dst, src0, src1, mask) ---
+  else if (op->op.same_as(tl::simd_vsel())) {
+    ICHECK(op->args.size() >= 4 && op->args.size() <= 5);
+    this->PrintIndent();
+    this->stream << "vsel(";
+    this->PrintExpr(op->args[0], this->stream);
+    for (int i = 1; i < 4; ++i) {
+      this->stream << ", ";
+      this->PrintExpr(op->args[i], this->stream);
+    }
+    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
+    this->stream << ");\n";
   } else if (op->op.same_as(tl::loop_break())) {
     this->PrintIndent();
     this->stream << "break;\n";
@@ -1415,13 +1491,13 @@ void CodeGenTileLangAscend::VisitStmt_(const AllocateNode *op) {
                   "T.alloc_shared.";
   }
 
-  // SimdVF: emit MicroAPI::RegTensor<T> for fragment buffers
+  // SimdVF: emit vector_<T> for fragment buffers
   if (inside_simdvf_body_ && scope == "local.fragment") {
     std::string vid = AllocVarID(op->buffer_var.get());
     this->PrintIndent();
-    stream << "AscendC::MicroAPI::RegTensor<";
-    PrintType(op->dtype, stream);
-    stream << "> " << vid << ";\n";
+    stream << "vector_";
+    PrintCCEVectorSuffix(op->dtype, stream);
+    stream << " " << vid << ";\n";
     alloc_storage_scope_[op->buffer_var.get()] = scope;
     RegisterHandleType(op->buffer_var.get(), op->dtype);
     this->PrintStmt(op->body);
@@ -1450,40 +1526,28 @@ void CodeGenTileLangAscend::VisitStmt_(const AllocateNode *op) {
 }
 
 void CodeGenTileLangAscend::VisitStmt_(const tir::LetStmtNode *op) {
-  // Inside SimdVF body, handle-typed let-bindings (e.g. MaskReg from
-  // UpdateMask) should use 'auto' instead of 'void*'.
-  if (inside_simdvf_body_ && op->var.dtype().is_handle()) {
+  // Inside SimdVF body: special handling for simd_pset / simd_alloc.
+  if (inside_simdvf_body_) {
     std::string vid = AllocVarID(op->var.get());
     if (const auto *call = op->value.as<CallNode>()) {
-      // ascend_init_mask(count) → uint32_t vid = count;
-      if (call->op.same_as(tl::ascend_init_mask())) {
+      // simd_pset(elem_width_bits, dist) → vector_bool vid = pset_bXX(dist);
+      if (call->op.same_as(tl::simd_pset())) {
+        int elem_bits = (int)Downcast<IntImm>(call->args[0])->value;
+        std::string dist =
+            (call->args.size() >= 2 && call->args[1].as<StringImmNode>())
+                ? Downcast<StringImm>(call->args[1])->value
+                : "PAT_ALL";
         PrintIndent();
-        stream << "uint32_t " << vid << " = ";
-        PrintExpr(call->args[0], stream);
-        stream << ";\n";
+        stream << "vector_bool " << vid << " = pset_b" << elem_bits << "("
+               << dist << ");\n";
         PrintStmt(op->body);
         return;
       }
-      // ascend_simd_update_mask(dtype, count) → auto vid =
-      // UpdateMask<dtype>(count); When count is a Var (from
-      // ascend_init_mask), use it directly as lvalue.
-      if (call->op.same_as(tl::ascend_simd_update_mask())) {
-        std::string dtype_str = Downcast<StringImm>(call->args[0])->value;
-        if (call->args[1].as<VarNode>()) {
-          PrintIndent();
-          stream << "auto " << vid << " = AscendC::MicroAPI::UpdateMask<"
-                 << dtype_str << ">(";
-          PrintExpr(call->args[1], stream);
-          stream << ");\n";
-        } else {
-          PrintIndent();
-          stream << "uint32_t " << vid << "_cnt = ";
-          PrintExpr(call->args[1], stream);
-          stream << ";\n";
-          PrintIndent();
-          stream << "auto " << vid << " = AscendC::MicroAPI::UpdateMask<"
-                 << dtype_str << ">(" << vid << "_cnt);\n";
-        }
+      // simd_alloc -> vector_<T> vid; (type from Var's DataType)
+      if (call->op.same_as(tl::simd_alloc())) {
+        DataType elem = op->var.dtype().element_of();
+        PrintIndent();
+        stream << "vector_" << CCEVectorSuffix(elem) << " " << vid << ";\n";
         PrintStmt(op->body);
         return;
       }

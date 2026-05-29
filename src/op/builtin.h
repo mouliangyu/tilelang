@@ -528,44 +528,59 @@ TVM_DLL const Op &ascend_reduce_add();
 TVM_DLL const Op &ascend_reduce_max();
 TVM_DLL const Op &ascend_reduce_min();
 
-/*!
- * \brief Ascend SimdVF MicroAPI binary arithmetic ops.
- *
- * ascend_simd_add(dst, src0, src1, mask) → MicroAPI::Add(dst, src0, src1, mask)
- * ascend_simd_sub(dst, src0, src1, mask) → MicroAPI::Sub(dst, src0, src1, mask)
- * ascend_simd_mul(dst, src0, src1, mask) → MicroAPI::Mul(dst, src0, src1, mask)
- */
-// SimdVF binary: (dst_reg, src0_reg, src1_reg, mask)
-TVM_DLL const Op &ascend_simd_add();
-TVM_DLL const Op &ascend_simd_sub();
-TVM_DLL const Op &ascend_simd_mul();
-TVM_DLL const Op &ascend_simd_div();
-TVM_DLL const Op &ascend_simd_max();
-TVM_DLL const Op &ascend_simd_min();
-// SimdVF reduce: (dst_reg, src_reg, mask) → scalar in lane 0
-TVM_DLL const Op &ascend_simd_reduce_max();
-TVM_DLL const Op &ascend_simd_reduce_sum();
-// SimdVF unary: (dst_reg, src_reg, mask)
-TVM_DLL const Op &ascend_simd_exp();
-TVM_DLL const Op &ascend_simd_ln();
-TVM_DLL const Op &ascend_simd_sqrt();
-TVM_DLL const Op &ascend_simd_rsqrt();
-TVM_DLL const Op &ascend_simd_abs();
-TVM_DLL const Op &ascend_simd_neg();
-TVM_DLL const Op &ascend_simd_duplicate();
-TVM_DLL const Op &ascend_simd_dup();
-TVM_DLL const Op &ascend_simd_cast();
-// SimdVF memory: (dtype_str, dst, src [, addr_reg] [, mask])
-TVM_DLL const Op &ascend_simd_load();
-TVM_DLL const Op &ascend_simd_load_single();
-TVM_DLL const Op &ascend_simd_store();
-TVM_DLL const Op &ascend_simd_store_pack();
-// SimdVF addr: (dtype_str, idx0, stride0, ...) → AddrReg handle
-TVM_DLL const Op &ascend_simd_create_addr_reg();
-// SimdVF mask
-TVM_DLL const Op &ascend_simd_update_mask();
-TVM_DLL const Op &ascend_init_mask();
-TVM_DLL const Op &ascend_simd_create_mask();
+// Ascend SIMD raw CCE intrinsics (T.simd.* API).
+// TIR ops registered as tl.simd.<name>. Emit raw CCE intrinsics
+// (vadd/vld/vst/vfcvt/...) from __clang_cce_vector_intrinsics.h.
+// Fragment registers use vector_<T> types; masks are vector_bool.
+
+// -- Register allocation
+TVM_DLL const Op &simd_alloc();
+
+// -- Mask
+TVM_DLL const Op &simd_pset();
+
+// -- Load / Store
+TVM_DLL const Op &simd_vld();
+TVM_DLL const Op &simd_vsts();
+
+// -- Binary arithmetic
+TVM_DLL const Op &simd_vadd();
+TVM_DLL const Op &simd_vsub();
+TVM_DLL const Op &simd_vmul();
+TVM_DLL const Op &simd_vdiv();
+TVM_DLL const Op &simd_vmax();
+TVM_DLL const Op &simd_vmin();
+TVM_DLL const Op &simd_vand();
+TVM_DLL const Op &simd_vor();
+
+// -- Unary
+TVM_DLL const Op &simd_vexp();
+TVM_DLL const Op &simd_vln();
+TVM_DLL const Op &simd_vsqrt();
+TVM_DLL const Op &simd_vrsqrt();
+TVM_DLL const Op &simd_vabs();
+TVM_DLL const Op &simd_vneg();
+TVM_DLL const Op &simd_vrelu();
+TVM_DLL const Op &simd_vrec();
+
+// -- Broadcast
+TVM_DLL const Op &simd_vdupi();
+TVM_DLL const Op &simd_vdup();
+
+// -- Cross-lane reduction
+TVM_DLL const Op &simd_vcadd();
+TVM_DLL const Op &simd_vcmax();
+
+// -- Type conversion
+TVM_DLL const Op &simd_vfcvt_narrow();
+TVM_DLL const Op &simd_vfcvt_widen();
+TVM_DLL const Op &simd_vfcvt_f2i();
+TVM_DLL const Op &simd_vfcvt_i2f();
+
+// -- Special
+TVM_DLL const Op &simd_vsel();
+TVM_DLL const Op &simd_vmuls();
+TVM_DLL const Op &simd_vadds();
 
 /*!
  * \brief Ascend SetFlag intrinsic for pipeline synchronization.

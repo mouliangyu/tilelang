@@ -122,27 +122,11 @@ from .ascend import (
     ascend_reduce_add,  # noqa: F401
     ascend_reduce_max,  # noqa: F401
     ascend_reduce_min,  # noqa: F401
-    ascend_simd_add,  # noqa: F401
-    ascend_simd_sub,  # noqa: F401
-    ascend_simd_mul,  # noqa: F401
-    ascend_simd_div,  # noqa: F401
-    ascend_simd_exp,  # noqa: F401
-    ascend_simd_ln,  # noqa: F401
-    ascend_simd_sqrt,  # noqa: F401
-    ascend_simd_rsqrt,  # noqa: F401
-    ascend_simd_abs,  # noqa: F401
-    ascend_simd_neg,  # noqa: F401
-    ascend_simd_duplicate,  # noqa: F401
-    ascend_simd_load,  # noqa: F401
-    ascend_simd_load_single,  # noqa: F401
-    ascend_simd_store,  # noqa: F401
-    ascend_simd_create_addr_reg,  # noqa: F401
-    ascend_simd_update_mask,  # noqa: F401
-    ascend_init_mask,  # noqa: F401
     ascend_get_buf,  # noqa: F401
     ascend_rls_buf,  # noqa: F401
     set_hf32_mode,  # noqa: F401
 )
+from . import simd  # noqa: F401 (exposed as T.simd.*)
 from .builtin import __ldg as __ldg  # noqa: F401
 from .builtin import ldg32 as ldg32  # noqa: F401
 from .builtin import ldg64 as ldg64  # noqa: F401

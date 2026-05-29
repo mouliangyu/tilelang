@@ -54,12 +54,11 @@ private:
 
   int64_t vreg_size_{0};
   Var chunk_var_;
-  Var mask_cnt_var_;
   Var mask_var_;
 
-  std::vector<Buffer> new_fragments_;
+  std::vector<std::pair<Var, DataType>> simd_regs_;
   int frag_counter_{0};
-  std::string dtype_str_;
+  int64_t elem_bits_{0};
   std::vector<Stmt> scalar_loads_;
 
   //-----------------------------------------------------------------------
@@ -69,28 +68,40 @@ private:
     return 8 * 32 / (dtype.bits() / 8);
   }
 
-  static std::string DTypeToAscendStr(DataType dtype) {
-    if (dtype.is_bfloat16())
-      return "bfloat16_t";
+  static int ElemWidthBits(DataType dtype) { return dtype.bits(); }
+
+  static std::string DTypeToCCEStr(DataType dtype) {
     if (dtype.is_float())
-      return (dtype.bits() == 16) ? "half_t" : "float";
+      return (dtype.bits() == 16) ? "float16" : "float32";
+    if (dtype.is_bfloat16())
+      return "bfloat16";
     if (dtype.is_int())
-      return "int" + std::to_string(dtype.bits()) + "_t";
-    if (dtype.is_uint())
-      return "uint" + std::to_string(dtype.bits()) + "_t";
-    return "float";
+      return "int" + std::to_string(dtype.bits());
+    return "float32";
   }
 
   //-----------------------------------------------------------------------
-  // Fragment allocation
+  // SIMD register allocation
   //-----------------------------------------------------------------------
-  Buffer AllocFragmentReg(DataType dtype) {
+  Var AllocSimdReg(DataType dtype) {
     std::string name = "vreg_" + std::to_string(frag_counter_++);
-    Var data(name, PointerType(PrimType(dtype), "local.fragment"));
-    Array<PrimExpr> shape = {IntImm(DataType::Int(32), vreg_size_)};
-    Buffer buf(data, dtype, shape, {}, PrimExpr(0), name, 0, 0, kDefault);
-    new_fragments_.push_back(buf);
-    return buf;
+    int vl = ComputeVRegSize(dtype);
+    Var reg(name, dtype.with_lanes(vl));
+    simd_regs_.push_back({reg, dtype});
+    return reg;
+  }
+
+  Stmt WrapWithSimdAllocs(const Stmt &body) {
+    Stmt result = body;
+    // Wrap in reverse order so first reg is outermost LetStmt
+    for (auto it = simd_regs_.rbegin(); it != simd_regs_.rend(); ++it) {
+      std::string dstr = DTypeToCCEStr(it->second);
+      result = LetStmt(it->first,
+                       Call(it->first.dtype(), simd_alloc(), {StringImm(dstr)}),
+                       result);
+    }
+    simd_regs_.clear();
+    return result;
   }
 
   //-----------------------------------------------------------------------
@@ -217,7 +228,7 @@ private:
   //-----------------------------------------------------------------------
   Var DecomposeExpr(const PrimExpr &expr, DataType dtype, Array<Stmt> *stmts) {
     if (const auto *load = expr.as<BufferLoadNode>()) {
-      Buffer reg = AllocFragmentReg(dtype);
+      Var reg = AllocSimdReg(dtype);
 
       // Check if any index depends on the VReg variable
       bool depends_on_vreg = false;
@@ -235,75 +246,72 @@ private:
         // Put the load in scalar_loads_ to be hoisted outside the VReg chunk
         // loop
         PrimExpr addr = MakeAddressOf(load->buffer, load->indices);
-        scalar_loads_.push_back(
-            Evaluate(Call(DataType::Void(), ascend_simd_load_single(),
-                          {StringImm(dtype_str_), reg->data, addr})));
+        scalar_loads_.push_back(Evaluate(Call(
+            DataType::Void(), simd_vld(), {reg, addr, StringImm("BRC_B32")})));
       } else if (!depends_on_vreg) {
         // Scalar load in 1D context: use load_single in-place
         PrimExpr addr = MakeAddressOf(load->buffer, load->indices);
-        stmts->push_back(
-            Evaluate(Call(DataType::Void(), ascend_simd_load_single(),
-                          {StringImm(dtype_str_), reg->data, addr})));
+        stmts->push_back(Evaluate(Call(DataType::Void(), simd_vld(),
+                                       {reg, addr, StringImm("BRC_B32")})));
       } else {
         // Vector load: full LoadAlign
         stmts->push_back(
-            Evaluate(Call(DataType::Void(), ascend_simd_load(),
-                          {StringImm(dtype_str_), reg->data,
-                           MakeAddressOf(load->buffer, load->indices)})));
+            Evaluate(Call(DataType::Void(), simd_vld(),
+                          {reg, MakeAddressOf(load->buffer, load->indices)})));
       }
-      return reg->data;
+      return reg;
     }
 
     auto EmitBinary = [&](const PrimExpr &a, const PrimExpr &b,
                           const Op &op) -> Var {
       Var lhs = DecomposeExpr(a, dtype, stmts);
       Var rhs = DecomposeExpr(b, dtype, stmts);
-      Buffer dst = AllocFragmentReg(dtype);
-      stmts->push_back(Evaluate(
-          Call(DataType::Void(), op, {dst->data, lhs, rhs, mask_var_})));
-      return dst->data;
+      Var dst = AllocSimdReg(dtype);
+      stmts->push_back(
+          Evaluate(Call(DataType::Void(), op, {dst, lhs, rhs, mask_var_})));
+      return dst;
     };
     if (auto *n = expr.as<AddNode>())
-      return EmitBinary(n->a, n->b, ascend_simd_add());
+      return EmitBinary(n->a, n->b, simd_vadd());
     if (auto *n = expr.as<SubNode>())
-      return EmitBinary(n->a, n->b, ascend_simd_sub());
+      return EmitBinary(n->a, n->b, simd_vsub());
     if (auto *n = expr.as<MulNode>())
-      return EmitBinary(n->a, n->b, ascend_simd_mul());
+      return EmitBinary(n->a, n->b, simd_vmul());
     if (auto *n = expr.as<DivNode>())
-      return EmitBinary(n->a, n->b, ascend_simd_div());
+      return EmitBinary(n->a, n->b, simd_vdiv());
 
     auto EmitUnary = [&](const PrimExpr &a, const Op &op) -> Var {
       Var src = DecomposeExpr(a, dtype, stmts);
-      Buffer dst = AllocFragmentReg(dtype);
+      Var dst = AllocSimdReg(dtype);
       stmts->push_back(
-          Evaluate(Call(DataType::Void(), op, {dst->data, src, mask_var_})));
-      return dst->data;
+          Evaluate(Call(DataType::Void(), op, {dst, src, mask_var_})));
+      return dst;
     };
     if (const auto *call = expr.as<CallNode>()) {
       if (const auto *opn = call->op.as<OpNode>()) {
         std::string n = opn->name;
         if (n == "tir.exp" && call->args.size() == 1)
-          return EmitUnary(call->args[0], ascend_simd_exp());
+          return EmitUnary(call->args[0], simd_vexp());
         if ((n == "tir.log" || n == "tir.ln") && call->args.size() == 1)
-          return EmitUnary(call->args[0], ascend_simd_ln());
+          return EmitUnary(call->args[0], simd_vln());
         if (n == "tir.sqrt" && call->args.size() == 1)
-          return EmitUnary(call->args[0], ascend_simd_sqrt());
+          return EmitUnary(call->args[0], simd_vsqrt());
         if (n == "tir.rsqrt" && call->args.size() == 1)
-          return EmitUnary(call->args[0], ascend_simd_rsqrt());
+          return EmitUnary(call->args[0], simd_vrsqrt());
         if (n == "tir.fabs" && call->args.size() == 1)
-          return EmitUnary(call->args[0], ascend_simd_abs());
+          return EmitUnary(call->args[0], simd_vabs());
       }
     }
     if (const auto *sub = expr.as<SubNode>())
       if (is_zero(sub->a))
-        return EmitUnary(sub->b, ascend_simd_neg());
+        return EmitUnary(sub->b, simd_vneg());
 
     // Scalar constants: broadcast via Duplicate
     if (expr.as<FloatImmNode>() || expr.as<IntImmNode>()) {
-      Buffer reg = AllocFragmentReg(dtype);
-      stmts->push_back(Evaluate(
-          Call(DataType::Void(), ascend_simd_dup(), {reg->data, expr})));
-      return reg->data;
+      Var reg = AllocSimdReg(dtype);
+      stmts->push_back(
+          Evaluate(Call(DataType::Void(), simd_vdupi(), {reg, expr})));
+      return reg;
     }
 
     LOG(FATAL) << "AscendSimdVFLowerParallel: unsupported expr: " << expr;
@@ -316,10 +324,9 @@ private:
   Stmt LowerBufferStore(const BufferStoreNode *store, DataType dtype) {
     Array<Stmt> stmts;
     Var result = DecomposeExpr(store->value, dtype, &stmts);
-    stmts.push_back(Evaluate(Call(DataType::Void(), ascend_simd_store(),
-                                  {StringImm(dtype_str_),
-                                   MakeAddressOf(store->buffer, store->indices),
-                                   result, mask_var_})));
+    stmts.push_back(Evaluate(Call(
+        DataType::Void(), simd_vsts(),
+        {MakeAddressOf(store->buffer, store->indices), result, mask_var_})));
     return stmts.size() == 1 ? stmts[0] : SeqStmt(stmts);
   }
 
@@ -372,26 +379,24 @@ private:
 
     bool saved = inside_simdvf_;
     inside_simdvf_ = true;
-    auto saved_frags = std::move(new_fragments_);
+    auto saved_regs = std::move(simd_regs_);
     int saved_cnt = frag_counter_;
-    new_fragments_.clear();
+    simd_regs_.clear();
     frag_counter_ = 0;
 
     Stmt new_body = VisitStmt(op->body);
-
-    Array<Buffer> alloc_bufs = op->alloc_buffers;
-    for (const Buffer &b : new_fragments_)
-      alloc_bufs.push_back(b);
+    new_body = WrapWithSimdAllocs(new_body);
 
     inside_simdvf_ = saved;
-    new_fragments_ = std::move(saved_frags);
+    simd_regs_ = std::move(saved_regs);
     frag_counter_ = saved_cnt;
 
-    if (alloc_bufs.same_as(op->alloc_buffers) && new_body.same_as(op->body))
+    if (new_body.same_as(op->body))
       return ffi::GetRef<Stmt>(op);
 
     return Block(op->iter_vars, op->reads, op->writes, op->name_hint, new_body,
-                 op->init, alloc_bufs, op->match_buffers, op->annotations);
+                 op->init, op->alloc_buffers, op->match_buffers,
+                 op->annotations);
   }
 
   Stmt VisitStmt_(const ForNode *op) override {
@@ -467,7 +472,7 @@ private:
 
     int ndim = ranges.size();
     vreg_size_ = ComputeVRegSize(dtype);
-    dtype_str_ = DTypeToAscendStr(dtype);
+    elem_bits_ = dtype.bits();
 
     // Check if this is a full-buffer fill (all mins=0, all extents=buf shape).
     // For full-buffer fills the elements are always contiguous in row-major.
@@ -496,16 +501,17 @@ private:
     int64_t nchunks = total / vreg_size_;
 
     // One fragment holds the broadcast value
-    Buffer frag = AllocFragmentReg(dtype);
+    Var frag = AllocSimdReg(dtype);
 
     // CreateMask<dtype>()
-    Var mask_var("mask", DataType::Handle());
-    PrimExpr create_mask = Call(DataType::Handle(), ascend_simd_create_mask(),
-                                {StringImm(dtype_str_)});
+    Var mask_var("mask", DataType::Bool(256));
+    PrimExpr create_mask =
+        Call(DataType::Bool(256), simd_pset(),
+             {IntImm(DataType::Int(32), elem_bits_), StringImm("PAT_ALL")});
 
     // Duplicate(frag, scalar)
-    Stmt dup_stmt = Evaluate(
-        Call(DataType::Void(), ascend_simd_dup(), {frag->data, value}));
+    Stmt dup_stmt =
+        Evaluate(Call(DataType::Void(), simd_vdupi(), {frag, value}));
 
     // StoreAlign<dtype>(buf + i*VL, frag, mask)
     // Use flat 1D addressing: index = chunk * VL + 0 (base=0 for full-buffer
@@ -533,8 +539,7 @@ private:
     PrimExpr addr = Call(DataType::Handle(), builtin::address_of(),
                          {BufferLoad(buf, idxs)});
     Stmt store =
-        Evaluate(Call(DataType::Void(), ascend_simd_store(),
-                      {StringImm(dtype_str_), addr, frag->data, mask_var}));
+        Evaluate(Call(DataType::Void(), simd_vsts(), {addr, frag, mask_var}));
 
     Stmt loop =
         For(chunk_var, IntImm(DataType::Int(32), 0),
@@ -563,8 +568,8 @@ private:
         << "T.copy inside SimdVF: cast copy only supports f32→bf16 or f32→half";
 
     vreg_size_ = ComputeVRegSize(src_dtype);
-    std::string src_dtype_str = DTypeToAscendStr(src_dtype);
-    std::string dst_dtype_str = DTypeToAscendStr(dst_dtype);
+    int src_elem_bits = src_dtype.bits();
+    int dst_elem_bits = dst_dtype.bits();
 
     // Validate both are full-buffer regions with same element count
     auto is_full = [](const Array<Range> &ranges, const Array<PrimExpr> &shape,
@@ -599,20 +604,18 @@ private:
     int64_t nchunks = total / vreg_size_;
 
     // Load fragment (src dtype), cast fragment (dst dtype for cast copies)
-    Buffer load_frag = AllocFragmentReg(src_dtype);
-    Buffer cast_frag;
+    Var load_frag = AllocSimdReg(src_dtype);
+    Var cast_frag;
     if (is_cast)
-      cast_frag = AllocFragmentReg(dst_dtype);
+      cast_frag = AllocSimdReg(dst_dtype);
 
     Var chunk_var("vchunk", DataType::Int(32));
-    mask_cnt_var_ = Var("mask_cnt", DataType::Handle());
-    mask_var_ = Var("mask", DataType::Handle());
+    mask_var_ = Var("mask", DataType::Bool(256));
 
-    PrimExpr im = Call(DataType::Handle(), ascend_init_mask(),
-                       {IntImm(DataType::Int(32), total)});
-    PrimExpr um = Call(
-        DataType::Handle(), ascend_simd_update_mask(),
-        {StringImm(is_cast ? dst_dtype_str : src_dtype_str), mask_cnt_var_});
+    int mask_elem_bits = is_cast ? dst_elem_bits : src_elem_bits;
+    PrimExpr mask_val =
+        Call(DataType::Bool(256), simd_pset(),
+             {IntImm(DataType::Int(32), mask_elem_bits), StringImm("PAT_ALL")});
 
     auto flat_addr = [&](const Buffer &buf, int ndim) -> PrimExpr {
       PrimExpr flat_idx = chunk_var * IntImm(DataType::Int(32), vreg_size_);
@@ -636,8 +639,7 @@ private:
 
     // LoadAlign from source
     Stmt load =
-        Evaluate(Call(DataType::Void(), ascend_simd_load(),
-                      {StringImm(src_dtype_str), load_frag->data, src_addr}));
+        Evaluate(Call(DataType::Void(), simd_vld(), {load_frag, src_addr}));
 
     Stmt store;
     Array<Stmt> body_stmts;
@@ -645,27 +647,24 @@ private:
 
     if (is_cast) {
       // Cast f32→bf16, then StoreAlign with DIST_PACK_B32
-      Stmt cast =
-          Evaluate(Call(DataType::Void(), ascend_simd_cast(),
-                        {StringImm(dst_dtype_str), StringImm(src_dtype_str),
-                         cast_frag->data, load_frag->data, mask_var_}));
+      Stmt cast = Evaluate(
+          Call(DataType::Void(), simd_vfcvt_narrow(),
+               {cast_frag, load_frag, mask_var_, IntImm(DataType::Int(32), 4),
+                IntImm(DataType::Int(32), 0)}));
       body_stmts.push_back(cast);
-      store = Evaluate(Call(
-          DataType::Void(), ascend_simd_store_pack(),
-          {StringImm(dst_dtype_str), dst_addr, cast_frag->data, mask_var_}));
+      store = Evaluate(Call(DataType::Void(), simd_vsts(),
+                            {dst_addr, cast_frag, mask_var_}));
     } else {
-      store = Evaluate(Call(
-          DataType::Void(), ascend_simd_store(),
-          {StringImm(src_dtype_str), dst_addr, load_frag->data, mask_var_}));
+      store = Evaluate(Call(DataType::Void(), simd_vsts(),
+                            {dst_addr, load_frag, mask_var_}));
     }
     body_stmts.push_back(store);
 
     Stmt body = SeqStmt(body_stmts);
-    Stmt ml = LetStmt(mask_var_, um, body);
     Stmt loop = For(chunk_var, IntImm(DataType::Int(32), 0),
-                    IntImm(DataType::Int(32), nchunks), ForKind::kSerial, ml);
+                    IntImm(DataType::Int(32), nchunks), ForKind::kSerial, body);
 
-    return LetStmt(mask_cnt_var_, im, loop);
+    return LetStmt(mask_var_, mask_val, loop);
   }
 
   //-----------------------------------------------------------------------
@@ -686,7 +685,7 @@ private:
 
     DataType dtype = src->dtype;
     vreg_size_ = ComputeVRegSize(dtype);
-    dtype_str_ = DTypeToAscendStr(dtype);
+    elem_bits_ = dtype.bits();
 
     ICHECK(sr.size() == 2 && dr.size() == 1 && (dim == 0 || dim == 1))
         << "T.reduce inside SimdVF requires 2D src → 1D dst, dim=0 or 1";
@@ -715,20 +714,24 @@ private:
         << "), got " << de;
     int64_t nc = de / vreg_size_;
 
-    const Op &eop = (rtype == "sum") ? ascend_simd_add() : ascend_simd_max();
-    const Op &rop =
-        (rtype == "sum") ? ascend_simd_reduce_sum() : ascend_simd_reduce_max();
+    const Op &eop = (rtype == "sum") ? simd_vadd() : simd_vmax();
+    const Op &rop = (rtype == "sum") ? simd_vcadd() : simd_vcmax();
     PrimExpr ival = (rtype == "sum") ? PrimExpr(FloatImm(dtype, 0.0))
                                      : PrimExpr(FloatImm(dtype, -3.402823e+38));
 
-    Buffer a = AllocFragmentReg(dtype), b = AllocFragmentReg(dtype);
+    Var a = AllocSimdReg(dtype);
+    Var b = AllocSimdReg(dtype);
 
-    mask_cnt_var_ = Var("mask_cnt", DataType::Handle());
-    PrimExpr mi = Call(DataType::Handle(), ascend_init_mask(),
-                       {IntImm(DataType::Int(32), de)});
-    PrimExpr mu = Call(DataType::Handle(), ascend_simd_update_mask(),
-                       {StringImm(dtype_str_), mask_cnt_var_});
-    mask_var_ = Var("mask", DataType::Handle());
+    PrimExpr mask_val =
+        Call(DataType::Bool(256), simd_pset(),
+             {IntImm(DataType::Int(32), elem_bits_), StringImm("PAT_ALL")});
+
+    // Legacy: kept for the dynamic VL pattern used in the original code
+    PrimExpr mi =
+        Call(DataType::Bool(256), simd_pset(),
+             {IntImm(DataType::Int(32), elem_bits_), StringImm("PAT_ALL")});
+    PrimExpr mu = mask_val;
+    mask_var_ = Var("mask", DataType::Bool(256));
 
     auto i32 = [](int64_t v) { return IntImm(DataType::Int(32), v); };
     auto a1d = [&](const Buffer &buf, const PrimExpr &i0) {
@@ -745,79 +748,59 @@ private:
     // Store at VReg-aligned address (rep * vreg_size), full mask → 32B aligned
     if (dim == 1 && nc == 1) {
       Stmt L = Evaluate(
-          Call(DataType::Void(), ascend_simd_load(),
-               {StringImm(dtype_str_), a->data, a2d(src, rep, i32(0))}));
-      Stmt R =
-          Evaluate(Call(DataType::Void(), rop, {a->data, a->data, mask_var_}));
-      Stmt S =
-          Evaluate(Call(DataType::Void(), ascend_simd_store(),
-                        {StringImm(dtype_str_), a1d(dst, rep * i32(vreg_size_)),
-                         a->data, mask_var_}));
+          Call(DataType::Void(), simd_vld(), {a, a2d(src, rep, i32(0))}));
+      Stmt R = Evaluate(Call(DataType::Void(), rop, {a, a, mask_var_}));
+      Stmt S = Evaluate(Call(DataType::Void(), simd_vsts(),
+                             {a1d(dst, rep * i32(vreg_size_)), a, mask_var_}));
 
       PrimExpr dst_off = rep * i32(vreg_size_);
       Stmt row_body;
       if (!clear) {
-        Stmt LP =
-            Evaluate(Call(DataType::Void(), ascend_simd_load_single(),
-                          {StringImm(dtype_str_), b->data, a1d(dst, dst_off)}));
-        Stmt MP = Evaluate(Call(DataType::Void(), eop,
-                                {a->data, a->data, b->data, mask_var_}));
+        Stmt LP = Evaluate(Call(DataType::Void(), simd_vld(),
+                                {b, a1d(dst, dst_off), StringImm("BRC_B32")}));
+        Stmt MP = Evaluate(Call(DataType::Void(), eop, {a, a, b, mask_var_}));
         row_body = LetStmt(mask_var_, mu, SeqStmt({L, R, LP, MP, S}));
       } else {
         row_body = LetStmt(mask_var_, mu, SeqStmt({L, R, S}));
       }
-      return LetStmt(mask_cnt_var_, mi,
-                     For(rep, i32(0), i32(oe), ForKind::kSerial, row_body));
+      return For(rep, i32(0), i32(oe), ForKind::kSerial, row_body));
     }
 
     // === dim=1, multi-VReg: per-chunk Reduce<MAX> + Max-accumulate ===
     if (dim == 1) {
-      Stmt DI =
-          Evaluate(Call(DataType::Void(), ascend_simd_dup(), {a->data, ival}));
+      Stmt DI = Evaluate(Call(DataType::Void(), simd_vdupi(), {a, ival}));
       Var ck("vchunk", DataType::Int(32));
       PrimExpr co = ck * i32(vreg_size_);
       Stmt LK =
-          Evaluate(Call(DataType::Void(), ascend_simd_load(),
-                        {StringImm(dtype_str_), b->data, a2d(src, rep, co)}));
-      Stmt RK =
-          Evaluate(Call(DataType::Void(), rop, {b->data, b->data, mask_var_}));
-      Stmt MA = Evaluate(
-          Call(DataType::Void(), eop, {a->data, a->data, b->data, mask_var_}));
+          Evaluate(Call(DataType::Void(), simd_vld(), {b, a2d(src, rep, co)}));
+      Stmt RK = Evaluate(Call(DataType::Void(), rop, {b, b, mask_var_}));
+      Stmt MA = Evaluate(Call(DataType::Void(), eop, {a, a, b, mask_var_}));
       Stmt CB = LetStmt(mask_var_, mu, SeqStmt({LK, RK, MA}));
 
       PrimExpr dst_off = rep * i32(vreg_size_);
-      Stmt S = Evaluate(
-          Call(DataType::Void(), ascend_simd_store(),
-               {StringImm(dtype_str_), a1d(dst, dst_off), a->data, mask_var_}));
+      Stmt S = Evaluate(Call(DataType::Void(), simd_vsts(),
+                             {a1d(dst, dst_off), a, mask_var_}));
 
-      // Fresh mask for post-loop store (inner loop consumed mask_cnt_var_)
-      Var mask_cnt2("mask_cnt2", DataType::Handle());
-      PrimExpr mi2 = Call(DataType::Handle(), ascend_init_mask(),
-                          {IntImm(DataType::Int(32), vreg_size_)});
-      PrimExpr mu2 = Call(DataType::Handle(), ascend_simd_update_mask(),
-                          {StringImm(dtype_str_), mask_cnt2});
-      Var mask2("mask2", DataType::Handle());
+      // Fresh mask for post-loop store
+      PrimExpr mask2_val =
+          Call(DataType::Bool(256), simd_pset(),
+               {IntImm(DataType::Int(32), elem_bits_), StringImm("PAT_ALL")});
+      Var mask2("mask2", DataType::Bool(256));
 
       Array<Stmt> rb = {DI, For(ck, i32(0), i32(nc), ForKind::kSerial, CB)};
       if (!clear) {
-        Stmt LP =
-            Evaluate(Call(DataType::Void(), ascend_simd_load_single(),
-                          {StringImm(dtype_str_), b->data, a1d(dst, dst_off)}));
-        Stmt MP = Evaluate(
-            Call(DataType::Void(), eop, {a->data, a->data, b->data, mask2}));
+        Stmt LP = Evaluate(Call(DataType::Void(), simd_vld(),
+                                {b, a1d(dst, dst_off), StringImm("BRC_B32")}));
+        Stmt MP = Evaluate(Call(DataType::Void(), eop, {a, a, b, mask2}));
         Stmt store2 = Evaluate(
-            Call(DataType::Void(), ascend_simd_store(),
-                 {StringImm(dtype_str_), a1d(dst, dst_off), a->data, mask2}));
-        rb.push_back(LetStmt(mask_cnt2, mi2,
-                             LetStmt(mask2, mu2, SeqStmt({LP, MP, store2}))));
+            Call(DataType::Void(), simd_vsts(), {a1d(dst, dst_off), a, mask2}));
+        rb.push_back(LetStmt(mask2, mask2_val, SeqStmt({LP, MP, store2})));
       } else {
         Stmt store2 = Evaluate(
-            Call(DataType::Void(), ascend_simd_store(),
-                 {StringImm(dtype_str_), a1d(dst, dst_off), a->data, mask2}));
-        rb.push_back(LetStmt(mask_cnt2, mi2, LetStmt(mask2, mu2, store2)));
+            Call(DataType::Void(), simd_vsts(), {a1d(dst, dst_off), a, mask2}));
+        rb.push_back(LetStmt(mask2, mask2_val, store2));
       }
-      return LetStmt(mask_cnt_var_, mi,
-                     For(rep, i32(0), i32(oe), ForKind::kSerial, SeqStmt(rb)));
+      return For(rep, i32(0), i32(oe), ForKind::kSerial, SeqStmt(rb));
     }
 
     // === dim=0: rows NOT contiguous → element-wise Max per column chunk ===
@@ -826,16 +809,12 @@ private:
     PrimExpr co = ck * i32(vreg_size_);
 
     Stmt L0 =
-        Evaluate(Call(DataType::Void(), ascend_simd_load(),
-                      {StringImm(dtype_str_), a->data, a2d(src, i32(0), co)}));
+        Evaluate(Call(DataType::Void(), simd_vld(), {a, a2d(src, i32(0), co)}));
     Stmt LK =
-        Evaluate(Call(DataType::Void(), ascend_simd_load(),
-                      {StringImm(dtype_str_), b->data, a2d(src, rv, co)}));
-    Stmt EA = Evaluate(
-        Call(DataType::Void(), eop, {a->data, a->data, b->data, mask_var_}));
+        Evaluate(Call(DataType::Void(), simd_vld(), {b, a2d(src, rv, co)}));
+    Stmt EA = Evaluate(Call(DataType::Void(), eop, {a, a, b, mask_var_}));
     Stmt SK = Evaluate(
-        Call(DataType::Void(), ascend_simd_store(),
-             {StringImm(dtype_str_), a1d(dst, co), a->data, mask_var_}));
+        Call(DataType::Void(), simd_vsts(), {a1d(dst, co), a, mask_var_}));
 
     Array<Stmt> cb;
     if (oe == 1)
@@ -846,8 +825,7 @@ private:
                        LetStmt(mask_var_, mu, SeqStmt({LK, EA}))));
     }
     cb.push_back(LetStmt(mask_var_, mu, SK));
-    return LetStmt(mask_cnt_var_, mi,
-                   For(ck, i32(0), i32(nc), ForKind::kSerial, SeqStmt(cb)));
+    return For(ck, i32(0), i32(nc), ForKind::kSerial, SeqStmt(cb));
   }
 
   //-----------------------------------------------------------------------
@@ -863,7 +841,7 @@ private:
 
     DataType dtype = InferDType(vreg_for->body);
     vreg_size_ = ComputeVRegSize(dtype);
-    dtype_str_ = DTypeToAscendStr(dtype);
+    elem_bits_ = dtype.bits();
     ICHECK_EQ(vreg_ext % vreg_size_, 0)
         << "T.Parallel inside SimdVF requires VReg extent divisible by VReg "
            "size ("
@@ -881,14 +859,14 @@ private:
     }
 
     chunk_var_ = Var("vchunk", DataType::Int(32));
-    mask_cnt_var_ = Var("mask_cnt", DataType::Handle());
-    mask_var_ = Var("mask", DataType::Handle());
+    mask_var_ = Var("mask", DataType::Bool(256));
     scalar_loads_.clear();
 
-    PrimExpr im = Call(DataType::Handle(), ascend_init_mask(),
-                       {IntImm(DataType::Int(32), vreg_ext)});
-    PrimExpr um = Call(DataType::Handle(), ascend_simd_update_mask(),
-                       {StringImm(dtype_str_), mask_cnt_var_});
+    PrimExpr mask_val =
+        Call(DataType::Bool(256), simd_pset(),
+             {IntImm(DataType::Int(32), elem_bits_), StringImm("PAT_ALL")});
+    PrimExpr im = mask_val;
+    PrimExpr um = mask_val;
 
     Stmt body = LowerParallelBody(vreg_for->body, dtype);
     Stmt ml = LetStmt(mask_var_, um, body);
@@ -896,7 +874,7 @@ private:
         For(chunk_var_, IntImm(DataType::Int(32), 0),
             IntImm(DataType::Int(32), nchunks), ForKind::kSerial, ml);
 
-    // Per-iteration body: scalar loads + mask_cnt init + VReg chunk loop
+    // Per-iteration body: scalar loads + VReg chunk loop
     Stmt per_iter_body = inner_loop;
     if (!scalar_loads_.empty()) {
       Array<Stmt> seq;
@@ -906,7 +884,6 @@ private:
       per_iter_body = SeqStmt(seq);
       scalar_loads_.clear();
     }
-    per_iter_body = LetStmt(mask_cnt_var_, im, per_iter_body);
 
     Stmt result;
     if (serial_for) {
