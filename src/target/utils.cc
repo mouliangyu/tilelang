@@ -174,6 +174,14 @@ bool IsCudaVectorizableFP8(DataType dtype) {
          dtype.is_float8_e5m2();
 }
 
+bool IsAscendVectorizableFP8(DataType dtype) {
+  // NOTE: E8M0 is a special type of FP8 which is not handled here.
+  // We only handle FP8 types which can be represented with
+  // __asc_fp8_interpretation_t here.
+  return dtype.is_float8_e4m3() || dtype.is_float8_e4m3fn() ||
+         dtype.is_float8_e5m2();
+}
+
 bool IsCudaVectorizableCast(DataType from_ty, DataType target_ty) {
   // float16 -> float32
   if (from_ty.is_float16() && target_ty.is_float() && target_ty.bits() == 32)

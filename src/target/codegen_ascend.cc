@@ -1,6 +1,7 @@
 #include "codegen_ascend.h"
 
 #include "../op/builtin.h"
+#include "./utils.h"
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -79,10 +80,56 @@ void CodeGenTileLangAscend::PrintCCEVectorSuffix(DataType t, std::ostream &os) {
 
 void CodeGenTileLangAscend::Init(bool output_ssa) {
   CodeGenC::Init(output_ssa);
+  decl_stream << "#include <tl_templates/ascend/common.h>\n";
+  decl_stream << "\n";
 }
 
 void CodeGenTileLangAscend::PrintFuncPrefix(std::ostream &os) {
   os << "extern \"C\"\n";
+}
+
+static std::string GetAscendFP8Type(DataType type) {
+  std::stringstream stream;
+  int32_t lanes = type.lanes();
+  std::string vec;
+  if (type.is_scalar()) {
+    vec = "";
+  } else if (lanes == 2) {
+    vec = "_2";
+  } else if (lanes == 4) {
+    vec = "_4";
+  } else if (lanes == 8) {
+    vec = "_8";
+  } else if (lanes == 16) {
+    vec = "_16";
+  } else if (lanes == 32) {
+    vec = "_32";
+  } else {
+    LOG(FATAL)
+        << "Only support scalar and vector types of width (2, 4, 8, 16, 32) "
+           "for Ascend fp8";
+  }
+  if (type.is_float8_e4m3() || type.is_float8_e4m3fn()) {
+    stream << "fp8_e4" << vec << "_t";
+  } else if (type.is_float8_e5m2()) {
+    stream << "fp8_e5" << vec << "_t";
+  } else if (type.is_float8_e8m0fnu()) {
+    stream << "fp8_e8" << vec << "_t";
+  } else {
+    LOG(FATAL) << "Unsupported Ascend fp8 type " << type;
+  }
+  return stream.str();
+}
+
+static std::string GetAscendFP8ScalarValueType(DataType type) {
+  if (type.is_float8_e4m3() || type.is_float8_e4m3fn()) {
+    return "tl::float_e4m3_t";
+  }
+  if (type.is_float8_e5m2()) {
+    return "tl::float_e5m2_t";
+  }
+  LOG(FATAL) << "Unsupported Ascend scalar fp8 conversion type " << type;
+  return "";
 }
 
 void CodeGenTileLangAscend::PrintType(DataType t, std::ostream &os) {
@@ -160,6 +207,9 @@ void CodeGenTileLangAscend::PrintType(DataType t, std::ostream &os) {
     } else {
       fail = true;
     }
+  } else if (t.is_float8()) {
+    os << GetAscendFP8Type(t);
+    return;
   } else if (t.is_int() || t.is_uint()) {
     switch (t.bits()) {
     case 8:
@@ -249,38 +299,6 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
     }
   });
 
-  // Pre-scan for bf16 buffers needing cast intrinsics
-  tir::PostOrderVisit(f->body, [&](const ObjectRef &n) {
-    if (const auto *alloc = n.as<tir::AllocateNode>()) {
-      if (alloc->dtype.is_bfloat16()) {
-        has_bf16_cast_ = true;
-      }
-    }
-    if (const auto *store = n.as<tir::BufferStoreNode>()) {
-      if (store->buffer->dtype.is_bfloat16()) {
-        has_bf16_cast_ = true;
-      }
-    }
-    if (const auto *load = n.as<tir::BufferLoadNode>()) {
-      if (load->buffer->dtype.is_bfloat16()) {
-        has_bf16_cast_ = true;
-      }
-    }
-    if (const auto *cast = n.as<tir::CastNode>()) {
-      if (cast->dtype.is_bfloat16() || cast->value->dtype.is_bfloat16()) {
-        has_bf16_cast_ = true;
-      }
-    }
-  });
-  if (!has_bf16_cast_) {
-    for (const auto &kv : f->buffer_map) {
-      if (kv.second->dtype.is_bfloat16()) {
-        has_bf16_cast_ = true;
-        break;
-      }
-    }
-  }
-
   // Conditionally include gemm.h when ascend_gemm_l1 is used
   if (has_gemm_l1_ && !has_gemm_l1_included_) {
     decl_stream << "#include <tl_templates/ascend/gemm.h>\n";
@@ -291,12 +309,6 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   if (!has_limits_included_) {
     decl_stream << "#include <limits>\n";
     has_limits_included_ = true;
-  }
-
-  // Include asc_bf16.h when bf16 buffers exist (needed for vector casts)
-  if (has_bf16_cast_ && !has_bf16_cast_included_) {
-    decl_stream << "#include <simt_api/asc_bf16.h>\n";
-    has_bf16_cast_included_ = true;
   }
 
   // Conditionally include nd2nz_copy.h when ascend_nd2nz_copy is used
@@ -1367,6 +1379,75 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   }
 }
 
+void CodeGenTileLangAscend::VisitExpr_(const BufferLoadNode *op,
+                                       std::ostream &os) {
+  DataType value_dtype = op->dtype;
+  const VarNode *buf_var = op->buffer->data.get();
+
+  // For Ascend: scalar FP8 loads from shared/UBUF memory need conversion
+  // through raw bytes, because the scalar FP8 type (tl::float_e4m3_t) is a
+  // struct whose operator= does not support __ubuf__ to local assignment.
+  if (value_dtype.is_scalar() && tl::IsAscendVectorizableFP8(value_dtype)) {
+    auto it = alloc_storage_scope_.find(buf_var);
+    if (it != alloc_storage_scope_.end()) {
+      const std::string &scope = it->second;
+      if (scope == "shared" || scope == "shared.dyn") {
+        // __ubuf__ does not support custom struct pointer
+        ICHECK_EQ(op->indices.size(), 1);
+        PrimExpr index = op->indices[0];
+        std::string buf_name = GetVarID(buf_var);
+
+        // tl::float_e4m3_t::from_bits(*(__ubuf__ uint8_t*)(buf + off))
+        os << GetAscendFP8ScalarValueType(value_dtype) << "::from_bits("
+           << "*(";
+        PrintStorageScope(scope, os);
+        os << "uint8_t*)(" << buf_name;
+        if (!is_zero(index)) {
+          os << " + ";
+          PrintExpr(index, os);
+        }
+        os << "))";
+        return;
+      }
+    }
+  }
+
+  CodeGenC::VisitExpr_(op, os);
+}
+
+void CodeGenTileLangAscend::VisitStmt_(const BufferStoreNode *op) {
+  DataType value_dtype = op->value.dtype();
+  DataType element_dtype = op->buffer->dtype;
+  const VarNode *buf_var = op->buffer->data.get();
+  PrimExpr index_expr = op->indices[0];
+
+  // For Ascend: scalar FP8 stores to shared/UBUF memory need to write the raw
+  // .data byte, because tl::float_e4m3_t::operator= does not accept a local
+  // struct on a __ubuf__ lvalue target.
+  if (value_dtype.is_scalar() && tl::IsAscendVectorizableFP8(value_dtype)) {
+    auto it = alloc_storage_scope_.find(buf_var);
+    if (it != alloc_storage_scope_.end()) {
+      const std::string &scope = it->second;
+      if (scope == "shared" || scope == "shared.dyn") {
+        // __ubuf__ does not support custom struct pointer
+        ICHECK_EQ(op->indices.size(), 1);
+        std::string buf_name = GetVarID(buf_var);
+        std::string value = PrintExpr(op->value);
+
+        // ((__ubuf__ uint8_t*)buf)[off] = value.data;
+        PrintIndent();
+        stream << "((";
+        PrintStorageScope(scope, stream);
+        stream << "uint8_t*)" << buf_name << ")[" << PrintExpr(index_expr)
+               << "] = " << value << ".data;\n";
+        return;
+      }
+    }
+  }
+
+  CodeGenC::VisitStmt_(op);
+}
+
 void CodeGenTileLangAscend::VisitStmt_(const ForNode *op) {
   if (op->kind == tir::ForKind::kUnrolled) {
     PrintIndent();
@@ -1570,24 +1651,113 @@ void CodeGenTileLangAscend::VisitExpr_(const FloatImmNode *op,
 
 void CodeGenTileLangAscend::VisitExpr_(const CastNode *op,
                                        std::ostream &os) { // NOLINT(*)
-  DataType from = op->value->dtype;
-  DataType to = op->dtype;
-  if (from.is_bfloat16() && from.lanes() == 2 && to.is_float() &&
-      to.bits() == 32 && to.lanes() == 2) {
-    has_bf16_cast_ = true;
+  DataType from_ty = op->value.dtype();
+  DataType target_ty = op->dtype;
+  ICHECK_EQ(target_ty.lanes(), from_ty.lanes());
+
+  if (from_ty.is_scalar()) {
+    if (from_ty.is_float() && from_ty.bits() == 32 &&
+        tl::IsAscendVectorizableFP8(target_ty)) {
+      os << GetAscendFP8ScalarValueType(target_ty) << "(";
+      PrintExpr(op->value, os);
+      os << ")";
+      return;
+    }
+
+    if (tl::IsAscendVectorizableFP8(from_ty) && target_ty.is_float() &&
+        target_ty.bits() == 32) {
+      os << "static_cast<float>(";
+      PrintExpr(op->value, os);
+      os << ")";
+      return;
+    }
+
+    return CodeGenC::VisitExpr_(op, os);
+  }
+
+  // We could emit make_float4 like calls, but the emitted code looks
+  // too compact to read. Emit this as vectorized unary ops.
+  std::string sret = name_supply_->FreshName("_");
+  this->PrintIndent();
+  this->PrintType(target_ty, stream);
+  stream << ' ' << sret << ";\n";
+  std::string src = SSAGetID(PrintExpr(op->value), from_ty);
+
+  int lanes = from_ty.lanes();
+
+  auto PrintVectorizedCast =
+      [&](const std::string &cast_func, const std::string &src_type,
+          const std::string &dst_type, const std::string &extra_args = "",
+          bool src_needs_reinterpret = false,
+          bool dst_needs_reinterpret = false) {
+        int num_chunks = lanes / 2;
+        std::string src_cast = src_needs_reinterpret
+                                   ? "reinterpret_cast<" + src_type + "*>"
+                                   : "(" + src_type + "*)";
+        std::string dst_cast = dst_needs_reinterpret
+                                   ? "reinterpret_cast<" + dst_type + "*>"
+                                   : "(" + dst_type + "*)";
+
+        for (int i = 0; i < num_chunks; i++) {
+          PrintIndent();
+          stream << "(" << dst_cast << "(&" << sret << "))[" << i
+                 << "] = " << cast_func << "((" << src_cast << "(&" << src
+                 << "))[" << i << "]" << extra_args << ");\n";
+        }
+        os << sret;
+      };
+
+  // Handle conversion from bfloat16 to float32
+  if (from_ty.is_bfloat16() && from_ty.lanes() == 2 && target_ty.is_float() &&
+      target_ty.bits() == 32 && target_ty.lanes() == 2) {
     os << "__bfloat1622float2(";
     PrintExpr(op->value, os);
     os << ")";
     return;
   }
-  if (from.is_float() && from.bits() == 32 && from.lanes() == 2 &&
-      to.is_bfloat16() && to.lanes() == 2) {
-    has_bf16_cast_ = true;
+
+  // Handle conversion from float32 to bfloat16
+  if (from_ty.is_float() && from_ty.bits() == 32 && from_ty.lanes() == 2 &&
+      target_ty.is_bfloat16() && target_ty.lanes() == 2) {
     os << "__float22bfloat162_rn(";
     PrintExpr(op->value, os);
     os << ")";
     return;
   }
+
+  // Handle conversion from float32 to float8 (E4M3/E5M2)
+  if (from_ty.is_float() && from_ty.bits() == 32 &&
+      tl::IsAscendVectorizableFP8(target_ty)) {
+    bool target_type_is_e4m3 =
+        target_ty.is_float8_e4m3() || target_ty.is_float8_e4m3fn();
+    std::string type_suffix = target_type_is_e4m3 ? "__ASC_E4M3" : "__ASC_E5M2";
+
+    // Use __asc_cvt_float2_to_fp8x2 for vectorized conversion (float2 -> fp8x2)
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      std::string extra_args = std::string(", __ASC_SATFINITE, ") + type_suffix;
+      PrintVectorizedCast("__asc_cvt_float2_to_fp8x2", "float2", "uint16_t",
+                          extra_args, false, true);
+      return;
+    }
+  }
+
+  // Handle conversion from float8 (E4M3/E5M2) to float32
+  if (tl::IsAscendVectorizableFP8(from_ty) && target_ty.is_float() &&
+      target_ty.bits() == 32) {
+    bool from_type_is_e4m3 =
+        from_ty.is_float8_e4m3() || from_ty.is_float8_e4m3fn();
+    std::string src_x2_type =
+        from_type_is_e4m3 ? "float8_e4m3x2_t" : "float8_e5m2x2_t";
+    std::string cvt_func =
+        from_type_is_e4m3 ? "__e4m3x22float2" : "__e5m2x22float2";
+
+    // Use Ascend x2 intrinsics for vectorized conversion (fp8x2 -> float2)
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast(cvt_func, src_x2_type, "float2", "", true, false);
+      return;
+    }
+  }
+
   CodeGenC::VisitExpr_(op, os);
 }
 
