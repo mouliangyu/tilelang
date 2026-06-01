@@ -27,9 +27,11 @@ env:
   COLUMNS: "100"
   FORCE_COLOR: "1"
   CLICOLOR_FORCE: "1"
-
+  UV_INDEX_STRATEGY: "unsafe-best-match"
+  UV_HTTP_TIMEOUT: "600"
   XDG_CACHE_HOME: "${{ github.workspace }}/.cache" # to be updated
   PIP_CACHE_DIR: "${{ github.workspace }}/.cache/pip" # to be updated
+  UV_CACHE_DIR: "${{ github.workspace }}/.cache/uv" # to be updated
   PRE_COMMIT_HOME: "${{ github.workspace }}/.cache/pip/.pre-commit" # to be updated
 
 jobs:
@@ -44,35 +46,25 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      - name: Set environment (self-hosted runners)
-        run: |
-          # Use runner tool_cache as cache root for self-hosted runners to avoid internet connection
-          # issues and to share cache between jobs.
-          export XDG_CACHE_HOME="${{ runner.tool_cache }}/.ci-cache-${{ github.workflow }}"
-          echo "XDG_CACHE_HOME=${XDG_CACHE_HOME}" | tee -a "${GITHUB_ENV}"
-          echo "PIP_CACHE_DIR=${XDG_CACHE_HOME}/pip" | tee -a "${GITHUB_ENV}"
-          echo "PRE_COMMIT_HOME=${XDG_CACHE_HOME}/pip/.pre-commit" | tee -a "${GITHUB_ENV}"
+      - name: Setup Python 3.12
+        id: setup-pylowest
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          update-environment: true
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements*.txt
+            .pre-commit-config.yaml
 
-      - name: Create venv from system Python
+      - name: Check AST with Python 3.12
         run: |
-          VENV_DIR="${{ runner.tool_cache }}/.ci-venv-self-hosted-ascend"
-          if [ ! -d "${VENV_DIR}" ]; then
-            python -m venv --system-site-packages "${VENV_DIR}"
-          fi
-          echo "${VENV_DIR}/bin" >> "${GITHUB_PATH}"
-
-      - name: Install lint dependencies
-        run: |
-          pip install --upgrade pip setuptools wheel
-          pip install -r requirements-lint.txt
-
-      - name: Check AST
-        run: |
-          python -m compileall -q -f tilelang
+          "${{ steps.setup-pylowest.outputs.python-path }}" -m compileall -q -f tilelang
 
       - name: Pre-commit Lint
         run: |
-          if ! pre-commit run --all-files --color=always --show-diff-on-failure; then
+          if ! pipx run pre-commit run --all-files --color=always --show-diff-on-failure; then
             echo "::error::Pre-commit checks failed. Please run 'pre-commit install' and 'pre-commit run --all-files' locally to see the issues."
             exit 1
           fi
@@ -119,39 +111,68 @@ jobs:
           export XDG_CACHE_HOME="${{ runner.tool_cache }}/.ci-cache-${{ github.workflow }}"
           echo "XDG_CACHE_HOME=${XDG_CACHE_HOME}" | tee -a "${GITHUB_ENV}"
           echo "PIP_CACHE_DIR=${XDG_CACHE_HOME}/pip" | tee -a "${GITHUB_ENV}"
-
+          echo "UV_CACHE_DIR=${XDG_CACHE_HOME}/uv" | tee -a "${GITHUB_ENV}"
           echo "PRE_COMMIT_HOME=${XDG_CACHE_HOME}/pip/.pre-commit" | tee -a "${GITHUB_ENV}"
 
-      - name: Create venv from system Python
-        run: |
-          VENV_DIR="${{ runner.tool_cache }}/.ci-venv-${{ matrix.runner.name }}"
-          if [ ! -d "${VENV_DIR}" ]; then
-            python -m venv --system-site-packages "${VENV_DIR}"
-          fi
-          echo "${VENV_DIR}/bin" >> "${GITHUB_PATH}"
+      - name: Setup Python and uv with caching
+        id: setup-uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          activate-environment: true
+          # Do not use cache for self-hosted runners, as it will download/upload caches which is slow.
+          enable-cache: ${{ !startsWith(matrix.runner.name, 'self-hosted') }}
+          prune-cache: ${{ !startsWith(matrix.runner.name, 'self-hosted') }}
+          # Use runner tool_cache for self-hosted runners
+          cache-local-path: ${{ env.UV_CACHE_DIR }}
+          ignore-nothing-to-cache: true
+          # Extra cache key to upload/download caches on GitHub-hosted runners
+          cache-suffix: uv-${{ runner.os }}-${{ runner.arch }}-${{ matrix.python-version }}-${{ matrix.runner.name }}-${{ matrix.runner.toolkit }}
+          cache-dependency-glob: |
+            pyproject.toml
+            requirements*.txt
+            .pre-commit-config.yaml
 
-      - name: Setup dependencies
+      - name: Setup venv
+        id: setup-venv
         run: |
           set -o pipefail
 
-          pip install --upgrade pip setuptools wheel
-          pip install -r requirements-test.txt
-          python -c "import torch; print(f'torch: {torch.__version__}')"
-          python -c "import torch_npu; print(f'torch_npu: {torch_npu.__version__}')"
+          uv pip install --upgrade pip setuptools wheel
+          uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu130
+          uv pip install -v -r requirements-test.txt
+          echo "import torch; print(f'torch: {torch.__version__}')" | uv run --no-project --script -
           echo "::group::torch.utils.collect_env"
-          python -m torch.utils.collect_env
+          uv run --no-project -m -- torch.utils.collect_env
+          uv pip install /nfs-hg/prod/deepseek/permanent/shared/caohuanqi/pytorch/dist/torch_npu-2.10.0+git6893d1e-cp312-cp312-linux_aarch64.whl
           echo "::endgroup::"
+
+      - name: Clear uv cache for self-hosted runners (if setup failed)
+        if: >-
+          ${{
+            failure() &&
+            startsWith(matrix.runner.name, 'self-hosted') &&
+            (steps.setup-uv.conclusion == 'failure' || steps.setup-venv.conclusion == 'failure')
+          }}
+        run: |
+          echo "Clearing uv cache at ${UV_CACHE_DIR} due to failure."
+          uv cache clean
 
       - name: Install project (wheel form)
         env:
           USE_CUDA: "OFF"
         run: |
-          pip install -v .
+          uv pip install -v .
 
       - name: Run Ascend tests with Python ${{ matrix.python-version }}
         run: |
           cd testing
-          python -m pytest -n 4 --verbose --color=yes --durations=0 --showlocals --cache-clear --maxfail=3 ../examples/ascend
+          PYTEST=(
+            uv run --no-project -m --
+            pytest --verbose --color=yes --durations=0 --showlocals --cache-clear -n 4
+          )
+          "${PYTEST[@]}" --maxfail=3 \
+            ../examples/ascend
 
       - name: List generated files
         if: ${{ !cancelled() }}
