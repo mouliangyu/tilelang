@@ -693,7 +693,7 @@ TVM_DLL const Op &ascend_copy_ubuf_to_cbuf();
 /*!
  * \brief Ascend ND→NZ scatter (SimdVF) from UB ND tile to UB NZ tile.
  *
- * ascend_nd2nz_scatter(src_ub, tmp_nz_ub, rows, cols, fuse_cast,
+ * ascend_nd2nz_scatter(src_ub, tmp_nz_ub, rows, cols,
  *                      dst_dtype_str, src_dtype_str)
  *
  */

@@ -1020,22 +1020,22 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_nd2nz_scatter())) {
-    // ascend_nd2nz_scatter(src_ub, tmp_ub, rows, cols, fuse_cast,
+    // ascend_nd2nz_scatter(src_ub, tmp_ub, rows, cols,
     //                      dst_dtype_str, src_dtype_str)
     // Emits the SimdVF scatter from an ND tile in `src_ub` into the NZ-laid
     // tmp buffer `tmp_ub`. The post-scatter UB→L1 raw DMA is emitted as a
     // separate ascend_nd2nz_post_copy stmt.
-    ICHECK_EQ(op->args.size(), 7)
-        << "tl.ascend_nd2nz_scatter expects exactly 7 arguments";
+    // Template: <ROWS, COLS, SrcT, DstT> — the (SrcT, DstT) pair selects
+    // the specialization (same-type or fused-cast).
+    ICHECK_EQ(op->args.size(), 6)
+        << "tl.ascend_nd2nz_scatter expects exactly 6 arguments";
     int rows = op->args[2].as<IntImmNode>()->value;
     int cols = op->args[3].as<IntImmNode>()->value;
-    int fuse_cast = op->args[4].as<IntImmNode>()->value;
-    std::string dst_dtype = op->args[5].as<StringImmNode>()->value;
-    std::string src_dtype = op->args[6].as<StringImmNode>()->value;
+    std::string dst_dtype = op->args[4].as<StringImmNode>()->value;
+    std::string src_dtype = op->args[5].as<StringImmNode>()->value;
     this->PrintIndent();
     this->stream << "ascend_nd2nz_scatter<" << rows << ", " << cols << ", "
-                 << rows << ", " << (fuse_cast ? "true" : "false") << ", "
-                 << dst_dtype << ", " << src_dtype << ">((__ubuf__ "
+                 << src_dtype << ", " << dst_dtype << ">((__ubuf__ "
                  << src_dtype << "*)(";
     this->PrintExpr(op->args[0], this->stream);
     this->stream << "), (__ubuf__ " << dst_dtype << "*)(";
@@ -1044,12 +1044,20 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintIndent();
     // this->stream << "pipe_barrier(PIPE_ALL);\n";
   } else if (op->op.same_as(tl::ascend_nd2nz_post_copy())) {
-    // ascend_nd2nz_post_copy(dst_l1, src_ub, rows, cols, full_rows,
+    // ascend_nd2nz_post_copy(dst_l1, src_nz_ub, rows, cols, full_rows,
     //                        dst_dtype_str)
-    // For multi-fractal: src_ub is the NZ tmp buffer produced by the scatter
-    // — emit per-D-group copy_ubuf_to_cbuf with sid correction.
-    // For single-fractal (rows<=16 && cols<=16): src_ub is the raw ND source
-    // — emit one direct copy (ND == NZ in this case).
+    // 2D copy_ubuf_to_cbuf from NZ tmp to L1.
+    //
+    // Sid correction: warpgroup_partition gives dst_ptr an ND offset
+    //   (sid * rows * cols elements).  The true NZ offset is
+    //   sid * rows * elems_perC0 (elems_perC0 = 32 / sizeof(elem)).
+    // We subtract the difference inline — sid is a runtime variable.
+    //
+    // 2D copy model: each D-group = one "row".
+    //   burst_num = cols / elems_perC0    (D-groups)
+    //   burst_len = rows                  (32B blocks per D-group: one per row)
+    //   src_gap   = 1                     (pad block in tmp between D-groups)
+    //   dst_gap   = full_rows - rows      (other AIV rows in L1 per D-group)
     ICHECK_EQ(op->args.size(), 6)
         << "tl.ascend_nd2nz_post_copy expects exactly 6 arguments";
     int rows = op->args[2].as<IntImmNode>()->value;
@@ -1057,73 +1065,23 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     int full_rows = op->args[4].as<IntImmNode>()->value;
     std::string dst_dtype = op->args[5].as<StringImmNode>()->value;
 
-    int dst_elem_bytes = (dst_dtype == "float") ? 4 : 2;
-    int full_nBlk = full_rows / 16;
-    int dBlk = cols / 16;
+    int elem_bytes = (dst_dtype == "float") ? 4 : 2;
+    int elems_perC0 = 32 / elem_bytes; // 16 (half) or 8 (float)
 
-    if (rows <= 16 && cols <= 16) {
-      // Single fractal: ND == NZ, emit one raw copy.
-      int total_bytes = rows * cols * dst_elem_bytes;
-      this->PrintIndent();
-      this->stream << "copy_ubuf_to_cbuf((__cbuf__ void*)(";
-      this->PrintExpr(op->args[0], this->stream);
-      this->stream << "), (__ubuf__ void*)(";
-      this->PrintExpr(op->args[1], this->stream);
-      this->stream << "), 0, " << total_bytes / 32 << ", 1, 0, 0);\n";
-    } else {
-      // Multi-fractal: per-D-group strided copy from NZ tmp to L1.
-      //
-      // Sub-tile NZ:  nBlk_sub  = rows / 16,         dBlk = cols / 16
-      // Full NZ:      nBlk_full = full_rows / 16
-      // Sub-tile fractal (n_sub, d) sits in tmp at offset
-      //     (d * nBlk_sub + n_sub) * 256 elements.
-      // Full fractal in L1 lives at
-      //     p_l1_base + (d * nBlk_full + n_start + n_sub) * 256
-      // where n_start = sid * nBlk_sub depends on the AIV id.
-      //
-      // The dst_ptr we receive from the lowering already includes an
-      // ND-style sid offset: dst_ptr = p_l1_base + sid * rows * cols. We
-      // need the NZ-style base p_l1_base + sid * nBlk_sub * 256 instead.
-      // We can't recover p_l1_base + sid at codegen time, so we emit the
-      // correction inline against the supplied dst_ptr:
-      //     target = dst_ptr
-      //            + (d * nBlk_full * 256 + sid * nBlk_sub * 256
-      //               - sid * rows * cols)
-      //            = dst_ptr + d * nBlk_full * 256
-      //                       - sid * (rows * cols - nBlk_sub * 256)
-      //                      [= rows * (cols - 16), per-sid correction]
-      // sid is unknown at compile time, so it stays in the emitted C++.
-      int nBlk_sub = rows / 16;
-      int frac_elems = 256;
-      int frac_bytes = frac_elems * dst_elem_bytes;
-      int nd_vs_nz_correction = rows * cols - nBlk_sub * frac_elems;
-      this->PrintIndent();
-      this->stream << "{\n";
-      this->PrintIndent();
-      this->stream << "  __ubuf__ " << dst_dtype << "* _nd2nz_tmp = (__ubuf__ "
-                   << dst_dtype << "*)(";
-      this->PrintExpr(op->args[1], this->stream);
-      this->stream << ");\n";
-      // For each D-group, copy nBlk_sub fractals from tmp to the right NZ
-      // slot in L1. d_group_offset = d * nBlk_full * 256 (full-NZ stride);
-      // the runtime `- sid * nd_vs_nz_correction` undoes the ND sid offset
-      // baked into dst_ptr.
-      for (int d = 0; d < dBlk; ++d) {
-        int tmp_offset_elems = d * nBlk_sub * frac_elems;
-        int copy_bytes = nBlk_sub * frac_bytes;
-        int d_group_offset = d * full_nBlk * frac_elems;
-        this->PrintIndent();
-        this->stream << "  copy_ubuf_to_cbuf((__cbuf__ void*)((__cbuf__ "
-                     << dst_dtype << "*)(";
-        this->PrintExpr(op->args[0], this->stream);
-        this->stream << ") + " << d_group_offset << " - sid * "
-                     << nd_vs_nz_correction
-                     << "), (__ubuf__ void*)(_nd2nz_tmp + " << tmp_offset_elems
-                     << "), 0, " << copy_bytes / 32 << ", 1, 0, 0);\n";
-      }
-      this->PrintIndent();
-      this->stream << "}\n";
-    }
+    int burst_num = cols / elems_perC0;           // D-groups
+    int burst_len = rows;                         // 32B blocks per D-group
+    int src_gap = 1;                              // pad in tmp between D-groups
+    int dst_gap = full_rows - rows;               // other AIV rows in L1
+    int correction = rows * (cols - elems_perC0); // ND→NZ ptr delta
+
+    this->PrintIndent();
+    this->stream << "copy_ubuf_to_cbuf((__cbuf__ void*)((__cbuf__ " << dst_dtype
+                 << "*)(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << ") - sid * " << correction << "), (__ubuf__ void*)(";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << "), 0, " << burst_num << ", " << burst_len << ", "
+                 << src_gap << ", " << dst_gap << ");\n";
   } else if (op->op.same_as(tl::ascend_mad())) {
     ICHECK_EQ(op->args.size(), 10)
         << "tl.ascend_mad expects exactly 10 arguments";

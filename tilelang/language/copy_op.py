@@ -11,52 +11,6 @@ from tilelang.language.utils import get_extent
 from tvm import ir, tir
 
 
-def _shape_for_nd2nz(buf: BufferLikeType):
-    """Return the underlying buffer's full (M, N) shape for nd2nz tmp sizing.
-
-    The dst passed to nd2nz copy may be a sliced sub-region (e.g. after an
-    M-split); the SimdVF scatter still needs the *full* L1 buffer's M to
-    compute fractal strides, so we look through to the underlying Buffer.
-    """
-    if isinstance(buf, tir.Buffer):
-        return buf.shape, buf.dtype
-    if isinstance(buf, tir.BufferLoad):
-        return buf.buffer.shape, buf.buffer.dtype
-    if isinstance(buf, tir.BufferRegion):
-        return buf.buffer.shape, buf.buffer.dtype
-    raise TypeError(f"Cannot infer nd2nz shape from {type(buf)}")
-
-
-def _allocate_nd2nz_tmp(src: BufferLikeType, dst: BufferLikeType):
-    """Allocate the UB scratch buffer that the Ascend nd2nz lowering needs.
-
-    Sized to one sub-tile in NZ layout (ROWS x COLS of dst dtype) — matches
-    what `ascend_nd2nz_scatter<ROWS, COLS, ROWS, ...>` writes. Returned as a
-    `tl.region` PrimExpr so it can be threaded as the 3rd positional arg of
-    `tl.tileop.copy`.
-    """
-    from tilelang.language.allocate import alloc_shared
-
-    src_shape, _ = _shape_for_nd2nz(src)
-    dst_shape, dst_dtype = _shape_for_nd2nz(dst)
-    # Sub-tile rows/cols come from the src side (the contiguous ND tile we
-    # will scatter); src may itself be a sliced region, so look through.
-    if isinstance(src, tir.BufferRegion):
-        rows = src.region[-2].extent
-        cols = src.region[-1].extent
-    elif isinstance(src, tir.BufferLoad):
-        # rare: a scalar BufferLoad here would have been short-circuited
-        # earlier in copy(); fall back to the underlying buffer's tail dims
-        rows, cols = src_shape[-2], src_shape[-1]
-    else:
-        rows, cols = src_shape[-2], src_shape[-1]
-    rows_v = rows.value if isinstance(rows, tir.IntImm) else int(rows)
-    cols_v = cols.value if isinstance(cols, tir.IntImm) else int(cols)
-    tmp_elems = rows_v * cols_v
-    tmp_buf = alloc_shared((tmp_elems,), dst_dtype, "shared.dyn")
-    return to_buffer_region(tmp_buf, access_type="rw", extents=[tmp_elems])
-
-
 def copy(
     src: BufferLikeType,
     dst: BufferLikeType,
@@ -177,16 +131,12 @@ def _emit_nd2nz_seq(
     dst_extent: list,
     ann: dict,
 ) -> tir.PrimExpr:
-    """Emit the Ascend ND→NZ copy as one or two raw intrinsic calls.
+    """Emit the Ascend ND→NZ copy as a scatter + post_copy intrinsic pair.
 
-    Multi-fractal:  scatter src ND tile → NZ tmp UB, then strided UB→L1 copy.
-                    The scatter is emitted into the active IRBuilder frame and
-                    the post_copy is returned as a PrimExpr so the caller
-                    auto-evaluates it (matches the single-Call return shape of
-                    `T.copy(...)`).
-    Small (≤16×16): skip the scatter (ND == NZ for a single fractal) and
-                    return the single post_copy reading the src ND tile
-                    directly.
+    Emits a SimdVF scatter (ND → NZ reorder in UB tmp) followed by a
+    2D copy_ubuf_to_cbuf (UB → L1).  When the tile is only one D-group wide
+    (cols * elem_bytes == 32), NZ == ND and the scatter is skipped —
+    the post_copy reads the raw ND source directly.
 
     Dual (``ann['double']``): src is the half-size per-AIV tile and dst is the
     full-size L1 buffer. The post_copy is emitted with two extra trailing args
@@ -197,6 +147,7 @@ def _emit_nd2nz_seq(
     """
     import tvm.script.ir_builder.tir as tb_tir
     from tilelang.language.builtin import access_ptr as _access_ptr
+    from tilelang.language.allocate import alloc_shared as _alloc_shared
 
     is_dual = bool(ann.get("double"))
     # For dual_copy: src is half-size (per-AIV tile), dst is full-size. Rows/cols
@@ -225,23 +176,18 @@ def _emit_nd2nz_seq(
             return "float"
         raise ValueError(f"Unsupported nd2nz dtype: {s}")
 
-    src_dtype_str = _to_dtype_str(src_buf.dtype)
-    dst_dtype_str = _to_dtype_str(dst_buf.dtype)
-    fuse_cast = 1 if src_buf.dtype != dst_buf.dtype else 0
-
     src_ptr = _access_ptr(src_orig, "r")
     dst_ptr = _access_ptr(dst_orig, "w")
 
-    def _as_int(e):
-        if isinstance(e, int):
-            return e
-        if isinstance(e, tir.IntImm):
-            return int(e.value)
-        return None
+    # Single D-group + same dtype: NZ == ND, scatter is a no-op → skip it.
+    # If dtypes differ the scatter is still needed for the cast.
+    _elem_bytes = dst_buf.dtype.bits // 8
+    cols_i = int(cols.value) if isinstance(cols, tir.IntImm) else None
+    single_dgroup = cols_i is not None and cols_i * _elem_bytes == 32
+    same_dtype = src_buf.dtype == dst_buf.dtype
 
-    rows_i = _as_int(rows)
-    cols_i = _as_int(cols)
-    small_fractal = rows_i is not None and cols_i is not None and rows_i <= 16 and cols_i <= 16
+    src_dtype_str = _to_dtype_str(src_buf.dtype)
+    dst_dtype_str = _to_dtype_str(dst_buf.dtype)
 
     scatter_op = tir.op.Op.get("tl.ascend_nd2nz_scatter")
     post_copy_op = tir.op.Op.get("tl.ascend_nd2nz_post_copy")
@@ -260,13 +206,7 @@ def _emit_nd2nz_seq(
             half_extent,
         ]
 
-    if small_fractal:
-        if fuse_cast:
-            raise ValueError(
-                "ascend_nd2nz small single-fractal path (rows<=16 && cols<=16) "
-                "cannot fuse a dtype cast — the cast lives in the SimdVF "
-                f"scatter, which is skipped here. src={src_buf.dtype}, dst={dst_buf.dtype}"
-            )
+    if single_dgroup and same_dtype:
         return tir.call_intrin(
             "handle",
             post_copy_op,
@@ -282,8 +222,9 @@ def _emit_nd2nz_seq(
     # Multi-fractal: allocate a UB scratch buffer for the NZ-laid intermediate,
     # emit the scatter into the active IRBuilder frame, and return the
     # post_copy Call so the eager-builder auto-evaluates it.
-    tmp_region = _allocate_nd2nz_tmp(src_orig, dst_orig)
-    tmp_buf = tmp_region.args[0].buffer
+    # NOTE: Pad one more row to avoid bank conflict. Swizzle is sadly impossible
+    #       on Ascend 950 given no vscatterb instruction support.
+    tmp_buf = _alloc_shared(((rows + 1) * cols,), dst_buf.dtype, "shared.dyn")
 
     scatter = tir.call_intrin(
         "handle",
@@ -292,7 +233,6 @@ def _emit_nd2nz_seq(
         _access_ptr(tmp_buf, "w"),
         rows,
         cols,
-        fuse_cast,
         dst_dtype_str,
         src_dtype_str,
     )
