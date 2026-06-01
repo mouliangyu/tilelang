@@ -564,7 +564,6 @@ TVM_DLL const Op &simd_vrelu();
 TVM_DLL const Op &simd_vrec();
 
 // -- Broadcast
-TVM_DLL const Op &simd_vdupi();
 TVM_DLL const Op &simd_vdup();
 
 // -- Cross-lane reduction

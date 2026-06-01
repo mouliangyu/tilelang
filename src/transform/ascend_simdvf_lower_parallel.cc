@@ -267,8 +267,9 @@ private:
       Var lhs = DecomposeExpr(a, dtype, stmts);
       Var rhs = DecomposeExpr(b, dtype, stmts);
       Var dst = AllocSimdReg(dtype);
-      stmts->push_back(
-          Evaluate(Call(DataType::Void(), op, {dst, lhs, rhs, mask_var_})));
+      stmts->push_back(Evaluate(
+          Call(DataType::Void(), op,
+               {dst, lhs, rhs, mask_var_, StringImm("MODE_ZEROING")})));
       return dst;
     };
     if (auto *n = expr.as<AddNode>())
@@ -284,7 +285,8 @@ private:
       Var src = DecomposeExpr(a, dtype, stmts);
       Var dst = AllocSimdReg(dtype);
       stmts->push_back(
-          Evaluate(Call(DataType::Void(), op, {dst, src, mask_var_})));
+          Evaluate(Call(DataType::Void(), op,
+                        {dst, src, mask_var_, StringImm("MODE_ZEROING")})));
       return dst;
     };
     if (const auto *call = expr.as<CallNode>()) {
@@ -306,11 +308,12 @@ private:
       if (is_zero(sub->a))
         return EmitUnary(sub->b, simd_vneg());
 
-    // Scalar constants: broadcast via Duplicate
+    // Scalar constants: broadcast via vdup
     if (expr.as<FloatImmNode>() || expr.as<IntImmNode>()) {
       Var reg = AllocSimdReg(dtype);
       stmts->push_back(
-          Evaluate(Call(DataType::Void(), simd_vdupi(), {reg, expr})));
+          Evaluate(Call(DataType::Void(), simd_vdup(),
+                        {reg, expr, mask_var_, StringImm("MODE_ZEROING")})));
       return reg;
     }
 
@@ -509,9 +512,10 @@ private:
         Call(DataType::Bool(256), simd_pset(),
              {IntImm(DataType::Int(32), elem_bits_), StringImm("PAT_ALL")});
 
-    // Duplicate(frag, scalar)
+    // vdup(frag, value, mask): broadcast scalar to all lanes
     Stmt dup_stmt =
-        Evaluate(Call(DataType::Void(), simd_vdupi(), {frag, value}));
+        Evaluate(Call(DataType::Void(), simd_vdup(),
+                      {frag, value, mask_var, StringImm("MODE_ZEROING")}));
 
     // StoreAlign<dtype>(buf + i*VL, frag, mask)
     // Use flat 1D addressing: index = chunk * VL + 0 (base=0 for full-buffer
@@ -650,7 +654,7 @@ private:
       Stmt cast = Evaluate(
           Call(DataType::Void(), simd_vfcvt_narrow(),
                {cast_frag, load_frag, mask_var_, IntImm(DataType::Int(32), 4),
-                IntImm(DataType::Int(32), 0)}));
+                IntImm(DataType::Int(32), 0), StringImm("MODE_MERGING")}));
       body_stmts.push_back(cast);
       store = Evaluate(Call(DataType::Void(), simd_vsts(),
                             {dst_addr, cast_frag, mask_var_}));
@@ -749,7 +753,8 @@ private:
     if (dim == 1 && nc == 1) {
       Stmt L = Evaluate(
           Call(DataType::Void(), simd_vld(), {a, a2d(src, rep, i32(0))}));
-      Stmt R = Evaluate(Call(DataType::Void(), rop, {a, a, mask_var_}));
+      Stmt R = Evaluate(Call(DataType::Void(), rop,
+                             {a, a, mask_var_, StringImm("MODE_ZEROING")}));
       Stmt S = Evaluate(Call(DataType::Void(), simd_vsts(),
                              {a1d(dst, rep * i32(vreg_size_)), a, mask_var_}));
 
@@ -758,7 +763,9 @@ private:
       if (!clear) {
         Stmt LP = Evaluate(Call(DataType::Void(), simd_vld(),
                                 {b, a1d(dst, dst_off), StringImm("BRC_B32")}));
-        Stmt MP = Evaluate(Call(DataType::Void(), eop, {a, a, b, mask_var_}));
+        Stmt MP =
+            Evaluate(Call(DataType::Void(), eop,
+                          {a, a, b, mask_var_, StringImm("MODE_ZEROING")}));
         row_body = LetStmt(mask_var_, mu, SeqStmt({L, R, LP, MP, S}));
       } else {
         row_body = LetStmt(mask_var_, mu, SeqStmt({L, R, S}));
@@ -768,13 +775,16 @@ private:
 
     // === dim=1, multi-VReg: per-chunk Reduce<MAX> + Max-accumulate ===
     if (dim == 1) {
-      Stmt DI = Evaluate(Call(DataType::Void(), simd_vdupi(), {a, ival}));
+      Stmt DI = Evaluate(Call(DataType::Void(), simd_vdup(),
+                              {a, ival, mask_var_, StringImm("MODE_ZEROING")}));
       Var ck("vchunk", DataType::Int(32));
       PrimExpr co = ck * i32(vreg_size_);
       Stmt LK =
           Evaluate(Call(DataType::Void(), simd_vld(), {b, a2d(src, rep, co)}));
-      Stmt RK = Evaluate(Call(DataType::Void(), rop, {b, b, mask_var_}));
-      Stmt MA = Evaluate(Call(DataType::Void(), eop, {a, a, b, mask_var_}));
+      Stmt RK = Evaluate(Call(DataType::Void(), rop,
+                              {b, b, mask_var_, StringImm("MODE_ZEROING")}));
+      Stmt MA = Evaluate(Call(DataType::Void(), eop,
+                              {a, a, b, mask_var_, StringImm("MODE_ZEROING")}));
       Stmt CB = LetStmt(mask_var_, mu, SeqStmt({LK, RK, MA}));
 
       PrimExpr dst_off = rep * i32(vreg_size_);
@@ -791,7 +801,8 @@ private:
       if (!clear) {
         Stmt LP = Evaluate(Call(DataType::Void(), simd_vld(),
                                 {b, a1d(dst, dst_off), StringImm("BRC_B32")}));
-        Stmt MP = Evaluate(Call(DataType::Void(), eop, {a, a, b, mask2}));
+        Stmt MP = Evaluate(Call(DataType::Void(), eop,
+                                {a, a, b, mask2, StringImm("MODE_ZEROING")}));
         Stmt store2 = Evaluate(
             Call(DataType::Void(), simd_vsts(), {a1d(dst, dst_off), a, mask2}));
         rb.push_back(LetStmt(mask2, mask2_val, SeqStmt({LP, MP, store2})));
@@ -812,7 +823,8 @@ private:
         Evaluate(Call(DataType::Void(), simd_vld(), {a, a2d(src, i32(0), co)}));
     Stmt LK =
         Evaluate(Call(DataType::Void(), simd_vld(), {b, a2d(src, rv, co)}));
-    Stmt EA = Evaluate(Call(DataType::Void(), eop, {a, a, b, mask_var_}));
+    Stmt EA = Evaluate(Call(DataType::Void(), eop,
+                            {a, a, b, mask_var_, StringImm("MODE_ZEROING")}));
     Stmt SK = Evaluate(
         Call(DataType::Void(), simd_vsts(), {a1d(dst, co), a, mask_var_}));
 

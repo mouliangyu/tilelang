@@ -1173,7 +1173,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   else if (op->op.same_as(tl::simd_vadd()) || op->op.same_as(tl::simd_vsub()) ||
            op->op.same_as(tl::simd_vmul()) || op->op.same_as(tl::simd_vdiv()) ||
            op->op.same_as(tl::simd_vmax()) || op->op.same_as(tl::simd_vmin())) {
-    ICHECK(op->args.size() >= 4 && op->args.size() <= 5);
+    ICHECK_EQ(op->args.size(), 5);
     const char *name = nullptr;
     if (op->op.same_as(tl::simd_vadd()))
       name = "vadd";
@@ -1194,13 +1194,11 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
-    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
-    this->stream << ");\n";
+    this->stream << ", " << Downcast<StringImm>(op->args[4])->value << ");\n";
   }
-  // --- SimdVF bitwise: (dst, src0, src1, mask) ---
+  // --- SimdVF bitwise: (dst, src0, src1, mask, mode) ---
   else if (op->op.same_as(tl::simd_vand()) || op->op.same_as(tl::simd_vor())) {
-    ICHECK(op->args.size() >= 4 && op->args.size() <= 5);
+    ICHECK_EQ(op->args.size(), 5);
     const char *name = op->op.same_as(tl::simd_vand()) ? "vand" : "vor";
     this->PrintIndent();
     this->stream << name << "(";
@@ -1209,18 +1207,16 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
-    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
-    this->stream << ");\n";
+    this->stream << ", " << Downcast<StringImm>(op->args[4])->value << ");\n";
   }
-  // --- SimdVF unary ops: (dst, src, mask) ---
+  // --- SimdVF unary ops: (dst, src, mask, mode) ---
   else if (op->op.same_as(tl::simd_vexp()) || op->op.same_as(tl::simd_vln()) ||
            op->op.same_as(tl::simd_vsqrt()) ||
            op->op.same_as(tl::simd_vrsqrt()) ||
            op->op.same_as(tl::simd_vabs()) || op->op.same_as(tl::simd_vneg()) ||
            op->op.same_as(tl::simd_vrelu()) ||
            op->op.same_as(tl::simd_vrec()) || op->op.same_as(tl::simd_vdup())) {
-    ICHECK(op->args.size() >= 3 && op->args.size() <= 4);
+    ICHECK_EQ(op->args.size(), 4);
     const char *name = nullptr;
     if (op->op.same_as(tl::simd_vexp()))
       name = "vexp";
@@ -1247,14 +1243,12 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[1], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[2], this->stream);
-    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
-    this->stream << ");\n";
+    this->stream << ", " << Downcast<StringImm>(op->args[3])->value << ");\n";
   }
-  // --- SimdVF cross-lane reduce: (dst, src, mask) ---
+  // --- SimdVF cross-lane reduce: (dst, src, mask, mode) ---
   else if (op->op.same_as(tl::simd_vcmax()) ||
            op->op.same_as(tl::simd_vcadd())) {
-    ICHECK(op->args.size() >= 3 && op->args.size() <= 4);
+    ICHECK_EQ(op->args.size(), 4);
     const char *name = op->op.same_as(tl::simd_vcmax()) ? "vcmax" : "vcadd";
     this->PrintIndent();
     this->stream << name << "(";
@@ -1263,9 +1257,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[1], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[2], this->stream);
-    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
-    this->stream << ");\n";
+    this->stream << ", " << Downcast<StringImm>(op->args[3])->value << ");\n";
   }
   // --- SimdVF load: (dst, addr, dist [, offset]) ---
   //  dist is a StringImm (e.g. "NORM", "BRC_B32"), default "NORM"
@@ -1321,18 +1313,25 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   }
-  // --- SimdVF dup: (dst, scalar) ---
-  else if (op->op.same_as(tl::simd_vdupi())) {
-    ICHECK_EQ(op->args.size(), 2);
-    os << "vdupi(";
-    this->PrintExpr(op->args[0], os);
-    os << ", ";
-    this->PrintExpr(op->args[1], os);
-    os << ")";
+  // --- SimdVF scalar-vector ops: (dst, src, scalar, mask, mode) ---
+  else if (op->op.same_as(tl::simd_vadds()) ||
+           op->op.same_as(tl::simd_vmuls())) {
+    ICHECK_EQ(op->args.size(), 5);
+    const char *name = op->op.same_as(tl::simd_vadds()) ? "vadds" : "vmuls";
+    this->PrintIndent();
+    this->stream << name << "(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[2], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[3], this->stream);
+    this->stream << ", " << Downcast<StringImm>(op->args[4])->value << ");\n";
   }
-  // --- SimdVF cast_narrow: (dst, src, mask, round, part) ---
+  // --- SimdVF cast_narrow: (dst, src, mask, round, part, mode) ---
   else if (op->op.same_as(tl::simd_vfcvt_narrow())) {
-    ICHECK(op->args.size() >= 5 && op->args.size() <= 6);
+    ICHECK_EQ(op->args.size(), 6);
     int rnd = (int)Downcast<IntImm>(op->args[3])->value;
     int part = (int)Downcast<IntImm>(op->args[4])->value;
     static const char *round_names[] = {"ROUND_R", "ROUND_A", "ROUND_F",
@@ -1342,15 +1341,13 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[0], os);
     os << ", ";
     this->PrintExpr(op->args[1], os);
-    std::string mode = (op->args.size() >= 6 && op->args[5].as<StringImmNode>())
-                           ? Downcast<StringImm>(op->args[5])->value
-                           : "MODE_MERGING";
     os << ", " << round_names[rnd] << ", "
-       << (part == 0 ? "PART_EVEN" : "PART_ODD") << ", " << mode << ")";
+       << (part == 0 ? "PART_EVEN" : "PART_ODD") << ", "
+       << Downcast<StringImm>(op->args[5])->value << ")";
   }
   // --- SimdVF cast_widen: (dst, src, part) ---
   else if (op->op.same_as(tl::simd_vfcvt_widen())) {
-    ICHECK(op->args.size() >= 3 && op->args.size() <= 4);
+    ICHECK_EQ(op->args.size(), 3);
     int part = (int)Downcast<IntImm>(op->args[2])->value;
     os << "vfcvt(";
     this->PrintExpr(op->args[0], os);
@@ -1358,9 +1355,9 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[1], os);
     os << ", " << (part == 0 ? "PART_EVEN" : "PART_ODD") << ")";
   }
-  // --- SimdVF sel: (dst, src0, src1, mask) ---
+  // --- SimdVF sel: (dst, src0, src1, mask, mode) ---
   else if (op->op.same_as(tl::simd_vsel())) {
-    ICHECK(op->args.size() >= 4 && op->args.size() <= 5);
+    ICHECK_EQ(op->args.size(), 5);
     this->PrintIndent();
     this->stream << "vsel(";
     this->PrintExpr(op->args[0], this->stream);
@@ -1368,9 +1365,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
-    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
-    this->stream << ");\n";
+    this->stream << ", " << Downcast<StringImm>(op->args[4])->value << ");\n";
   } else if (op->op.same_as(tl::loop_break())) {
     this->PrintIndent();
     this->stream << "break;\n";

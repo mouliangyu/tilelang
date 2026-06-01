@@ -148,11 +148,6 @@ def vrec(dst, src, mask, mode="MODE_ZEROING"):
 # -- Broadcast ----------------------------------------------------------------
 
 
-def vdupi(dst, scalar):
-    """Broadcast scalar to all lanes: vdupi(dst, scalar)."""
-    return tir.call_intrin("void", _Op("tl.simd.vdupi"), dst, scalar)
-
-
 def vdup(dst, src, mask, mode="MODE_ZEROING"):
     """Broadcast lane 0 to all lanes: vdup(dst, src, mask, MODE_ZEROING)."""
     return tir.call_intrin("void", _Op("tl.simd.vdup"), dst, src, mask, mode)
