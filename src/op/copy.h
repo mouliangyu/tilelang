@@ -194,6 +194,15 @@ public:
     return 0;
   }
 
+  int GetL2CacheCtrl() const {
+    if (auto val = annotations.Get("l2_cache_ctrl")) {
+      if (auto int_val = val->as<IntImmNode>()) {
+        return int_val->value;
+      }
+    }
+    return 0; // default: L2_NORMAL_FV
+  }
+
   /*!
    * \brief Lower the copy operator to a TIR statement.
    * \param T        Arguments for lowering.

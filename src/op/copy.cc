@@ -964,12 +964,13 @@ Stmt CopyNode::LowerAscendDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
       if (plan_single_row) {
         call = Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
                     {plan_dst_ptr, plan_src_ptr, sid, I(1), plan_total_bytes,
-                     zero, plan_total_bytes, plan_total_bytes});
+                     I(this->GetL2CacheCtrl()), plan_total_bytes,
+                     plan_total_bytes});
       } else {
-        call =
-            Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
-                 {plan_dst_ptr, plan_src_ptr, sid, plan.n_rows, plan.row_bytes,
-                  zero, plan.dst_stride_bytes, plan.src_stride_bytes});
+        call = Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
+                    {plan_dst_ptr, plan_src_ptr, sid, plan.n_rows,
+                     plan.row_bytes, I(this->GetL2CacheCtrl()),
+                     plan.dst_stride_bytes, plan.src_stride_bytes});
       }
     }
   } else if (dma_path == 2) {
@@ -980,8 +981,9 @@ Stmt CopyNode::LowerAscendDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
     PrimExpr n_value = (this->GetTranspose()) ? inner_elems : n_rows;
     PrimExpr d_value = (this->GetTranspose()) ? n_rows : inner_elems;
     call = Call(DataType::Void(), ascend_copy_gm_to_cbuf(),
-                {dst_ptr, src_ptr, sid, src_row_stride_bytes, zero, n_value,
-                 d_value, zero, zero, transpose_flag});
+                {dst_ptr, src_ptr, sid, src_row_stride_bytes,
+                 I(this->GetL2CacheCtrl()), n_value, d_value, zero, zero,
+                 transpose_flag});
   } else if (dma_path == 3 || dma_path == 4) {
     // L1 -> L0A/L0B: fractal-addressed load
     // K offset handled by kStartPosition param, not in src pointer.
