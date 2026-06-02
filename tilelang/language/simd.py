@@ -68,7 +68,7 @@ def vsts(addr, src, mask, dist="NORM_B32", off=None):
     addr can be a BufferLoad auto-wrapped as tl.access_ptr.
     """
     if isinstance(addr, BufferLoad):
-        addr = access_ptr(addr, "rw", extent=_vreg_extent(addr.buffer.dtype))
+        addr = access_ptr(addr, "w", extent=_vreg_extent(addr.buffer.dtype))
     args = [addr, src, mask, dist]
     if off is not None:
         args.append(off)
