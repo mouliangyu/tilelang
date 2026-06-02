@@ -1366,6 +1366,10 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->PrintExpr(op->args[i], this->stream);
     }
     this->stream << ", " << Downcast<StringImm>(op->args[4])->value << ");\n";
+  } else if (op->op.same_as(tl::simd_mem_bar())) {
+    std::string mem_type_str = Downcast<StringImm>(op->args[0])->value;
+    this->PrintIndent();
+    this->stream << "mem_bar(" << mem_type_str << ");\n";
   } else if (op->op.same_as(tl::loop_break())) {
     this->PrintIndent();
     this->stream << "break;\n";

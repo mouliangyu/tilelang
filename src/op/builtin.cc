@@ -441,6 +441,9 @@ TIR_DEFINE_TL_SIMD_BUILTIN(vmuls).set_num_inputs(-1).set_attr<TCallEffectKind>(
 TIR_DEFINE_TL_SIMD_BUILTIN(vadds).set_num_inputs(-1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_SIMD_BUILTIN(mem_bar).set_num_inputs(1).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(ascend_set_flag)
     .set_num_inputs(2)
     .set_attr<TCallEffectKind>("TCallEffectKind",

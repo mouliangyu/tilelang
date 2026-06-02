@@ -210,3 +210,8 @@ def vmuls(dst, src, scalar, mask, mode="MODE_ZEROING"):
 
 def vadds(dst, src, scalar, mask, mode="MODE_ZEROING"):
     return tir.call_intrin("void", _Op("tl.simd.vadds"), dst, src, scalar, mask, mode)
+
+
+def mem_bar(mem_type):
+    """Memory barrier: mem_bar(mem_type), e.g. mem_bar(VST_VLD)."""
+    return tir.call_intrin("void", _Op("tl.simd.mem_bar"), mem_type)

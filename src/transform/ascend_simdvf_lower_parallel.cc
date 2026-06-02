@@ -382,16 +382,13 @@ private:
 
     bool saved = inside_simdvf_;
     inside_simdvf_ = true;
-    auto saved_regs = std::move(simd_regs_);
     int saved_cnt = frag_counter_;
     simd_regs_.clear();
     frag_counter_ = 0;
 
     Stmt new_body = VisitStmt(op->body);
-    new_body = WrapWithSimdAllocs(new_body);
 
     inside_simdvf_ = saved;
-    simd_regs_ = std::move(saved_regs);
     frag_counter_ = saved_cnt;
 
     if (new_body.same_as(op->body))
@@ -464,6 +461,8 @@ private:
   // Fill lowering: T.fill(buf, value) → Duplicate + StoreAlign loop
   //-----------------------------------------------------------------------
   Stmt LowerFill(const CallNode *call) {
+    auto saved_regs = std::move(simd_regs_);
+    simd_regs_.clear();
     BufferRegion buf_region = NormalizeToBufferRegion(call->args[0]);
     Buffer buf = buf_region->buffer;
     Array<Range> ranges = buf_region->region;
@@ -549,13 +548,18 @@ private:
         For(chunk_var, IntImm(DataType::Int(32), 0),
             IntImm(DataType::Int(32), nchunks), ForKind::kSerial, store);
 
-    return LetStmt(mask_var, create_mask, SeqStmt({dup_stmt, loop}));
+    Stmt result = LetStmt(mask_var, create_mask, SeqStmt({dup_stmt, loop}));
+    result = WrapWithSimdAllocs(result);
+    simd_regs_ = std::move(saved_regs);
+    return result;
   }
 
   //-----------------------------------------------------------------------
   // Copy lowering: T.copy(src, dst) → LoadAlign + StoreAlign loop
   //-----------------------------------------------------------------------
   Stmt LowerCopy(const CallNode *call) {
+    auto saved_regs = std::move(simd_regs_);
+    simd_regs_.clear();
     BufferRegion src_region = NormalizeToBufferRegion(call->args[0]);
     BufferRegion dst_region = NormalizeToBufferRegion(call->args[1]);
     Buffer src_buf = src_region->buffer;
@@ -668,7 +672,10 @@ private:
     Stmt loop = For(chunk_var, IntImm(DataType::Int(32), 0),
                     IntImm(DataType::Int(32), nchunks), ForKind::kSerial, body);
 
-    return LetStmt(mask_var_, mask_val, loop);
+    Stmt result = LetStmt(mask_var_, mask_val, loop);
+    result = WrapWithSimdAllocs(result);
+    simd_regs_ = std::move(saved_regs);
+    return result;
   }
 
   //-----------------------------------------------------------------------
@@ -678,6 +685,8 @@ private:
   // dim=1: reduce across columns → Max per chunk, then Reduce<MAX> final
   //-----------------------------------------------------------------------
   Stmt LowerReduce(const CallNode *call) {
+    auto saved_regs = std::move(simd_regs_);
+    simd_regs_.clear();
     BufferRegion src_region = NormalizeToBufferRegion(call->args[0]);
     BufferRegion dst_region = NormalizeToBufferRegion(call->args[1]);
     Buffer src = src_region->buffer, dst = dst_region->buffer;
@@ -770,7 +779,10 @@ private:
       } else {
         row_body = LetStmt(mask_var_, mu, SeqStmt({L, R, S}));
       }
-      return For(rep, i32(0), i32(oe), ForKind::kSerial, row_body);
+      Stmt result = For(rep, i32(0), i32(oe), ForKind::kSerial, row_body);
+      result = WrapWithSimdAllocs(result);
+      simd_regs_ = std::move(saved_regs);
+      return result;
     }
 
     // === dim=1, multi-VReg: per-chunk Reduce<MAX> + Max-accumulate ===
@@ -811,7 +823,10 @@ private:
             Call(DataType::Void(), simd_vsts(), {a1d(dst, dst_off), a, mask2}));
         rb.push_back(LetStmt(mask2, mask2_val, store2));
       }
-      return For(rep, i32(0), i32(oe), ForKind::kSerial, SeqStmt(rb));
+      Stmt result = For(rep, i32(0), i32(oe), ForKind::kSerial, SeqStmt(rb));
+      result = WrapWithSimdAllocs(result);
+      simd_regs_ = std::move(saved_regs);
+      return result;
     }
 
     // === dim=0: rows NOT contiguous → element-wise Max per column chunk ===
@@ -837,7 +852,10 @@ private:
                        LetStmt(mask_var_, mu, SeqStmt({LK, EA}))));
     }
     cb.push_back(LetStmt(mask_var_, mu, SK));
-    return For(ck, i32(0), i32(nc), ForKind::kSerial, SeqStmt(cb));
+    Stmt result = For(ck, i32(0), i32(nc), ForKind::kSerial, SeqStmt(cb));
+    result = WrapWithSimdAllocs(result);
+    simd_regs_ = std::move(saved_regs);
+    return result;
   }
 
   //-----------------------------------------------------------------------
@@ -847,6 +865,8 @@ private:
   // serial_for — (nullable) the outer serial loop for 2D parallel
   //-----------------------------------------------------------------------
   Stmt LowerParallel(const ForNode *vreg_for, const ForNode *serial_for) {
+    auto saved_regs = std::move(simd_regs_);
+    simd_regs_.clear();
     int64_t vreg_ext = Downcast<IntImm>(vreg_for->extent)->value;
     int64_t serial_ext =
         serial_for ? Downcast<IntImm>(serial_for->extent)->value : 1;
@@ -908,6 +928,8 @@ private:
 
     parallel_var_ = saved_pv;
     outer_parallel_var_ = saved_ov;
+    result = WrapWithSimdAllocs(result);
+    simd_regs_ = std::move(saved_regs);
     return result;
   }
 };
