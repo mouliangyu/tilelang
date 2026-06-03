@@ -4,10 +4,7 @@ import tilelang.language as T
 from typing import Tuple
 from tilelang.utils.tensor import torch_assert_close
 
-try:
-    from examples.ascend.bench import bench
-except ImportError:
-    from bench import bench
+from bench import bench
 
 
 @tilelang.jit(
@@ -63,21 +60,10 @@ def per_token_cast_to_fp8(M, N):
 
 
 def ceil_div(x: int, y: int) -> int:
-    """
-    Perform ceiling division of two integers.
-
-    Args:
-        x: the dividend.
-        y: the divisor.
-
-    Returns:
-        The result of the ceiling division.
-    """
     return (x + y - 1) // y
 
 
 def ref_program(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    # this function don't support cpu tensor
     assert x.dim() == 2
     m, n = x.shape
     new_n = ceil_div(n, 128) * 128
@@ -99,9 +85,10 @@ def print_latency_bandwidth(name: str, latency_ms: float, io_gb: float) -> None:
     print(f"{name}: {latency_ms:.2f} ms | {bandwidth_gbs:.2f} GB/s")
 
 
-def main(M=8192, N=8192):
+def test(M=8192, N=8192, *, print_source=False):
     kernel = per_token_cast_to_fp8(M, N)
-    print(kernel.get_kernel_source())
+    if print_source:
+        print(kernel.get_kernel_source())
 
     x = torch.randn(M, N, device="npu", dtype=torch.float32)
 
@@ -117,21 +104,25 @@ def main(M=8192, N=8192):
     torch_assert_close(x_amax, x_amax_ref, rtol=0.01, atol=0.01)
     print("All checks pass.")
 
-    io_gb = effective_io_gb(M, N)
 
-    profile = bench(lambda: kernel(x))
-    print(profile)
-    print_latency_bandwidth("Tile-lang", profile.dur_us / 1e3, io_gb)
+def main(M=8192, N=8192):
+    test(M, N, print_source=True)
+    run_regression_perf(M, N)
 
 
 def run_regression_perf(M=8192, N=8192):
     kernel = per_token_cast_to_fp8(M, N)
     x = torch.randn(M, N, device="npu", dtype=torch.float32)
+    io_gb = effective_io_gb(M, N)
 
     def run_kernel_only():
         kernel(x)
 
-    return bench(run_kernel_only).dur_us / 1e3
+    profile = bench(run_kernel_only)
+    print(profile)
+    latency_ms = profile.dur_us / 1e3
+    print_latency_bandwidth("Tile-lang", latency_ms, io_gb)
+    return latency_ms
 
 
 if __name__ == "__main__":

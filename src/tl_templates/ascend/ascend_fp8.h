@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+#include "simt_api/asc_fp16.h"
 #include "simt_api/asc_fp8.h"
 
 #ifndef TL_DEVICE
@@ -39,6 +40,42 @@ TL_DEVICE float cast_fp8_e5m2_to_float(uint8_t x) {
   alignas(8) float y2_storage[2];
   *reinterpret_cast<float2 *>(y2_storage) = __e5m2x22float2(x2);
   return y2_storage[0];
+}
+
+TL_DEVICE uint16_t cast_half2_to_fp8_e4m3x2(half2 x) {
+  return __asc_cvt_float2_to_fp8x2(__half22float2(x), __ASC_SATFINITE,
+                                   __ASC_E4M3);
+}
+
+TL_DEVICE uint16_t cast_half2_to_fp8_e5m2x2(half2 x) {
+  return __asc_cvt_float2_to_fp8x2(__half22float2(x), __ASC_SATFINITE,
+                                   __ASC_E5M2);
+}
+
+TL_DEVICE uint16_t cast_bfloat162_to_fp8_e4m3x2(bfloat16x2_t x) {
+  return __asc_cvt_float2_to_fp8x2(__bfloat1622float2(x), __ASC_SATFINITE,
+                                   __ASC_E4M3);
+}
+
+TL_DEVICE uint16_t cast_bfloat162_to_fp8_e5m2x2(bfloat16x2_t x) {
+  return __asc_cvt_float2_to_fp8x2(__bfloat1622float2(x), __ASC_SATFINITE,
+                                   __ASC_E5M2);
+}
+
+TL_DEVICE half2 cast_fp8_e4m3x2_to_half2(float8_e4m3x2_t x) {
+  return __float22half2_rn(__e4m3x22float2(x));
+}
+
+TL_DEVICE half2 cast_fp8_e5m2x2_to_half2(float8_e5m2x2_t x) {
+  return __float22half2_rn(__e5m2x22float2(x));
+}
+
+TL_DEVICE bfloat16x2_t cast_fp8_e4m3x2_to_bfloat162(float8_e4m3x2_t x) {
+  return __float22bfloat162_rn(__e4m3x22float2(x));
+}
+
+TL_DEVICE bfloat16x2_t cast_fp8_e5m2x2_to_bfloat162(float8_e5m2x2_t x) {
+  return __float22bfloat162_rn(__e5m2x22float2(x));
 }
 
 } // namespace detail
@@ -107,11 +144,8 @@ using fp8_e8_2_t = uint16_t;
 using fp8_e8_4_t = uint32_t;
 using fp8_e8_8_t = uint64_t;
 
-using fp8_e4_16_t = ulonglong2;
-using fp8_e4_32_t = ulonglong4;
+using fp8_e4_16_t = uint4;
 
-using fp8_e5_16_t = ulonglong2;
-using fp8_e5_32_t = ulonglong4;
+using fp8_e5_16_t = uint4;
 
-using fp8_e8_16_t = ulonglong2;
-using fp8_e8_32_t = ulonglong4;
+using fp8_e8_16_t = uint4;

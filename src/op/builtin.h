@@ -570,11 +570,13 @@ TVM_DLL const Op &simd_vdup();
 TVM_DLL const Op &simd_vcadd();
 TVM_DLL const Op &simd_vcmax();
 
+// -- Register permutation
+TVM_DLL const Op &simd_vintlv();
+TVM_DLL const Op &simd_vdintlv();
+TVM_DLL const Op &simd_vpack();
+
 // -- Type conversion
-TVM_DLL const Op &simd_vfcvt_narrow();
-TVM_DLL const Op &simd_vfcvt_widen();
-TVM_DLL const Op &simd_vfcvt_f2i();
-TVM_DLL const Op &simd_vfcvt_i2f();
+TVM_DLL const Op &simd_vcvt();
 
 // -- Special
 TVM_DLL const Op &simd_vsel();

@@ -655,10 +655,12 @@ private:
 
     if (is_cast) {
       // Cast f32→bf16, then StoreAlign with DIST_PACK_B32
-      Stmt cast = Evaluate(
-          Call(DataType::Void(), simd_vfcvt_narrow(),
-               {cast_frag, load_frag, mask_var_, IntImm(DataType::Int(32), 4),
-                IntImm(DataType::Int(32), 0), StringImm("MODE_MERGING")}));
+      // TODO
+      Stmt cast =
+          Evaluate(Call(DataType::Void(), simd_vcvt(),
+                        {cast_frag, load_frag, mask_var_, StringImm("ROUND_R"),
+                         StringImm("RS_ENABLE"), StringImm("PART_EVEN"),
+                         StringImm("MODE_ZEROING")}));
       body_stmts.push_back(cast);
       store = Evaluate(Call(DataType::Void(), simd_vsts(),
                             {dst_addr, cast_frag, mask_var_}));

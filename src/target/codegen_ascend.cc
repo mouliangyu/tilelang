@@ -43,6 +43,12 @@ static std::string FixIndent(const std::string &body) {
 // Map a TVM DataType to the Ascend CCE vector type suffix (e.g. Float32 ->
 // "f32").
 static std::string CCEVectorSuffix(tvm::DataType dtype) {
+  if (dtype.is_float8_e4m3() || dtype.is_float8_e4m3fn())
+    return "f8e4m3";
+  if (dtype.is_float8_e5m2())
+    return "f8e5m2";
+  if (dtype.is_float8_e8m0fnu())
+    return "f8e8m0";
   if (dtype.is_float())
     return (dtype.bits() == 16) ? "f16" : "f32";
   if (dtype.is_bfloat16())
@@ -60,6 +66,12 @@ static int CCEElemWidthBits(tvm::DataType dtype) { return dtype.bits(); }
 
 // Map DataType to the C++ type name used in __ubuf__ pointer casts.
 static std::string CCEUBufType(tvm::DataType dtype) {
+  if (dtype.is_float8_e4m3() || dtype.is_float8_e4m3fn())
+    return "float8_e4m3_t";
+  if (dtype.is_float8_e5m2())
+    return "float8_e5m2_t";
+  if (dtype.is_float8_e8m0fnu())
+    return "float8_e8m0_t";
   if (dtype.is_float())
     return (dtype.bits() == 16) ? "half" : "float";
   if (dtype.is_bfloat16())
@@ -168,12 +180,9 @@ void CodeGenTileLangAscend::PrintType(DataType t, std::ostream &os) {
     case 16:
       if (lanes == 1) {
         os << "half";
-      } else if (lanes == 2) {
-        os << "float16x2_t";
-      } else if (lanes == 4) {
-        os << "float16x4_t";
-      } else if (lanes == 8) {
-        os << "float16x8_t";
+      } else if (lanes <= 8) {
+        ICHECK_EQ(lanes % 2, 0) << "only support even lane for half type";
+        os << "uint" << lanes / 2;
       } else {
         fail = true;
       }
@@ -202,8 +211,9 @@ void CodeGenTileLangAscend::PrintType(DataType t, std::ostream &os) {
   } else if (t.is_bfloat16()) {
     if (lanes == 1) {
       os << "bfloat16_t";
-    } else if (lanes == 2) {
-      os << "bfloat16x2_t";
+    } else if (lanes <= 8) {
+      ICHECK_EQ(lanes % 2, 0) << "only support even lane for bfloat16 type";
+      os << "uint" << lanes / 2;
     } else {
       fail = true;
     }
@@ -762,8 +772,6 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << "AscendC::SetFlag<AscendC::HardEvent::" << hard_event_str
                  << ">(";
     this->PrintExpr(op->args[1], this->stream);
-    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_wait_flag())) {
     ICHECK_EQ(op->args.size(), 2) << "tl.ascend_wait_flag expects exactly 2 "
@@ -773,8 +781,6 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << "AscendC::WaitFlag<AscendC::HardEvent::" << hard_event_str
                  << ">(";
     this->PrintExpr(op->args[1], this->stream);
-    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_threadfence())) {
     ICHECK_EQ(op->args.size(), 0)
@@ -832,8 +838,6 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << "AscendC::CrossCoreSetFlag<" << mode_id << ", " << pipe_str
                  << ">(";
     this->PrintExpr(op->args[2], this->stream);
-    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_cross_core_wait_flag())) {
     ICHECK_EQ(op->args.size(), 3)
@@ -845,8 +849,6 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << "AscendC::CrossCoreWaitFlag<" << mode_id << ", " << pipe_str
                  << ">(";
     this->PrintExpr(op->args[2], this->stream);
-    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_gm_to_ubuf())) {
     ICHECK_EQ(op->args.size(), 7)
@@ -866,8 +868,6 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[5], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[6], this->stream);
-    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_ubuf_to_gm())) {
     ICHECK_EQ(op->args.size(), 8)
@@ -1215,7 +1215,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
            op->op.same_as(tl::simd_vrsqrt()) ||
            op->op.same_as(tl::simd_vabs()) || op->op.same_as(tl::simd_vneg()) ||
            op->op.same_as(tl::simd_vrelu()) ||
-           op->op.same_as(tl::simd_vrec()) || op->op.same_as(tl::simd_vdup())) {
+           op->op.same_as(tl::simd_vrec())) {
     ICHECK_EQ(op->args.size(), 4);
     const char *name = nullptr;
     if (op->op.same_as(tl::simd_vexp()))
@@ -1232,8 +1232,6 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       name = "vrelu";
     else if (op->op.same_as(tl::simd_vrec()))
       name = "vrec";
-    else if (op->op.same_as(tl::simd_vdup()))
-      name = "vdup";
     else
       name = "vneg";
     this->PrintIndent();
@@ -1259,6 +1257,30 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[2], this->stream);
     this->stream << ", " << Downcast<StringImm>(op->args[3])->value << ");\n";
   }
+  // --- SimdVF register permutation: (dst0, dst1, src0, src1) ---
+  else if (op->op.same_as(tl::simd_vintlv()) ||
+           op->op.same_as(tl::simd_vdintlv())) {
+    ICHECK_EQ(op->args.size(), 4);
+    const char *name = op->op.same_as(tl::simd_vintlv()) ? "vintlv" : "vdintlv";
+    this->PrintIndent();
+    this->stream << name << "(";
+    this->PrintExpr(op->args[0], this->stream);
+    for (int i = 1; i < 4; ++i) {
+      this->stream << ", ";
+      this->PrintExpr(op->args[i], this->stream);
+    }
+    this->stream << ");\n";
+  }
+  // --- SimdVF register pack: (dst, src, LOWER/HIGHER) ---
+  else if (op->op.same_as(tl::simd_vpack())) {
+    ICHECK_EQ(op->args.size(), 3);
+    this->PrintIndent();
+    this->stream << "vpack((vector_u16 &)";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << ", (vector_u32 &)";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", " << Downcast<StringImm>(op->args[2])->value << ");\n";
+  }
   // --- SimdVF load: (dst, addr, dist [, offset]) ---
   //  dist is a StringImm (e.g. "NORM", "BRC_B32"), default "NORM"
   else if (op->op.same_as(tl::simd_vld())) {
@@ -1277,7 +1299,9 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[1], this->stream);
     if (has_off) {
       this->stream << ", ";
+      this->stream << "vag_b" << CCEElemWidthBits(dtype) << "(";
       this->PrintExpr(op->args[off_idx], this->stream);
+      this->stream << ")";
     }
     this->stream << ", " << dist << ");\n";
   }
@@ -1329,31 +1353,49 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[3], this->stream);
     this->stream << ", " << Downcast<StringImm>(op->args[4])->value << ");\n";
   }
-  // --- SimdVF cast_narrow: (dst, src, mask, round, part, mode) ---
-  else if (op->op.same_as(tl::simd_vfcvt_narrow())) {
-    ICHECK_EQ(op->args.size(), 6);
-    int rnd = (int)Downcast<IntImm>(op->args[3])->value;
-    int part = (int)Downcast<IntImm>(op->args[4])->value;
-    static const char *round_names[] = {"ROUND_R", "ROUND_A", "ROUND_F",
-                                        "ROUND_C", "ROUND_Z", "ROUND_O",
-                                        "ROUND_H"};
-    os << "vfcvt(";
-    this->PrintExpr(op->args[0], os);
-    os << ", ";
-    this->PrintExpr(op->args[1], os);
-    os << ", " << round_names[rnd] << ", "
-       << (part == 0 ? "PART_EVEN" : "PART_ODD") << ", "
-       << Downcast<StringImm>(op->args[5])->value << ")";
+  // --- SimdVF dup: scalar broadcast or vector lane-0 broadcast ---
+  else if (op->op.same_as(tl::simd_vdup())) {
+    ICHECK(op->args.size() >= 3 && op->args.size() <= 4);
+    std::string mode = (op->args.size() >= 4 && op->args[3].as<StringImmNode>())
+                           ? Downcast<StringImm>(op->args[3])->value
+                           : "MODE_ZEROING";
+    this->PrintIndent();
+    this->stream << "vdup(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[2], this->stream);
+    if (op->args[1].dtype().lanes() > 1) {
+      this->stream << ", POS_LOWEST";
+    }
+    this->stream << ", " << mode << ");\n";
   }
-  // --- SimdVF cast_widen: (dst, src, part) ---
-  else if (op->op.same_as(tl::simd_vfcvt_widen())) {
-    ICHECK_EQ(op->args.size(), 3);
-    int part = (int)Downcast<IntImm>(op->args[2])->value;
-    os << "vfcvt(";
-    this->PrintExpr(op->args[0], os);
-    os << ", ";
-    this->PrintExpr(op->args[1], os);
-    os << ", " << (part == 0 ? "PART_EVEN" : "PART_ODD") << ")";
+  // --- SimdVF cast: CCE vcvt overload selected by dst/src vector types ---
+  /*
+  f32 -> f16 : vcvt(dst, src, mask, ROUND, SATURATION, PART, MODE)
+  f16 -> f32 : vcvt(dst, src, mask, PART, MODE)
+  f32 -> i32 : vcvt(dst, src, mask, ROUND, SATURATION, MODE)
+  i32 -> f32 : vcvt(dst, src, mask, ROUND, MODE)
+  f32 -> f8  : vcvt(dst, src, mask, ROUND, SATURATION, PART, MODE)
+  f8  -> f32 : vcvt(dst, src, mask, PART, MODE)
+  f16 -> f8  : vcvt(dst, src, mask, ROUND, SATURATION, PART, MODE)
+  f8  -> f16 : not supported
+  */
+  else if (op->op.same_as(tl::simd_vcvt())) {
+    ICHECK(op->args.size() >= 5 && op->args.size() <= 7);
+    this->PrintIndent();
+    this->stream << "vcvt(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[2], this->stream);
+    for (int i = 3; i < static_cast<int>(op->args.size()); ++i) {
+      this->stream << ", ";
+      this->stream << Downcast<StringImm>(op->args[i])->value;
+    }
+    this->stream << ");\n";
   }
   // --- SimdVF sel: (dst, src0, src1, mask, mode) ---
   else if (op->op.same_as(tl::simd_vsel())) {
@@ -1663,11 +1705,39 @@ void CodeGenTileLangAscend::VisitExpr_(const CastNode *op,
       return;
     }
 
+    if (from_ty.is_float16() && tl::IsAscendVectorizableFP8(target_ty)) {
+      os << GetAscendFP8ScalarValueType(target_ty) << "(static_cast<float>(";
+      PrintExpr(op->value, os);
+      os << "))";
+      return;
+    }
+
+    if (from_ty.is_bfloat16() && tl::IsAscendVectorizableFP8(target_ty)) {
+      os << GetAscendFP8ScalarValueType(target_ty) << "(__bfloat162float(";
+      PrintExpr(op->value, os);
+      os << "))";
+      return;
+    }
+
     if (tl::IsAscendVectorizableFP8(from_ty) && target_ty.is_float() &&
         target_ty.bits() == 32) {
       os << "static_cast<float>(";
       PrintExpr(op->value, os);
       os << ")";
+      return;
+    }
+
+    if (tl::IsAscendVectorizableFP8(from_ty) && target_ty.is_float16()) {
+      os << "static_cast<half>(static_cast<float>(";
+      PrintExpr(op->value, os);
+      os << "))";
+      return;
+    }
+
+    if (tl::IsAscendVectorizableFP8(from_ty) && target_ty.is_bfloat16()) {
+      os << "__float2bfloat16_rn(static_cast<float>(";
+      PrintExpr(op->value, os);
+      os << "))";
       return;
     }
 
@@ -1706,6 +1776,22 @@ void CodeGenTileLangAscend::VisitExpr_(const CastNode *op,
         os << sret;
       };
 
+  // Handle conversion from float16 to float32.
+  if (from_ty.is_float16() && target_ty.is_float() && target_ty.bits() == 32) {
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__half22float2", "half2", "float2");
+      return;
+    }
+  }
+
+  // Handle conversion from float32 to float16.
+  if (from_ty.is_float() && from_ty.bits() == 32 && target_ty.is_float16()) {
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__float22half2_rn", "float2", "half2");
+      return;
+    }
+  }
+
   // Handle conversion from bfloat16 to float32
   if (from_ty.is_bfloat16() && from_ty.lanes() == 2 && target_ty.is_float() &&
       target_ty.bits() == 32 && target_ty.lanes() == 2) {
@@ -1740,6 +1826,34 @@ void CodeGenTileLangAscend::VisitExpr_(const CastNode *op,
     }
   }
 
+  // Handle conversion from float16 to float8 (E4M3/E5M2)
+  if (from_ty.is_float16() && tl::IsAscendVectorizableFP8(target_ty)) {
+    bool target_type_is_e4m3 =
+        target_ty.is_float8_e4m3() || target_ty.is_float8_e4m3fn();
+    std::string cvt_func = target_type_is_e4m3
+                               ? "tl::detail::cast_half2_to_fp8_e4m3x2"
+                               : "tl::detail::cast_half2_to_fp8_e5m2x2";
+
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast(cvt_func, "half2", "uint16_t", "", false, true);
+      return;
+    }
+  }
+
+  // Handle conversion from bfloat16 to float8 (E4M3/E5M2)
+  if (from_ty.is_bfloat16() && tl::IsAscendVectorizableFP8(target_ty)) {
+    bool target_type_is_e4m3 =
+        target_ty.is_float8_e4m3() || target_ty.is_float8_e4m3fn();
+    std::string cvt_func = target_type_is_e4m3
+                               ? "tl::detail::cast_bfloat162_to_fp8_e4m3x2"
+                               : "tl::detail::cast_bfloat162_to_fp8_e5m2x2";
+
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast(cvt_func, "bfloat16x2_t", "uint16_t", "", true, true);
+      return;
+    }
+  }
+
   // Handle conversion from float8 (E4M3/E5M2) to float32
   if (tl::IsAscendVectorizableFP8(from_ty) && target_ty.is_float() &&
       target_ty.bits() == 32) {
@@ -1753,6 +1867,39 @@ void CodeGenTileLangAscend::VisitExpr_(const CastNode *op,
     // Use Ascend x2 intrinsics for vectorized conversion (fp8x2 -> float2)
     if (lanes == 2 || lanes == 4 || lanes == 8) {
       PrintVectorizedCast(cvt_func, src_x2_type, "float2", "", true, false);
+      return;
+    }
+  }
+
+  // Handle conversion from float8 (E4M3/E5M2) to float16
+  if (tl::IsAscendVectorizableFP8(from_ty) && target_ty.is_float16()) {
+    bool from_type_is_e4m3 =
+        from_ty.is_float8_e4m3() || from_ty.is_float8_e4m3fn();
+    std::string src_x2_type =
+        from_type_is_e4m3 ? "float8_e4m3x2_t" : "float8_e5m2x2_t";
+    std::string cvt_func = from_type_is_e4m3
+                               ? "tl::detail::cast_fp8_e4m3x2_to_half2"
+                               : "tl::detail::cast_fp8_e5m2x2_to_half2";
+
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast(cvt_func, src_x2_type, "half2", "", true, false);
+      return;
+    }
+  }
+
+  // Handle conversion from float8 (E4M3/E5M2) to bfloat16
+  if (tl::IsAscendVectorizableFP8(from_ty) && target_ty.is_bfloat16()) {
+    bool from_type_is_e4m3 =
+        from_ty.is_float8_e4m3() || from_ty.is_float8_e4m3fn();
+    std::string src_x2_type =
+        from_type_is_e4m3 ? "float8_e4m3x2_t" : "float8_e5m2x2_t";
+    std::string cvt_func = from_type_is_e4m3
+                               ? "tl::detail::cast_fp8_e4m3x2_to_bfloat162"
+                               : "tl::detail::cast_fp8_e5m2x2_to_bfloat162";
+
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast(cvt_func, src_x2_type, "bfloat16x2_t", "", true,
+                          true);
       return;
     }
   }
@@ -1790,8 +1937,13 @@ void CodeGenTileLangAscend::PrintVecElemLoad(const std::string &vec, DataType t,
     return;
   }
   static const char access[] = {'x', 'y', 'z', 'w'};
-  ICHECK(i >= 0 && i < 4) << "Ascend vector lanes max 4: i=" << i;
-  if (t.lanes() <= 4) {
+  ICHECK(i >= 0 && i < t.lanes() && i < 128 / t.bits())
+      << "Ascend " << t << " vector lanes max " << (128 / t.bits())
+      << ": i=" << i << " t.bits()=" << t.bits() << " t.lanes()=" << t.lanes();
+  if (t.is_float16()) {
+    os << "((half2*)(&(" << vec << "." << access[i / 2] << ")))->"
+       << access[i % 2];
+  } else if (t.lanes() <= 4) {
     os << vec << "." << access[i];
   } else {
     os << "((" << vec << ")." << access[i / 2] << ")";
@@ -1803,8 +1955,13 @@ void CodeGenTileLangAscend::PrintVecElemStore(const std::string &vec,
                                               const std::string &value) {
   this->PrintIndent();
   static const char access[] = {'x', 'y', 'z', 'w'};
-  ICHECK(i >= 0 && i < 4) << "Ascend vector lanes max 4: i=" << i;
-  if (t.lanes() <= 4) {
+  ICHECK(i >= 0 && i < t.lanes() && i < 128 / t.bits())
+      << "Ascend " << t << " vector lanes max " << (128 / t.bits())
+      << ": i=" << i << " t.bits()=" << t.bits() << " t.lanes()=" << t.lanes();
+  if (t.is_float16()) {
+    stream << "((half2*)(&(" << vec << "." << access[i / 2] << ")))->"
+           << access[i % 2] << " = " << value << ";\n";
+  } else if (t.lanes() <= 4) {
     stream << vec << "." << access[i] << " = " << value << ";\n";
   } else {
     stream << "((" << vec << ")." << access[i / 2] << ") = " << value << ";\n";

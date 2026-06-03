@@ -31,6 +31,10 @@ def alloc(dtype: str):
         "uint16": 16,
         "int8": 8,
         "uint8": 8,
+        "float8_e4m3": 8,
+        "float8_e4m3fn": 8,
+        "float8_e5m2": 8,
+        "float8_e8m0fnu": 8,
     }.get(dtype, 32)
     vreg_lanes = 8 * 32 // (elem_bits // 8)
     vec_dtype = f"{dtype}x{vreg_lanes}"
@@ -55,7 +59,13 @@ def vld(dst, addr, dist="NORM", off=None):
     addr can be a BufferLoad (e.g. temp[i*64]) auto-wrapped as tl.access_ptr.
     """
     if isinstance(addr, BufferLoad):
-        addr = access_ptr(addr, "r", extent=_vreg_extent(addr.buffer.dtype))
+        extent = _vreg_extent(addr.buffer.dtype)
+        if isinstance(dist, str):
+            if dist.startswith("BRC_"):
+                extent = 1
+            elif dist in ("UNPK_B16", "UNPK4_B8"):
+                extent = 64
+        addr = access_ptr(addr, "r", extent=extent)
     args = [dst, addr, dist]
     if off is not None:
         args.append(off)
@@ -68,7 +78,13 @@ def vsts(addr, src, mask, dist="NORM_B32", off=None):
     addr can be a BufferLoad auto-wrapped as tl.access_ptr.
     """
     if isinstance(addr, BufferLoad):
-        addr = access_ptr(addr, "w", extent=_vreg_extent(addr.buffer.dtype))
+        extent = _vreg_extent(addr.buffer.dtype)
+        if isinstance(dist, str):
+            if dist.startswith("ONEPT_"):
+                extent = 1
+            elif dist in ("PK_B32", "PK4_B32"):
+                extent = 64
+        addr = access_ptr(addr, "w", extent=extent)
     args = [addr, src, mask, dist]
     if off is not None:
         args.append(off)
@@ -166,34 +182,83 @@ def vcmax(dst, src, mask, mode="MODE_ZEROING"):
     return tir.call_intrin("void", _Op("tl.simd.vcmax"), dst, src, mask, mode)
 
 
+# -- Register permutation -----------------------------------------------------
+
+
+def vintlv(dst0, dst1, src0, src1):
+    """Interleave two vector registers: vintlv(dst0, dst1, src0, src1)."""
+    return tir.call_intrin("void", _Op("tl.simd.vintlv"), dst0, dst1, src0, src1)
+
+
+def vdintlv(dst0, dst1, src0, src1):
+    """De-interleave two vector registers: vdintlv(dst0, dst1, src0, src1)."""
+    return tir.call_intrin("void", _Op("tl.simd.vdintlv"), dst0, dst1, src0, src1)
+
+
+def vpack(dst, src, part=0):
+    """Pack 32-bit lanes to 16-bit lanes: vpack(dst, src, LOWER/HIGHER)."""
+    if isinstance(part, tir.IntImm):
+        part = int(part.value)
+    if isinstance(part, int):
+        part = ("LOWER", "HIGHER")[part]
+    return tir.call_intrin("void", _Op("tl.simd.vpack"), dst, src, part)
+
+
 # -- Type conversion ----------------------------------------------------------
 
 
-def vfcvt_narrow(dst, src, mask, round_mode=4, part=0, mode="MODE_MERGING"):
-    """Narrowing cast f32->f16/bf16: vfcvt(dst, src, ROUND_X, PART_X, mode).
+def vcvt(
+    dst,
+    src,
+    mask,
+    round_mode=0,
+    saturation=None,
+    part=0,
+    mode="MODE_ZEROING",
+):
+    """Vector cast. The concrete CCE vcvt signature is inferred from dst/src dtype."""
 
-    round_mode: 0=R, 1=A, 2=F, 3=C, 4=Z, 5=O, 6=H.  part: 0=EVEN, 1=ODD.
-    mode: "MODE_MERGING", "MODE_ZEROING", "MODE_ZEROING".
-    """
-    return tir.call_intrin("void", _Op("tl.simd.vfcvt_narrow"), dst, src, mask, round_mode, part, mode)
+    src_dtype = str(src.dtype).split("x", 1)[0]
+    dst_dtype = str(dst.dtype).split("x", 1)[0]
+    fp16_dtypes = ("float16", "bfloat16")
+    fp8_dtypes = ("float8_e4m3", "float8_e4m3fn", "float8_e5m2")
 
+    ROUNDS = ("ROUND_R", "ROUND_A", "ROUND_F", "ROUND_C", "ROUND_Z", "ROUND_O", "ROUND_H")
+    if isinstance(round_mode, tir.IntImm):
+        round_mode = int(round_mode.value)
 
-def vfcvt_widen(dst, src, part=0):
-    """Widening cast f16/bf16->f32: vfcvt(dst, src, PART_X).
+    saturation = saturation or "RS_ENABLE"
 
-    part: 0=EVEN, 1=ODD.
-    """
-    return tir.call_intrin("void", _Op("tl.simd.vfcvt_widen"), dst, src, part)
+    PART_F16 = ("PART_EVEN", "PART_ODD")
+    PART_F8 = ("PART_P0", "PART_P1", "PART_P2", "PART_P3")
+    if isinstance(part, tir.IntImm):
+        part = int(part.value)
 
+    mode = mode or "MODE_ZEROING"
 
-def vfcvt_f2i(dst, src, mask, round_mode=4):
-    """Float to int cast: vfcvt(dst, src, mask, ROUND_X, MODE_XX)."""
-    return tir.call_intrin("void", _Op("tl.simd.vfcvt_f2i"), dst, src, mask, round_mode)
+    def call(*args):
+        return tir.call_intrin("void", _Op("tl.simd.vcvt"), dst, src, mask, *args)
 
+    if src_dtype == "float32":
+        if dst_dtype == "int32":
+            return call("ROUND_Z", saturation, mode)
+        elif dst_dtype in fp16_dtypes:
+            return call(ROUNDS[round_mode], saturation, PART_F16[part], mode)
+        elif dst_dtype in fp8_dtypes:
+            return call(ROUNDS[round_mode], saturation, PART_F8[part], mode)
 
-def vfcvt_i2f(dst, src, mask, round_mode=4):
-    """Int to float cast: vfcvt(dst, src, mask, ROUND_X, MODE_XX)."""
-    return tir.call_intrin("void", _Op("tl.simd.vfcvt_i2f"), dst, src, mask, round_mode)
+    if dst_dtype == "float32":
+        if src_dtype == "int32":
+            return call("ROUND_R", mode)
+        elif src_dtype in fp16_dtypes:
+            return call(PART_F16[part], mode)
+        elif src_dtype in fp8_dtypes:
+            return call(PART_F8[part], mode)
+
+    if src_dtype in fp16_dtypes and dst_dtype in fp8_dtypes:
+        return call(ROUNDS[round_mode], saturation, PART_F16[part], mode)
+
+    raise ValueError(f"Unsupported vcvt conversion {src_dtype}->{dst_dtype}")
 
 
 # -- Special ------------------------------------------------------------------
