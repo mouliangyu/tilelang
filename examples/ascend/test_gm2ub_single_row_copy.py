@@ -30,8 +30,11 @@ def test_gm2ub_single_row_copy():
     )
 
     source = kernel.get_kernel_source()
-    good = re.search(r"copy_gm_to_ubuf\([^;]*,\s*0,\s*1,\s*128,\s*0,\s*0\);", source)
-    bad = re.search(r"copy_gm_to_ubuf\([^;]*,\s*0,\s*128,\s*1,\s*0,\s*0\);", source)
+    good = re.search(
+        r"copy_gm_to_ubuf_align_v2\([^;]*,\s*0,\s*1,\s*4096,\s*0,\s*0,\s*0,\s*0,\s*4096,\s*4096\);",
+        source,
+    )
+    bad = re.search(r"copy_gm_to_ubuf\(", source)
     assert good is not None, source
     assert bad is None, source
 

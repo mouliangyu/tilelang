@@ -851,23 +851,18 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[2], this->stream);
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_gm_to_ubuf())) {
-    ICHECK_EQ(op->args.size(), 7)
-        << "tl.ascend_copy_gm_to_ubuf expects exactly 7 arguments";
+    ICHECK_EQ(op->args.size(), 11)
+        << "tl.ascend_copy_gm_to_ubuf expects exactly 11 arguments";
     this->PrintIndent();
-    this->stream << "copy_gm_to_ubuf((__ubuf__ void*)(";
+    this->stream << "copy_gm_to_ubuf_align_v2((__ubuf__ uint8_t*)(";
     this->PrintExpr(op->args[0], this->stream);
-    this->stream << "), (__gm__ void*)(";
+    this->stream << "), (__gm__ uint8_t*)(";
     this->PrintExpr(op->args[1], this->stream);
-    this->stream << "), ";
-    this->PrintExpr(op->args[2], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[3], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[4], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[5], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[6], this->stream);
+    this->stream << ")";
+    for (size_t i = 2; i < op->args.size(); ++i) {
+      this->stream << ", ";
+      this->PrintExpr(op->args[i], this->stream);
+    }
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_ubuf_to_gm())) {
     ICHECK_EQ(op->args.size(), 8)

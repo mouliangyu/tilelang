@@ -627,7 +627,9 @@ TVM_DLL const Op &ascend_cross_core_wait_flag();
 /*!
  * \brief Ascend DMA copy from GM to UBuf.
  *
- * ascend_copy_gm_to_ubuf(dst, src, sid, nBurst, lenBurst, srcStride, dstStride)
+ * ascend_copy_gm_to_ubuf(dst, src, sid, nBurst, burstLen,
+ * leftPadding, rightPadding, dataSelect, l2CacheCtl,
+ * burstSrcStride, burstDstStride)
  *
  */
 TVM_DLL const Op &ascend_copy_gm_to_ubuf();

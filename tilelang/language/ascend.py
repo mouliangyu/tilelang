@@ -174,10 +174,24 @@ def ascend_cross_core_wait_flag(mode_id: int, pipe: str, flag_id) -> None:
     return tir.call_intrin("void", tir.op.Op.get("tl.ascend_cross_core_wait_flag"), mode_id, pipe, flag_id)
 
 
-def ascend_copy_gm_to_ubuf(dst, src, sid, n_burst, len_burst, src_stride, dst_stride) -> None:
+def ascend_copy_gm_to_ubuf(
+    dst,
+    src,
+    sid,
+    n_burst,
+    burst_len,
+    left_padding,
+    right_padding,
+    data_select,
+    l2_cache_ctl,
+    burst_src_stride,
+    burst_dst_stride,
+) -> None:
     """Insert an Ascend DMA copy from GM to UBuf.
 
-    Generates: copy_gm_to_ubuf(dst, src, sid, nBurst, lenBurst, srcStride, dstStride);
+    Generates: copy_gm_to_ubuf_align_v2(dst, src, sid, nBurst, burstLen,
+    leftPadding, rightPadding, dataSelect, l2CacheCtl, burstSrcStride,
+    burstDstStride);
 
     Parameters
     ----------
@@ -189,34 +203,36 @@ def ascend_copy_gm_to_ubuf(dst, src, sid, n_burst, len_burst, src_stride, dst_st
         Sub-block ID (usually 0).
     n_burst : int or PrimExpr
         Number of bursts.
-    len_burst : int or PrimExpr
+    burst_len : int or PrimExpr
         Length of each burst in bytes.
-    src_stride : int or PrimExpr
-        Source stride between bursts.
-    dst_stride : int or PrimExpr
-        Destination stride between bursts.
+    left_padding : int or PrimExpr
+        Left padding count.
+    right_padding : int or PrimExpr
+        Right padding count.
+    data_select : bool, int, or PrimExpr
+        v2 data select / constant padding control.
+    l2_cache_ctl : int or PrimExpr
+        L2 cache control.
+    burst_src_stride : int or PrimExpr
+        Source stride between burst starts in bytes.
+    burst_dst_stride : int or PrimExpr
+        Destination stride between burst starts in bytes.
     """
-    if isinstance(sid, int):
-        sid = tir.IntImm("int32", sid)
-    if isinstance(n_burst, int):
-        n_burst = tir.IntImm("int32", n_burst)
-    if isinstance(len_burst, int):
-        len_burst = tir.IntImm("int32", len_burst)
-    if isinstance(src_stride, int):
-        src_stride = tir.IntImm("int32", src_stride)
-    if isinstance(dst_stride, int):
-        dst_stride = tir.IntImm("int32", dst_stride)
-    return tir.call_intrin(
-        "void",
-        tir.op.Op.get("tl.ascend_copy_gm_to_ubuf"),
-        dst,
-        src,
-        sid,
-        n_burst,
-        len_burst,
-        src_stride,
-        dst_stride,
-    )
+    args = [dst, src] + [
+        _to_int32(a)
+        for a in [
+            sid,
+            n_burst,
+            burst_len,
+            left_padding,
+            right_padding,
+            data_select,
+            l2_cache_ctl,
+            burst_src_stride,
+            burst_dst_stride,
+        ]
+    ]
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_copy_gm_to_ubuf"), *args)
 
 
 def ascend_copy_ubuf_to_gm(dst, src, sid, burst_num, burst_len, l2_cache_ctl, burst_dst_stride, burst_src_stride) -> None:
@@ -243,30 +259,18 @@ def ascend_copy_ubuf_to_gm(dst, src, sid, burst_num, burst_len, l2_cache_ctl, bu
     burst_src_stride : int or PrimExpr
         Source stride between bursts.
     """
-    if isinstance(sid, int):
-        sid = tir.IntImm("int32", sid)
-    if isinstance(burst_num, int):
-        burst_num = tir.IntImm("int32", burst_num)
-    if isinstance(burst_len, int):
-        burst_len = tir.IntImm("int32", burst_len)
-    if isinstance(l2_cache_ctl, int):
-        l2_cache_ctl = tir.IntImm("int32", l2_cache_ctl)
-    if isinstance(burst_dst_stride, int):
-        burst_dst_stride = tir.IntImm("int32", burst_dst_stride)
-    if isinstance(burst_src_stride, int):
-        burst_src_stride = tir.IntImm("int32", burst_src_stride)
-    return tir.call_intrin(
-        "void",
-        tir.op.Op.get("tl.ascend_copy_ubuf_to_gm"),
-        dst,
-        src,
-        sid,
-        burst_num,
-        burst_len,
-        l2_cache_ctl,
-        burst_dst_stride,
-        burst_src_stride,
-    )
+    args = [dst, src] + [
+        _to_int32(a)
+        for a in [
+            sid,
+            burst_num,
+            burst_len,
+            l2_cache_ctl,
+            burst_dst_stride,
+            burst_src_stride,
+        ]
+    ]
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_copy_ubuf_to_gm"), *args)
 
 
 def _to_int32(v):

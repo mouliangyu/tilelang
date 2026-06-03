@@ -949,15 +949,15 @@ Stmt CopyNode::LowerAscendDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
       // GM -> UBuf
       if (plan_single_row) {
         call = Call(DataType::Void(), ascend_copy_gm_to_ubuf(),
-                    {plan_dst_ptr, plan_src_ptr, sid, I(1),
-                     plan_total_bytes / I(32), zero, zero});
+                    {plan_dst_ptr, plan_src_ptr, sid, I(1), plan_total_bytes,
+                     zero, zero, zero, I(this->GetL2CacheCtrl()),
+                     plan_total_bytes, plan_total_bytes});
       } else {
-        PrimExpr len_burst = plan.row_bytes / I(32);
-        PrimExpr src_gap = (plan.src_stride_bytes - plan.row_bytes) / I(32);
-        PrimExpr dst_gap = (plan.dst_stride_bytes - plan.row_bytes) / I(32);
-        call = Call(DataType::Void(), ascend_copy_gm_to_ubuf(),
-                    {plan_dst_ptr, plan_src_ptr, sid, plan.n_rows, len_burst,
-                     src_gap, dst_gap});
+        call =
+            Call(DataType::Void(), ascend_copy_gm_to_ubuf(),
+                 {plan_dst_ptr, plan_src_ptr, sid, plan.n_rows, plan.row_bytes,
+                  zero, zero, zero, I(this->GetL2CacheCtrl()),
+                  plan.src_stride_bytes, plan.dst_stride_bytes});
       }
     } else {
       // UBuf -> GM (dma_path == 1)
