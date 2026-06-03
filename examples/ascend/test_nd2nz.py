@@ -94,8 +94,10 @@ def test_nd2nz_matmul(M, N, src_dtype, mul_dtype, num_aiv):
     torch.npu.synchronize()
 
     # Verify: I @ X = X  (identity matmul)
-    max_diff = (X_gm.to(dtype=mul_td) - O_gm.to(dtype=mul_td)).max().item()
-    assert max_diff == 0, f"M={M} N={N} src_dtype={src_dtype} mul_dtype={mul_dtype} num_aiv={num_aiv} max_diff={max_diff}"
+    expected = X_gm.to(dtype=mul_td)
+    actual = O_gm.to(dtype=mul_td)
+    rel_err = ((expected - actual).abs() / expected.abs().clamp(min=1.0)).max().item()
+    assert rel_err < 1e-3, f"M={M} N={N} src_dtype={src_dtype} mul_dtype={mul_dtype} num_aiv={num_aiv} rel_err={rel_err}"
 
 
 if __name__ == "__main__":

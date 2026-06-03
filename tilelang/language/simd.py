@@ -165,8 +165,17 @@ def vrec(dst, src, mask, mode="MODE_ZEROING"):
 
 
 def vdup(dst, src, mask, mode="MODE_ZEROING"):
-    """Broadcast lane 0 to all lanes: vdup(dst, src, mask, MODE_ZEROING)."""
+    """Broadcast scalar to all lanes: vdup(dst, scalar, mask, MODE_ZEROING)."""
     return tir.call_intrin("void", _Op("tl.simd.vdup"), dst, src, mask, mode)
+
+
+def vdupv(dst, src, mask, pos="POS_LOWEST", mode="MODE_ZEROING"):
+    """Broadcast lane N of src vector to all lanes: vdup(dst, src, mask, pos, mode).
+
+    pos: "POS_LOWEST" (lane 0) or "POS_HIGHEST" (lane N).
+    This is the 5-argument form of the bisheng vdup intrinsic.
+    """
+    return tir.call_intrin("void", _Op("tl.simd.vdupv"), dst, src, mask, pos, mode)
 
 
 # -- Cross-lane reduction -----------------------------------------------------
@@ -205,6 +214,14 @@ def vpack(dst, src, part=0):
 
 
 # -- Type conversion ----------------------------------------------------------
+
+
+def vexpdif(dst, src0, src1, mask, part=0):
+    """Fused exp-sub: vexpdif(dst, src0, src1, mask, PART_X).
+
+    Computes dst = exp(src0 - src1).  part: 0=EVEN, 1=ODD.
+    """
+    return tir.call_intrin("void", _Op("tl.simd.vexpdif"), dst, src0, src1, mask, part)
 
 
 def vcvt(

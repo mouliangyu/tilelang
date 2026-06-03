@@ -1276,6 +1276,19 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[1], this->stream);
     this->stream << ", " << Downcast<StringImm>(op->args[2])->value << ");\n";
   }
+  // --- SimdVF vector broadcast: (dst, src, mask, pos, mode) → vdup 5-arg ---
+  else if (op->op.same_as(tl::simd_vdupv())) {
+    ICHECK_EQ(op->args.size(), 5);
+    this->PrintIndent();
+    this->stream << "vdup(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[2], this->stream);
+    this->stream << ", " << Downcast<StringImm>(op->args[3])->value;
+    this->stream << ", " << Downcast<StringImm>(op->args[4])->value << ");\n";
+  }
   // --- SimdVF load: (dst, addr, dist [, offset]) ---
   //  dist is a StringImm (e.g. "NORM", "BRC_B32"), default "NORM"
   else if (op->op.same_as(tl::simd_vld())) {
@@ -1391,6 +1404,20 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->stream << Downcast<StringImm>(op->args[i])->value;
     }
     this->stream << ");\n";
+  }
+  // --- SimdVF vexpdif: (dst, src0, src1, mask, part) ---
+  else if (op->op.same_as(tl::simd_vexpdif())) {
+    ICHECK_EQ(op->args.size(), 5);
+    int part = (int)Downcast<IntImm>(op->args[4])->value;
+    os << "vexpdif(";
+    this->PrintExpr(op->args[0], os);
+    os << ", ";
+    this->PrintExpr(op->args[1], os);
+    os << ", ";
+    this->PrintExpr(op->args[2], os);
+    os << ", ";
+    this->PrintExpr(op->args[3], os);
+    os << ", " << (part == 0 ? "PART_EVEN" : "PART_ODD") << ")";
   }
   // --- SimdVF sel: (dst, src0, src1, mask, mode) ---
   else if (op->op.same_as(tl::simd_vsel())) {

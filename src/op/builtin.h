@@ -565,6 +565,7 @@ TVM_DLL const Op &simd_vrec();
 
 // -- Broadcast
 TVM_DLL const Op &simd_vdup();
+TVM_DLL const Op &simd_vdupv(); // 5-arg vector→vector lane-N broadcast
 
 // -- Cross-lane reduction
 TVM_DLL const Op &simd_vcadd();
@@ -583,6 +584,7 @@ TVM_DLL const Op &simd_vsel();
 TVM_DLL const Op &simd_vmuls();
 TVM_DLL const Op &simd_vadds();
 TVM_DLL const Op &simd_mem_bar();
+TVM_DLL const Op &simd_vexpdif();
 
 /*!
  * \brief Ascend SetFlag intrinsic for pipeline synchronization.
