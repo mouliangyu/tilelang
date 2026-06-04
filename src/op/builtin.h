@@ -533,9 +533,6 @@ TVM_DLL const Op &ascend_reduce_min();
 // (vadd/vld/vst/vfcvt/...) from __clang_cce_vector_intrinsics.h.
 // Fragment registers use vector_<T> types; masks are vector_bool.
 
-// -- Register allocation
-TVM_DLL const Op &simd_alloc();
-
 // -- Mask
 TVM_DLL const Op &simd_pset();
 
@@ -574,6 +571,7 @@ TVM_DLL const Op &simd_vcmax();
 // -- Register permutation
 TVM_DLL const Op &simd_vintlv();
 TVM_DLL const Op &simd_vdintlv();
+TVM_DLL const Op &simd_pair_get();
 TVM_DLL const Op &simd_vpack();
 
 // -- Type conversion

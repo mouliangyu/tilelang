@@ -30,14 +30,12 @@ def vector_add(N):
                 T.copy(A[begin:end], temp1)
                 T.copy(B[begin:end], temp2)
                 with T.SimdVF():
-                    r0 = T.simd.alloc("float32")
-                    r1 = T.simd.alloc("float32")
                     mask = T.simd.pset(32)
                     for i in range(TILE // 64):
-                        T.simd.vld(r0, temp1[i * 64])
-                        T.simd.vld(r1, temp2[i * 64])
-                        T.simd.vadd(r0, r0, r1, mask)
-                        T.simd.vsts(temp3[i * 64], r0, mask)
+                        r0 = T.simd.vld(temp1[i * 64])
+                        r1 = T.simd.vld(temp2[i * 64])
+                        r2 = T.simd.vadd(r0, r1, mask)
+                        T.simd.vsts(temp3[i * 64], r2, mask)
                 T.copy(temp3, C[begin:end])
 
     return main

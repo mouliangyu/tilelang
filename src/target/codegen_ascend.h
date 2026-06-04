@@ -57,6 +57,8 @@ private:
   bool has_nd2nz_copy_{false};
   bool has_nd2nz_copy_included_{false};
   bool has_limits_included_{false};
+  bool has_simd_ops_{false};
+  bool has_simd_inst_included_{false};
 
   ffi::Array<tir::Var> CollectVFCaptures(const tir::BlockNode *op) const;
   void EmitVFFunction(const tir::BlockNode *op,

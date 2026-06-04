@@ -545,6 +545,9 @@ def AscendSimdVFLowerParallel():
     return _ffi_api.AscendSimdVFLowerParallel()  # type: ignore
 
 
+from .hoist_simd_pairs import HoistSimdPairs  # noqa: F401, E402
+
+
 def LayoutReducer():
     """
     Return a TVM transform pass that performs layout reduction/normalization.

@@ -191,6 +191,8 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
         IRModule: The transformed module, ready for target-specific optimization passes.
     """
     mod = tir.transform.BindTarget(target)(mod)
+    # Hoist duplicate vintlv/vdintlv calls inside pair_get
+    mod = tilelang.transform.HoistSimdPairs()(mod)
 
     if should_force_let_inline():
         # Force-let inline whenever the pass config requests it.

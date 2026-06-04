@@ -527,6 +527,10 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
     return;
   }
   if (op->name_hint == "SIMD_VF") {
+    if (!has_simd_inst_included_) {
+      decl_stream << "#include <tl_templates/ascend/simd_inst.h>\n";
+      has_simd_inst_included_ = true;
+    }
     auto captures = CollectVFCaptures(op);
     std::string helper_name =
         "simd_vf_" + std::to_string(simdvf_helper_counter_++);
@@ -1159,11 +1163,11 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       CodeGenC::VisitExpr_(op, os);
     }
   }
-  // --- SimdVF binary ops: (dst, src0, src1, mask) ---
+  // --- SimdVF binary ops: (src0, src1, mask, mode) ---
   else if (op->op.same_as(tl::simd_vadd()) || op->op.same_as(tl::simd_vsub()) ||
            op->op.same_as(tl::simd_vmul()) || op->op.same_as(tl::simd_vdiv()) ||
            op->op.same_as(tl::simd_vmax()) || op->op.same_as(tl::simd_vmin())) {
-    ICHECK_EQ(op->args.size(), 5);
+    ICHECK_EQ(op->args.size(), 4);
     const char *name = nullptr;
     if (op->op.same_as(tl::simd_vadd()))
       name = "vadd";
@@ -1177,36 +1181,36 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       name = "vmin";
     else
       name = "vdiv";
-    this->PrintIndent();
-    this->stream << name << "(";
-    this->PrintExpr(op->args[0], this->stream);
-    for (int i = 1; i < 4; ++i) {
-      this->stream << ", ";
-      this->PrintExpr(op->args[i], this->stream);
-    }
-    this->stream << ", " << Downcast<StringImm>(op->args[4])->value << ");\n";
+    os << "simd_inst::" << name << "(";
+    PrintExpr(op->args[0], os); // src0
+    os << ", ";
+    PrintExpr(op->args[1], os); // src1
+    os << ", ";
+    PrintExpr(op->args[2], os);                            // mask
+    os << ", " << Downcast<StringImm>(op->args[3])->value; // mode
+    os << ")";
   }
-  // --- SimdVF bitwise: (dst, src0, src1, mask, mode) ---
+  // --- SimdVF bitwise: (src0, src1, mask, mode) ---
   else if (op->op.same_as(tl::simd_vand()) || op->op.same_as(tl::simd_vor())) {
-    ICHECK_EQ(op->args.size(), 5);
+    ICHECK_EQ(op->args.size(), 4);
     const char *name = op->op.same_as(tl::simd_vand()) ? "vand" : "vor";
-    this->PrintIndent();
-    this->stream << name << "(";
-    this->PrintExpr(op->args[0], this->stream);
-    for (int i = 1; i < 4; ++i) {
-      this->stream << ", ";
-      this->PrintExpr(op->args[i], this->stream);
-    }
-    this->stream << ", " << Downcast<StringImm>(op->args[4])->value << ");\n";
+    os << "simd_inst::" << name << "(";
+    PrintExpr(op->args[0], os); // src0
+    os << ", ";
+    PrintExpr(op->args[1], os); // src1
+    os << ", ";
+    PrintExpr(op->args[2], os);                            // mask
+    os << ", " << Downcast<StringImm>(op->args[3])->value; // mode
+    os << ")";
   }
-  // --- SimdVF unary ops: (dst, src, mask, mode) ---
+  // --- SimdVF unary ops: (src, mask, mode) ---
   else if (op->op.same_as(tl::simd_vexp()) || op->op.same_as(tl::simd_vln()) ||
            op->op.same_as(tl::simd_vsqrt()) ||
            op->op.same_as(tl::simd_vrsqrt()) ||
            op->op.same_as(tl::simd_vabs()) || op->op.same_as(tl::simd_vneg()) ||
            op->op.same_as(tl::simd_vrelu()) ||
            op->op.same_as(tl::simd_vrec())) {
-    ICHECK_EQ(op->args.size(), 4);
+    ICHECK_EQ(op->args.size(), 3);
     const char *name = nullptr;
     if (op->op.same_as(tl::simd_vexp()))
       name = "vexp";
@@ -1224,92 +1228,86 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       name = "vrec";
     else
       name = "vneg";
-    this->PrintIndent();
-    this->stream << name << "(";
-    this->PrintExpr(op->args[0], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[1], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[2], this->stream);
-    this->stream << ", " << Downcast<StringImm>(op->args[3])->value << ");\n";
+    os << "simd_inst::" << name << "(";
+    PrintExpr(op->args[0], os); // src
+    os << ", ";
+    PrintExpr(op->args[1], os);                            // mask
+    os << ", " << Downcast<StringImm>(op->args[2])->value; // mode
+    os << ")";
   }
-  // --- SimdVF cross-lane reduce: (dst, src, mask, mode) ---
+  // --- SimdVF cross-lane reduce: (src, mask, mode) ---
   else if (op->op.same_as(tl::simd_vcmax()) ||
            op->op.same_as(tl::simd_vcadd())) {
-    ICHECK_EQ(op->args.size(), 4);
+    ICHECK_EQ(op->args.size(), 3);
     const char *name = op->op.same_as(tl::simd_vcmax()) ? "vcmax" : "vcadd";
-    this->PrintIndent();
-    this->stream << name << "(";
-    this->PrintExpr(op->args[0], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[1], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[2], this->stream);
-    this->stream << ", " << Downcast<StringImm>(op->args[3])->value << ");\n";
+    os << "simd_inst::" << name << "(";
+    PrintExpr(op->args[0], os); // src
+    os << ", ";
+    PrintExpr(op->args[1], os);                            // mask
+    os << ", " << Downcast<StringImm>(op->args[2])->value; // mode
+    os << ")";
   }
-  // --- SimdVF register permutation: (dst0, dst1, src0, src1) ---
+  // --- SimdVF register permutation: (src0, src1) → pair ---
   else if (op->op.same_as(tl::simd_vintlv()) ||
            op->op.same_as(tl::simd_vdintlv())) {
-    ICHECK_EQ(op->args.size(), 4);
+    ICHECK_EQ(op->args.size(), 2);
     const char *name = op->op.same_as(tl::simd_vintlv()) ? "vintlv" : "vdintlv";
-    this->PrintIndent();
-    this->stream << name << "(";
-    this->PrintExpr(op->args[0], this->stream);
-    for (int i = 1; i < 4; ++i) {
-      this->stream << ", ";
-      this->PrintExpr(op->args[i], this->stream);
-    }
-    this->stream << ");\n";
+    os << "simd_inst::" << name << "(";
+    PrintExpr(op->args[0], os); // src0
+    os << ", ";
+    PrintExpr(op->args[1], os); // src1
+    os << ")";
   }
-  // --- SimdVF register pack: (dst, src, LOWER/HIGHER) ---
+  // --- SimdVF pair element access: pair_get(pair, index) → pair.vN ---
+  else if (op->op.same_as(tl::simd_pair_get())) {
+    ICHECK_EQ(op->args.size(), 2);
+    PrintExpr(op->args[0], os); // pair
+    int idx = (int)Downcast<IntImm>(op->args[1])->value;
+    os << (idx == 0 ? ".v0" : ".v1");
+  }
+  // --- SimdVF register pack: (src, part) ---
   else if (op->op.same_as(tl::simd_vpack())) {
-    ICHECK_EQ(op->args.size(), 3);
-    this->PrintIndent();
-    this->stream << "vpack((vector_u16 &)";
-    this->PrintExpr(op->args[0], this->stream);
-    this->stream << ", (vector_u32 &)";
-    this->PrintExpr(op->args[1], this->stream);
-    this->stream << ", " << Downcast<StringImm>(op->args[2])->value << ");\n";
+    ICHECK_EQ(op->args.size(), 2);
+    DataType elem = op->dtype.element_of();
+    os << "simd_inst::vpack<";
+    PrintType(elem, os);
+    os << ">(";
+    PrintExpr(op->args[0], os); // src
+    os << ", " << Downcast<StringImm>(op->args[1])->value << ")";
   }
-  // --- SimdVF vector broadcast: (dst, src, mask, pos, mode) → vdup 5-arg ---
+  // --- SimdVF vector broadcast vdupv: (src, mask, pos, mode) ---
   else if (op->op.same_as(tl::simd_vdupv())) {
-    ICHECK_EQ(op->args.size(), 5);
-    this->PrintIndent();
-    this->stream << "vdup(";
-    this->PrintExpr(op->args[0], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[1], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[2], this->stream);
-    this->stream << ", " << Downcast<StringImm>(op->args[3])->value;
-    this->stream << ", " << Downcast<StringImm>(op->args[4])->value << ");\n";
+    ICHECK_EQ(op->args.size(), 4);
+    os << "simd_inst::vdupv(";
+    PrintExpr(op->args[0], os); // src
+    os << ", ";
+    PrintExpr(op->args[1], os);                                   // mask
+    os << ", " << Downcast<StringImm>(op->args[2])->value;        // pos
+    os << ", " << Downcast<StringImm>(op->args[3])->value << ")"; // mode
   }
-  // --- SimdVF load: (dst, addr, dist [, offset]) ---
-  //  dist is a StringImm (e.g. "NORM", "BRC_B32"), default "NORM"
+  // --- SimdVF load: (addr, dist [, offset]) ---
   else if (op->op.same_as(tl::simd_vld())) {
-    ICHECK(op->args.size() >= 2 && op->args.size() <= 4);
-    DataType dtype = op->args[0].dtype().element_of();
-    std::string dist = (op->args.size() >= 3 && op->args[2].as<StringImmNode>())
-                           ? Downcast<StringImm>(op->args[2])->value
-                           : "NORM";
-    bool has_off = (op->args.size() == 4);
-    int off_idx =
-        (op->args.size() == 4 && op->args[2].as<StringImmNode>()) ? 3 : -1;
-    this->PrintIndent();
-    this->stream << "vld(";
-    this->PrintExpr(op->args[0], this->stream);
-    this->stream << ", (__ubuf__ " << CCEUBufType(dtype) << "*)";
-    this->PrintExpr(op->args[1], this->stream);
+    ICHECK(op->args.size() >= 2 && op->args.size() <= 3);
+    DataType elem = op->dtype.element_of();
+    std::string dist = Downcast<StringImm>(op->args[1])->value;
+    bool has_off = (op->args.size() == 3);
+    os << "simd_inst::vld<";
+    PrintType(elem, os);
+    os << ">((" << "__ubuf__" << " ";
+    PrintType(elem, os);
+    os << "*)";
+    PrintExpr(op->args[0], os); // addr
+    os << ", ";
     if (has_off) {
-      this->stream << ", ";
-      this->stream << "vag_b" << CCEElemWidthBits(dtype) << "(";
-      this->PrintExpr(op->args[off_idx], this->stream);
-      this->stream << ")";
+      os << "vag_b" << CCEElemWidthBits(elem) << "(";
+      PrintExpr(op->args[2], os);
+      os << ")";
+    } else {
+      os << dist;
     }
-    this->stream << ", " << dist << ");\n";
+    os << ")";
   }
   // --- SimdVF store: (addr, src, mask, dist [, offset]) ---
-  //  dist is a StringImm (e.g. "NORM_B32", "PK_B32"), default "NORM_B32"
   else if (op->op.same_as(tl::simd_vsts())) {
     ICHECK(op->args.size() >= 3 && op->args.size() <= 5);
     DataType dtype = op->args[1].dtype().element_of();
@@ -1324,111 +1322,88 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       off_idx = 3;
     }
     this->PrintIndent();
-    this->stream << "vsts(";
-    this->PrintExpr(op->args[1], this->stream); // src
+    this->stream << "simd_inst::vsts(";
+    PrintExpr(op->args[1], this->stream); // src
     this->stream << ", (__ubuf__ " << CCEUBufType(dtype) << "*)";
-    this->PrintExpr(op->args[0], this->stream); // addr
+    PrintExpr(op->args[0], this->stream); // addr
     if (off_idx >= 0) {
       this->stream << ", ";
-      this->PrintExpr(op->args[off_idx], this->stream);
+      PrintExpr(op->args[off_idx], this->stream);
     } else {
       this->stream << ", 0";
     }
     this->stream << ", " << dist << ", ";
-    this->PrintExpr(op->args[2], this->stream); // mask
+    PrintExpr(op->args[2], this->stream); // mask
     if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
       this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
   }
-  // --- SimdVF scalar-vector ops: (dst, src, scalar, mask, mode) ---
+  // --- SimdVF scalar-vector ops: (src, scalar, mask, mode) ---
   else if (op->op.same_as(tl::simd_vadds()) ||
            op->op.same_as(tl::simd_vmuls())) {
-    ICHECK_EQ(op->args.size(), 5);
+    ICHECK_EQ(op->args.size(), 4);
     const char *name = op->op.same_as(tl::simd_vadds()) ? "vadds" : "vmuls";
-    this->PrintIndent();
-    this->stream << name << "(";
-    this->PrintExpr(op->args[0], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[1], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[2], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[3], this->stream);
-    this->stream << ", " << Downcast<StringImm>(op->args[4])->value << ");\n";
+    os << "simd_inst::" << name << "(";
+    PrintExpr(op->args[0], os); // src
+    os << ", ";
+    PrintExpr(op->args[1], os); // scalar
+    os << ", ";
+    PrintExpr(op->args[2], os);                                   // mask
+    os << ", " << Downcast<StringImm>(op->args[3])->value << ")"; // mode
   }
-  // --- SimdVF dup: scalar broadcast or vector lane-0 broadcast ---
+  // --- SimdVF dup: scalar broadcast ---
   else if (op->op.same_as(tl::simd_vdup())) {
-    ICHECK(op->args.size() >= 3 && op->args.size() <= 4);
-    std::string mode = (op->args.size() >= 4 && op->args[3].as<StringImmNode>())
-                           ? Downcast<StringImm>(op->args[3])->value
-                           : "MODE_ZEROING";
-    this->PrintIndent();
-    this->stream << "vdup(";
-    this->PrintExpr(op->args[0], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[1], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[2], this->stream);
-    if (op->args[1].dtype().lanes() > 1) {
-      this->stream << ", POS_LOWEST";
-    }
-    this->stream << ", " << mode << ");\n";
+    ICHECK_EQ(op->args.size(), 3);
+    DataType elem = op->dtype.element_of();
+    os << "simd_inst::vdup<";
+    PrintType(elem, os);
+    os << ">(";
+    PrintExpr(op->args[0], os); // scalar
+    os << ", ";
+    PrintExpr(op->args[1], os);                                   // mask
+    os << ", " << Downcast<StringImm>(op->args[2])->value << ")"; // mode
   }
-  // --- SimdVF cast: CCE vcvt overload selected by dst/src vector types ---
-  /*
-  f32 -> f16 : vcvt(dst, src, mask, ROUND, SATURATION, PART, MODE)
-  f16 -> f32 : vcvt(dst, src, mask, PART, MODE)
-  f32 -> i32 : vcvt(dst, src, mask, ROUND, SATURATION, MODE)
-  i32 -> f32 : vcvt(dst, src, mask, ROUND, MODE)
-  f32 -> f8  : vcvt(dst, src, mask, ROUND, SATURATION, PART, MODE)
-  f8  -> f32 : vcvt(dst, src, mask, PART, MODE)
-  f16 -> f8  : vcvt(dst, src, mask, ROUND, SATURATION, PART, MODE)
-  f8  -> f16 : not supported
-  */
+  // --- SimdVF cast: (src, mask, ...extra) ---
   else if (op->op.same_as(tl::simd_vcvt())) {
-    ICHECK(op->args.size() >= 5 && op->args.size() <= 7);
-    this->PrintIndent();
-    this->stream << "vcvt(";
-    this->PrintExpr(op->args[0], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[1], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[2], this->stream);
-    for (int i = 3; i < static_cast<int>(op->args.size()); ++i) {
-      this->stream << ", ";
-      this->stream << Downcast<StringImm>(op->args[i])->value;
+    ICHECK(op->args.size() >= 4 && op->args.size() <= 6);
+    DataType elem = op->dtype.element_of();
+    os << "simd_inst::vcvt<";
+    PrintType(elem, os);
+    os << ">(";
+    PrintExpr(op->args[0], os); // src
+    os << ", ";
+    PrintExpr(op->args[1], os); // mask
+    for (int i = 2; i < static_cast<int>(op->args.size()); ++i) {
+      os << ", " << Downcast<StringImm>(op->args[i])->value;
     }
-    this->stream << ");\n";
+    os << ")";
   }
-  // --- SimdVF vexpdif: (dst, src0, src1, mask, part) ---
+  // --- SimdVF vexpdif: (src0, src1, mask, part) ---
   else if (op->op.same_as(tl::simd_vexpdif())) {
-    ICHECK_EQ(op->args.size(), 5);
-    int part = (int)Downcast<IntImm>(op->args[4])->value;
-    os << "vexpdif(";
-    this->PrintExpr(op->args[0], os);
+    ICHECK_EQ(op->args.size(), 4);
+    int part = (int)Downcast<IntImm>(op->args[3])->value;
+    os << "simd_inst::vexpdif(";
+    PrintExpr(op->args[0], os); // src0
     os << ", ";
-    this->PrintExpr(op->args[1], os);
+    PrintExpr(op->args[1], os); // src1
     os << ", ";
-    this->PrintExpr(op->args[2], os);
-    os << ", ";
-    this->PrintExpr(op->args[3], os);
+    PrintExpr(op->args[2], os); // mask
     os << ", " << (part == 0 ? "PART_EVEN" : "PART_ODD") << ")";
   }
-  // --- SimdVF sel: (dst, src0, src1, mask, mode) ---
+  // --- SimdVF sel: (src0, src1, mask, mode) ---
   else if (op->op.same_as(tl::simd_vsel())) {
-    ICHECK_EQ(op->args.size(), 5);
-    this->PrintIndent();
-    this->stream << "vsel(";
-    this->PrintExpr(op->args[0], this->stream);
-    for (int i = 1; i < 4; ++i) {
-      this->stream << ", ";
-      this->PrintExpr(op->args[i], this->stream);
-    }
-    this->stream << ", " << Downcast<StringImm>(op->args[4])->value << ");\n";
+    ICHECK_EQ(op->args.size(), 4);
+    os << "simd_inst::vsel(";
+    PrintExpr(op->args[0], os); // src0
+    os << ", ";
+    PrintExpr(op->args[1], os); // src1
+    os << ", ";
+    PrintExpr(op->args[2], os);                                   // mask
+    os << ", " << Downcast<StringImm>(op->args[3])->value << ")"; // mode
   } else if (op->op.same_as(tl::simd_mem_bar())) {
     std::string mem_type_str = Downcast<StringImm>(op->args[0])->value;
     this->PrintIndent();
-    this->stream << "mem_bar(" << mem_type_str << ");\n";
+    this->stream << "simd_inst::mem_bar(" << mem_type_str << ");\n";
   } else if (op->op.same_as(tl::loop_break())) {
     this->PrintIndent();
     this->stream << "break;\n";
@@ -1623,7 +1598,7 @@ void CodeGenTileLangAscend::VisitStmt_(const AllocateNode *op) {
 }
 
 void CodeGenTileLangAscend::VisitStmt_(const tir::LetStmtNode *op) {
-  // Inside SimdVF body: special handling for simd_pset / simd_alloc.
+  // Inside SimdVF body: special handling for simd_pset.
   if (inside_simdvf_body_) {
     std::string vid = AllocVarID(op->var.get());
     if (const auto *call = op->value.as<CallNode>()) {
@@ -1640,11 +1615,13 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::LetStmtNode *op) {
         PrintStmt(op->body);
         return;
       }
-      // simd_alloc -> vector_<T> vid; (type from Var's DataType)
-      if (call->op.same_as(tl::simd_alloc())) {
-        DataType elem = op->var.dtype().element_of();
-        PrintIndent();
-        stream << "vector_" << CCEVectorSuffix(elem) << " " << vid << ";\n";
+      // pair_get(pair, idx) → inline as pair.vN, no auto decl
+      if (call->op.same_as(tl::simd_pair_get())) {
+        int idx = (int)Downcast<IntImm>(call->args[1])->value;
+        std::ostringstream tmp;
+        PrintExpr(call->args[0], tmp);
+        tmp << (idx == 0 ? ".v0" : ".v1");
+        var_idmap_[op->var.get()] = tmp.str();
         PrintStmt(op->body);
         return;
       }
