@@ -143,9 +143,3 @@ using fp8_e5_8_t = uint64_t;
 using fp8_e8_2_t = uint16_t;
 using fp8_e8_4_t = uint32_t;
 using fp8_e8_8_t = uint64_t;
-
-using fp8_e4_16_t = uint4;
-
-using fp8_e5_16_t = uint4;
-
-using fp8_e8_16_t = uint4;

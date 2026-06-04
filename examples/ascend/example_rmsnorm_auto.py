@@ -14,6 +14,7 @@ Performance (fp32, batch=4096, HBM peak 1600 GB/s):
 import tilelang
 import tilelang.language as T
 import torch
+from tilelang.profiler import do_bench
 
 
 def rms_norm_fwd(batch, d, dtype="float32"):
@@ -117,15 +118,12 @@ if __name__ == "__main__":
 
         # Benchmark
         N_ITERS = 20
-        t0 = torch.npu.Event(enable_timing=True)
-        t1 = torch.npu.Event(enable_timing=True)
-        t0.record()
-        for _ in range(N_ITERS):
-            kernel(x_flat, weight, eps)
-        t1.record()
-        torch.npu.synchronize()
 
-        elapsed_us = t0.elapsed_time(t1) * 1e3 / N_ITERS
+        def run_kernel(kernel=kernel, x_flat=x_flat, weight=weight, eps=eps):
+            return kernel(x_flat, weight, eps)
+
+        latency_ms = do_bench(run_kernel, backend="msprof", _n_warmup=30, _n_repeat=N_ITERS)
+        elapsed_us = latency_ms * 1e3
         total_bytes = batch * d * 4 * 2 + d * 4 + batch * 4
         bw_gbs = total_bytes / (elapsed_us * 1e-6) / 1e9
         print(f"  {elapsed_us:.1f} us  {bw_gbs:.0f} GB/s  {ok}")

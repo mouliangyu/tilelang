@@ -1,5 +1,6 @@
 import tilelang
 import tilelang.language as T
+from tilelang.profiler import do_bench
 
 
 def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", hf32=None):
@@ -98,14 +99,10 @@ if __name__ == "__main__":
         print(f"  {'PASS' if max_diff < thresh else 'FAIL'}  max_diff={max_diff:.2e}")
 
         NUM_REPEATS = 100 if dt == "bfloat16" else 50
-        t0 = torch.npu.Event(enable_timing=True)
-        t1 = torch.npu.Event(enable_timing=True)
-        t0.record()
-        for _ in range(NUM_REPEATS):
-            kernel(x, w)
-        t1.record()
-        torch.npu.synchronize()
-        ms = t0.elapsed_time(t1)
-        flops = 2.0 * M * N * K * NUM_REPEATS
-        tf = flops / (ms / 1e3) / 1e12
-        print(f"  {ms / NUM_REPEATS:.3f} ms/iter  |  {tf:.1f} TFLOPS")
+
+        def run_kernel(kernel=kernel, x=x, w=w):
+            return kernel(x, w)
+
+        latency_ms = do_bench(run_kernel, backend="msprof", _n_warmup=30, _n_repeat=NUM_REPEATS)
+        flops = 2.0 * M * N * K
+        print(f"  {latency_ms:.3f} ms/iter  |  {flops / (latency_ms / 1e3) / 1e12:.1f} TFLOPS")

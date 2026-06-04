@@ -1,6 +1,6 @@
 import tilelang
 import tilelang.language as T
-from bench import bench_msprof
+from tilelang.profiler import do_bench
 
 
 def gemm(M_DIM=256, N_DIM=7168, K_DIM=2048, TILE_M=256, TILE_N=224, TILE_K=128, NUM_STAGES=2):
@@ -70,8 +70,8 @@ if __name__ == "__main__":
     max_diff = torch.max(torch.abs(c - expected)).item()
     print(f"  {'PASS' if max_diff < 1e-2 else 'FAIL'}  max_diff={max_diff:.2e}")
 
-    prof = bench_msprof(lambda: kernel(x, w), kernel_names="main")
-    us = prof.dur_us
+    latency_ms = do_bench(lambda: kernel(x, w), backend="msprof", _n_warmup=30, _n_repeat=100)
+    us = latency_ms * 1e3
     flops = 2.0 * M * N * K
     tf = flops / (us / 1e6) / 1e12
     print(f"  {us:.1f} us  |  {tf:.1f} TFLOPS")

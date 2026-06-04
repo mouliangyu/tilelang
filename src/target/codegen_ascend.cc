@@ -112,14 +112,9 @@ static std::string GetAscendFP8Type(DataType type) {
     vec = "_4";
   } else if (lanes == 8) {
     vec = "_8";
-  } else if (lanes == 16) {
-    vec = "_16";
-  } else if (lanes == 32) {
-    vec = "_32";
   } else {
-    LOG(FATAL)
-        << "Only support scalar and vector types of width (2, 4, 8, 16, 32) "
-           "for Ascend fp8";
+    LOG(FATAL) << "Only support scalar and vector types of width (2, 4, 8) for "
+                  "Ascend fp8";
   }
   if (type.is_float8_e4m3() || type.is_float8_e4m3fn()) {
     stream << "fp8_e4" << vec << "_t";
@@ -1959,11 +1954,13 @@ void CodeGenTileLangAscend::PrintVecElemLoad(const std::string &vec, DataType t,
     return;
   }
   static const char access[] = {'x', 'y', 'z', 'w'};
-  ICHECK(i >= 0 && i < t.lanes() && i < 128 / t.bits())
-      << "Ascend " << t << " vector lanes max " << (128 / t.bits())
+  ICHECK(i >= 0 && i < t.lanes() && i < 64 / t.bits())
+      << "Ascend " << t << " vector lanes max " << (64 / t.bits())
       << ": i=" << i << " t.bits()=" << t.bits() << " t.lanes()=" << t.lanes();
   if (t.is_float16()) {
-    os << "((half2*)(&(" << vec << "." << access[i / 2] << ")))->"
+    os << "((half2*)(&(" << vec << ")))[" << (i / 2) << "]." << access[i % 2];
+  } else if (t.is_bfloat16()) {
+    os << "((bfloat16x2_t*)(&(" << vec << ")))[" << (i / 2) << "]."
        << access[i % 2];
   } else if (t.lanes() <= 4) {
     os << vec << "." << access[i];
@@ -1977,11 +1974,14 @@ void CodeGenTileLangAscend::PrintVecElemStore(const std::string &vec,
                                               const std::string &value) {
   this->PrintIndent();
   static const char access[] = {'x', 'y', 'z', 'w'};
-  ICHECK(i >= 0 && i < t.lanes() && i < 128 / t.bits())
-      << "Ascend " << t << " vector lanes max " << (128 / t.bits())
+  ICHECK(i >= 0 && i < t.lanes() && i < 64 / t.bits())
+      << "Ascend " << t << " vector lanes max " << (64 / t.bits())
       << ": i=" << i << " t.bits()=" << t.bits() << " t.lanes()=" << t.lanes();
   if (t.is_float16()) {
-    stream << "((half2*)(&(" << vec << "." << access[i / 2] << ")))->"
+    stream << "((half2*)(&(" << vec << ")))[" << (i / 2) << "]."
+           << access[i % 2] << " = " << value << ";\n";
+  } else if (t.is_bfloat16()) {
+    stream << "((bfloat16x2_t*)(&(" << vec << ")))[" << (i / 2) << "]."
            << access[i % 2] << " = " << value << ";\n";
   } else if (t.lanes() <= 4) {
     stream << vec << "." << access[i] << " = " << value << ";\n";
@@ -1995,7 +1995,8 @@ void CodeGenTileLangAscend::PrintVecBinaryOp(const std::string &op, DataType t,
                                              std::ostream &os) {
   // Only scalarize float4 division; other vector binary ops fall through
   // to the base CodeGenC implementation.
-  if (op != "/" || t.lanes() <= 1) {
+  // TODO add support for fp16x4 since it becomes uint2
+  if ((op != "/" || t.lanes() <= 1) && !(t.is_float16() || t.is_bfloat16())) {
     CodeGenC::PrintVecBinaryOp(op, t, lhs, rhs, os);
     return;
   }
@@ -2004,19 +2005,29 @@ void CodeGenTileLangAscend::PrintVecBinaryOp(const std::string &op, DataType t,
   this->PrintIndent();
   this->PrintType(t, stream);
   stream << ' ' << sret << ";\n";
+  int ssa_scope = BeginScope();
   {
     std::string vlhs = SSAGetID(PrintExpr(lhs), lhs.dtype());
     std::string vrhs = SSAGetID(PrintExpr(rhs), rhs.dtype());
     for (int i = 0; i < t.lanes(); ++i) {
       std::ostringstream value_temp;
-      value_temp << "(";
-      PrintVecElemLoad(vlhs, lhs.dtype(), i, value_temp);
-      value_temp << " / ";
-      PrintVecElemLoad(vrhs, rhs.dtype(), i, value_temp);
-      value_temp << ")";
+      if (isalpha(op[0])) {
+        value_temp << op << "(";
+        PrintVecElemLoad(vlhs, lhs.dtype(), i, value_temp);
+        value_temp << ", ";
+        PrintVecElemLoad(vrhs, rhs.dtype(), i, value_temp);
+        value_temp << ")";
+      } else {
+        value_temp << "(";
+        PrintVecElemLoad(vlhs, lhs.dtype(), i, value_temp);
+        value_temp << op;
+        PrintVecElemLoad(vrhs, rhs.dtype(), i, value_temp);
+        value_temp << ")";
+      }
       PrintVecElemStore(sret, t, i, value_temp.str());
     }
   }
+  EndScope(ssa_scope);
   os << sret;
 }
 

@@ -1,5 +1,6 @@
 import tilelang
 import tilelang.language as T
+from tilelang.profiler import do_bench
 
 
 def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
@@ -140,15 +141,6 @@ if __name__ == "__main__":
         raise AssertionError(f"Results mismatch! Max diff: {max_diff}")
 
     # Benchmark
-    t0 = torch.npu.Event(enable_timing=True)
-    t1 = torch.npu.Event(enable_timing=True)
-    t0.record()
-    for _ in range(NUM_REPEATS):
-        c = kernel(x, w)
-    t1.record()
-    torch.npu.synchronize()
-
-    ms = t0.elapsed_time(t1)
-    flops = 2.0 * M_DIM * N_DIM * K_DIM * NUM_REPEATS
-    ref = flops / (ms / 1e3) / 1e12
-    print(f"{ms / 1e3:.1f}s total  |  {ms / NUM_REPEATS:.3f} ms/iter  |  {ref:.1f} TFLOPS")
+    latency_ms = do_bench(lambda: kernel(x, w), backend="msprof", _n_warmup=30, _n_repeat=NUM_REPEATS)
+    flops = 2.0 * M_DIM * N_DIM * K_DIM
+    print(f"{latency_ms:.3f} ms/iter  |  {flops / (latency_ms / 1e3) / 1e12:.1f} TFLOPS")

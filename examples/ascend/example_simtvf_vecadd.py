@@ -1,8 +1,10 @@
 import tilelang
 import tilelang.language as T
 
+from tilelang.profiler import do_bench
 
-def vector_add(N):
+
+def vector_add(N, dtype="float32"):
     NUM_BLOCKS = 64  # AI cores
     NUM_THREADS = 2048  # SIMT threads per core
     TILE_ELEMS = NUM_THREADS * 4  # 8192 floats = 32 KB per tile
@@ -12,9 +14,9 @@ def vector_add(N):
 
     @T.prim_func
     def main(
-        A: T.Buffer((N,), "float32"),
-        B: T.Buffer((N,), "float32"),
-        C: T.Buffer((N,), "float32"),
+        A: T.Buffer((N,), dtype),
+        B: T.Buffer((N,), dtype),
+        C: T.Buffer((N,), dtype),
     ):
         with T.Kernel(NUM_BLOCKS) as bx:
             temp1 = T.alloc_shared(
@@ -22,21 +24,21 @@ def vector_add(N):
                     NUM_STAGES,
                     TILE_ELEMS,
                 ),
-                "float32",
+                dtype,
             )
             temp2 = T.alloc_shared(
                 (
                     NUM_STAGES,
                     TILE_ELEMS,
                 ),
-                "float32",
+                dtype,
             )
             temp3 = T.alloc_shared(
                 (
                     NUM_STAGES,
                     TILE_ELEMS,
                 ),
-                "float32",
+                dtype,
             )
 
             for f in range(NUM_STAGES):
@@ -77,18 +79,17 @@ def ref_program(a, b):
     return a + b
 
 
-NUM_REPEATS = 10
-
 if __name__ == "__main__":
     import torch
 
     N = 2**30
     dtype = torch.float32
+    tl_dtype = "float32"
     device = torch.device("npu")
 
     # Create and compile kernel
-    print(f"Compiling vector_add kernel (N={N})...")
-    program = vector_add(N)
+    print(f"Compiling vector_add kernel (N={N}, dtype={tl_dtype})...")
+    program = vector_add(N, tl_dtype)
     kernel = tilelang.compile(program, out_idx=-1, pass_configs={tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False})
     print("Compilation succeeded!")
 
@@ -113,14 +114,8 @@ if __name__ == "__main__":
     print("\nVerification passed!")
 
     # Benchmark
-    t0 = torch.npu.Event(enable_timing=True)
-    t1 = torch.npu.Event(enable_timing=True)
-    t0.record()
-    for _ in range(NUM_REPEATS):
+    def run_kernel_only():
         kernel(a, b)
-    t1.record()
-    torch.npu.synchronize()
 
-    ms = t0.elapsed_time(t1)
-    total_gb = N * 4 * 3 * NUM_REPEATS / 1e9
-    print(f"{ms:.1f} ms  |  {ms / NUM_REPEATS:.1f} ms/iter  |  {total_gb / (ms / 1e3):.1f} GB/s")
+    latency_ms = do_bench(run_kernel_only, backend="msprof", _n_warmup=30, _n_repeat=100)
+    print(f"{latency_ms:.1f} ms/iter  |  {(N * a.element_size() * 3) / (latency_ms / 1e3) / 1e9:.1f} GB/s")

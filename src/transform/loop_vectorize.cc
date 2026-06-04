@@ -167,17 +167,18 @@ public:
       : arith::IRMutatorWithAnalyzer(analyzer), layout_map_(layout_map) {}
 
   int Plan(const For &node) {
+    Target target = Target::Current(false);
     bool disable_vectorize_256 = tl_config::Vectorize256Disabled();
     bool verbose = tl_config::VectorizePlannerVerboseEnabled();
+    int default_vector_load_bits = TargetIsAscend(target) ? 64 : 128;
 
-    if (TargetSupportVectorize256(Target::Current(false)) &&
-        !disable_vectorize_256 &&
+    if (TargetSupportVectorize256(target) && !disable_vectorize_256 &&
         VectorizeFindMemoryAccess::MaySupportVectorize256(node)) {
       vector_load_bits_max_ = initial_vector_size_ = loop_extent_vector_size_ =
           256;
     } else {
       vector_load_bits_max_ = initial_vector_size_ = loop_extent_vector_size_ =
-          128;
+          default_vector_load_bits;
     }
 
     // Check if For body contains SeqStmt (multiple statements).
@@ -655,9 +656,6 @@ private:
     int min_vec_size = arith::ZeroAwareGCD(
         buffer_vec_size,
         vector_load_bits_max_ / (buffer->dtype.bits() * buffer->dtype.lanes()));
-    if (buffer->dtype.is_bfloat16()) {
-      min_vec_size = arith::ZeroAwareGCD(min_vec_size, 2);
-    }
     bool is_invariant = false;
     int try_vec_size = buffer_vec_size;
     while (try_vec_size >= min_vec_size) {

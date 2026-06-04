@@ -9,6 +9,7 @@ Note: T.SimdVF() can only access UBuf (shared memory), not GM.
 
 import tilelang
 import tilelang.language as T
+from tilelang.profiler import do_bench
 
 
 def mem_bar_demo(N):
@@ -105,12 +106,5 @@ if __name__ == "__main__":
     status = "PASS" if max_diff == 0 else f"FAIL (max diff={max_diff:.6f})"
     print(f"Verification: {status}")
 
-    t0 = torch.npu.Event(enable_timing=True)
-    t1 = torch.npu.Event(enable_timing=True)
-    t0.record()
-    for _ in range(NUM_REPEATS):
-        kernel(a, b)
-    t1.record()
-    torch.npu.synchronize()
-    ms = t0.elapsed_time(t1)
-    print(f"{ms:.1f} ms  |  {ms / NUM_REPEATS:.1f} ms/iter")
+    latency_ms = do_bench(lambda: kernel(a, b), backend="msprof", _n_warmup=30, _n_repeat=NUM_REPEATS)
+    print(f"{latency_ms:.1f} ms/iter")

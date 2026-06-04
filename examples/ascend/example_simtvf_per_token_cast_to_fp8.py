@@ -4,7 +4,7 @@ import tilelang.language as T
 from typing import Tuple
 from tilelang.utils.tensor import torch_assert_close
 
-from bench import bench
+from tilelang.profiler import do_bench
 
 
 @tilelang.jit(
@@ -118,9 +118,7 @@ def run_regression_perf(M=8192, N=8192):
     def run_kernel_only():
         kernel(x)
 
-    profile = bench(run_kernel_only)
-    print(profile)
-    latency_ms = profile.dur_us / 1e3
+    latency_ms = do_bench(run_kernel_only, backend="msprof", _n_warmup=30, _n_repeat=100)
     print_latency_bandwidth("Tile-lang", latency_ms, io_gb)
     return latency_ms
 

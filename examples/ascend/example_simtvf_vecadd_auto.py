@@ -1,5 +1,6 @@
 import tilelang
 import tilelang.language as T
+from tilelang.profiler import do_bench
 
 
 def vector_add(N):
@@ -29,6 +30,7 @@ def vector_add(N):
                 (TILE_ELEMS,),
                 "float32",
             )
+            T.annotate_buffer_versions({temp1: NUM_STAGES, temp2: NUM_STAGES, temp3: NUM_STAGES})
 
             for iter in T.Pipelined(TOTAL_TILES, num_stages=NUM_STAGES):
                 begin = (iter * NUM_BLOCKS + bx) * TILE_ELEMS
@@ -49,7 +51,7 @@ def ref_program(a, b):
     return a + b
 
 
-NUM_REPEATS = 10
+NUM_REPEATS = 100
 
 if __name__ == "__main__":
     import torch
@@ -85,14 +87,5 @@ if __name__ == "__main__":
     print("\nVerification passed!")
 
     # Benchmark
-    t0 = torch.npu.Event(enable_timing=True)
-    t1 = torch.npu.Event(enable_timing=True)
-    t0.record()
-    for _ in range(NUM_REPEATS):
-        kernel(a, b)
-    t1.record()
-    torch.npu.synchronize()
-
-    ms = t0.elapsed_time(t1)
-    total_gb = N * 4 * 3 * NUM_REPEATS / 1e9
-    print(f"{ms:.1f} ms  |  {ms / NUM_REPEATS:.1f} ms/iter  |  {total_gb / (ms / 1e3):.1f} GB/s")
+    latency_ms = do_bench(lambda: kernel(a, b), backend="msprof", _n_warmup=30, _n_repeat=NUM_REPEATS)
+    print(f"{latency_ms:.1f} ms/iter  |  {(N * a.element_size() * 3) / (latency_ms / 1e3) / 1e9:.1f} GB/s")

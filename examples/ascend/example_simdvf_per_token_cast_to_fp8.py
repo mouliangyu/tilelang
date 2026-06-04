@@ -4,7 +4,7 @@ import tilelang.language as T
 from typing import Tuple
 from tilelang.utils.tensor import torch_assert_close
 
-from bench import bench
+from tilelang.profiler import do_bench
 
 
 @tilelang.jit(
@@ -16,6 +16,7 @@ def per_token_cast_to_fp8(M, N):
     fp8_max = 448.0
 
     N_CORES = 64
+    NUM_STAGES = 2
     num_groups = (N + group_size - 1) // group_size
 
     if num_groups >= 64 and num_groups % 64 == 0:
@@ -45,11 +46,12 @@ def per_token_cast_to_fp8(M, N):
                 N_CORES,
                 core_id,
                 group_size=1,
-                num_stages=2,
+                num_stages=NUM_STAGES,
             ):
                 y_ub = T.alloc_shared((blk_m, tile_n), dtype)
                 y_q_ub_fp8 = T.alloc_shared((blk_m, tile_n), T.float8_e4m3fn)
                 y_s_ub = T.alloc_shared((blk_m, group_block), dtype)
+                T.annotate_buffer_versions({y_ub: NUM_STAGES, y_q_ub_fp8: NUM_STAGES, y_s_ub: NUM_STAGES})
 
                 T.copy(X[row * blk_m : (row + 1) * blk_m, row_g_id * tile_n : (row_g_id + 1) * tile_n], y_ub)
                 with T.SimdVF():
@@ -156,9 +158,7 @@ def run_regression_perf(M=8192, N=8192):
     def run_kernel_only():
         kernel(x)
 
-    profile = bench(run_kernel_only)
-    print(profile)
-    latency_ms = profile.dur_us / 1e3
+    latency_ms = do_bench(run_kernel_only, backend="msprof", _n_warmup=30, _n_repeat=100)
     print_latency_bandwidth("Tile-lang", latency_ms, io_gb)
     return latency_ms
 
