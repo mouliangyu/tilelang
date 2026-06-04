@@ -22,7 +22,7 @@ from tilelang.jit.adapter import (
     TVMFFIKernelAdapter,
     MetalKernelAdapter,
 )
-from tilelang.profiler import Profiler, TensorSupplyType
+from tilelang.utils.tensor import TensorSupplyType
 from tilelang.utils.target import determine_target
 from tilelang.contrib import nvcc as tl_nvcc
 from tilelang.transform import PassConfigKey
@@ -418,7 +418,7 @@ class JITKernel(Generic[_P, _T]):
         """
         return cls(func=tilelang_func, **kwargs)
 
-    def get_profiler(self, tensor_supply_type: TensorSupplyType = TensorSupplyType.Auto) -> Profiler:
+    def get_profiler(self, tensor_supply_type: TensorSupplyType = TensorSupplyType.Auto):
         """
         Creates a profiler to benchmark the compiled runtime module.
 
@@ -432,6 +432,8 @@ class JITKernel(Generic[_P, _T]):
         Profiler
             A Profiler instance for benchmarking the runtime module.
         """
+        from tilelang.profiler import Profiler
+
         return Profiler(self.params, self.out_idx, tensor_supply_type).with_default_adapter(self.adapter)
 
     def get_kernel_source(self, kernel_only: bool = True) -> str:

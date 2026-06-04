@@ -117,5 +117,7 @@ if __name__ == "__main__":
     def run_kernel_only():
         kernel(a, b)
 
+    profile = do_bench(run_kernel_only, backend="msprof_detail", _n_warmup=30, _n_repeat=100)
+    print(profile)
     latency_ms = do_bench(run_kernel_only, backend="msprof", _n_warmup=30, _n_repeat=100)
     print(f"{latency_ms:.1f} ms/iter  |  {(N * a.element_size() * 3) / (latency_ms / 1e3) / 1e9:.1f} GB/s")
