@@ -29,6 +29,9 @@ public:
   void VisitExpr_(const tir::BufferLoadNode *op, std::ostream &os) final;
   void VisitStmt_(const tir::BufferStoreNode *op) final;
 
+  std::string GetBufferRef(DataType t, const BufferNode *buffer,
+                           PrimExpr index) final;
+
   // Vector element access (use .x/.y/.z/.w like CUDA, not .s0/.s1 from base)
   void PrintVecElemLoad(const std::string &vec, DataType t, int i,
                         std::ostream &os) final;

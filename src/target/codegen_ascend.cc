@@ -443,6 +443,14 @@ void CodeGenTileLangAscend::EmitVFFunction(const tir::BlockNode *op,
   for (const auto &kv : saved_var_idmap) {
     var_idmap_[kv.first] = kv.second;
   }
+  // Reserve all capture parameter names in the fresh NameSupply so that
+  // newly generated variables inside the VF body do not shadow them.
+  for (const auto &v : captures) {
+    auto it = var_idmap_.find(v.get());
+    std::string cap_name =
+        (it != var_idmap_.end()) ? it->second : std::string(v->name_hint);
+    name_supply_->ReserveName(cap_name, false);
+  }
   // Render body to temporary stream
   std::ostringstream saved_main_stream;
   stream.swap(saved_main_stream);
@@ -883,12 +891,12 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[6], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[7], this->stream);
-    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
+    if (op->args.size() >= 4 && op->args[3].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[3])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_gm_to_cbuf())) {
-    ICHECK_EQ(op->args.size(), 10)
-        << "tl.ascend_copy_gm_to_cbuf expects exactly 10 arguments";
+    ICHECK_EQ(op->args.size(), 11)
+        << "tl.ascend_copy_gm_to_cbuf expects exactly 11 arguments";
     // arg[9] is the transpose flag: 0 → nd2nz, nonzero → dn2nz
     const IntImmNode *transpose_node = op->args[9].as<IntImmNode>();
     bool use_dn2nz = transpose_node && transpose_node->value != 0;
@@ -899,7 +907,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     //   dstNzC0Stride = ceil(height/16)*16  where height = n_rows for nd2nz,
     //   inner_elems for dn2nz
     {
-      const IntImmNode *rows_node = op->args[5].as<IntImmNode>();
+      const IntImmNode *rows_node = op->args[10].as<IntImmNode>();
       const IntImmNode *inner_node = op->args[6].as<IntImmNode>();
       int n_rows_val = rows_node ? rows_node->value : 16;
       int inner_val = inner_node ? inner_node->value : 16;
@@ -933,8 +941,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
-    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
+    if (op->args.size() >= 4 && op->args[3].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[3])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_load_cbuf_to_ca())) {
     ICHECK_EQ(op->args.size(), 9)
@@ -950,8 +958,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
-    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
+    if (op->args.size() >= 4 && op->args[3].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[3])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_load_cbuf_to_cb())) {
     ICHECK_EQ(op->args.size(), 9)
@@ -967,8 +975,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
-    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
+    if (op->args.size() >= 4 && op->args[3].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[3])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_matrix_cc_to_ub())) {
     ICHECK_EQ(op->args.size(), 26)
@@ -984,8 +992,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
-    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
+    if (op->args.size() >= 4 && op->args[3].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[3])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_matrix_cc_to_gm())) {
     ICHECK_EQ(op->args.size(), 25)
@@ -1005,8 +1013,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
-    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
+    if (op->args.size() >= 4 && op->args[3].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[3])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_ubuf_to_cbuf())) {
     ICHECK_EQ(op->args.size(), 7)
@@ -1022,8 +1030,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
-    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
+    if (op->args.size() >= 4 && op->args[3].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[3])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_nd2nz_scatter())) {
     // ascend_nd2nz_scatter(src_ub, tmp_ub, rows, cols,
@@ -1104,8 +1112,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
-    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
+    if (op->args.size() >= 4 && op->args[3].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[3])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_gemm_l1())) {
     // ascend_gemm_l1(cc_ptr, cbuf_a_ptr, cbuf_b_ptr, M, K, N, tile_k_sub,
@@ -1132,8 +1140,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[8], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[10], this->stream);
-    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
+    if (op->args.size() >= 4 && op->args[3].as<StringImmNode>())
+      this->stream << ", " << Downcast<StringImm>(op->args[3])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tir::builtin::address_of())) {
     const auto *load = op->args[0].as<tir::BufferLoadNode>();
@@ -1235,11 +1243,15 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     os << ", " << Downcast<StringImm>(op->args[2])->value; // mode
     os << ")";
   }
-  // --- SimdVF cross-lane reduce: (src, mask, mode) ---
+  // --- SimdVF cross-lane reduce with vcgadd addition ---
   else if (op->op.same_as(tl::simd_vcmax()) ||
-           op->op.same_as(tl::simd_vcadd())) {
+           op->op.same_as(tl::simd_vcadd()) ||
+           op->op.same_as(tl::simd_vcgadd())) {
     ICHECK_EQ(op->args.size(), 3);
-    const char *name = op->op.same_as(tl::simd_vcmax()) ? "vcmax" : "vcadd";
+    const char *name =
+        op->op.same_as(tl::simd_vcmax())
+            ? "vcmax"
+            : (op->op.same_as(tl::simd_vcgadd()) ? "vcgadd" : "vcadd");
     os << "simd_inst::" << name << "(";
     PrintExpr(op->args[0], os); // src
     os << ", ";
@@ -1284,6 +1296,24 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     PrintExpr(op->args[1], os);                                   // mask
     os << ", " << Downcast<StringImm>(op->args[2])->value;        // pos
     os << ", " << Downcast<StringImm>(op->args[3])->value << ")"; // mode
+  }
+  // --- SimdVF gather 32B blocks: (base, index [, mask]) ---
+  else if (op->op.same_as(tl::simd_vgatherb())) {
+    ICHECK(op->args.size() == 2 || op->args.size() == 3);
+    DataType elem = op->dtype.element_of();
+    os << "simd_inst::vgatherb<";
+    PrintType(elem, os);
+    os << ">((" << "__ubuf__" << " ";
+    PrintType(elem, os);
+    os << "*)";
+    PrintExpr(op->args[0], os); // base
+    os << ", ";
+    PrintExpr(op->args[1], os); // index
+    if (op->args.size() == 3) {
+      os << ", ";
+      PrintExpr(op->args[2], os); // mask
+    }
+    os << ")";
   }
   // --- SimdVF load: (addr, dist [, offset]) ---
   else if (op->op.same_as(tl::simd_vld())) {
@@ -1336,6 +1366,22 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     PrintExpr(op->args[2], this->stream); // mask
     if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
       this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
+    this->stream << ");\n";
+  }
+
+  // --- SimdVF scatter-store blocks: (src, base, stride, mask) ---
+  else if (op->op.same_as(tl::simd_vsstb())) {
+    ICHECK_EQ(op->args.size(), 4);
+    DataType dtype = op->args[0].dtype().element_of();
+    this->PrintIndent();
+    this->stream << "simd_inst::vsstb(";
+    PrintExpr(op->args[0], this->stream); // src
+    this->stream << ", (__ubuf__ " << CCEUBufType(dtype) << "*)";
+    PrintExpr(op->args[1], this->stream); // base
+    this->stream << ", ";
+    PrintExpr(op->args[2], this->stream); // stride
+    this->stream << ", ";
+    PrintExpr(op->args[3], this->stream); // mask
     this->stream << ");\n";
   }
   // --- SimdVF scalar-vector ops: (src, scalar, mask, mode) ---
@@ -1589,6 +1635,29 @@ void CodeGenTileLangAscend::VisitStmt_(const AllocateNode *op) {
     stream << " *)0;\n";
     alloc_storage_scope_[op->buffer_var.get()] = scope;
     RegisterHandleType(op->buffer_var.get(), dtype);
+    this->PrintStmt(op->body);
+    return;
+  }
+
+  if (scope == "local.var") {
+    ICHECK_EQ(op->ConstantAllocationSize(), 1U) << "local.var should be scalar";
+    std::string vid = AllocVarID(op->buffer_var.get());
+    PrimExpr init = tir::make_const(op->dtype, 0);
+    auto init_it = op->annotations.find(tl::attr::kLocalVarInit);
+    if (init_it != op->annotations.end()) {
+      PrimExpr user_init = Downcast<PrimExpr>((*init_it).second);
+      if (!user_init.dtype().is_void() && user_init.dtype() != op->dtype) {
+        user_init = tir::Cast(op->dtype, user_init);
+      }
+      init = user_init;
+    }
+    PrintIndent();
+    PrintType(op->dtype, stream);
+    stream << " " << vid << " = ";
+    PrintExpr(init, stream);
+    stream << ";\n";
+    alloc_storage_scope_[op->buffer_var.get()] = scope;
+    RegisterHandleType(op->buffer_var.get(), op->dtype);
     this->PrintStmt(op->body);
     return;
   }
@@ -1965,6 +2034,20 @@ void CodeGenTileLangAscend::PrintVecElemStore(const std::string &vec,
   } else {
     stream << "((" << vec << ")." << access[i / 2] << ") = " << value << ";\n";
   }
+}
+
+std::string CodeGenTileLangAscend::GetBufferRef(DataType t,
+                                                const BufferNode *buffer,
+                                                PrimExpr index) {
+  const VarNode *buffer_var = buffer->data.get();
+  std::string scope;
+  if (alloc_storage_scope_.count(buffer_var)) {
+    scope = alloc_storage_scope_.at(buffer_var);
+  }
+  if (scope == "local.var") {
+    return GetVarID(buffer_var);
+  }
+  return CodeGenC::GetBufferRef(t, buffer, index);
 }
 
 void CodeGenTileLangAscend::PrintVecBinaryOp(const std::string &op, DataType t,

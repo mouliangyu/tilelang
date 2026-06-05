@@ -277,13 +277,19 @@ def _to_int32(v):
     return tir.IntImm("int32", v) if isinstance(v, int) else v
 
 
-def ascend_copy_gm_to_cbuf(dst, src, sid, loop1_src_stride, l2_cache_ctrl, n_value, d_value, loop4_src_stride, smallc0_en) -> None:
+def ascend_copy_gm_to_cbuf(
+    dst, src, sid, loop1_src_stride, l2_cache_ctrl, n_value, d_value, loop4_src_stride, smallc0_en, dst_n_value=None
+) -> None:
     """Ascend DMA copy from GM to CBuf (L1).
 
     Generates: copy_gm_to_cbuf_multi_nd2nz(dst, src, sid,
     loop1_src_stride, l2_cache_ctrl, n_value, d_value, loop4_src_stride, smallc0_en);
     """
-    args = [dst, src] + [_to_int32(a) for a in [sid, loop1_src_stride, l2_cache_ctrl, n_value, d_value, loop4_src_stride, smallc0_en]]
+    if dst_n_value is None:
+        dst_n_value = n_value
+    args = [dst, src] + [
+        _to_int32(a) for a in [sid, loop1_src_stride, l2_cache_ctrl, n_value, d_value, loop4_src_stride, smallc0_en, dst_n_value]
+    ]
     return tir.call_intrin("void", tir.op.Op.get("tl.ascend_copy_gm_to_cbuf"), *args)
 
 
@@ -371,8 +377,28 @@ def ascend_copy_ubuf_to_cbuf(dst, src, sub_blockid, burst_num, burst_len, src_ga
     Generates: copy_ubuf_to_cbuf(dst, src, sub_blockid, burst_num,
     burst_len, src_gap, dst_gap);
     """
+    from tvm.tir import BufferLoad
+    from tilelang.language.builtin import access_ptr
+
+    if isinstance(dst, BufferLoad):
+        dst = access_ptr(dst, "w")
+    if isinstance(src, BufferLoad):
+        src = access_ptr(src, "r")
     args = [dst, src] + [_to_int32(a) for a in [sub_blockid, burst_num, burst_len, src_gap, dst_gap]]
     return tir.call_intrin("void", tir.op.Op.get("tl.ascend_copy_ubuf_to_cbuf"), *args)
+
+
+def ascend_nd2nz_post_copy(dst, src, rows, cols, full_rows, dst_dtype: str) -> None:
+    """Ascend ND->NZ post-copy from UB scratch to L1 with NZ pointer correction."""
+    from tvm.tir import BufferLoad
+    from tilelang.language.builtin import access_ptr
+
+    if isinstance(dst, BufferLoad):
+        dst = access_ptr(dst, "w")
+    if isinstance(src, BufferLoad):
+        src = access_ptr(src, "r")
+    args = [dst, src, _to_int32(rows), _to_int32(cols), _to_int32(full_rows), dst_dtype]
+    return tir.call_intrin("void", tir.op.Op.get("tl.ascend_nd2nz_post_copy"), *args)
 
 
 def ascend_get_buf(pipe, buf_id, mode=False):

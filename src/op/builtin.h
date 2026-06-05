@@ -539,6 +539,7 @@ TVM_DLL const Op &simd_pset();
 // -- Load / Store
 TVM_DLL const Op &simd_vld();
 TVM_DLL const Op &simd_vsts();
+TVM_DLL const Op &simd_vsstb();
 
 // -- Binary arithmetic
 TVM_DLL const Op &simd_vadd();
@@ -567,9 +568,11 @@ TVM_DLL const Op &simd_vdupv(); // 5-arg vector→vector lane-N broadcast
 // -- Cross-lane reduction
 TVM_DLL const Op &simd_vcadd();
 TVM_DLL const Op &simd_vcmax();
+TVM_DLL const Op &simd_vcgadd();
 
 // -- Register permutation
 TVM_DLL const Op &simd_vintlv();
+TVM_DLL const Op &simd_vgatherb();
 TVM_DLL const Op &simd_vdintlv();
 TVM_DLL const Op &simd_pair_get();
 TVM_DLL const Op &simd_vpack();

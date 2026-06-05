@@ -161,7 +161,7 @@ TIR_VAR_SCOPE_FRAME = (
 
 
 def is_var(v: Any) -> bool:
-    return isinstance(v, Buffer) and v.scope() == "local.var"
+    return isinstance(v, Buffer) and v.scope() in ("local.var", "local.simd.var")
 
 
 # phase1: eager jit obtain function signature

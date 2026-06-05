@@ -119,6 +119,8 @@ from .ascend import (
     ascend_cross_core_wait_flag,  # noqa: F401
     ascend_copy_gm_to_ubuf,  # noqa: F401
     ascend_copy_ubuf_to_gm,  # noqa: F401
+    ascend_copy_ubuf_to_cbuf,  # noqa: F401
+    ascend_nd2nz_post_copy,  # noqa: F401
     ascend_reduce_add,  # noqa: F401
     ascend_reduce_max,  # noqa: F401
     ascend_reduce_min,  # noqa: F401

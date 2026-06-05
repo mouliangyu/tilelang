@@ -975,15 +975,22 @@ Stmt CopyNode::LowerAscendDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
     }
   } else if (dma_path == 2) {
     PrimExpr transpose_flag = I(this->GetTranspose());
+    size_t dst_ndim = dst_range.size();
+    PrimExpr dst_inner_elems = dst_range[dst_ndim - 1]->extent;
+    PrimExpr dst_n_rows = I(1);
+    for (size_t i = 0; i + 1 < dst_ndim; ++i) {
+      dst_n_rows = dst_n_rows * dst_range[i]->extent;
+    }
     // For dn2nz (transpose): SDK expects nValue=width(cols),
     // dValue=height(rows) which is the reverse of nd2nz where
     // nValue=height(rows), dValue=width(cols).
     PrimExpr n_value = (this->GetTranspose()) ? inner_elems : n_rows;
     PrimExpr d_value = (this->GetTranspose()) ? n_rows : inner_elems;
+    PrimExpr dst_n_value = dst_n_rows;
     call = Call(DataType::Void(), ascend_copy_gm_to_cbuf(),
                 {dst_ptr, src_ptr, sid, src_row_stride_bytes,
                  I(this->GetL2CacheCtrl()), n_value, d_value, zero, zero,
-                 transpose_flag});
+                 transpose_flag, dst_n_value});
   } else if (dma_path == 3 || dma_path == 4) {
     // L1 -> L0A/L0B: fractal-addressed load
     // K offset handled by kStartPosition param, not in src pointer.
@@ -1291,9 +1298,8 @@ Stmt CopyNode::LowerTmemCopy(const LowerArgs &T,
   } else if (src.scope() == "shared.dyn" && dst.scope() == "shared.tmem") {
     is_cp = true;
   } else {
-    LOG(FATAL) << "Unsupported tensor memory copy: "
-               << "src scope = " << src.scope()
-               << ", dst scope = " << dst.scope();
+    LOG(FATAL) << "Unsupported tensor memory copy: " << "src scope = "
+               << src.scope() << ", dst scope = " << dst.scope();
   }
   // Currently tcgen05.cp is not supported
   // TODO (mzw) Support tcgen05.cp

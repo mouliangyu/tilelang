@@ -5,6 +5,7 @@ Function names match the underlying CCE intrinsics directly.
 
 from tvm import tir
 from tvm.tir import BufferLoad
+from tvm.script import tir as T
 
 from tilelang.language.builtin import access_ptr
 
@@ -69,6 +70,11 @@ def pset(elem_width: int, dist: str = "PAT_ALL"):
     return tir.call_intrin("boolx256", _Op("tl.simd.pset"), elem_width, dist)
 
 
+def alloc_var(dtype: str):
+    """Allocate a mutable SIMD variable for return-value style SIMD code."""
+    return T.alloc_buffer([1], _vec_dtype(dtype), scope="local.var")
+
+
 # -- Data movement ---------------------------------------------------------------
 
 
@@ -120,6 +126,14 @@ def vsts(addr, src, mask, dist="NORM_B32", off=None):
     if off is not None:
         args.append(off)
     return tir.call_intrin("void", _Op("tl.simd.vsts"), *args)
+
+
+def vsstb(src, base, stride, mask):
+    """Scatter-store 32B blocks with block stride: vsstb(src, base, stride, mask)."""
+    if isinstance(base, BufferLoad):
+        elem_dtype = str(base.buffer.dtype)
+        base = access_ptr(base, "w", extent=_vreg_lanes(_elem_bits(elem_dtype)))
+    return tir.call_intrin("void", _Op("tl.simd.vsstb"), src, base, stride, mask)
 
 
 # -- Binary arithmetic ------------------------------------------------------------
@@ -225,6 +239,11 @@ def vcmax(src, mask, mode="MODE_ZEROING"):
     return tir.call_intrin(str(src.dtype), _Op("tl.simd.vcmax"), src, mask, mode)
 
 
+def vcgadd(src, mask, mode="MODE_ZEROING"):
+    """Grouped add reduction: dst = vcgadd(src, mask)."""
+    return tir.call_intrin(str(src.dtype), _Op("tl.simd.vcgadd"), src, mask, mode)
+
+
 # -- Register permutation ---------------------------------------------------------
 
 
@@ -264,6 +283,22 @@ def vpack(src, part=0):
     dst_elem = pack_map.get(src_elem, src_elem)
     vec_dtype = f"{dst_elem}x{src_lanes * 2}"
     return tir.call_intrin(vec_dtype, _Op("tl.simd.vpack"), src, part)
+
+
+def vgatherb(base, index, mask=None):
+    """Gather 32B blocks from base using vector_u32 block offsets. Returns a vector."""
+    if isinstance(base, BufferLoad):
+        elem_dtype = str(base.buffer.dtype)
+        base = access_ptr(base, "r", extent=_vreg_lanes(_elem_bits(elem_dtype)))
+        vec_dtype = _vec_dtype(elem_dtype)
+    else:
+        inner_load = base.args[0]
+        elem_dtype = str(inner_load.buffer.dtype)
+        vec_dtype = _vec_dtype(elem_dtype)
+    args = [base, index]
+    if mask is not None:
+        args.append(mask)
+    return tir.call_intrin(vec_dtype, _Op("tl.simd.vgatherb"), *args)
 
 
 # -- Type conversion --------------------------------------------------------------

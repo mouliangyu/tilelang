@@ -158,8 +158,6 @@ ForFrame PersistentFor(const Array<PrimExpr> &domain, const PrimExpr &wave_size,
     domain_size *= domain[i];
   }
 
-  auto waves = ceildiv(domain_size, wave_size);
-  auto loop_var = Var("w", waves.dtype());
   group_size = min(group_size, domain[domain.size() - 1]);
   Array<Var> coord_vars;
 
@@ -171,12 +169,41 @@ ForFrame PersistentFor(const Array<PrimExpr> &domain, const PrimExpr &wave_size,
     n->doms.push_back(Range(make_const(dtype, 0), domain[i]));
   }
 
+  // Build a "grouped" domain that reorders iteration so that consecutive
+  // linear indices map to consecutive values in the last dimension (for
+  // locality), while still covering the full domain exactly once.
+  //
+  // Original domain: [D0, D1, ..., D_{n-1}]  (n >= 1)
+  // We split D_{n-1} into (num_groups, group_size) where:
+  //   num_groups = ceildiv(D_{n-1}, group_size)
+  //   last group may be partial
+  //
+  // Grouped domain ordering: [D0, ..., D_{n-2}, num_groups, group_size]
+  // This means: outer dims iterate slowest, then groups, then offsets within
+  // a group. So consecutive linear indices stay within the same group (same
+  // outer dims), maximizing locality along the last dimension.
+  //
+  // When D_{n-1} % group_size != 0, some grouped coords map to
+  // coord_{n-1} >= D_{n-1}. We must guard against this.
+
+  PrimExpr num_groups = ceildiv(domain[domain.size() - 1], group_size);
+  // The "virtual" domain size including padding for incomplete last group.
+  PrimExpr virtual_domain_size = num_groups;
+  for (int i = 0; i < domain.size() - 1; ++i) {
+    virtual_domain_size = virtual_domain_size * domain[i];
+  }
+  virtual_domain_size = virtual_domain_size * group_size;
+
+  // grouped_domain = [D0, ..., D_{n-2}, num_groups, group_size]
   Array<PrimExpr> grouped_domain;
-  grouped_domain.push_back(truncdiv(domain[domain.size() - 1], group_size));
   for (int i = 0; i < domain.size() - 1; ++i) {
     grouped_domain.push_back(domain[i]);
   }
+  grouped_domain.push_back(num_groups);
   grouped_domain.push_back(group_size);
+
+  auto virtual_waves = ceildiv(virtual_domain_size, wave_size);
+  auto loop_var = Var("w", virtual_waves.dtype());
 
   n->f_make_for_loop = [=](const Array<Var> &vars, const Array<Range> &doms,
                            const Array<Optional<PrimExpr>> &steps,
@@ -186,6 +213,9 @@ ForFrame PersistentFor(const Array<PrimExpr> &domain, const PrimExpr &wave_size,
     if (num_stages > 0) {
       anno.Set("num_stages", PrimExpr(num_stages));
     }
+    // Decompose linear_index into grouped coords via mixed-radix.
+    // grouped_domain = [D0, ..., D_{n-2}, num_groups, group_size]
+    // idxs[0..n-2] = outer dims, idxs[n-1] = group_idx, idxs[n] = offset
     Array<PrimExpr> idxs(grouped_domain.size(), PrimExpr());
     PrimExpr rem = loop_var * wave_size + index;
 
@@ -195,27 +225,46 @@ ForFrame PersistentFor(const Array<PrimExpr> &domain, const PrimExpr &wave_size,
     }
     idxs.Set(0, rem);
 
-    auto out_if = tvm::tir::IfThenElse(
-        domain_size <= (loop_var * wave_size + index),
-        tvm::tir::Evaluate(
-            tvm::tir::Call(DataType::Handle(), tvm::tl::loop_break(), {})),
-        Stmt());
+    // Compute the last-dimension coordinate from group_idx and offset.
+    // idxs[n-2] = group_idx (second to last in grouped_domain)
+    // idxs[n-1] = offset (last in grouped_domain)
+    int gd_size = grouped_domain.size();
+    PrimExpr last_dim_coord =
+        idxs[gd_size - 2] * group_size + idxs[gd_size - 1];
 
     arith::Analyzer analyzer;
     Stmt new_body = body;
-    if (analyzer.CanProveGreaterEqual(waves, 2) && num_stages == 0) {
-      new_body = SeqStmt({out_if, body});
+    // Guard against two kinds of overflow:
+    // 1. Total overflow: virtual_waves * wave_size > virtual_domain_size
+    //    (some linear_index values exceed the grouped domain)
+    // 2. Last-dim overflow: domain[-1] % group_size != 0
+    //    (last group is partial, some coords exceed domain[-1])
+    PrimExpr linear_index = loop_var * wave_size + index;
+    bool needs_total_guard =
+        !analyzer.CanProveEqual(virtual_waves * wave_size, virtual_domain_size);
+    bool needs_lastdim_guard =
+        !analyzer.CanProveEqual(virtual_domain_size, domain_size);
+    if (needs_total_guard || needs_lastdim_guard) {
+      PrimExpr guard_cond = tir::const_true();
+      if (needs_total_guard) {
+        guard_cond = guard_cond && (linear_index < virtual_domain_size);
+      }
+      if (needs_lastdim_guard) {
+        guard_cond = guard_cond && (last_dim_coord < domain[domain.size() - 1]);
+      }
+      new_body = IfThenElse(guard_cond, body);
     }
     Optional<PrimExpr> step =
         !steps.empty() ? steps[0] : Optional<PrimExpr>(std::nullopt);
-    Stmt outer = For(loop_var, 0, waves, ForKind::kSerial, new_body,
+    Stmt outer = For(loop_var, 0, virtual_waves, ForKind::kSerial, new_body,
                      /*thread_binding=*/std::nullopt, /*annotations=*/anno,
                      /*step=*/step);
+    // vars[0..n-2] = outer domain coords (from idxs[0..n-2])
     for (int i = 0; i < vars.size() - 1; ++i) {
-      outer = tvm::tir::LetStmt(vars[i], idxs[i + 1], outer);
+      outer = tvm::tir::LetStmt(vars[i], idxs[i], outer);
     }
-    outer = tvm::tir::LetStmt(vars[vars.size() - 1],
-                              idxs[0] * group_size + idxs[vars.size()], outer);
+    // vars[n-1] = last dim coord (reconstructed from group_idx + offset)
+    outer = tvm::tir::LetStmt(vars[vars.size() - 1], last_dim_coord, outer);
     return outer;
   };
 
