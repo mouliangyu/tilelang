@@ -410,16 +410,26 @@ public:
     };
     enumerate_buffers([&](const Buffer &buffer) {
       if (!IsSharedBuffer(buffer) && !IsL1Buffer(buffer) &&
-          !IsL0CBuffer(buffer)) {
+          !IsL0CBuffer(buffer) && !IsL0ABuffer(buffer) &&
+          !IsL0BBuffer(buffer)) {
         return; // Only consider on-chip buffers for multi-buffer
       }
       if (visited_buffers.count(buffer)) {
         return;
       }
       visited_buffers.insert(buffer);
-      std::string scope = IsL1Buffer(buffer)
-                              ? "shared.l1"
-                              : (IsL0CBuffer(buffer) ? "shared.l0c" : "shared");
+      std::string scope;
+      if (IsL1Buffer(buffer)) {
+        scope = "shared.l1";
+      } else if (IsL0CBuffer(buffer)) {
+        scope = "shared.l0c";
+      } else if (IsL0ABuffer(buffer)) {
+        scope = "shared.l0a";
+      } else if (IsL0BBuffer(buffer)) {
+        scope = "shared.l0b";
+      } else {
+        scope = "shared";
+      }
       int group_id = scope_to_group[scope];
       if (!eligible_set.count(buffer)) {
         // These buffers cannot be multi-buffered, and cannot share memory with

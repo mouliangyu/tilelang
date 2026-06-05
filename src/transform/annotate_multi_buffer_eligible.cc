@@ -447,7 +447,8 @@ private:
   std::set<Buffer> used_buffers_;
 
   static bool IsOnChipMultiBufferScope(const Buffer &b) {
-    return IsSharedBuffer(b) || IsL1Buffer(b) || IsL0CBuffer(b);
+    return IsSharedBuffer(b) || IsL1Buffer(b) || IsL0CBuffer(b) ||
+           IsL0ABuffer(b) || IsL0BBuffer(b);
   }
 
   static std::set<Buffer> CollectTouched(const Stmt &s) {

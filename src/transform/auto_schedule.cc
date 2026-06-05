@@ -1042,6 +1042,8 @@ static ScheduledKernelResult ScheduleSingleKernel(
   unit_builder.SetMemoryLimit("shared", GetSharedMemoryLimit(target));
   unit_builder.SetMemoryLimit("shared.l1", GetL1MemoryLimit(target));
   unit_builder.SetMemoryLimit("shared.l0c", GetL0CMemoryLimit(target));
+  unit_builder.SetMemoryLimit("shared.l0a", GetL0AMemoryLimit(target));
+  unit_builder.SetMemoryLimit("shared.l0b", GetL0BMemoryLimit(target));
   unit_builder.SetBufferVersionsOverride(buffer_versions_overrides);
   unit_builder.ScheduleRecursive(ir_structure);
 
