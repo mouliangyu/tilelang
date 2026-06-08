@@ -484,21 +484,33 @@ void CodeGenTileLangAscend::EmitVFFunction(const tir::BlockNode *op,
       PrintType(v.dtype(), decl_stream);
       decl_stream << " " << vname;
     } else {
-      auto it = handle_data_type_.find(v.get());
-      if (it == handle_data_type_.end()) {
-        for (const auto &kv : handle_data_type_) {
-          if (kv.first->name_hint == v->name_hint) {
-            it = handle_data_type_.find(kv.first);
-            break;
+      auto scope_it = alloc_storage_scope_.find(v.get());
+      if (scope_it != alloc_storage_scope_.end() &&
+          scope_it->second == "local.var") {
+        auto it = handle_data_type_.find(v.get());
+        if (it != handle_data_type_.end()) {
+          PrintType(it->second, decl_stream);
+        } else {
+          PrintType(v.dtype(), decl_stream);
+        }
+        decl_stream << " " << vname;
+      } else {
+        auto it = handle_data_type_.find(v.get());
+        if (it == handle_data_type_.end()) {
+          for (const auto &kv : handle_data_type_) {
+            if (kv.first->name_hint == v->name_hint) {
+              it = handle_data_type_.find(kv.first);
+              break;
+            }
           }
         }
-      }
-      PrintStorageScope(GetPtrStorageScope(v), decl_stream);
-      if (it != handle_data_type_.end()) {
-        PrintType(it->second, decl_stream);
-        decl_stream << "* " << vname;
-      } else {
-        decl_stream << "void* " << vname;
+        PrintStorageScope(GetPtrStorageScope(v), decl_stream);
+        if (it != handle_data_type_.end()) {
+          PrintType(it->second, decl_stream);
+          decl_stream << "* " << vname;
+        } else {
+          decl_stream << "void* " << vname;
+        }
       }
     }
   }

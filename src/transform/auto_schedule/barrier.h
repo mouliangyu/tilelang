@@ -621,13 +621,16 @@ static std::string GetPipeName(uint16_t mask) {
     return "FIX";
   if (mask & static_cast<uint16_t>(ResourcePipe::kScalar))
     return "S";
-  LOG(FATAL) << "Unknown pipe";
   return "UNKNOWN";
 }
 
-static std::string GetHardEvent(uint16_t producer_mask,
-                                uint16_t consumer_mask) {
-  auto event = GetPipeName(producer_mask) + "_" + GetPipeName(consumer_mask);
+static std::string GetHardEvent(const TaskNode *producer,
+                                const TaskNode *consumer) {
+  auto producer_pipe = GetPipeName(producer->GetPipeMask());
+  ICHECK(producer_pipe != "UNKNOWN") << producer->stmts[0];
+  auto consumer_pipe = GetPipeName(consumer->GetPipeMask());
+  ICHECK(consumer_pipe != "UNKNOWN") << consumer->stmts[0];
+  auto event = producer_pipe + "_" + consumer_pipe;
   if (event == "MTE2_M")
     return "MTE2_MTE1";
   if (event == "M_MTE2")
@@ -755,8 +758,7 @@ static std::vector<SyncPoint> CollectSyncPoints(
           const TaskNode *producer = si.producer_pt.task();
           const TaskNode *consumer = si.consumer_pt.task();
           num_versions = std::max(num_versions, si.num_versions);
-          all_event.insert(
-              GetHardEvent(producer->GetPipeMask(), consumer->GetPipeMask()));
+          all_event.insert(GetHardEvent(producer, consumer));
           prod_chains.push_back(CollectInsertCandidates(si.producer_pt, false));
           cons_chains.push_back(CollectInsertCandidates(si.consumer_pt, true));
         }
