@@ -8,6 +8,9 @@ template <typename T> struct vec {};
 template <> struct vec<float> {
   using type = vector_f32;
 };
+template <> struct vec<half> {
+  using type = vector_f16;
+};
 
 #if (__NPU_ARCH__ == 3510)
 template <> struct vec<bfloat16_t> {
@@ -16,8 +19,23 @@ template <> struct vec<bfloat16_t> {
 template <> struct vec<fp8_e4_t> {
   using type = vector_f8e4m3;
 };
+template <> struct vec<fp8_e5_t> {
+  using type = vector_f8e5m2;
+};
 template <> struct vec<float8_e4m3_t> {
   using type = vector_f8e4m3;
+};
+template <> struct vec<float8_e5m2_t> {
+  using type = vector_f8e5m2;
+};
+template <> struct vec<float8_e8m0_t> {
+  using type = vector_f8e8m0;
+};
+template <> struct vec<float4_e2m1x2_t> {
+  using type = vector_f4e2m1x2;
+};
+template <> struct vec<float4_e1m2x2_t> {
+  using type = vector_f4e1m2x2;
 };
 #endif
 
@@ -48,6 +66,13 @@ template <typename T, typename Dist>
 __simd_callee__ inline vec_t<T> vld(__ubuf__ T *src, Dist dist) {
   vec_t<T> dst;
   ::vld(dst, src, dist);
+  return dst;
+}
+
+template <typename T, typename Offset, typename Dist>
+__simd_callee__ inline vec_t<T> vld(__ubuf__ T *src, Offset offset, Dist dist) {
+  vec_t<T> dst;
+  ::vld(dst, src, offset, dist);
   return dst;
 }
 

@@ -45,6 +45,7 @@ _ELEM_BITS = {
     "float8_e4m3fn": 8,
     "float8_e5m2": 8,
     "float8_e8m0fnu": 8,
+    "float4_e2m1fn": 4,
 }
 
 
@@ -53,7 +54,7 @@ def _elem_bits(dtype_str: str) -> int:
 
 
 def _vreg_lanes(elem_bits: int) -> int:
-    return 8 * 32 // (elem_bits // 8)
+    return 2048 // elem_bits
 
 
 def _vec_dtype(elem_dtype: str) -> str:
@@ -326,6 +327,7 @@ def vcvt(
     src_dtype = str(src.dtype).split("x", 1)[0]
     fp16_dtypes = ("float16", "bfloat16")
     fp8_dtypes = ("float8_e4m3", "float8_e4m3fn", "float8_e5m2")
+    fp4_dtypes = ("float4_e2m1fn",)
 
     ROUNDS = ("ROUND_R", "ROUND_A", "ROUND_F", "ROUND_C", "ROUND_Z", "ROUND_O", "ROUND_H")
     if isinstance(round_mode, tir.IntImm):
@@ -363,6 +365,12 @@ def vcvt(
 
     if src_dtype in fp16_dtypes and target_dtype in fp8_dtypes:
         return call(ROUNDS[round_mode], saturation, PART_F16[part], mode)
+
+    if src_dtype == "bfloat16" and target_dtype in fp4_dtypes:
+        return call(ROUNDS[round_mode], PART_F8[part], mode)
+
+    if src_dtype in fp4_dtypes and target_dtype == "bfloat16":
+        return call(PART_F8[part], mode)
 
     raise ValueError(f"Unsupported vcvt conversion {src_dtype}->{target_dtype}")
 

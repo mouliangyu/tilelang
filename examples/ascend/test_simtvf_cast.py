@@ -95,7 +95,7 @@ def run_case(case, elems_per_thread: int) -> bool:
     return ok
 
 
-def main():
+def test_simtvf_cast():
     results = []
     for case in CASES:
         for elems_per_thread in COUNTS:
@@ -105,9 +105,8 @@ def main():
     for name, elems_per_thread, ok in results:
         print(f"{name}, elems_per_thread={elems_per_thread}: {'PASS' if ok else 'FAIL'}")
 
-    if not all(ok for _, _, ok in results):
-        raise SystemExit(1)
+    assert all(ok for _, _, ok in results)
 
 
 if __name__ == "__main__":
-    main()
+    test_simtvf_cast()

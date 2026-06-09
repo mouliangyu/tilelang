@@ -885,6 +885,7 @@ class TLAscendSourceWrapper(TLCUDASourceWrapper):
         "float8_e4m3fn": "fp8_e4_t",
         "float8_e5m2": "fp8_e5_t",
         "float8_e8m0fnu": "fp8_e8_t",
+        "float4_e2m1fn": "float4_e2m1x2_t",
         "float64": "double",
         "int64": "int64_t",
         "int32": "int",

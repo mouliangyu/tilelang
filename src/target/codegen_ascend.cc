@@ -49,6 +49,8 @@ static std::string CCEVectorSuffix(tvm::DataType dtype) {
     return "f8e5m2";
   if (dtype.is_float8_e8m0fnu())
     return "f8e8m0";
+  if (dtype.is_float4_e2m1fn())
+    return "f4e2m1x2";
   if (dtype.is_float())
     return (dtype.bits() == 16) ? "f16" : "f32";
   if (dtype.is_bfloat16())
@@ -62,7 +64,11 @@ static std::string CCEVectorSuffix(tvm::DataType dtype) {
 
 // Get element width in bits for choosing b8/b16/b32 predicate/load/store
 // variants.
-static int CCEElemWidthBits(tvm::DataType dtype) { return dtype.bits(); }
+static int CCEElemWidthBits(tvm::DataType dtype) {
+  if (dtype.is_float4_e2m1fn())
+    return 8;
+  return dtype.bits();
+}
 
 // Map DataType to the C++ type name used in __ubuf__ pointer casts.
 static std::string CCEUBufType(tvm::DataType dtype) {
@@ -72,6 +78,8 @@ static std::string CCEUBufType(tvm::DataType dtype) {
     return "float8_e5m2_t";
   if (dtype.is_float8_e8m0fnu())
     return "float8_e8m0_t";
+  if (dtype.is_float4_e2m1fn())
+    return "float4_e2m1x2_t";
   if (dtype.is_float())
     return (dtype.bits() == 16) ? "half" : "float";
   if (dtype.is_bfloat16())
@@ -214,6 +222,9 @@ void CodeGenTileLangAscend::PrintType(DataType t, std::ostream &os) {
     }
   } else if (t.is_float8()) {
     os << GetAscendFP8Type(t);
+    return;
+  } else if (t.is_float4_e2m1fn()) {
+    os << "float4_e2m1x2_t";
     return;
   } else if (t.is_int() || t.is_uint()) {
     switch (t.bits()) {
@@ -1334,16 +1345,16 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::string dist = Downcast<StringImm>(op->args[1])->value;
     bool has_off = (op->args.size() == 3);
     os << "simd_inst::vld<";
-    PrintType(elem, os);
+    os << CCEUBufType(elem);
     os << ">((" << "__ubuf__" << " ";
-    PrintType(elem, os);
+    os << CCEUBufType(elem);
     os << "*)";
     PrintExpr(op->args[0], os); // addr
     os << ", ";
     if (has_off) {
       os << "vag_b" << CCEElemWidthBits(elem) << "(";
       PrintExpr(op->args[2], os);
-      os << ")";
+      os << "), " << dist;
     } else {
       os << dist;
     }
