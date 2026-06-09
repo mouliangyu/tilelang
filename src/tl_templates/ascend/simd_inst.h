@@ -307,11 +307,11 @@ __simd_callee__ inline SrcVec vdupv(SrcVec src, vector_bool mask, Pos pos,
 // -- Select
 // ---------------------------------------------------------------------
 
-template <typename SrcVec, typename Mode>
-__simd_callee__ inline SrcVec vsel(SrcVec src_0, SrcVec src_1, vector_bool mask,
-                                   Mode mode) {
+template <typename SrcVec>
+__simd_callee__ inline SrcVec vsel(SrcVec src_0, SrcVec src_1,
+                                   vector_bool mask) {
   SrcVec dst;
-  ::vsel(dst, src_0, src_1, mask, mode);
+  ::vsel(dst, src_0, src_1, mask);
   return dst;
 }
 

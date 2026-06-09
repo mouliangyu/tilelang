@@ -378,9 +378,9 @@ def vcvt(
 # -- Special ----------------------------------------------------------------------
 
 
-def vsel(src0, src1, mask, mode="MODE_ZEROING"):
+def vsel(src0, src1, mask):
     """Bitwise select: mask ? src0 : src1."""
-    return tir.call_intrin(str(src0.dtype), _Op("tl.simd.vsel"), src0, src1, mask, mode)
+    return tir.call_intrin(str(src0.dtype), _Op("tl.simd.vsel"), src0, src1, mask)
 
 
 def vmuls(src, scalar, mask, mode="MODE_ZEROING"):

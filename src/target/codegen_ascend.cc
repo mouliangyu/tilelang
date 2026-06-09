@@ -1459,16 +1459,16 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     PrintExpr(op->args[2], os); // mask
     os << ", " << (part == 0 ? "PART_EVEN" : "PART_ODD") << ")";
   }
-  // --- SimdVF sel: (src0, src1, mask, mode) ---
+  // --- SimdVF sel: (src0, src1, mask) ---
   else if (op->op.same_as(tl::simd_vsel())) {
-    ICHECK_EQ(op->args.size(), 4);
+    ICHECK_EQ(op->args.size(), 3);
     os << "simd_inst::vsel(";
     PrintExpr(op->args[0], os); // src0
     os << ", ";
     PrintExpr(op->args[1], os); // src1
     os << ", ";
-    PrintExpr(op->args[2], os);                                   // mask
-    os << ", " << Downcast<StringImm>(op->args[3])->value << ")"; // mode
+    PrintExpr(op->args[2], os); // mask
+    os << ")";
   } else if (op->op.same_as(tl::simd_mem_bar())) {
     std::string mem_type_str = Downcast<StringImm>(op->args[0])->value;
     this->PrintIndent();
