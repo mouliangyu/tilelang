@@ -154,23 +154,15 @@ private:
     red_buf[tx] = x;
     asc_syncthreads();
 
-    float result = x;
-    if (lane % scale == 0) {
-      result = red_buf[group * threads + lane];
+    if (lane < scale) {
+      float result = red_buf[group * threads + lane];
       for (int i = scale; i < threads; i += scale) {
-        int idx = group * threads + (lane % scale) + i;
-        result = op(result, red_buf[idx]);
+        result = op(result, red_buf[group * threads + lane + i]);
       }
+      red_buf[group * threads + lane] = result;
     }
     asc_syncthreads();
-
-    if (lane % scale == 0 && lane / scale == 0) {
-      red_buf[group * threads + (lane % scale)] = result;
-    }
-    asc_syncthreads();
-    result = red_buf[group * threads + (tx % scale)];
-    asc_syncthreads();
-    return result;
+    return red_buf[group * threads + (lane % scale)];
   }
 
   // ─── Cross-warp reduction via UB ──────────────────────────────────────────
