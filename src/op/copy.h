@@ -194,13 +194,13 @@ public:
     return 0;
   }
 
-  int GetL2CacheCtrl() const {
+  int GetL2CacheCtrl(int default_value = 0) const {
     if (auto val = annotations.Get("l2_cache_ctrl")) {
       if (auto int_val = val->as<IntImmNode>()) {
         return int_val->value;
       }
     }
-    return 0; // default: L2_NORMAL_FV
+    return default_value;
   }
 
   /*!

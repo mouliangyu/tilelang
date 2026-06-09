@@ -15,19 +15,22 @@ from tilelang.utils.device import Event, device_synchronize, get_current_device
 
 @tilelang.jit(out_idx=[], target="ascend")
 def get_msprof_cache_flush_kernel(numel: int, dtype: T.dtype):
-    elems_per_block = (numel + 63) // 64
-    vec = 2048
-    repeat = (elems_per_block + vec - 1) // vec
+    tile_elems = (32 * 1024) // (4 if dtype == "int32" else 1)
+    tiles_per_core = numel // tile_elems // 64
 
     @T.prim_func
     def _tilelang_profiler_cache_flush(Cache: T.Tensor((numel,), dtype)):
         with T.Kernel(64) as bx:
-            for r in range(repeat):
-                with T.SimtVF(threads=vec):
-                    for i in T.Parallel(vec):
-                        offset = bx * elems_per_block + r * vec + i
-                        if offset < numel:
-                            Cache[offset] = T.cast(0, dtype)
+            ub = T.alloc_shared((tile_elems,), dtype)
+
+            with T.SimtVF(threads=2048):
+                for i in T.Parallel(tile_elems):
+                    ub[i] = T.cast(0, dtype)
+
+            for it in T.serial(tiles_per_core):
+                begin = (it * 64 + bx) * tile_elems
+                if begin < numel:
+                    T.copy(ub, Cache[begin : begin + tile_elems], l2_cache_ctrl="WTS_FV")
 
     return _tilelang_profiler_cache_flush
 

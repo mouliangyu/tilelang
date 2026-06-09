@@ -961,16 +961,18 @@ Stmt CopyNode::LowerAscendDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
       }
     } else {
       // UBuf -> GM (dma_path == 1)
+      constexpr int kStoreDefaultL2CacheCtrl = 4;
       if (plan_single_row) {
         call = Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
                     {plan_dst_ptr, plan_src_ptr, sid, I(1), plan_total_bytes,
-                     I(this->GetL2CacheCtrl()), plan_total_bytes,
-                     plan_total_bytes});
+                     I(this->GetL2CacheCtrl(kStoreDefaultL2CacheCtrl)),
+                     plan_total_bytes, plan_total_bytes});
       } else {
-        call = Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
-                    {plan_dst_ptr, plan_src_ptr, sid, plan.n_rows,
-                     plan.row_bytes, I(this->GetL2CacheCtrl()),
-                     plan.dst_stride_bytes, plan.src_stride_bytes});
+        call =
+            Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
+                 {plan_dst_ptr, plan_src_ptr, sid, plan.n_rows, plan.row_bytes,
+                  I(this->GetL2CacheCtrl(kStoreDefaultL2CacheCtrl)),
+                  plan.dst_stride_bytes, plan.src_stride_bytes});
       }
     }
   } else if (dma_path == 2) {
