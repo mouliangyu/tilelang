@@ -1651,6 +1651,23 @@ void CodeGenTileLangAscend::VisitStmt_(const AllocateNode *op) {
     return;
   }
 
+  // SimdVF: emit vector_<T> for local.var vector register temps.
+  // CCE vector register variables should be declared uninitialized
+  // since they are always written before read via SIMD operations.
+  // Without this, zero-init via Broadcast expands to make_vector_f32(...)
+  // with one argument per lane, which is both verbose and unnecessary.
+  if (inside_simdvf_body_ && scope == "local.var" && op->dtype.lanes() >= 32) {
+    std::string vid = AllocVarID(op->buffer_var.get());
+    this->PrintIndent();
+    stream << "vector_";
+    PrintCCEVectorSuffix(op->dtype, stream);
+    stream << " " << vid << ";\n";
+    alloc_storage_scope_[op->buffer_var.get()] = scope;
+    RegisterHandleType(op->buffer_var.get(), op->dtype);
+    this->PrintStmt(op->body);
+    return;
+  }
+
   if (scope == "local.var") {
     ICHECK_EQ(op->ConstantAllocationSize(), 1U) << "local.var should be scalar";
     std::string vid = AllocVarID(op->buffer_var.get());
