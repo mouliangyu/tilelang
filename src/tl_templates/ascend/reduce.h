@@ -162,7 +162,9 @@ private:
       red_buf[group * threads + lane] = result;
     }
     asc_syncthreads();
-    return red_buf[group * threads + (lane % scale)];
+    float result = red_buf[group * threads + (lane % scale)];
+    asc_syncthreads();
+    return result;
   }
 
   // ─── Cross-warp reduction via UB ──────────────────────────────────────────
