@@ -4,6 +4,7 @@ from tvm.target import Target
 import tilelang
 from tilelang.transform import PassContext
 from tilelang.contrib.nvcc import have_tma
+from tilelang.analysis.vf_local_var_checker import VFLocalVarChecker
 
 
 def is_ascend_target(target: Target | None = None) -> bool:
@@ -250,6 +251,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
     mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
+    mod = VFLocalVarChecker()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tir.transform.NarrowDataType(32)(mod)
     mod = tilelang.transform.FlattenBuffer()(mod)
