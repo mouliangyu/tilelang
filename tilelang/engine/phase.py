@@ -209,6 +209,8 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.InjectAssumes()(mod)
     # Simplify the IR expressions
     mod = tilelang.transform.Simplify()(mod)
+    # Check that all T.Parallel loops are inside SIMD_VF/SIMT_VF blocks
+    tilelang.analysis.VFParallelChecker()(mod)
     if allow_autoschedule():
         mod = tilelang.transform.AnnotateMultiBufferEligible()(mod)
         mod = tilelang.transform.IfConditionExtract()(mod)
