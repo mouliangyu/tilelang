@@ -29,9 +29,10 @@ pitfalls you need to produce correct, high-performance Ascend kernels.
 | Shared memory | `T.alloc_shared(...)` ("shared") | `T.alloc_shared(...)` maps to UB (Unified Buffer) |
 | Global memory | Global | GM (Global Memory / HBM) |
 | L1 cache / data | N/A | `T.alloc_l1(...)` -- Cube Buffer (CBuf) |
-| Register fragments | wmma/MMA | `T.alloc_l0a/l0b/l0c(...)` -- Cube engine buffers |
+| Register fragments | `T.alloc_fragment(...)` | `T.alloc_fragment(...)` |
+| Cube engine buffers | N/A | `T.alloc_l0a/l0b/l0c(...)` -- L0A/L0B/L0C |
 | Warp-level ops | `__shfl_sync` | `T.alloc_reducer` / `T.ascend_reduce_add` |
-| Synchronization | `__syncthreads()` | Flag-based: `T.ascend_set_flag` / `T.ascend_wait_flag` |
+| Synchronization | `__syncthreads()`, `mbarrier`, `cp.async` | `asc_syncthreads()` (auto-inserted in SimtVF), Flag-based: `T.ascend_set_flag` / `T.ascend_wait_flag` |
 | Auto-Schedule | `T.Pipelined(...)` | `T.Pipelined(...)` with `num_stages=...` |
 | Compiler | nvcc | Bisheng (Huawei Ascend compiler) |
 
@@ -73,8 +74,8 @@ binding is accessed via `T.get_thread_binding()`.
 ### 2.3 SIMD VF: Register-Level Vector (No Threads)
 
 `T.SimdVF()` maps to CCE MicroAPI vector instructions (2048-bit vectors,
-32 x float32 or 64 x float16). There is **no thread concept** -- the
-code runs as scalar instructions on the vector unit.
+64 x float32 or 128 x float16). There is **no thread concept** -- the
+code runs as SIMD vector instructions directly on the vector unit.
 
 ```python
 with T.SimdVF():
@@ -95,10 +96,12 @@ The Ascend NPU has two distinct compute cores on each die:
 | AIC | Cube unit | Matrix multiply (GEMM, convolutions) | `T.Cube()` |
 | AIV | Vector unit | Element-wise ops, reductions, data movement | `T.Vector()` |
 
-### 3.1 Pure Cube-Only Kernel
+### 3.1 Pure Kernel (Single-Scope)
 
-Use `T.Kernel(N)` with no core split. All code runs on the AIC core.
-Suitable for GEMM that stays entirely on the cube engine.
+Use `T.Kernel(N)` without explicit `T.Cube()`/`T.Vector()` scopes. The
+codegen auto-detects the kernel type based on the operations inside:
+Cube ops (`T.gemm`) produce a `__cube__` kernel on AIC, while Vector ops
+produce a `__vector__` kernel on AIV.
 
 ```python
 with T.Kernel(NUM_BLOCKS) as bx:
@@ -108,51 +111,49 @@ with T.Kernel(NUM_BLOCKS) as bx:
     # ... T.copy into L1, T.gemm, T.copy out ...
 ```
 
-### 3.2 MixedKernel: Cube + Vector
+### 3.2 MixedKernel: Auto-Scheduled Cube + Vector
 
-Use `T.MixedKernel(NUM_BLOCKS, sids=2)` to split work across AIC (Cube)
-and AIV (Vector) cores. The `sid` variable identifies which AIV sub-core
-(0 or 1). Use `T.Cube()` and `T.Vector()` scopes to place code on each
-core respectively.
+**`T.MixedKernel` exists solely to provide the `sid` variable** (AIV
+sub-core ID: 0 or 1) for manual output partitioning. If you don't need
+`sid`, just use `T.Kernel` — the compiler handles `T.dual_copy` and AIC/AIV
+splitting automatically.
 
 ```python
-with T.MixedKernel(NUM_BLOCKS, sids=2) as (bx, sid):
-    # AIC side: GEMM
+# MixedKernel: only needed when you want sid for manual partitioning
+with T.MixedKernel(NUM_BLOCKS) as (bx, sid):
+    ...
+    T.copy(temp[sid * (TILE_M // 2):...], C[...])
+
+# Equivalent without sid: just use T.Kernel + T.dual_copy
+with T.Kernel(NUM_BLOCKS) as bx:
+    ...
+    T.dual_copy(res, temp)
+    T.dual_copy(temp, C[...])
+```
+
+Reference: `examples/ascend/example_gemm_mixedkernel.py`
+
+### 3.3 Manual Mixed: T.Cube() and T.Vector() inside T.Kernel
+
+The explicit pattern for full manual control. Use `T.Kernel(N)` with
+nested `T.Cube()` and `T.Vector()` scopes, and manage cross-core
+synchronization with manual flags:
+
+```python
+with T.Kernel(NUM_BLOCKS) as bx:
     with T.Cube():
-        T.gemm(x_l1, w_l1, res, transpose_B=True)
+        T.ascend_cross_core_set_flag(4, "PIPE_FIX", my_aiv_flag)
+        ...
+        T.ascend_cross_core_wait_flag(4, "PIPE_FIX", my_aic_flag)
 
-    # AIV side: element-wise + data movement
-    with T.Vector():
-        T.dual_copy(res, temp)
-        T.copy(temp[sid * HALF:...], output[...])
+    with T.Vector() as sid:
+        my_aic_flag = 6 + sid * 16
+        my_aiv_flag = 4 + sid * 16
+        T.ascend_cross_core_wait_flag(4, "PIPE_FIX", my_aic_flag)
+        ...
 ```
 
-**When to use MixedKernel:**
-- FlashAttention variants (Cube does QK^T and PV, Vector does softmax)
-- Any GEMM with post-processing (activation, bias, etc.)
-- When you need to overlap Cube compute with Vector data movement
-
-Auto-scheduled MixedKernel: The compiler can auto-schedule sync between
-AIC and AIV. Use `T.MixedKernel` with `T.Pipelined`/`T.Persistent` --
-the compiler inserts `CrossCoreSetFlag`/`CrossCoreWaitFlag` automatically.
-
-### 3.3 Manual Mixed: T.Cube() and T.Vector() with Manual Sync
-
-The older/explicit pattern. Use when you need full control over
-cross-core synchronization flags:
-
-```python
-with T.Cube():
-    T.ascend_cross_core_set_flag(4, "PIPE_MTE3", my_aiv_flag)
-    ...
-    T.ascend_cross_core_wait_flag(4, "PIPE_MTE3", my_aic_flag)
-
-with T.Vector() as sid:
-    my_aic_flag = 6 + sid * 16
-    my_aiv_flag = 4 + sid * 16
-    T.ascend_cross_core_wait_flag(4, "PIPE_MTE3", my_aic_flag)
-    ...
-```
+Reference: `examples/ascend/example_gemm_mix.py`
 
 ---
 
@@ -406,7 +407,7 @@ https://github.com/PTO-ISA/PTO-Gym/blob/main/docs/PTO-micro-Instruction-SPEC.md
 
 ```python
 with T.SimdVF():
-    mask = T.simd.pset(32)            # set all 32 lanes active
+    mask = T.simd.pset(32)            # all lanes active for 32-bit elements
 
     # Load/Store
     r = T.simd.vld(buf[offset])       # 2048-bit vector load
@@ -524,13 +525,14 @@ def main(X: T.Buffer((M, K), dtype),
 
 Reference: `examples/ascend/example_gemm_auto.py`
 
-### Pattern 2: MixedKernel GEMM (Auto-Scheduled Cube + Vector)
+### Pattern 2: MixedKernel GEMM (Auto-Scheduled, sid Access)
 
-Same as Pattern 1 but uses `T.MixedKernel` to automatically split
-work between AIC and AIV.
+Same as Pattern 1 but uses `T.MixedKernel` to get `sid` for AIV output
+partitioning. No `T.Cube()`/`T.Vector()` scopes needed — the compiler
+auto-splits AIC/AIV.
 
 ```python
-with T.MixedKernel(NUM_BLOCKS, sids=2) as (bx, sid):
+with T.MixedKernel(NUM_BLOCKS) as (bx, sid):
     x_l1 = T.alloc_l1((TILE_M, TILE_K), dtype)
     w_l1 = T.alloc_l1((TILE_N, TILE_K), dtype)
     res = T.alloc_l0c((TILE_M, TILE_N), accum_dtype)
