@@ -563,8 +563,16 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
       has_simd_inst_included_ = true;
     }
     auto captures = CollectVFCaptures(op);
-    std::string helper_name =
-        "simd_vf_" + std::to_string(simdvf_helper_counter_++);
+    int64_t vf_idx = simdvf_helper_counter_++;
+    {
+      auto it = op->annotations.find("tl.vf_source_index");
+      if (it != op->annotations.end()) {
+        if (auto *imm = (*it).second.as<IntImmNode>()) {
+          vf_idx = imm->value;
+        }
+      }
+    }
+    std::string helper_name = "simd_vf_" + std::to_string(vf_idx);
     EmitVFFunction(op, captures, helper_name, "__simd_vf__ inline void",
                    inside_simdvf_body_);
 
@@ -603,8 +611,16 @@ void CodeGenTileLangAscend::VisitStmt_(const tir::BlockNode *op) {
     }
 
     auto captures = CollectVFCaptures(op);
-    std::string helper_name =
-        "simt_vf_" + std::to_string(simtvf_helper_counter_++);
+    int64_t vf_idx = simtvf_helper_counter_++;
+    {
+      auto it = op->annotations.find("tl.vf_source_index");
+      if (it != op->annotations.end()) {
+        if (auto *imm = (*it).second.as<IntImmNode>()) {
+          vf_idx = imm->value;
+        }
+      }
+    }
+    std::string helper_name = "simt_vf_" + std::to_string(vf_idx);
 
     int64_t total_threads = thread_x * thread_y * thread_z;
     std::string func_attrs = "__simt_vf__ ";

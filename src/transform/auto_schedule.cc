@@ -477,6 +477,9 @@ private:
     struct ResourceAnalyzer : public StmtExprVisitor {
       TaskNode *task_node;
       uint16_t pipe_mask{0};
+      // HBM port-contention mask (HbmPort bits), tracked separately from the
+      // issue-pipe mask so it never participates in pipe-name derivation.
+      uint16_t hbm_mask{0};
 
       // Tensor Core shape information (multiple shapes possible)
       struct TensorCoreShape {
@@ -524,6 +527,22 @@ private:
         return static_cast<uint16_t>(ResourcePipe::kMTE2);
       }
 
+      // HBM bandwidth-contention bit for a copy, by buffer scope. Only paths
+      // that actually egress HBM get a bit; on-chip moves (UB->L1, L1->L0A/B,
+      // L0C->UB) get none. AIC and AIV egress HBM through distinct ports, so
+      // AIV port = GM<->UB; AIC port = GM->L1 / L0C->GM.
+      static uint16_t GetHbmPortBit(const Buffer &src, const Buffer &dst) {
+        bool aiv = (IsGlobalBuffer(src) && IsSharedBuffer(dst)) || // GM->UB
+                   (IsSharedBuffer(src) && IsGlobalBuffer(dst));   // UB->GM
+        bool aic = (IsGlobalBuffer(src) && IsL1Buffer(dst)) ||     // GM->L1
+                   (IsL0CBuffer(src) && IsGlobalBuffer(dst));      // L0C->GM
+        if (aiv)
+          return static_cast<uint16_t>(HbmPort::kAiv);
+        if (aic)
+          return static_cast<uint16_t>(HbmPort::kAic);
+        return 0;
+      }
+
       static int64_t CalculateCopyBytes(const CopyNode *copy) {
         int64_t elements = 1;
         for (size_t i = 0; i < copy->dst_range.size(); ++i) {
@@ -557,6 +576,10 @@ private:
           const CopyNode *copy = copy_obj.get();
           uint16_t copy_pipe = GetCopyPipeMask(copy->src, copy->dst);
           pipe_mask |= copy_pipe;
+          // Tag the HBM contention port (if this copy egresses HBM) so the
+          // scheduler serialises GM<->UB / GM->L1 traffic that shares a port.
+          // Tracked in hbm_mask, separate from the issue-pipe mask.
+          hbm_mask |= GetHbmPortBit(copy->src, copy->dst);
           copy_infos.emplace_back(copy->src.scope(), copy->dst.scope(),
                                   DataType(copy->dst->dtype),
                                   CalculateCopyBytes(copy), copy_pipe);
@@ -613,6 +636,8 @@ private:
     if (!only_variables) {
       // Set task node pipe mask
       task_node->SetPipeMask(analyzer.pipe_mask);
+      // Set task node HBM port-contention mask
+      task_node->SetHbmMask(analyzer.hbm_mask);
       // Set Tensor Core shape information if available
       for (const auto &shape : analyzer.tensor_core_shapes) {
         if (shape.m > 0 && shape.n > 0 && shape.k > 0) {

@@ -128,3 +128,6 @@ maint/host_checks/logs/*
 
 # clangd
 .clangd
+
+# cann-sim
+.cannsim_work/

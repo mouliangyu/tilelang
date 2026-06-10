@@ -189,7 +189,17 @@ bool HasRegisterRegion(const IRStructure *node) {
 }
 
 bool HasResourceDependency(const IRStructure *a, const IRStructure *b) {
-  return (a->GetPipeMask() & b->GetPipeMask()) != 0;
+  // Issue-pipe conflict: two nodes sharing an issue pipe cannot run
+  // concurrently.
+  if ((a->GetPipeMask() & b->GetPipeMask()) != 0)
+    return true;
+  // HBM port-contention conflict. A load (MTE2) and a store (MTE3/Fixpipe) sit
+  // on different issue pipes and so escape the check above, but share an HBM
+  // port within one agent. GetHbmMask OR-aggregates over subtrees, so this also
+  // catches an HBM-egress task nested inside a composite sibling.
+  if ((a->GetHbmMask() & b->GetHbmMask()) != 0)
+    return true;
+  return false;
 }
 
 /*

@@ -80,6 +80,15 @@ uint16_t SequenceNode::GetPipeMask() const {
   return mask;
 }
 
+uint16_t SequenceNode::GetHbmMask() const {
+  uint16_t mask = 0;
+  for (const auto &child : children) {
+    if (child)
+      mask |= child->GetHbmMask();
+  }
+  return mask;
+}
+
 std::vector<BufferRegion> SequenceNode::GetReadRegions() const {
   std::vector<BufferRegion> all_read_regions;
   for (const auto &child : children) {
@@ -210,6 +219,8 @@ std::shared_ptr<IRStructure> TaskNode::Clone() const {
   new_task->stmts = stmts;
   // Copy resource pipe mask
   new_task->SetPipeMask(GetPipeMask());
+  // Copy HBM port-contention mask
+  new_task->SetHbmMask(GetHbmMask());
   // Copy memory access regions
   new_task->SetReadRegions(GetReadRegions());
   new_task->SetWriteRegions(GetWriteRegions());

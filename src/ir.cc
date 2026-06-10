@@ -26,6 +26,9 @@ using namespace script::ir_builder::tir;
 class SimtVFFrameNode;
 class SimtVFFrame;
 
+static int simtvf_source_counter_ = 0;
+static int simdvf_source_counter_ = 0;
+
 static Var CreateEnvThread(String name, String thread_tag, DataType dtype) {
   using namespace tvm::tir;
   using namespace tvm::script::ir_builder;
@@ -547,6 +550,8 @@ public:
                               std::move(body));
 
     ffi::Map<ffi::String, ffi::Any> simtvf_annotations;
+    simtvf_annotations.Set("tl.vf_source_index",
+                           IntImm(DataType::Int(64), simtvf_source_counter_++));
     if (vf_latency_ > 0) {
       simtvf_annotations.Set("tl.vf_latency",
                              IntImm(DataType::Int(64), vf_latency_));
@@ -631,6 +636,8 @@ public:
     // No thread extent AttrStmts — SimdVF has no thread dimensions.
 
     ffi::Map<ffi::String, ffi::Any> simdvf_annotations;
+    simdvf_annotations.Set("tl.vf_source_index",
+                           IntImm(DataType::Int(64), simdvf_source_counter_++));
     if (vf_latency_ > 0) {
       simdvf_annotations.Set("tl.vf_latency",
                              IntImm(DataType::Int(64), vf_latency_));

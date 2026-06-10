@@ -752,6 +752,7 @@ public:
             cloned_task->SetLatency(node_i_task->GetLatency());
             cloned_task->SetII(node_i_task->GetII());
             cloned_task->SetPipeMask(node_i_task->GetPipeMask());
+            cloned_task->SetHbmMask(node_i_task->GetHbmMask());
             for (size_t s = 0; s < node_i_task->GetTensorCoreShapeCount();
                  ++s) {
               const auto &shape = node_i_task->GetTensorCoreShape(s);

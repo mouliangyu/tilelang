@@ -48,13 +48,13 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
             x_l1 = T.alloc_l1((TILE_M, TILE_K), "bfloat16")
             w_l1 = T.alloc_l1((TILE_N, TILE_K), "bfloat16")
             temp = T.alloc_shared((TILE_M // 2, TILE_N), "float32")
-            T.annotate_buffer_versions({x_l0: NUM_STAGES, w_l0: NUM_STAGES, x_l1: NUM_STAGES, w_l1: NUM_STAGES})
+            # T.annotate_buffer_versions({x_l0: NUM_STAGES, w_l0: NUM_STAGES, x_l1: NUM_STAGES, w_l1: NUM_STAGES})
             for tile_idx in T.Persistent([OUT_TILES], NUM_BLOCKS, bx):
                 m_tile, n_tile = aswt_swizzle(tile_idx)
                 for kt in T.Pipelined(K_TILES, num_stages=NUM_STAGES):
                     T.copy(X[m_tile * TILE_M : (m_tile + 1) * TILE_M, kt * TILE_K : (kt + 1) * TILE_K], x_l1)
                     T.copy(W[n_tile * TILE_N : (n_tile + 1) * TILE_N, kt * TILE_K : (kt + 1) * TILE_K], w_l1)
-                    for sk in T.Serial(SUB_K):
+                    for sk in T.Pipelined(SUB_K, num_stages=NUM_STAGES):
                         T.copy(x_l1[:, sk * TILE_K_SUB : (sk + 1) * TILE_K_SUB], x_l0)
                         T.copy(w_l1[:, sk * TILE_K_SUB : (sk + 1) * TILE_K_SUB], w_l0)
                         T.gemm(x_l0, w_l0, res, transpose_B=True, clear_accum=(kt == 0 and sk == 0))

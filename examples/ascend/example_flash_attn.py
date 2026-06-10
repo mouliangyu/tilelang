@@ -10,6 +10,7 @@ import math
 import tilelang
 import tilelang.language as T
 from tilelang.language.simd import pset, vld, vsts, vmul, vadd, vmax, vdupv, vcadd, vcmax, vexpdif, vcvt, vmuls
+from tilelang.profiler import do_bench
 
 
 def flash_attention(D=128, SEQ_LEN=4096):
@@ -186,8 +187,6 @@ if __name__ == "__main__":
     rel = diff / expected.cpu().abs().max().item()
     print(f"  rel={rel:.4f} {'PASS' if rel < 0.05 else 'FAIL'}")
 
-    from bench import bench_msprof
-
-    prof = bench_msprof(lambda: kernel(Q, K, V), kernel_names="main")
+    prof = do_bench(lambda: kernel(Q, K, V), backend="msprof_detail", _n_warmup=30, _n_repeat=500)
     flops = 4.0 * SEQ_LEN * SEQ_LEN * D
     print(f"  {prof.dur_us:6.1f} us  |  {prof.tflops(flops):5.1f} TFLOPS")

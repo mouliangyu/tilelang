@@ -47,6 +47,22 @@ enum class ResourcePipe : uint16_t {
   kScalar = 1 << 6,  // S pipe: scalar ops, set_flag / wait_flag
 };
 
+// HBM bandwidth-contention resource bits. These are NOT issue pipes — they are
+// tracked on TaskNode separately from the ResourcePipe mask (see hbm_mask_ /
+// GetHbmMask) and compared independently in HasResourceDependency. A bit is set
+// (by buffer scope, in ResourceAnalyzer) only when a task actually egresses
+// HBM. Two tasks sharing an HBM port bit conflict, so the scheduler serialises
+// their HBM accesses instead of overlapping a load and a store — which sit on
+// different issue pipes (MTE2 vs MTE3/Fixpipe) and so would not otherwise
+// conflict — at unphysical aggregate bandwidth. AIC and AIV have distinct L2
+// ports on A5, so they get two separate bits and never serialise against each
+// other.
+enum class HbmPort : uint16_t {
+  kNone = 0,
+  kAiv = 1 << 0, // AIV HBM port: GM<->UB (MTE2 load / MTE3 store)
+  kAic = 1 << 1, // AIC HBM port: GM->L1 (MTE2) / L0C->GM (FixPipe)
+};
+
 // Structure to represent a specific access to a buffer (used for ordering
 // accesses). `path` records the chain of IRStructure nodes traversed from the
 // queried subtree's root down to (and including) the task — only real IR-tree
@@ -157,6 +173,12 @@ public:
   bool UsesOnlyPipe(ResourcePipe pipe) const {
     return GetPipeMask() == static_cast<uint16_t>(pipe);
   }
+
+  // HBM port-contention bitmask (HbmPort values). Like GetPipeMask, composite
+  // nodes OR-aggregate their children, so an HBM-egress task nested in a loop
+  // body still surfaces a conflict at the enclosing node. Only TaskNode carries
+  // a settable mask (SetHbmMask) — composites derive it from children.
+  virtual uint16_t GetHbmMask() const = 0;
 
   // Memory access regions (collected during analysis)
   virtual std::vector<BufferRegion> GetReadRegions() const = 0;
@@ -270,6 +292,8 @@ public:
 
   // Resource pipe mask
   uint16_t GetPipeMask() const override { return pipe_mask_; }
+  // HBM port-contention mask (settable only here; composites aggregate it).
+  uint16_t GetHbmMask() const override { return hbm_mask_; }
 
   // Memory access regions (collected during analysis)
   std::vector<BufferRegion> GetReadRegions() const override {
@@ -286,6 +310,7 @@ public:
 
   // Setters
   void SetPipeMask(uint16_t mask) override { pipe_mask_ = mask; }
+  void SetHbmMask(uint16_t mask) { hbm_mask_ = mask; }
   void SetReadRegions(const std::vector<BufferRegion> &regions) override {
     read_regions_ = regions;
   }
@@ -448,6 +473,9 @@ private:
   // Resource pipe mask (bitmask of ResourcePipe values)
   uint16_t pipe_mask_{0};
 
+  // HBM port-contention mask (bitmask of HbmPort values)
+  uint16_t hbm_mask_{0};
+
   // Memory access regions (collected during analysis)
   std::vector<BufferRegion> read_regions_;
   std::vector<BufferRegion> write_regions_;
@@ -487,6 +515,10 @@ public:
   // Resource pipe mask (aggregate from child)
   uint16_t GetPipeMask() const override {
     return child ? child->GetPipeMask() : 0;
+  }
+  // HBM port-contention mask (aggregate from child)
+  uint16_t GetHbmMask() const override {
+    return child ? child->GetHbmMask() : 0;
   }
 
   // Memory access regions (aggregate from child & task)
@@ -641,6 +673,10 @@ public:
   uint16_t GetPipeMask() const override {
     return child ? child->GetPipeMask() : 0;
   }
+  // HBM port-contention mask (aggregate from child)
+  uint16_t GetHbmMask() const override {
+    return child ? child->GetHbmMask() : 0;
+  }
 
   // Memory access regions (aggregate from child & task)
   std::vector<BufferRegion> GetReadRegions() const override {
@@ -758,6 +794,15 @@ public:
       result |= then_child->GetPipeMask();
     if (else_child)
       result |= else_child->GetPipeMask();
+    return result;
+  }
+  // HBM port-contention mask (union of both branches)
+  uint16_t GetHbmMask() const override {
+    uint16_t result = 0;
+    if (then_child)
+      result |= then_child->GetHbmMask();
+    if (else_child)
+      result |= else_child->GetHbmMask();
     return result;
   }
 
@@ -898,6 +943,10 @@ public:
   uint16_t GetPipeMask() const override {
     return child ? child->GetPipeMask() : 0;
   }
+  // HBM port-contention mask (aggregate from child)
+  uint16_t GetHbmMask() const override {
+    return child ? child->GetHbmMask() : 0;
+  }
 
   // Memory access regions (aggregate from child)
   std::vector<BufferRegion> GetReadRegions() const override {
@@ -999,6 +1048,8 @@ public:
 
   // Resource pipe mask (union of all children)
   uint16_t GetPipeMask() const override;
+  // HBM port-contention mask (union of all children)
+  uint16_t GetHbmMask() const override;
 
   // Memory access regions (aggregate from all children)
   std::vector<BufferRegion> GetReadRegions() const override;
