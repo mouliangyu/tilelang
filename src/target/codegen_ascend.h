@@ -72,6 +72,7 @@ private:
   enum class AscendKernelMode { kVector, kCube, kMix };
   AscendKernelMode kernel_mode_{AscendKernelMode::kVector};
   int mix_aiv_count_{2};
+  bool enable_fast_math_{false};
 };
 
 } // namespace codegen

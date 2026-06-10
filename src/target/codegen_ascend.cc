@@ -4,6 +4,7 @@
 #include "./utils.h"
 #include <sstream>
 #include <string>
+#include <tvm/ir/transform.h>
 #include <unordered_set>
 
 #include "../../3rdparty/tvm/src/tir/transforms/ir_utils.h"
@@ -100,6 +101,9 @@ void CodeGenTileLangAscend::PrintCCEVectorSuffix(DataType t, std::ostream &os) {
 
 void CodeGenTileLangAscend::Init(bool output_ssa) {
   CodeGenC::Init(output_ssa);
+  auto pass_ctx = tvm::transform::PassContext::Current();
+  enable_fast_math_ =
+      pass_ctx->GetConfig<Bool>(tl::kEnableFastMath, Bool(false)).value();
   decl_stream << "#include <tl_templates/ascend/common.h>\n";
   decl_stream << "\n";
 }
@@ -1227,7 +1231,10 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     else if (op->op.same_as(tl::simd_vmin()))
       name = "vmin";
     else
-      name = "vdiv";
+      name =
+          (!enable_fast_math_ && op->dtype.is_float() && op->dtype.bits() == 32)
+              ? "vdiv_precise"
+              : "vdiv";
     os << "simd_inst::" << name << "(";
     PrintExpr(op->args[0], os); // src0
     os << ", ";

@@ -177,6 +177,67 @@ __simd_callee__ inline SrcVec vdiv(SrcVec src_0, SrcVec src_1, vector_bool mask,
   return dst;
 }
 
+// ============================================================================
+// Precision division matching Ascend DivPrecisionImpl / torch.npu behavior.
+// This intentionally keeps hardware FTZ/special-value behavior and only applies
+// the 0ULP error-correction core.
+// ============================================================================
+
+// Precision f32 division exposed under the historical vdiv_precise name.
+template <typename Mode>
+__simd_callee__ inline vector_f32 vdiv_precise(vector_f32 src0, vector_f32 src1,
+                                               vector_bool mask, Mode mode) {
+  constexpr uint32_t infNanBound = 0xff800000u;
+  constexpr uint32_t signBitNum = 0x80000000u;
+
+  vector_f32 regNegZero;
+  ::vdup((vector_u32 &)regNegZero, signBitNum, mask, mode);
+
+  vector_f32 z;
+  ::vdiv(z, src0, src1, mask, mode);
+
+  vector_u32 infNan;
+  ::vor(infNan, (vector_u32 &)z, (vector_u32 &)regNegZero, mask, mode);
+
+  vector_f32 tmpDst = z;
+
+  vector_bool zeroCmp;
+  ::vcmps_eq(zeroCmp, z, 0.0f, mask);
+  vector_bool infNanCmp;
+  ::vcmps_ge(infNanCmp, infNan, infNanBound, mask);
+  ::por(infNanCmp, infNanCmp, zeroCmp, mask);
+
+  vector_f32 y;
+  ::vmuls(y, src1, -1.0f, mask, mode);
+  vector_f32 r = src0;
+  ::vmula(r, z, y, mask, mode);
+
+  vector_f32 rPre, rNext, zPre, zNext;
+  ::vadds((vector_s32 &)zPre, (vector_s32 &)z, -1, mask, mode);
+  ::vadds((vector_s32 &)zNext, (vector_s32 &)z, 1, mask, mode);
+
+  rPre = src0;
+  rNext = src0;
+  ::vmula(rPre, zPre, y, mask, mode);
+  ::vmula(rNext, zNext, y, mask, mode);
+
+  ::vabs(r, r, mask, mode);
+  ::vabs(rPre, rPre, mask, mode);
+  ::vabs(rNext, rNext, mask, mode);
+
+  vector_bool cmpMaskReg;
+  ::vcmp_lt(cmpMaskReg, r, rPre, mask);
+  ::vsel(r, r, rPre, cmpMaskReg);
+  ::vsel(z, z, zPre, cmpMaskReg);
+
+  ::vcmp_lt(cmpMaskReg, rNext, r, mask);
+  ::vsel(z, zNext, z, cmpMaskReg);
+
+  vector_f32 dst;
+  ::vsel(dst, tmpDst, z, infNanCmp);
+  return dst;
+}
+
 template <typename SrcVec, typename Mode>
 __simd_callee__ inline SrcVec vmax(SrcVec src_0, SrcVec src_1, vector_bool mask,
                                    Mode mode) {
