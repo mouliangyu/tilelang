@@ -471,11 +471,7 @@ or correctness issues.
 python measure_vf_latency.py examples/ascend/example_simdvf_vecadd.py
 
 # Preview without modifying the file
-python measure_vf_latency.py examples/ascend/example_fa.py --dry-run
-
-# Specify which kernel function to measure
-python measure_vf_latency.py examples/ascend/example_fa.py \
-    --call "flash_attention(D=128, SEQ_LEN=4096)"
+python measure_vf_latency.py examples/ascend/example_simdvf_vecadd.py --dry-run
 ```
 
 This tool compiles the kernel, extracts generated VF functions from
@@ -596,15 +592,7 @@ reduction of `sum(x^2)`.
 
 Reference: `examples/ascend/example_rmsnorm.py`
 
-### Pattern 7: FlashAttention (Hybrid Cube + SIMD VF + SIMT VF)
-
-Combines Cube GEMM (`S = Q @ K^T`, `O += P @ V`) with SIMD VF softmax
-(online rescaling, exp) and SIMT VF reductions (row max, sum). Uses
-`T.dual_copy` with `nd2nz=True` for NZ format conversion.
-
-Reference: `examples/ascend/example_fa.py`
-
-### Pattern 8: L0-Staged GEMM
+### Pattern 7: L0-Staged GEMM
 
 Double-buffers L0A and L0B within each K-tile for maximum Cube
 utilization. Adds an inner `SUB_K` tiling loop.
@@ -750,8 +738,7 @@ All examples are in `examples/ascend/`. Key files organized by category:
 ### Attention
 | File | Description |
 |---|---|
-| `example_fa.py` | FlashAttention (Cube + Vector hybrid, online softmax) |
-| `example_flash_attn.py` | Alternative FlashAttention variant |
+| `example_flash_attn.py` | FlashAttention variant |
 
 ### Misc
 | File | Description |
