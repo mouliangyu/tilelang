@@ -39,19 +39,25 @@ class _VFLocalVarCheckVisitor(PyStmtExprVisitor):
 
     def visit_decl_buffer_(self, op: tir.DeclBuffer) -> None:
         if op.buffer.scope() == "local.var" and _is_direct_vf_wrapper(op.body):
-            # This DeclBuffer wraps a VF block — enter VF scope here
-            # so that op.buffer is tracked as VF-local.
-            was_inside = self.inside_vf
-            saved_vars = self.vf_declared_vars
+            # This DeclBuffer is part of an alloc chain that directly wraps a
+            # VF AttrStmt. Only the outermost such DeclBuffer should open a new
+            # VF scope; inner ones must extend the existing scope so that all
+            # buffers in the chain are tracked as VF-local.
+            if not self.inside_vf:
+                was_inside = self.inside_vf
+                saved_vars = self.vf_declared_vars
 
-            self.inside_vf = True
-            self.vf_declared_vars = set()
-            self.vf_declared_vars.add(op.buffer.data)
+                self.inside_vf = True
+                self.vf_declared_vars = set()
+                self.vf_declared_vars.add(op.buffer.data)
 
-            self.visit_stmt(op.body)
+                self.visit_stmt(op.body)
 
-            self.inside_vf = was_inside
-            self.vf_declared_vars = saved_vars
+                self.inside_vf = was_inside
+                self.vf_declared_vars = saved_vars
+            else:
+                self.vf_declared_vars.add(op.buffer.data)
+                self.visit_stmt(op.body)
             return
 
         if self.inside_vf and op.buffer.scope() == "local.var":
