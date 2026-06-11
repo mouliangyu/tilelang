@@ -203,6 +203,15 @@ public:
     return default_value;
   }
 
+  bool GetScaleFactor() const {
+    if (auto val = annotations.Get("scale_factor")) {
+      if (auto int_val = val->as<IntImmNode>()) {
+        return int_val->value != 0;
+      }
+    }
+    return false;
+  }
+
   /*!
    * \brief Lower the copy operator to a TIR statement.
    * \param T        Arguments for lowering.

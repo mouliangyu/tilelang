@@ -128,7 +128,8 @@ struct float_e5m2_t {
 
 } // namespace tl
 
-using fp8_e4_t = tl::float_e4m3_t;
+// using fp8_e4_t = tl::float_e4m3_t;
+using fp8_e4_t = float8_e4m3_t;
 using fp8_e5_t = tl::float_e5m2_t;
 using fp8_e8_t = uint8_t;
 

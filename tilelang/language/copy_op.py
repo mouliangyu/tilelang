@@ -83,6 +83,7 @@ def copy(
     transpose: bool = False,
     nd2nz: bool = False,
     l2_cache_ctrl: int | str | None = None,
+    scale_factor: bool = False,
 ) -> tir.PrimExpr | tir.Stmt:
     """Copy data between memory regions.
 
@@ -106,6 +107,9 @@ def copy(
             avoid pollution). Defaults to None; Ascend UB→GM store paths use
             default 4, while load paths use default 0.
             Ascend only; ignored on other backends.
+        scale_factor (bool, keyword-only): Whether the copied data is a scale factor.
+            A semantic marker passed through to the builtin call; currently no
+            behaviour difference in lowering/codegen. Defaults to False.
 
     Raises:
         TypeError: If copy extents cannot be deduced from arguments
@@ -184,6 +188,10 @@ def copy(
     # Ascend DMA: L2 cache control for GM↔L1 and UB↔GM paths
     if l2_cache_ctrl is not None and "l2_cache_ctrl" not in ann:
         ann["l2_cache_ctrl"] = l2_cache_ctrl
+
+    # Scale factor marker: indicates the copied data is a scale factor tensor
+    if scale_factor and "scale_factor" not in ann:
+        ann["scale_factor"] = 1
 
     # Normalize string l2_cache_ctrl values (may come from kwarg or annotations dict)
     if "l2_cache_ctrl" in ann:

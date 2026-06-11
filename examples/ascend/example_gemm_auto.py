@@ -81,14 +81,14 @@ if __name__ == "__main__":
     device = torch.device("npu")
     M, K, N = 8192, 8192, 8192
 
-    for dt, thresh in [("bfloat16", 1e-2), ("float32", 5e-3)]:
+    for dt, thresh in [("float8_e4m3fn", 1e-1), ("bfloat16", 1e-2), ("float32", 5e-3)]:
         print(f"\n=== {dt} GEMM ===")
         program = gemm(M, K, N, dtype=dt)
         kernel = tilelang.compile(program, out_idx=-1)
         print("Compilation succeeded!")
 
-        x = torch.randn(M, K, dtype=getattr(torch, dt), device=device)
-        w = torch.randn(N, K, dtype=getattr(torch, dt), device=device)
+        x = torch.randn(M, K, device=device).to(dtype=getattr(torch, dt))
+        w = torch.randn(N, K, device=device).to(dtype=getattr(torch, dt))
 
         c = kernel(x, w)
         torch.npu.synchronize()

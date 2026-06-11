@@ -87,6 +87,20 @@ GemmPy::GemmPy(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   }
   node->cCoords_ = Array<PrimExpr>(
       {args[17].as<PrimExpr>().value(), args[18].as<PrimExpr>().value()});
+  if (args.size() > 19) {
+    node->blockScaled_ = args[19].as<IntImm>().value()->value;
+  }
+  if (args.size() > 20 && args[20].as<CallNode>()) {
+    node->sfaRegion_ = NormalizeToBufferRegion(args[20]);
+    node->sfa_ = node->sfaRegion_->buffer;
+  }
+  if (args.size() > 21 && args[21].as<CallNode>()) {
+    node->sfbRegion_ = NormalizeToBufferRegion(args[21]);
+    node->sfb_ = node->sfbRegion_->buffer;
+  }
+  if (args.size() > 22) {
+    node->sfKWithinChunk_ = args[22];
+  }
   data_ = std::move(node);
 }
 

@@ -9,13 +9,17 @@ def _test(dtype, thresh):
     M, K, N = 8192, 8192, 8192
     kernel = tilelang.compile(gemm(M, K, N, dtype=dtype), out_idx=-1)
     device = torch.device("npu")
-    x = torch.randn(M, K, dtype=getattr(torch, dtype), device=device)
-    w = torch.randn(N, K, dtype=getattr(torch, dtype), device=device)
+    x = torch.randn(M, K, device=device).to(dtype=getattr(torch, dtype))
+    w = torch.randn(N, K, device=device).to(dtype=getattr(torch, dtype))
     c = kernel(x, w)
     torch.npu.synchronize()
     expected = ref_program(x, w)
     max_diff = (c - expected).abs().max().item()
     assert max_diff < thresh, f"{dtype} max_diff={max_diff:.2e}"
+
+
+def test_gemm_auto_fp8():
+    _test("float8_e4m3fn", 1e-1)
 
 
 def test_gemm_auto_bf16():
@@ -42,6 +46,8 @@ def test_gemm_auto_fp32_hf32():
 
 
 if __name__ == "__main__":
+    test_gemm_auto_fp8()
+    print("PASS: test_gemm_auto_fp8")
     test_gemm_auto_bf16()
     print("PASS: test_gemm_auto_bf16")
     test_gemm_auto_fp32()

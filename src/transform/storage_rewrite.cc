@@ -563,8 +563,25 @@ public:
       const StorageEntry *se = it->second;
       PrimExpr offset = this->VisitExpr(op->args[2]);
       PrimExpr extent = this->VisitExpr(op->args[3]);
-      uint64_t elem_bits = dtype.bits() * dtype.lanes();
+      uint64_t child_elem_bits = dtype.bits() * dtype.lanes();
+      uint64_t elem_bits = child_elem_bits;
+      // If merged into a parent alloc, use parent's element type so the
+      // offset matches the base pointer's C++ pointer arithmetic.
+      if (se->alloc_var.get() != buffer) {
+        auto parent_it = alloc_map_.find(se->alloc_var.get());
+        if (parent_it != alloc_map_.end()) {
+          elem_bits = parent_it->second->elem_type.bits() *
+                      parent_it->second->elem_type.lanes();
+        }
+      }
       ICHECK_EQ(se->bits_offset % elem_bits, 0U);
+      // Scale region offset (e.g. pipeline version) to parent element units
+      if (elem_bits != child_elem_bits) {
+        offset =
+            offset *
+            make_const(offset.dtype(), static_cast<int64_t>(child_elem_bits)) /
+            make_const(offset.dtype(), static_cast<int64_t>(elem_bits));
+      }
       if (se->bits_offset != 0) {
         offset =
             make_const(offset.dtype(), se->bits_offset / elem_bits) + offset;

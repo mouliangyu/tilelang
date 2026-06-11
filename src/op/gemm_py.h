@@ -35,6 +35,12 @@ public:
   // only will be enabled under cdna mfma instructions
   int kPack_ = 1;
   int wgWait_ = 0;
+  int blockScaled_ = 0;
+  PrimExpr sfKWithinChunk_ = IntImm(DataType::Int(32), 0);
+  tir::Buffer sfa_;
+  tir::Buffer sfb_;
+  tir::BufferRegion sfaRegion_;
+  tir::BufferRegion sfbRegion_;
   mutable GemmWarpPolicy policy_;
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.GemmPy", GemmPyNode, TileOperatorNode);
@@ -62,6 +68,12 @@ public:
         .def_ro("cCoords", &GemmPyNode::cCoords_)
         .def_ro("kPack", &GemmPyNode::kPack_)
         .def_ro("wgWait", &GemmPyNode::wgWait_)
+        .def_ro("blockScaled", &GemmPyNode::blockScaled_)
+        .def_ro("sfKWithinChunk", &GemmPyNode::sfKWithinChunk_)
+        .def_ro("sfa", &GemmPyNode::sfa_)
+        .def_ro("sfb", &GemmPyNode::sfb_)
+        .def_ro("sfaRegion", &GemmPyNode::sfaRegion_)
+        .def_ro("sfbRegion", &GemmPyNode::sfbRegion_)
         .def_ro("policy", &GemmPyNode::policy_);
   }
 

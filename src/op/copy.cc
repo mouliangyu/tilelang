@@ -992,7 +992,7 @@ Stmt CopyNode::LowerAscendDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
     call = Call(DataType::Void(), ascend_copy_gm_to_cbuf(),
                 {dst_ptr, src_ptr, sid, src_row_stride_bytes,
                  I(this->GetL2CacheCtrl()), n_value, d_value, zero, zero,
-                 transpose_flag, dst_n_value});
+                 transpose_flag, dst_n_value, I(this->GetScaleFactor())});
   } else if (dma_path == 3 || dma_path == 4) {
     // L1 -> L0A/L0B: fractal-addressed load
     // K offset handled by kStartPosition param, not in src pointer.
@@ -1300,8 +1300,9 @@ Stmt CopyNode::LowerTmemCopy(const LowerArgs &T,
   } else if (src.scope() == "shared.dyn" && dst.scope() == "shared.tmem") {
     is_cp = true;
   } else {
-    LOG(FATAL) << "Unsupported tensor memory copy: " << "src scope = "
-               << src.scope() << ", dst scope = " << dst.scope();
+    LOG(FATAL) << "Unsupported tensor memory copy: "
+               << "src scope = " << src.scope()
+               << ", dst scope = " << dst.scope();
   }
   // Currently tcgen05.cp is not supported
   // TODO (mzw) Support tcgen05.cp

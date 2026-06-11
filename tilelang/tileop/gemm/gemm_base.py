@@ -120,6 +120,30 @@ class GemmBase:
         return getattr(self.gemm_node, "wgWait", 0)
 
     @property
+    def block_scaled(self) -> bool:
+        return bool(getattr(self.gemm_node, "blockScaled", 0))
+
+    @property
+    def sfa(self):
+        return getattr(self.gemm_node, "sfa", None)
+
+    @property
+    def sfb(self):
+        return getattr(self.gemm_node, "sfb", None)
+
+    @property
+    def sfaRegion(self):
+        return getattr(self.gemm_node, "sfaRegion", None)
+
+    @property
+    def sfbRegion(self):
+        return getattr(self.gemm_node, "sfbRegion", None)
+
+    @property
+    def sf_k_within_chunk(self):
+        return getattr(self.gemm_node, "sfKWithinChunk", tir.IntImm("int32", 0))
+
+    @property
     def policy(self) -> GemmWarpPolicy:
         return getattr(self.gemm_node, "policy", None)
 

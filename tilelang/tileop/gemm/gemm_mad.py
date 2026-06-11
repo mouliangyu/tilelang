@@ -68,6 +68,7 @@ _ASCEND_DTYPE_MAP = {
     "int8": "int8_t",
     "int16": "int16_t",
     "int32": "int32_t",
+    "float8_e4m3fn": "float8_e4m3_t",
 }
 
 
@@ -132,7 +133,9 @@ class GemmMAD(GemmBase):
         return _Simplify(_gemm_mad, inline_let=True)
 
     def _lower_l1(self):
-        """New path: A and B in L1 scope, emit ascend_gemm_l1 template call."""
+        """New path: A and B in L1 scope, emit ascend_gemm_l1 or ascend_blockscaled_gemm_l1."""
+        if self.block_scaled:
+            return self._lower_l1_blockscaled()
         tile_k_sub = self._compute_tile_k_sub()
 
         # L0C access pointer
@@ -191,3 +194,111 @@ class GemmMAD(GemmBase):
             T.evaluate(call)
 
         return _Simplify(_gemm_mad_l1, inline_let=True)
+
+    def _lower_l1_blockscaled(self):
+        """Block-scaled GEMM path: A, B, SFA, SFB in L1 → emit ascend_blockscaled_gemm_l1."""
+        tile_k_sub = self._compute_tile_k_sub()
+
+        c_ptr = _make_access_ptr(self.CRegion.buffer, self.CRegion, 2)
+
+        # L1 data access pointers
+        a_buf = self.ARegion.buffer
+        b_buf = self.BRegion.buffer
+        a_base_offset = _compute_flat_offset_excluding_last(a_buf, self.ARegion)
+        b_base_offset = _compute_flat_offset_excluding_last(b_buf, self.BRegion)
+        a_total = _compute_extent(self.ARegion)
+        b_total = _compute_extent(self.BRegion)
+
+        a_ptr = tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tir.tvm_access_ptr"),
+            tir.type_annotation(a_buf.dtype),
+            a_buf.data,
+            a_base_offset,
+            a_total,
+            _to_int32(1),
+        )
+        b_ptr = tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tir.tvm_access_ptr"),
+            tir.type_annotation(b_buf.dtype),
+            b_buf.data,
+            b_base_offset,
+            b_total,
+            _to_int32(1),
+        )
+
+        # L1 SF access pointers
+        sfa_region = self.sfaRegion
+        sfb_region = self.sfbRegion
+        assert sfa_region is not None and sfb_region is not None, "block_scaled=True requires sfa and sfb buffers"
+        sfa_buf = sfa_region.buffer
+        sfb_buf = sfb_region.buffer
+        sfa_base_offset = _compute_flat_offset_excluding_last(sfa_buf, sfa_region)
+        sfb_base_offset = _compute_flat_offset_excluding_last(sfb_buf, sfb_region)
+        sfa_total = _compute_extent(sfa_region)
+        sfb_total = _compute_extent(sfb_region)
+
+        sfa_ptr = tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tir.tvm_access_ptr"),
+            tir.type_annotation(sfa_buf.dtype),
+            sfa_buf.data,
+            sfa_base_offset,
+            sfa_total,
+            _to_int32(1),
+        )
+        sfb_ptr = tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tir.tvm_access_ptr"),
+            tir.type_annotation(sfb_buf.dtype),
+            sfb_buf.data,
+            sfb_base_offset,
+            sfb_total,
+            _to_int32(1),
+        )
+
+        in_dtype_str = _ASCEND_DTYPE_MAP.get(self.in_dtype)
+        assert in_dtype_str is not None, f"Unsupported dtype: {self.in_dtype}"
+
+        def _sf_dtype_str(dt) -> str:
+            s = str(dt)
+            if "int16" in s:
+                return "int16_t"
+            if "float8_e4m3" in s:
+                return "float8_e4m3_t"
+            return s
+
+        sf_dtype_str = _sf_dtype_str(sfa_buf.dtype)
+
+        sf_load_chunk_size = int(sfa_buf.shape[-2]) // (self.K // 64)
+
+        call = tir.Call(
+            "void",
+            tir.op.Op.get("tl.ascend_blockscaled_gemm_l1"),
+            [
+                c_ptr,
+                a_ptr,
+                b_ptr,
+                sfa_ptr,
+                sfb_ptr,
+                _to_int32(self.M),
+                _to_int32(self.K),
+                _to_int32(self.N),
+                _to_int32(tile_k_sub),
+                _to_int32(1 if self.trans_B else 0),
+                self.clear_accum,
+                tir.StringImm(in_dtype_str),
+                tir.StringImm(sf_dtype_str),
+                tir.StringImm("float"),
+                _to_int32(0),  # buf_offset
+                _to_int32(self.sf_k_within_chunk),
+                _to_int32(sf_load_chunk_size),  # sf_load_chunk_size
+            ],
+        )
+
+        @T.prim_func
+        def _gemm_mad_l1_bs() -> None:
+            T.evaluate(call)
+
+        return _Simplify(_gemm_mad_l1_bs, inline_let=True)

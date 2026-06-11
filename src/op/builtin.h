@@ -656,11 +656,14 @@ TVM_DLL const Op &ascend_copy_ubuf_to_gm();
  * \brief Ascend DMA copy from GM to CBuf (L1).
  *
  * ascend_copy_gm_to_cbuf(dst, src, sid, loop1_src_stride, l2_cache_ctrl,
- * n_value, d_value, loop4_src_stride, smallc0_en, transpose)
+ * n_value, d_value, loop4_src_stride, smallc0_en, transpose, dst_n_value,
+ * scale_factor)
  *
  * When transpose=0 emits copy_gm_to_cbuf_multi_nd2nz (row-major → NZ).
  * When transpose!=0 emits copy_gm_to_cbuf_multi_dn2nz (col-major → NZ),
  * which transposes the N/D mapping — useful for NN matmul on Ascend.
+ * When scale_factor!=0, nz_c0_stride = n_rows_val without ceil-to-16
+ * grouping, for scale factor data in flat layout.
  */
 TVM_DLL const Op &ascend_copy_gm_to_cbuf();
 
@@ -739,6 +742,17 @@ TVM_DLL const Op &ascend_mad();
  *
  */
 TVM_DLL const Op &ascend_gemm_l1();
+
+/*!
+ * \brief Ascend block-scaled GEMM with L1-scoped inputs (MXFP8).
+ *
+ * ascend_blockscaled_gemm_l1(cc_ptr, a_ptr, b_ptr, sfa_ptr, sfb_ptr,
+ * M, K, N, tile_k_sub, trans_b, clear_accum, in_dtype_str, sf_dtype_str,
+ * accum_dtype_str, buf_offset, sf_k_within_chunk, sf_load_chunk_size)
+ *
+ * Uses blockscaled_gemm.h template with mad_mx instruction.
+ */
+TVM_DLL const Op &ascend_blockscaled_gemm_l1();
 
 /*!
  * \brief Ascend get_buf for pipe buffer acquisition.

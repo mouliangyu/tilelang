@@ -95,3 +95,114 @@ ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
     rls_buf(PIPE_M, buf_offset + (sk & 1), false);
   }
 }
+
+/*!
+ * \brief Ascend block-scaled GEMM template for L1-scoped inputs with
+ *        double-buffered L0 and scale factor pipeline.
+ *
+ * Data flow:
+ *   1. L1→L0A/L0B  data:  load_cbuf_to_ca  / load_cbuf_to_cb
+ *   2. L1→L0A/L0B  scale: load_cbuf_to_ca_mx / load_cbuf_to_cb_mx
+ *   3. Compute:            mad_mx (reads data + scale from L0A/L0B)
+ *
+ * SF layout conventions:
+ *   - kSFDivisor = 64:  one SF pair (int16_t = 2×float8_e8m0) per 64 K-elements
+ *   - kSFPack    = 2:   two SF values packed in each int16_t
+ *   - kSFAddrDiv = 16:  hardware divisor for L0A/L0B SF destination address
+ *   - kAddrUnit  = 32:  L1 address unit for NZ stride parameters (bytes)
+ *
+ * \tparam M           Tile M dimension
+ * \tparam K           Full K dimension of the L1 tile
+ * \tparam N           Tile N dimension
+ * \tparam TILE_K_SUB  Sub-K chunk size that fits in L0A/L0B
+ * \tparam TRANS_B     Whether B is transposed
+ * \tparam SF_LOAD_INTERVAL  Multi-load factor for SF tiles per K chunk
+ * \tparam InT         Input element type (float8_e4m3_t, etc.)
+ * \tparam SFT         Scale factor L1 storage type (int16_t: 2× float8_e8m0
+ *                     packed per element, one pair per 64 K-elements)
+ * \tparam AccumT      Accumulator element type (deduced from cc_ptr)
+ */
+template <int M, int K, int N, int TILE_K_SUB, bool TRANS_B,
+          int SF_LOAD_INTERVAL, typename InT, typename SFT, typename AccumT>
+__aicore__ inline void
+ascend_blockscaled_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
+                           __cbuf__ InT *cbuf_b_ptr, __cbuf__ SFT *cbuf_sfa_ptr,
+                           __cbuf__ SFT *cbuf_sfb_ptr, int clear_accum,
+                           int buf_offset = 0, int sf_k_within_chunk = 0) {
+  constexpr int C0 = 32 / sizeof(InT);
+  constexpr int FRAC_N = 16;
+
+  static_assert(K % TILE_K_SUB == 0, "K must be divisible by TILE_K_SUB");
+  static_assert(TILE_K_SUB % C0 == 0, "TILE_K_SUB must be a multiple of C0");
+  static_assert(TILE_K_SUB % 64 == 0,
+                "MXFP8 requires TILE_K_SUB to be a multiple of 64 "
+                "(one SF pair covers 64 K-elements)");
+  static_assert(M % FRAC_N == 0, "M must be a multiple of 16");
+  static_assert(N % FRAC_N == 0, "N must be a multiple of 16");
+
+  constexpr int SUB_K = K / TILE_K_SUB;
+  constexpr int mStepA = M / FRAC_N;
+  constexpr int mStepB = N / FRAC_N;
+  constexpr int kStep = TILE_K_SUB / C0;
+  constexpr int L0A_STAGE = M * TILE_K_SUB;
+  constexpr int L0B_STAGE = N * TILE_K_SUB;
+
+  static constexpr int kSFDivisor = 64;
+  static constexpr int kSFPack = 2;
+  static constexpr int kSFAddrDiv = 16;
+
+  static constexpr int kSFPairsPerInner = TILE_K_SUB / kSFDivisor;
+  static constexpr int kSFValuesPerKBlock = K / kSFDivisor;
+  static constexpr int kSFNZStride = SF_LOAD_INTERVAL * K / kSFDivisor;
+
+  __ca__ InT *l0a = (__ca__ InT *)0;
+  __cb__ InT *l0b = (__cb__ InT *)0;
+
+  for (int sk = 0; sk < SUB_K; ++sk) {
+    get_buf(PIPE_MTE1, buf_offset + (sk & 1), false);
+
+    load_cbuf_to_ca((__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)), cbuf_a_ptr, 0,
+                    (sk * kStep), mStepA, kStep, mStepA, mStepA, 0);
+
+    if constexpr (TRANS_B) {
+      load_cbuf_to_cb((__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), cbuf_b_ptr,
+                      0, (sk * kStep), mStepB, kStep, mStepB, mStepB, 0);
+    } else {
+      constexpr int srcStrideNN = K / C0;
+      load_cbuf_to_cb((__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), cbuf_b_ptr,
+                      (sk * kStep), 0, kStep, mStepB, srcStrideNN, kStep, 1);
+    }
+
+    {
+      uint64_t dst_a =
+          (uint64_t)(uintptr_t)((__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE))) /
+          kSFAddrDiv;
+      uint64_t dst_b =
+          (uint64_t)(uintptr_t)((__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE))) /
+          kSFAddrDiv;
+
+      uint16_t sf_y =
+          sf_k_within_chunk * kSFValuesPerKBlock + sk * kSFPairsPerInner;
+
+      load_cbuf_to_ca_mx(dst_a, (__cbuf__ fp8_e4_t *)cbuf_sfa_ptr, 0, sf_y,
+                         mStepA, kSFPairsPerInner, kSFNZStride,
+                         kSFPairsPerInner);
+
+      load_cbuf_to_cb_mx(dst_b, (__cbuf__ fp8_e4_t *)cbuf_sfb_ptr, 0, sf_y,
+                         mStepB, kSFPairsPerInner, kSFNZStride,
+                         kSFPairsPerInner);
+    }
+
+    rls_buf(PIPE_MTE1, buf_offset + (sk & 1), false);
+
+    get_buf(PIPE_M, buf_offset + (sk & 1), false);
+
+    bool is_first = (sk == 0);
+
+    mad_mx(cc_ptr, (__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)),
+           (__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), M, TILE_K_SUB, N, 0,
+           false, false, clear_accum && is_first);
+
+    rls_buf(PIPE_M, buf_offset + (sk & 1), false);
+  }
+}

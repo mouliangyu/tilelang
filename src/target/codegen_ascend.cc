@@ -225,7 +225,11 @@ void CodeGenTileLangAscend::PrintType(DataType t, std::ostream &os) {
       fail = true;
     }
   } else if (t.is_float8()) {
-    os << GetAscendFP8Type(t);
+    if (inside_simtvf_body_ && t.is_scalar()) {
+      os << GetAscendFP8ScalarValueType(t);
+    } else {
+      os << GetAscendFP8Type(t);
+    }
     return;
   } else if (t.is_float4_e2m1fn()) {
     os << "float4_e2m1x2_t";
@@ -315,6 +319,9 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
       if (call->op.same_as(tl::ascend_nd2nz_scatter()) ||
           call->op.same_as(tl::ascend_nd2nz_post_copy())) {
         has_nd2nz_copy_ = true;
+      }
+      if (call->op.same_as(tl::ascend_blockscaled_gemm_l1())) {
+        has_gemm_l1_ = true;
       }
     }
   });
@@ -938,8 +945,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->stream << ", " << Downcast<StringImm>(op->args[3])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_gm_to_cbuf())) {
-    ICHECK_EQ(op->args.size(), 11)
-        << "tl.ascend_copy_gm_to_cbuf expects exactly 11 arguments";
+    ICHECK_EQ(op->args.size(), 12)
+        << "tl.ascend_copy_gm_to_cbuf expects exactly 12 arguments";
     // arg[9] is the transpose flag: 0 → nd2nz, nonzero → dn2nz
     const IntImmNode *transpose_node = op->args[9].as<IntImmNode>();
     bool use_dn2nz = transpose_node && transpose_node->value != 0;
@@ -966,7 +973,15 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       // After copy.cc swaps n_value/d_value for dn2nz, args[5] is always
       // nValue (= height for nd2nz, = width for dn2nz). Both cases:
       // dstNzC0Stride = Ceil(nValue, 16) * 16.
-      int nz_c0_stride = ((n_rows_val + 15) / 16) * 16;
+      // For scale_factor copies: nz_c0_stride = n_rows_val (no fractal
+      // grouping). n_rows_val from args[5] (n_value = actual row count), not
+      // args[10] (dst_n_value).
+      const IntImmNode *scale_node = op->args[11].as<IntImmNode>();
+      bool is_scale_factor = scale_node && scale_node->value != 0;
+      int n_rows_v = rows_node ? rows_node->value : 16;
+      const IntImmNode *nval_node = op->args[5].as<IntImmNode>();
+      int nval = nval_node ? nval_node->value : n_rows_v;
+      int nz_c0_stride = is_scale_factor ? nval : ((n_rows_v + 15) / 16) * 16;
       this->PrintIndent();
       this->stream << "set_mte2_nz_para("
                    << "uint64_t(1) | (uint64_t(1) << 16) | (uint64_t("
@@ -1186,6 +1201,41 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     if (op->args.size() >= 4 && op->args[3].as<StringImmNode>())
       this->stream << ", " << Downcast<StringImm>(op->args[3])->value;
     this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_blockscaled_gemm_l1())) {
+    ICHECK_EQ(op->args.size(), 17)
+        << "tl.ascend_blockscaled_gemm_l1 expects exactly 17 arguments";
+    int M = op->args[5].as<IntImmNode>()->value;
+    int K = op->args[6].as<IntImmNode>()->value;
+    int N = op->args[7].as<IntImmNode>()->value;
+    int tile_k_sub = op->args[8].as<IntImmNode>()->value;
+    int trans_b = op->args[9].as<IntImmNode>()->value;
+    int sf_load_chunk_size = op->args[16].as<IntImmNode>()->value;
+    std::string in_dtype_str = op->args[11].as<StringImmNode>()->value;
+    std::string sf_dtype_str = op->args[12].as<StringImmNode>()->value;
+    std::string accum_dtype_str = op->args[13].as<StringImmNode>()->value;
+
+    this->PrintIndent();
+    this->stream << "ascend_blockscaled_gemm_l1<" << M << ", " << K << ", " << N
+                 << ", " << tile_k_sub << ", " << (trans_b ? "true" : "false")
+                 << ", " << sf_load_chunk_size << ", " << in_dtype_str << ", "
+                 << sf_dtype_str << ", " << accum_dtype_str << ">(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[2], this->stream);
+    this->stream << ", ";
+    this->stream << "(__cbuf__ " << sf_dtype_str << "*)(";
+    this->PrintExpr(op->args[3], this->stream);
+    this->stream << "), (__cbuf__ " << sf_dtype_str << "*)(";
+    this->PrintExpr(op->args[4], this->stream);
+    this->stream << "), ";
+    this->PrintExpr(op->args[10], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[14], this->stream);
+    this->stream << ", ";
+    this->PrintExpr(op->args[15], this->stream);
+    this->stream << ");\n";
   } else if (op->op.same_as(tir::builtin::address_of())) {
     const auto *load = op->args[0].as<tir::BufferLoadNode>();
     ICHECK(op->args.size() == 1 && load);
@@ -1382,7 +1432,9 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     DataType elem = op->dtype.element_of();
     os << "simd_inst::vgatherb<";
     PrintType(elem, os);
-    os << ">((" << "__ubuf__" << " ";
+    os << ">(("
+       << "__ubuf__"
+       << " ";
     PrintType(elem, os);
     os << "*)";
     PrintExpr(op->args[0], os); // base
@@ -1402,7 +1454,9 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     bool has_off = (op->args.size() == 3);
     os << "simd_inst::vld<";
     os << CCEUBufType(elem);
-    os << ">((" << "__ubuf__" << " ";
+    os << ">(("
+       << "__ubuf__"
+       << " ";
     os << CCEUBufType(elem);
     os << "*)";
     PrintExpr(op->args[0], os); // addr
