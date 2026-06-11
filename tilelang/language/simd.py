@@ -240,9 +240,43 @@ def vcmax(src, mask, mode="MODE_ZEROING"):
     return tir.call_intrin(str(src.dtype), _Op("tl.simd.vcmax"), src, mask, mode)
 
 
+def vcmin(src, mask, mode="MODE_ZEROING"):
+    """Pairwise min reduction: dst = vcmin(src, mask)."""
+    return tir.call_intrin(str(src.dtype), _Op("tl.simd.vcmin"), src, mask, mode)
+
+
 def vcgadd(src, mask, mode="MODE_ZEROING"):
     """Grouped add reduction: dst = vcgadd(src, mask)."""
     return tir.call_intrin(str(src.dtype), _Op("tl.simd.vcgadd"), src, mask, mode)
+
+
+# -- Index ramp / compare ---------------------------------------------------------
+
+
+def vci(index, dtype_str, order="INC_ORDER"):
+    """Index ramp: dst = vci(index, dtype_str, order).
+
+    dst[lane] = index + lane (INC_ORDER) / index - lane (DEC_ORDER).
+    dtype_str is the destination vector element type (e.g. "int32", "float32").
+    """
+    vec_dtype = _vec_dtype(dtype_str)
+    return tir.call_intrin(vec_dtype, _Op("tl.simd.vci"), index, order)
+
+
+def vcmp(src0, src1, mask, op="eq"):
+    """Elementwise compare → vector_bool: dst = vcmp_<op>(src0, src1, mask).
+
+    op: eq/ne/gt/ge/lt/le.
+    """
+    return tir.call_intrin("boolx256", _Op("tl.simd.vcmp"), src0, src1, mask, op)
+
+
+def vcmps(src, scalar, mask, op="lt"):
+    """Compare vector vs scalar → vector_bool: dst = vcmps_<op>(src, scalar, mask).
+
+    op: eq/ne/gt/ge/lt/le.
+    """
+    return tir.call_intrin("boolx256", _Op("tl.simd.vcmps"), src, scalar, mask, op)
 
 
 # -- Register permutation ---------------------------------------------------------

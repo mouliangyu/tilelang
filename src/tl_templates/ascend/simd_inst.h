@@ -346,6 +346,47 @@ __simd_callee__ inline SrcVec vcmax(SrcVec src, vector_bool mask, Mode mode) {
   return dst;
 }
 
+template <typename SrcVec, typename Mode>
+__simd_callee__ inline SrcVec vcmin(SrcVec src, vector_bool mask, Mode mode) {
+  SrcVec dst;
+  ::vcmin(dst, src, mask, mode);
+  return dst;
+}
+
+// -- Index ramp / compare
+// ------------------------------------------------------------
+
+// index ramp: T = int32_t / float / ...; returns dst[lane] = index (+/-) lane
+template <typename T, typename Order>
+__simd_callee__ inline vec_t<T> vci(T index, Order order) {
+  vec_t<T> dst;
+  ::vci(dst, index, order);
+  return dst;
+}
+
+#define __SIMD_INST_VCMP(OP)                                                   \
+  template <typename SrcVec>                                                   \
+  __simd_callee__ inline vector_bool vcmp_##OP(SrcVec src_0, SrcVec src_1,     \
+                                               vector_bool mask) {             \
+    vector_bool dst;                                                           \
+    ::vcmp_##OP(dst, src_0, src_1, mask);                                      \
+    return dst;                                                                \
+  }                                                                            \
+  template <typename SrcVec, typename ScalarT>                                 \
+  __simd_callee__ inline vector_bool vcmps_##OP(SrcVec src, ScalarT scalar,    \
+                                                vector_bool mask) {            \
+    vector_bool dst;                                                           \
+    ::vcmps_##OP(dst, src, scalar, mask);                                      \
+    return dst;                                                                \
+  }
+__SIMD_INST_VCMP(eq)
+__SIMD_INST_VCMP(ne)
+__SIMD_INST_VCMP(gt)
+__SIMD_INST_VCMP(ge)
+__SIMD_INST_VCMP(lt)
+__SIMD_INST_VCMP(le)
+#undef __SIMD_INST_VCMP
+
 // -- Broadcast
 // ------------------------------------------------------------------
 

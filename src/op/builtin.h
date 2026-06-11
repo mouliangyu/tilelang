@@ -568,7 +568,13 @@ TVM_DLL const Op &simd_vdupv(); // 5-arg vector→vector lane-N broadcast
 // -- Cross-lane reduction
 TVM_DLL const Op &simd_vcadd();
 TVM_DLL const Op &simd_vcmax();
+TVM_DLL const Op &simd_vcmin();
 TVM_DLL const Op &simd_vcgadd();
+
+// -- Index ramp / compare
+TVM_DLL const Op &simd_vci();
+TVM_DLL const Op &simd_vcmp();
+TVM_DLL const Op &simd_vcmps();
 
 // -- Register permutation
 TVM_DLL const Op &simd_vintlv();

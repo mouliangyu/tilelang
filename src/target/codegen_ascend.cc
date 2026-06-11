@@ -1291,18 +1291,51 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   }
   // --- SimdVF cross-lane reduce with vcgadd addition ---
   else if (op->op.same_as(tl::simd_vcmax()) ||
+           op->op.same_as(tl::simd_vcmin()) ||
            op->op.same_as(tl::simd_vcadd()) ||
            op->op.same_as(tl::simd_vcgadd())) {
     ICHECK_EQ(op->args.size(), 3);
-    const char *name =
-        op->op.same_as(tl::simd_vcmax())
-            ? "vcmax"
-            : (op->op.same_as(tl::simd_vcgadd()) ? "vcgadd" : "vcadd");
+    const char *name = op->op.same_as(tl::simd_vcmax())    ? "vcmax"
+                       : op->op.same_as(tl::simd_vcmin())  ? "vcmin"
+                       : op->op.same_as(tl::simd_vcgadd()) ? "vcgadd"
+                                                           : "vcadd";
     os << "simd_inst::" << name << "(";
     PrintExpr(op->args[0], os); // src
     os << ", ";
     PrintExpr(op->args[1], os);                            // mask
     os << ", " << Downcast<StringImm>(op->args[2])->value; // mode
+    os << ")";
+  }
+  // --- SimdVF index ramp: (index, order) → vci<T>(index, order) ---
+  else if (op->op.same_as(tl::simd_vci())) {
+    ICHECK_EQ(op->args.size(), 2);
+    DataType elem = op->dtype.element_of();
+    os << "simd_inst::vci<";
+    PrintType(elem, os);
+    os << ">(";
+    PrintExpr(op->args[0], os);                                   // index
+    os << ", " << Downcast<StringImm>(op->args[1])->value << ")"; // order
+  }
+  // --- SimdVF compare: (src0, src1, mask, op) → vcmp_<op>(...) → bool ---
+  else if (op->op.same_as(tl::simd_vcmp())) {
+    ICHECK_EQ(op->args.size(), 4);
+    os << "simd_inst::vcmp_" << Downcast<StringImm>(op->args[3])->value << "(";
+    PrintExpr(op->args[0], os); // src0
+    os << ", ";
+    PrintExpr(op->args[1], os); // src1
+    os << ", ";
+    PrintExpr(op->args[2], os); // mask
+    os << ")";
+  }
+  // --- SimdVF compare-scalar: (src, scalar, mask, op) → vcmps_<op>(...) ---
+  else if (op->op.same_as(tl::simd_vcmps())) {
+    ICHECK_EQ(op->args.size(), 4);
+    os << "simd_inst::vcmps_" << Downcast<StringImm>(op->args[3])->value << "(";
+    PrintExpr(op->args[0], os); // src
+    os << ", ";
+    PrintExpr(op->args[1], os); // scalar
+    os << ", ";
+    PrintExpr(op->args[2], os); // mask
     os << ")";
   }
   // --- SimdVF register permutation: (src0, src1) → pair ---

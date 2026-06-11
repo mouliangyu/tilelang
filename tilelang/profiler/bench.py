@@ -304,7 +304,7 @@ def _bench_with_msprof(
             return flops / self.dur_ns / 1000
 
         def gbps(self, bytes: float) -> float:
-            return bytes / self.dur_ns / 1e3
+            return bytes / self.dur_ns
 
         def __repr__(self):
             def _fmt(label, val):
