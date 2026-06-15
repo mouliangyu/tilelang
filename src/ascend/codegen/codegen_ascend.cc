@@ -22,6 +22,20 @@ namespace codegen {
 
 namespace {
 
+static std::string GetAscendScopeQualifier(const std::string &scope) {
+  if (scope == "shared" || scope == "shared.dyn")
+    return "__ubuf__";
+  if (scope == "shared.l0a" || scope == "shared.l0a.dyn")
+    return "__ca__";
+  if (scope == "shared.l0b" || scope == "shared.l0b.dyn")
+    return "__cb__";
+  if (scope == "shared.l0c" || scope == "shared.l0c.dyn")
+    return "__cc__";
+  if (scope == "shared.l1" || scope == "shared.l1.dyn")
+    return "__cbuf__";
+  return "";
+}
+
 std::string FixIndent(const std::string &body) {
   size_t min_indent = std::string::npos;
   std::istringstream iss(body);
@@ -1585,6 +1599,66 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::loop_break())) {
     this->PrintIndent();
     this->stream << "break;\n";
+    // --- Atomic ops: emit asc_atomic_{add,max,min}(ptr, val) ---
+  } else if (op->op.same_as(tl::atomic_add_elem_op()) ||
+             op->op.same_as(tl::atomic_max_elem_op()) ||
+             op->op.same_as(tl::atomic_min_elem_op()) ||
+             op->op.same_as(tl::atomic_add_ret_elem_op()) ||
+             op->op.same_as(tl::atomic_max_ret_elem_op()) ||
+             op->op.same_as(tl::atomic_min_ret_elem_op())) {
+    ICHECK_GE(op->args.size(), 2);
+    const auto *addr = op->args[0].as<CallNode>();
+    ICHECK(addr && addr->op.same_as(tirx::builtin::address_of()));
+    const auto *load = addr->args[0].as<BufferLoadNode>();
+    ICHECK(load);
+    const auto *buf_var = load->buffer->data.get();
+    std::string scope;
+    auto scope_it = alloc_storage_scope_.find(buf_var);
+    if (scope_it != alloc_storage_scope_.end()) {
+      scope = scope_it->second;
+    } else {
+      scope = GetPtrStorageScope(load->buffer->data);
+    }
+    std::string qual =
+        (scope == "global") ? "__gm__" : GetAscendScopeQualifier(scope);
+    const char *fn = nullptr;
+    bool is_ret = false;
+    if (op->op.same_as(tl::atomic_add_elem_op()) ||
+        op->op.same_as(tl::atomic_add_ret_elem_op()))
+      fn = "add";
+    else if (op->op.same_as(tl::atomic_max_elem_op()) ||
+             op->op.same_as(tl::atomic_max_ret_elem_op()))
+      fn = "max";
+    else
+      fn = "min";
+    is_ret = op->op.same_as(tl::atomic_add_ret_elem_op()) ||
+             op->op.same_as(tl::atomic_max_ret_elem_op()) ||
+             op->op.same_as(tl::atomic_min_ret_elem_op());
+    auto emit_ptr_and_val = [&](std::ostream &out) {
+      out << "asc_atomic_" << fn << "((" << qual << " ";
+      PrintType(load->dtype, out);
+      out << "*)(" << GetVarID(buf_var);
+      if (load->indices.size() == 1) {
+        PrimExpr idx = load->indices[0];
+        if (!is_zero(idx)) {
+          out << " + ";
+          PrintExpr(idx, out);
+        }
+      }
+      out << "), ";
+      PrintExpr(op->args[1], out);
+      if (op->args.size() > 2) {
+        out << ", " << PrintExpr(op->args[2]);
+      }
+      out << ")";
+    };
+    if (is_ret) {
+      emit_ptr_and_val(os);
+    } else {
+      this->PrintIndent();
+      emit_ptr_and_val(this->stream);
+      this->stream << ";\n";
+    }
   } else {
     CodeGenC::VisitExpr_(op, os);
   }
@@ -1741,20 +1815,6 @@ void CodeGenTileLangAscend::VisitStmt_(const AttrStmtNode *op) {
     return;
   }
   CodeGenC::VisitStmt_(op);
-}
-
-static std::string GetAscendScopeQualifier(const std::string &scope) {
-  if (scope == "shared" || scope == "shared.dyn")
-    return "__ubuf__";
-  if (scope == "shared.l0a" || scope == "shared.l0a.dyn")
-    return "__ca__";
-  if (scope == "shared.l0b" || scope == "shared.l0b.dyn")
-    return "__cb__";
-  if (scope == "shared.l0c" || scope == "shared.l0c.dyn")
-    return "__cc__";
-  if (scope == "shared.l1" || scope == "shared.l1.dyn")
-    return "__cbuf__";
-  return "";
 }
 
 void CodeGenTileLangAscend::VisitStmt_(const AllocBufferNode *op) {
