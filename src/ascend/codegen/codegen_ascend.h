@@ -60,7 +60,6 @@ private:
   bool has_gemm_l1_included_{false};
   bool has_nd2nz_copy_{false};
   bool has_nd2nz_copy_included_{false};
-  bool has_limits_included_{false};
   bool has_simd_ops_{false};
   bool has_simd_inst_included_{false};
 

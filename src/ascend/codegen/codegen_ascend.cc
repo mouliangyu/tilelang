@@ -353,12 +353,6 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
     has_gemm_l1_included_ = true;
   }
 
-  // Conditionally include <limits> for std::numeric_limits<T>::infinity()
-  if (!has_limits_included_) {
-    decl_stream << "#include <limits>\n";
-    has_limits_included_ = true;
-  }
-
   // Conditionally include nd2nz_copy.h when ascend_nd2nz_copy is used
   if (has_nd2nz_copy_ && !has_nd2nz_copy_included_) {
     decl_stream << "#include <tl_templates/ascend/nd2nz_copy.h>\n";
@@ -1960,16 +1954,14 @@ inline void PrintConst(const FloatImmNode *op, std::ostream &os,
       op->dtype.is_float()) {
     std::ostringstream temp;
     if (std::isinf(op->value)) {
-      if (op->value < 0) {
-        temp << "-";
-      }
-      temp << "std::numeric_limits<";
+      temp << "AscendC::NumericLimits<";
       p->PrintType(op->dtype, temp);
-      temp << ">::infinity()";
+      temp << ">::" << (op->value < 0 ? "NegativeInfinity" : "Infinity")
+           << "()";
     } else if (std::isnan(op->value)) {
-      temp << "std::numeric_limits<";
+      temp << "AscendC::NumericLimits<";
       p->PrintType(op->dtype, temp);
-      temp << ">::quiet_NaN()";
+      temp << ">::QuietNaN()";
     } else {
       p->PrintType(op->dtype, temp);
       temp << '(' << std::hexfloat << op->value << 'f';
