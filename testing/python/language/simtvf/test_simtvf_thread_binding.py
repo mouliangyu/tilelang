@@ -9,7 +9,8 @@ from __future__ import annotations
 import tilelang.language as T
 from tilelang.language import kernel as K
 from tilelang import tvm
-from tilelang.utils.target import determine_target
+from tilelang.backend.target import determine_target
+from tvm.tirx.stmt_functor import post_order_visit
 
 from testing.python.language.simtvf._inspect_utils import collect_simtvf_blocks
 
@@ -51,7 +52,7 @@ def test_get_thread_binding_inside_simtvf():
                 for i in T.Parallel(16):
                     B[i] = A[i] + T.float32(1)
 
-    assert isinstance(results["tx"], tvm.tir.Var), f"Expected tvm.tir.Var, got {type(results['tx'])}"
+    assert isinstance(results["tx"], tvm.tirx.Var), f"Expected tvm.tirx.Var, got {type(results['tx'])}"
     assert results["tx"].name == "simtvf_tx", f"Expected name 'simtvf_tx', got '{results['tx'].name}'"
 
 
@@ -163,15 +164,15 @@ def test_variable_identity():
 
     def _find_thread_vars(node):
         if (
-            isinstance(node, tvm.tir.AttrStmt)
+            isinstance(node, tvm.tirx.AttrStmt)
             and node.attr_key == "thread_extent"
-            and isinstance(node.node, tvm.tir.IterVar)
+            and isinstance(node.node, tvm.tirx.IterVar)
             and node.node.thread_tag == "threadIdx.x"
         ):
             tir_thread_vars.append(node.node.var)
 
     for block in simtvf_blocks:
-        tvm.tir.stmt_functor.post_order_visit(block.body, _find_thread_vars)
+        post_order_visit(block.body, _find_thread_vars)
 
     assert len(tir_thread_vars) >= 1, "Expected at least one threadIdx.x AttrStmt in SIMT_VF"
 

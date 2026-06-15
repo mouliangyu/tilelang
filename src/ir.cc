@@ -6,22 +6,22 @@
 
 #include "./transform/common/attr.h"
 #include "op/builtin.h"
-#include "tvm/ffi/any.h"
-#include <tvm/ffi/object.h>
+#include "support/check.h"
+#include <tvm/ir/cast.h>
+#include <tvm/runtime/logging.h>
+#include <tvm/tirx/stmt.h>
 
-#include "support/ffi_aliases.h"
 #include <tvm/arith/analyzer.h>
-#include <tvm/ffi/reflection/registry.h>
 #include <tvm/script/ir_builder/tir/ir.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/stmt.h>
+#include <tvm/tirx/analysis.h>
 
 #include <utility>
 
 namespace tvm {
 namespace tl {
 
-using namespace script::ir_builder::tir;
+using namespace script::ir_builder::tirx;
+using namespace ffi;
 
 class SimtVFFrameNode;
 class SimtVFFrame;
@@ -30,10 +30,10 @@ static int simtvf_source_counter_ = 0;
 static int simdvf_source_counter_ = 0;
 
 static Var CreateEnvThread(String name, String thread_tag, DataType dtype) {
-  using namespace tvm::tir;
+  using namespace tvm::tirx;
   using namespace tvm::script::ir_builder;
   IterVar iter_var(Range{nullptr}, Var(std::move(name), dtype),
-                   tvm::tir::IterVarType::kThreadIndex, std::move(thread_tag));
+                   tvm::tirx::IterVarType::kThreadIndex, std::move(thread_tag));
   Var var = iter_var->var;
   if (Optional<PrimFuncFrame> opt_frame =
           IRBuilder::Current()->FindFrame<PrimFuncFrame>()) {
@@ -45,10 +45,10 @@ static Var CreateEnvThread(String name, String thread_tag, DataType dtype) {
 }
 
 static ForFrame MakeIterVarFrame(const std::string &name, const PrimExpr &dom) {
-  using namespace tvm::tir;
+  using namespace tvm::tirx;
   Var var = Var(name, dom->dtype);
   // Create a frame that represents a loop over the given domain.
-  ObjectPtr<ForFrameNode> n = tvm::ffi::make_object<ForFrameNode>();
+  ObjectPtr<ForFrameNode> n = make_object<ForFrameNode>();
   n->vars.push_back(var);
   n->doms.push_back(Range(0, dom));
   n->f_make_for_loop = [](const Array<Var> &vars, const Array<Range> &doms,
@@ -60,16 +60,16 @@ static ForFrame MakeIterVarFrame(const std::string &name, const PrimExpr &dom) {
         !steps.empty() ? steps[0] : Optional<PrimExpr>(std::nullopt);
     return For(vars[0], doms[0]->min, doms[0]->extent, ForKind::kSerial, body,
                /*thread_binding=*/std::nullopt,
-               /*annotations=*/tvm::ffi::Map<tvm::ffi::String, tvm::ffi::Any>{},
+               /*annotations=*/Map<String, Any>{},
                /*step=*/step);
   };
   return ForFrame(n);
 }
 
 ForFrame ParallelFor(const Array<PrimExpr> &extents,
-                     const Map<String, tvm::ffi::Any> &annotations) {
-  using namespace tvm::tir;
-  ObjectPtr<ForFrameNode> n = tvm::ffi::make_object<ForFrameNode>();
+                     const Map<String, Any> &annotations) {
+  using namespace tvm::tirx;
+  ObjectPtr<ForFrameNode> n = make_object<ForFrameNode>();
   n->vars.reserve(extents.size());
   n->doms.reserve(extents.size());
   for (const auto &extent : extents) {
@@ -94,7 +94,7 @@ ForFrame ParallelFor(const Array<PrimExpr> &extents,
       // lets lowering/validators reason about and rewrite the whole nest.
       // Layout annotations (like parallel_loop_layout) and other hints are
       // read from the outermost loop.
-      Map<String, tvm::ffi::Any> loop_annotations;
+      Map<String, Any> loop_annotations;
       if (i == 0) {
         loop_annotations = annotations;
       }
@@ -116,9 +116,9 @@ ForFrame PipelinedFor(PrimExpr start, const PrimExpr &stop, int num_stages,
                       const Array<PrimExpr> &stages,
                       const Array<Array<PrimExpr>> &sync,
                       const Array<Array<PrimExpr>> &groups,
-                      const Map<String, tvm::ffi::Any> &annotations) {
-  using namespace tvm::tir;
-  ObjectPtr<ForFrameNode> n = tvm::ffi::make_object<ForFrameNode>();
+                      const Map<String, Any> &annotations) {
+  using namespace tvm::tirx;
+  ObjectPtr<ForFrameNode> n = make_object<ForFrameNode>();
   DataType dtype = stop.dtype();
   n->vars.push_back(Var("v", dtype));
   n->doms.push_back(Range(std::move(start), stop));
@@ -128,7 +128,7 @@ ForFrame PipelinedFor(PrimExpr start, const PrimExpr &stop, int num_stages,
     ICHECK_EQ(vars.size(), doms.size());
     int n = vars.size();
     ICHECK(n == 1);
-    Map<String, tvm::ffi::Any> anno = annotations;
+    Map<String, Any> anno = annotations;
     if (num_stages > 0)
       anno.Set("num_stages", PrimExpr(num_stages));
     if (!order.empty())
@@ -149,11 +149,10 @@ ForFrame PipelinedFor(PrimExpr start, const PrimExpr &stop, int num_stages,
 
 ForFrame PersistentFor(const Array<PrimExpr> &domain, const PrimExpr &wave_size,
                        const PrimExpr &index, PrimExpr group_size,
-                       int num_stages,
-                       const Map<String, tvm::ffi::Any> &annotations) {
-  using namespace tvm::tir;
+                       int num_stages, const Map<String, Any> &annotations) {
+  using namespace tvm::tirx;
   ICHECK(!domain.empty());
-  ObjectPtr<ForFrameNode> n = tvm::ffi::make_object<ForFrameNode>();
+  ObjectPtr<ForFrameNode> n = make_object<ForFrameNode>();
   n->vars.reserve(domain.size());
   n->doms.reserve(domain.size());
   PrimExpr domain_size = domain[0];
@@ -212,7 +211,7 @@ ForFrame PersistentFor(const Array<PrimExpr> &domain, const PrimExpr &wave_size,
                            const Array<Optional<PrimExpr>> &steps,
                            Stmt body) -> Stmt {
     ICHECK_EQ(vars.size(), doms.size());
-    Map<String, tvm::ffi::Any> anno = annotations;
+    Map<String, Any> anno = annotations;
     if (num_stages > 0) {
       anno.Set("num_stages", PrimExpr(num_stages));
     }
@@ -248,7 +247,7 @@ ForFrame PersistentFor(const Array<PrimExpr> &domain, const PrimExpr &wave_size,
     bool needs_lastdim_guard =
         !analyzer.CanProveEqual(virtual_domain_size, domain_size);
     if (needs_total_guard || needs_lastdim_guard) {
-      PrimExpr guard_cond = tir::const_true();
+      PrimExpr guard_cond = const_true();
       if (needs_total_guard) {
         guard_cond = guard_cond && (linear_index < virtual_domain_size);
       }
@@ -264,10 +263,10 @@ ForFrame PersistentFor(const Array<PrimExpr> &domain, const PrimExpr &wave_size,
                      /*step=*/step);
     // vars[0..n-2] = outer domain coords (from idxs[0..n-2])
     for (int i = 0; i < vars.size() - 1; ++i) {
-      outer = tvm::tir::LetStmt(vars[i], idxs[i], outer);
+      outer = SeqStmt({tirx::Bind(vars[i], idxs[i]), outer});
     }
     // vars[n-1] = last dim coord (reconstructed from group_idx + offset)
-    outer = tvm::tir::LetStmt(vars[vars.size() - 1], last_dim_coord, outer);
+    outer = SeqStmt({tirx::Bind(vars[vars.size() - 1], last_dim_coord), outer});
     return outer;
   };
 
@@ -284,7 +283,7 @@ public:
   Array<TIRFrame> frames;
 
   static void RegisterReflection() {
-    namespace refl = tvm::ffi::reflection;
+    namespace refl = reflection;
     refl::ObjectDef<KernelLaunchFrameNode>().def_ro(
         "frames", &KernelLaunchFrameNode::frames);
   }
@@ -315,7 +314,7 @@ public:
 class KernelLaunchFrame : public TIRFrame {
 public:
   explicit KernelLaunchFrame(ObjectPtr<KernelLaunchFrameNode> data)
-      : TIRFrame(::tvm::ffi::UnsafeInit{}) {
+      : TIRFrame(UnsafeInit{}) {
     ICHECK(data != nullptr);
     data_ = std::move(data);
   }
@@ -325,9 +324,8 @@ public:
 
 KernelLaunchFrame KernelLaunch(const Array<PrimExpr> &grid_size,
                                const Optional<Array<PrimExpr>> &block_size_opt,
-                               const Map<String, ffi::Any> &attrs) {
-  ObjectPtr<KernelLaunchFrameNode> n =
-      tvm::ffi::make_object<KernelLaunchFrameNode>();
+                               const Map<String, Any> &attrs) {
+  ObjectPtr<KernelLaunchFrameNode> n = make_object<KernelLaunchFrameNode>();
 
   // If the kernel is a CPU kernel, we don't need to launch any threads.
   bool is_cpu_kernel_frame =
@@ -390,20 +388,20 @@ KernelLaunchFrame KernelLaunch(const Array<PrimExpr> &grid_size,
     }
   }
 
-  if (attrs.defined()) {
-    auto empty_block = tvm::script::ir_builder::tir::Block(MainBlockName);
-    empty_block->annotations = attrs;
-    n->frames.push_back(empty_block);
-  } else {
-    n->frames.push_back(tvm::script::ir_builder::tir::Block(MainBlockName));
-  }
+  auto empty_block = tvm::script::ir_builder::tirx::Block(DeviceMainBlockName);
+  empty_block->reads = Array<tvm::tirx::BufferRegion>();
+  empty_block->writes = Array<tvm::tirx::BufferRegion>();
+  Map<String, Any> block_annotations =
+      attrs.defined() ? attrs : Map<String, Any>{};
+  empty_block->annotations = block_annotations;
+  n->frames.push_back(empty_block);
 
   return KernelLaunchFrame(n);
 }
 
 KernelLaunchFrame MixedKernelLaunch(const Array<PrimExpr> &grid_size,
                                     PrimExpr cthread_extent,
-                                    const Map<String, ffi::Any> &attrs) {
+                                    const Map<String, Any> &attrs) {
   ObjectPtr<KernelLaunchFrameNode> n =
       tvm::ffi::make_object<KernelLaunchFrameNode>();
 
@@ -419,7 +417,9 @@ KernelLaunchFrame MixedKernelLaunch(const Array<PrimExpr> &grid_size,
                    cthread_extent));
 
   // Frame 2: MainBlock with NPU marker
-  auto main_block = tvm::script::ir_builder::tir::Block(MainBlockName);
+  auto main_block = tvm::script::ir_builder::tirx::Block(DeviceMainBlockName);
+  main_block->reads = Array<tvm::tirx::BufferRegion>();
+  main_block->writes = Array<tvm::tirx::BufferRegion>();
   main_block->annotations = attrs;
   n->frames.push_back(main_block);
 
@@ -427,7 +427,7 @@ KernelLaunchFrame MixedKernelLaunch(const Array<PrimExpr> &grid_size,
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
-  namespace refl = tvm::ffi::reflection;
+  namespace refl = reflection;
   refl::GlobalDef()
       .def("tl.Parallel", ParallelFor)
       .def("tl.SimtVF", SimtVF)
@@ -438,7 +438,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 }
 
 /**
- * Record the current number of alloc_buffers on the parent BlockFrame.
+ * Record the current number of alloc_buffers on the parent SBlockFrame.
  * Call this during EnterWithScope of SimtVF/Cube/Vector frames so that
  * ExitWithScope can later steal only the buffers added during this frame's
  * lifetime (i.e. those hoisted by TVM's AllocBuffer).
@@ -446,7 +446,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 static size_t RecordParentAllocCount() {
   script::ir_builder::IRBuilder builder =
       script::ir_builder::IRBuilder::Current();
-  ffi::Optional<BlockFrame> opt_parent = builder->FindFrame<BlockFrame>();
+  ffi::Optional<SBlockFrame> opt_parent = builder->FindFrame<SBlockFrame>();
   if (!opt_parent.defined()) {
     return 0;
   }
@@ -454,25 +454,25 @@ static size_t RecordParentAllocCount() {
 }
 
 /**
- * Steal buffers that were added to the parent BlockFrame during this frame's
- * lifetime.  TVM's AllocBuffer() hoists buffers to the nearest BlockFrame,
+ * Steal buffers that were added to the parent SBlockFrame during this frame's
+ * lifetime.  TVM's AllocBuffer() hoists buffers to the nearest SBlockFrame,
  * but for SimtVF/Cube/Vector frames we want those buffers inside their own
  * Block node instead.
  *
  * @param parent_alloc_count  The alloc_buffers count recorded at
  *                            EnterWithScope time via RecordParentAllocCount().
  */
-static ffi::Array<tvm::tir::Buffer>
+static ffi::Array<tvm::tirx::Buffer>
 StealAllocBuffers(size_t parent_alloc_count) {
-  using namespace tvm::tir;
+  using namespace tvm::tirx;
   script::ir_builder::IRBuilder builder =
       script::ir_builder::IRBuilder::Current();
 
-  ffi::Optional<BlockFrame> opt_parent = builder->FindFrame<BlockFrame>();
+  ffi::Optional<SBlockFrame> opt_parent = builder->FindFrame<SBlockFrame>();
   if (!opt_parent.defined()) {
     return {};
   }
-  BlockFrame parent = opt_parent.value();
+  SBlockFrame parent = opt_parent.value();
 
   size_t total = parent->alloc_buffers.size();
   if (parent_alloc_count >= total) {
@@ -496,7 +496,7 @@ StealAllocBuffers(size_t parent_alloc_count) {
 class SimtVFFrameNode : public TIRFrameNode {
 public:
   Array<PrimExpr> thread_extents;
-  Array<tvm::tir::Var> thread_vars;
+  Array<Var> thread_vars;
   size_t parent_alloc_count_{0};
   int64_t vf_latency_{0};
 
@@ -517,7 +517,7 @@ public:
   }
 
   TVM_DLL void ExitWithScope() final {
-    using namespace tvm::tir;
+    using namespace tvm::tirx;
     TIRFrameNode::ExitWithScope();
     auto stolen_bufs = StealAllocBuffers(parent_alloc_count_);
 
@@ -526,7 +526,7 @@ public:
       DataType dtype = extent.dtype();
       IterVar iv(Range::FromMinExtent(make_zero(dtype), extent), var,
                  IterVarType::kThreadIndex, thread_tag);
-      return AttrStmt(iv, tir::attr::thread_extent, extent, inner);
+      return AttrStmt(iv, tirx::attr::thread_extent, extent, inner);
     };
 
     ICHECK_EQ(thread_extents.size(), 3)
@@ -534,7 +534,7 @@ public:
     ICHECK_EQ(thread_vars.size(), 3)
         << "SimtVF requires exactly 3 thread vars [tx, ty, tz]";
 
-    Stmt body = tvm::tir::SeqStmt::Flatten(stmts);
+    Stmt body = tvm::tirx::SeqStmt::Flatten(stmts);
 
     // SimtVF scope marker: placed inside thread extents (innermost),
     // so that StorageRewrite attaches local.fragment allocations here.
@@ -556,8 +556,8 @@ public:
       simtvf_annotations.Set("tl.vf_latency",
                              IntImm(DataType::Int(64), vf_latency_));
     }
-    Stmt stmt = tvm::tir::Block({}, {}, {}, "SIMT_VF", body, std::nullopt,
-                                stolen_bufs, {}, simtvf_annotations);
+    Stmt stmt = SBlock({}, {}, {}, "SIMT_VF", body, std::nullopt, stolen_bufs,
+                       {}, simtvf_annotations);
 
     script::ir_builder::IRBuilder builder =
         script::ir_builder::IRBuilder::Current();
@@ -593,9 +593,9 @@ SimtVFFrame SimtVF(const Array<PrimExpr> &thread_extents, int64_t vf_latency) {
   n->thread_extents = thread_extents;
   DataType dtype = DataType::Int(32);
   n->thread_vars = {
-      tvm::tir::Var("simtvf_tx", dtype),
-      tvm::tir::Var("simtvf_ty", dtype),
-      tvm::tir::Var("simtvf_tz", dtype),
+      Var("simtvf_tx", dtype),
+      Var("simtvf_ty", dtype),
+      Var("simtvf_tz", dtype),
   };
   n->vf_latency_ = vf_latency;
   return SimtVFFrame(n);
@@ -621,11 +621,11 @@ public:
   }
 
   TVM_DLL void ExitWithScope() final {
-    using namespace tvm::tir;
+    using namespace tvm::tirx;
     TIRFrameNode::ExitWithScope();
     auto stolen_bufs = StealAllocBuffers(parent_alloc_count_);
 
-    Stmt body = tvm::tir::SeqStmt::Flatten(stmts);
+    Stmt body = tvm::tirx::SeqStmt::Flatten(stmts);
 
     // SimdVF scope marker: placed inside the Block body so that
     // fragment allocations (stolen into alloc_buffers) stay inside
@@ -642,8 +642,8 @@ public:
       simdvf_annotations.Set("tl.vf_latency",
                              IntImm(DataType::Int(64), vf_latency_));
     }
-    Stmt stmt = tvm::tir::Block({}, {}, {}, "SIMD_VF", body, std::nullopt,
-                                stolen_bufs, {}, simdvf_annotations);
+    Stmt stmt = SBlock({}, {}, {}, "SIMD_VF", body, std::nullopt, stolen_bufs,
+                       {}, simdvf_annotations);
 
     script::ir_builder::IRBuilder builder =
         script::ir_builder::IRBuilder::Current();
@@ -683,7 +683,7 @@ public:
   Array<TIRFrame> frames;
 
   static void RegisterReflection() {
-    namespace refl = tvm::ffi::reflection;
+    namespace refl = reflection;
     refl::ObjectDef<WarpSpecializeFrameNode>().def_ro(
         "frames", &WarpSpecializeFrameNode::frames);
   }
@@ -709,7 +709,7 @@ public:
 class WarpSpecializeFrame : public TIRFrame {
 public:
   explicit WarpSpecializeFrame(ObjectPtr<WarpSpecializeFrameNode> data)
-      : TIRFrame(::tvm::ffi::UnsafeInit{}) {
+      : TIRFrame(UnsafeInit{}) {
     ICHECK(data != nullptr);
     data_ = std::move(data);
   }
@@ -720,8 +720,7 @@ public:
 WarpSpecializeFrame WarpSpecialize(const Array<IntImm> &warp_group_ids,
                                    const PrimExpr &thread_idx,
                                    int warp_group_size = 128) {
-  ObjectPtr<WarpSpecializeFrameNode> n =
-      tvm::ffi::make_object<WarpSpecializeFrameNode>();
+  ObjectPtr<WarpSpecializeFrameNode> n = make_object<WarpSpecializeFrameNode>();
   PrimExpr condition;
   std::vector<int> warp_groups;
   warp_groups.reserve(warp_group_ids.size());
@@ -746,7 +745,7 @@ WarpSpecializeFrame WarpSpecialize(const Array<IntImm> &warp_group_ids,
     PrimExpr range_cond = (thread_idx >= min_bound) && (thread_idx < max_bound);
 
     if (condition.defined()) {
-      condition = tir::Or(condition, range_cond);
+      condition = tirx::Or(condition, range_cond);
     } else {
       condition = range_cond;
     }
@@ -778,13 +777,13 @@ public:
   }
 
   TVM_DLL void ExitWithScope() final {
-    using namespace tvm::tir;
+    using namespace tvm::tirx;
     TIRFrameNode::ExitWithScope();
     auto stolen_bufs = StealAllocBuffers(parent_alloc_count_);
 
-    Stmt body = SeqStmt::Flatten(stmts);
-    Stmt stmt = tvm::tir::Block({}, {}, {}, "CUBE", body, std::nullopt,
-                                stolen_bufs, {}, {});
+    Stmt body = tvm::tirx::SeqStmt::Flatten(stmts);
+    Stmt stmt =
+        SBlock({}, {}, {}, "CUBE", body, std::nullopt, stolen_bufs, {}, {});
 
     script::ir_builder::IRBuilder builder =
         script::ir_builder::IRBuilder::Current();
@@ -818,7 +817,7 @@ CubeFrame Cube() { return CubeFrame(tvm::ffi::make_object<CubeFrameNode>()); }
 class VectorFrameNode : public TIRFrameNode {
 public:
   int vector_count;
-  tvm::tir::Var sid_var;
+  tvm::tirx::Var sid_var;
   size_t parent_alloc_count_{0};
 
   static void RegisterReflection() {
@@ -838,22 +837,22 @@ public:
   }
 
   TVM_DLL void ExitWithScope() final {
-    using namespace tvm::tir;
+    using namespace tvm::tirx;
     TIRFrameNode::ExitWithScope();
     auto stolen_bufs = StealAllocBuffers(parent_alloc_count_);
 
-    Stmt body = SeqStmt::Flatten(stmts);
+    Stmt body = tvm::tirx::SeqStmt::Flatten(stmts);
 
     DataType dtype = DataType::Int(32);
     PrimExpr extent = IntImm(dtype, vector_count);
     IterVar iv(Range::FromMinExtent(make_zero(dtype), extent), sid_var,
                IterVarType::kThreadIndex, "cthread");
-    body = AttrStmt(iv, tir::attr::thread_extent, extent, body);
+    body = AttrStmt(iv, tirx::attr::thread_extent, extent, body);
 
     Map<String, ObjectRef> annotations;
     annotations.Set("vector_count", IntImm(dtype, vector_count));
-    Stmt stmt = tvm::tir::Block({}, {}, {}, "VECTOR", body, std::nullopt,
-                                stolen_bufs, {}, annotations);
+    Stmt stmt = SBlock({}, {}, {}, "VECTOR", body, std::nullopt, stolen_bufs,
+                       {}, annotations);
 
     script::ir_builder::IRBuilder builder =
         script::ir_builder::IRBuilder::Current();
@@ -887,12 +886,12 @@ VectorFrame Vector(int vector_count) {
       << "Vector core count must be 1 or 2, got " << vector_count;
   auto n = tvm::ffi::make_object<VectorFrameNode>();
   n->vector_count = vector_count;
-  n->sid_var = tvm::tir::Var("sid", DataType::Int(32));
+  n->sid_var = tvm::tirx::Var("sid", DataType::Int(32));
   return VectorFrame(n);
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
-  namespace refl = tvm::ffi::reflection;
+  namespace refl = reflection;
   refl::GlobalDef()
       .def("tl.WarpSpecialize", WarpSpecialize)
       .def("tl.SideEffect", SideEffect)

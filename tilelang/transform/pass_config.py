@@ -1,12 +1,17 @@
+from __future__ import annotations
+
 # TODO: Add more documentation for each pass config
 
+import warnings
 from enum import Enum
+from typing import Any
 
 
 class PassConfigKey(str, Enum):
     """Pass configuration keys for TileLang compiler."""
 
-    # TileLang specific configs
+    # TileLang specific configs: TL_XX
+
     TL_SIMPLIFY = "tl.Simplify"
     """Configuration for TileLang simplification passes.
 
@@ -47,6 +52,9 @@ class PassConfigKey(str, Enum):
     TL_DISABLE_DATA_RACE_CHECK = "tl.disable_data_race_check"
     """Disable data race check in TileLang. Default: False"""
 
+    TL_DISABLE_PRELOWER_SEMANTIC_CHECK = "tl.disable_prelower_semantic_check"
+    """Disable Python-side pre-lower semantic checks. Default: False"""
+
     TL_DISABLE_WARP_SPECIALIZED = "tl.disable_warp_specialized"
     """Disable warp specialization optimization. Default: False"""
 
@@ -84,13 +92,42 @@ class PassConfigKey(str, Enum):
     """Bitwidth for configuration indices. Default: 32"""
 
     TL_DISABLE_TMA_LOWER = "tl.disable_tma_lower"
-    """Disable TMA (Tensor Memory Access) lowering. Default: False"""
+    """Deprecated flag — prevents plain T.copy() from auto-lowering to TMA store.
+
+    Temporarily re-enabled for backward compatibility. Will be removed in
+    v0.1.10.
+    """
 
     TL_DISABLE_SAFE_MEMORY_ACCESS = "tl.disable_safe_memory_legalize"
     """Disable safe memory access optimization. Default: False"""
 
     TL_DISABLE_VECTORIZE_256 = "tl.disable_vectorize_256"
     """Disable usage of LDG/STG 256. Default: False"""
+
+    TL_ENABLE_ASYNC_COPY = "tl.enable_async_copy"
+    """Enable lowering eligible global->shared copies to PTX `cp.async`.
+
+    When True (default), TileLang may lower:
+    - `T.copy(global -> shared, ...)` to `ptx_cp_async + commit + wait`
+    - `T.async_copy(global -> shared, ...)` to `ptx_cp_async + commit` (no wait)
+    - plain user-written global->shared copy stores (e.g. in `T.Parallel`) to
+      `ptx_cp_async + commit + wait`
+
+    Important: Automatic cp.async lowering is gated by the surrounding loop
+    context. TileLang will only auto-enable cp.async when the copy is observed
+    inside a software-pipelined loop annotated with `num_stages > 0`
+    (e.g. created by `T.Pipelined(..., num_stages=...)` or by pipeline planning).
+    Outside such loops, TileLang will prefer synchronous copy lowering even when
+    this flag is True.
+    You can request local cp.async injection on a specific parallel loop via
+    `T.Parallel(..., prefer_async=True)`.
+
+    When False, TileLang will avoid the cp.async lowering path for `T.copy`.
+    Explicit `T.async_copy` still requires cp.async support and may error if
+    it cannot be lowered.
+
+    Default: True
+    """
 
     TL_ENABLE_LOWER_LDGSTG = "tl.enable_lower_ldgstg"
     """Enable non-predicated LDG/STG lowering for global memory access.
@@ -118,6 +155,12 @@ class PassConfigKey(str, Enum):
     TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE = "tl.enable_aggressive_shared_memory_merge"
     """Enable aggressive merge of shared memory allocations. Default: False"""
 
+    TL_DISABLE_SHARED_MEMORY_REUSE = "tl.disable_shared_memory_reuse"
+    """Disable shared memory reuse planning in MergeSharedMemoryAllocations.
+    When enabled, shared memory allocations are still merged into a single
+    allocation but each buffer gets its own dedicated region without lifetime-based
+    reuse. Default: False"""
+
     TL_DISABLE_SHUFFLE_ELECT = "tl.disable_shuffle_elect"
     """Disable shuffle election optimization. Default: False"""
 
@@ -128,6 +171,17 @@ class PassConfigKey(str, Enum):
     """Allow loop unswitching even when the else-version of the loop body has side effects.
 
     This is more aggressive and may increase code size. Default: False.
+    """
+
+    TL_IF_STMT_BINDING_INLINE_REPLAYABLE_BINDS = "tl.if_stmt_binding_inline_replayable_binds"
+    """Inline replayable scalar Bind statements while distributing if conditions.
+
+    When True (default), IfStmtBinding may rewrite a guarded sequence such as
+    ``if cond: idx = ids[i]; copy(idx); gemm()`` into separately guarded
+    statements with ``idx`` substituted at each use, provided the Bind does not
+    read a buffer written inside the same guarded body. This exposes copy and
+    compute statements to pipeline planning while preserving non-replayable
+    Bind scopes.
     """
 
     TL_DISABLE_THREAD_STORAGE_SYNC = "tl.disable_thread_storage_sync"
@@ -159,10 +213,8 @@ class PassConfigKey(str, Enum):
     such as `dst[i] = f(src[i])`, avoiding implicit aliasing:
 
     ```
-    read = T.allocate([1], T.int32, "local.var")
-    write = T.allocate([1], T.int32, "local.var")
-    read_buf = T.Buffer((1,), T.int32, data=read, scope="local.var")
-    write_buf = T.Buffer((1,), T.int32, data=write, scope="local.var")
+    read_buf = T.alloc_buffer((1,), T.int32, scope="local.var")
+    write_buf = T.alloc_buffer((1,), T.int32, scope="local.var")
     write_buf[0] = read_buf[0] * 2
     f(write_buf[0])
     ```
@@ -172,8 +224,7 @@ class PassConfigKey(str, Enum):
     like:
 
     ```
-    read = T.allocate([1], T.int32, "local.var")
-    read_buf = T.Buffer((1,), T.int32, data=read, scope="local.var")
+    read_buf = T.alloc_buffer((1,), T.int32, scope="local.var")
     read_buf[0] = read_buf[0] * 2
     f(read_buf[0])
     ```
@@ -192,39 +243,75 @@ class PassConfigKey(str, Enum):
     ```
     """
 
-    # TIR related configs
+    # TIR related configs: TIR_XX
+
     TIR_ENABLE_EQUIV_TERMS_IN_CSE = "tir.enable_equiv_terms_in_cse_tir"
     """Enable equivalent terms in TIR Common Subexpression Elimination. Default: True"""
 
-    TIR_DISABLE_CSE = "tir.disable_cse_tir"
+    TIR_DISABLE_CSE = "tirx.disable_cse_tir"
     """Disable TIR Common Subexpression Elimination. Default: False"""
 
-    TIR_SIMPLIFY = "tir.Simplify"
+    TIR_SIMPLIFY = "tirx.Simplify"
     """Enable/disable TIR simplification passes. Default: True"""
 
-    TIR_DISABLE_STORAGE_REWRITE = "tir.disable_storage_rewrite"
+    TIR_DISABLE_STORAGE_REWRITE = "tirx.disable_storage_rewrite"
     """Disable storage rewrite optimization. Default: False"""
 
-    TIR_DISABLE_VECTORIZE = "tir.disable_vectorize"
+    TIR_DISABLE_VECTORIZE = "tirx.disable_vectorize"
     """Disable vectorization optimization. Default: False"""
 
-    TIR_USE_ASYNC_COPY = "tir.use_async_copy"
+    TIR_USE_ASYNC_COPY = "tirx.use_async_copy"
     """Enable asynchronous memory copy operations. Default: True"""
 
-    TIR_ENABLE_DEBUG = "tir.enable_debug"
+    TIR_ENABLE_DEBUG = "tirx.enable_debug"
     """Enable debug information in generated code. Default: False"""
 
-    TIR_MERGE_STATIC_SMEM = "tir.merge_static_smem"
+    TIR_MERGE_STATIC_SMEM = "tirx.merge_static_smem"
     """Merge static shared memory allocations. Default: True"""
 
-    TIR_ADD_LOWER_PASS = "tir.add_lower_pass"
+    TIR_ADD_LOWER_PASS = "tirx.add_lower_pass"
     """Additional lowering passes to be applied. Default: None"""
 
-    TIR_NOALIAS = "tir.noalias"
+    TIR_NOALIAS = "tirx.noalias"
     """Enable pointer non-aliasing assumptions. Default: True"""
+
+    # Output debugging options
 
     CUDA_KERNELS_OUTPUT_DIR = "cuda.kernels_output_dir"
     """Output directory for generated CUDA kernels. Default: empty string"""
 
     TL_DISABLE_OUT_OF_BOUND_WARNING = "tl.disable_out_of_bound_warning"
-    """Disable out-of-bound access warnings in safe memory access legalization. Default: False"""
+    """Disable out-of-bound access warnings in safe memory access legalization. Default: True"""
+
+    TL_ENABLE_DUMP_IR = "tl.enable_dump_ir"
+    """Enable dumping IR during lowering between passes. Default: False"""
+
+    TL_DUMP_IR_DIR = "tl.dump_ir_path"
+    """Path to the directory where IR will be dumped. Default: ./dump_ir/"""
+
+
+_DEPRECATED_PASS_CONFIG_MESSAGES = {
+    PassConfigKey.TL_DISABLE_TMA_LOWER.value: (
+        "`tl.disable_tma_lower` is deprecated and will be removed in v0.1.10. Use `T.copy(..., disable_tma=True)` per-copy instead."
+    ),
+}
+
+
+def normalize_pass_configs(pass_configs: dict[str | PassConfigKey, Any] | None) -> dict[str, Any]:
+    """Canonicalize known pass-config keys and emit compatibility warnings."""
+    if pass_configs is None:
+        return {}
+
+    normalized: dict[str, Any] = {}
+    warned_keys: set[str] = set()
+
+    for key, value in pass_configs.items():
+        normalized_key = key.value if isinstance(key, PassConfigKey) else key
+
+        normalized[normalized_key] = value
+
+        if normalized_key in _DEPRECATED_PASS_CONFIG_MESSAGES and normalized_key not in warned_keys:
+            warnings.warn(_DEPRECATED_PASS_CONFIG_MESSAGES[normalized_key], DeprecationWarning, stacklevel=3)
+            warned_keys.add(normalized_key)
+
+    return normalized

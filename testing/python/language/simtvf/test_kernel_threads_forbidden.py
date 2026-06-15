@@ -1,5 +1,5 @@
 import tilelang.language as T
-from tilelang.utils.target import determine_target
+from tilelang.backend.target import determine_target
 
 
 def main():

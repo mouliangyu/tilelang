@@ -22,7 +22,7 @@ def main():
         "Ascend source should use '__global__ __vector__ <ret> <name>' signature order"
     )
     assert "asc_vf_call" in source, "Ascend source should emit asc_vf_call marker"
-    assert "pipe_barrier(pipe_t::PIPE_ALL);" in source, "Ascend source should map tvm_storage_sync to pipe_barrier(pipe_t::PIPE_ALL)"
+    assert "asc_syncthreads();" in source, "Ascend source should map tvm_storage_sync to asc_syncthreads()"
 
     @T.prim_func
     def simtvf_codegen_two_vf(

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Callable, Literal
+from typing import Literal
+from collections.abc import Callable
 
 import torch
 import tilelang
@@ -15,22 +16,19 @@ from tilelang.utils.device import Event, device_synchronize, get_current_device
 
 @tilelang.jit(out_idx=[], target="ascend")
 def get_msprof_cache_flush_kernel(numel: int, dtype: T.dtype):
-    tile_elems = (32 * 1024) // (4 if dtype == "int32" else 1)
-    tiles_per_core = numel // tile_elems // 64
+    elems_per_block = (numel + 63) // 64
+    vec = 2048
+    repeat = (elems_per_block + vec - 1) // vec
 
     @T.prim_func
     def _tilelang_profiler_cache_flush(Cache: T.Tensor((numel,), dtype)):
         with T.Kernel(64) as bx:
-            ub = T.alloc_shared((tile_elems,), dtype)
-
-            with T.SimtVF(threads=2048):
-                for i in T.Parallel(tile_elems):
-                    ub[i] = T.cast(0, dtype)
-
-            for it in T.serial(tiles_per_core):
-                begin = (it * 64 + bx) * tile_elems
-                if begin < numel:
-                    T.copy(ub, Cache[begin : begin + tile_elems], l2_cache_ctrl="WTS_FV")
+            for r in range(repeat):
+                with T.SimtVF(threads=vec):
+                    for i in T.Parallel(vec):
+                        offset = bx * elems_per_block + r * vec + i
+                        if offset < numel:
+                            Cache[offset] = T.cast(0, dtype)
 
     return _tilelang_profiler_cache_flush
 
@@ -80,6 +78,9 @@ class suppress_stdout_stderr:
         # Close null device files
         self.outnull_file.close()
         self.errnull_file.close()
+
+
+_CACHE_FLUSH_ID = "tilelang::cache_flush"
 
 
 def do_bench(
@@ -206,25 +207,36 @@ def _bench_with_cupti(
     with suppress_stdout_stderr():
         schedule = torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1)
         profiler = torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CUDA],
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
             schedule=schedule,
         )
 
         with profiler:
             for _ in range(2):
                 for _ in range(n_repeat):
-                    cache.zero_()
+                    with torch.profiler.record_function(_CACHE_FLUSH_ID):
+                        cache.zero_()
                     fn()
                 profiler.step()
 
-    # Calculate average kernel time, excluding cache-clearing overhead
+    # `cache.zero_()` and user code such as `torch.zeros` can share the same
+    # generated kernel name, so exclude only the annotated cache flush range.
+    def is_cuda_event(event):
+        return getattr(getattr(event, "device_type", None), "name", "") == "CUDA"
+
     total_cuda_time = 0.0
     excluded_time = 0.0
-    excluded_kernels = "at::native::vectorized_elementwise"
 
-    for event in profiler.key_averages():
-        total_cuda_time += event.self_device_time_total
-        if excluded_kernels in event.key:
+    for event in profiler.events():
+        if not is_cuda_event(event):
+            continue
+
+        if not event.is_user_annotation:
+            total_cuda_time += event.self_device_time_total
+        elif event.key == _CACHE_FLUSH_ID:
             excluded_time += event.self_device_time_total
 
     kernel_time_us = (total_cuda_time - excluded_time) / n_repeat

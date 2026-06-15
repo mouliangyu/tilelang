@@ -73,7 +73,7 @@ def test_jit2_gemm_ptr():
                 T.gemm(A_shared, B_shared, C_local)
             T.copy(C_local, C[bx * block_M, by * block_N])
 
-    prod = product([T.float16, T.float32], [T.float32])
+    prod = product([T.float16, T.tfloat32], [T.float32])
     gemm_ptr.par_compile(
         [
             {"A": T.ptr(), "B": T.ptr(), "C": T.ptr(), "M": 1024, "N": 1024, "K": 1024, "dtype": in_dtype, "out_dtype": out_dtype}
@@ -238,5 +238,4 @@ def test_jit2_compile_with_consts():
 
 
 if __name__ == "__main__":
-    # tilelang.testing.main()
-    test_jit2_return()
+    tilelang.testing.main()

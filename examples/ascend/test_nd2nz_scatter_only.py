@@ -12,7 +12,7 @@ import pytest
 import torch
 import tilelang
 import tilelang.language as T
-from tvm import tir
+from tvm import tirx
 
 
 def _to_dtype_str(s) -> str:
@@ -47,7 +47,7 @@ def nd2nz_scatter_test(sd: torch.dtype, dd: torch.dtype, rows: int, cols: int):
                     T.ascend_pipe_barrier("PIPE_ALL")
                     T.call_intrin(
                         "handle",
-                        tir.op.Op.get("tl.ascend_nd2nz_scatter"),
+                        tirx.op.Op.get("tl.ascend_nd2nz_scatter"),
                         T.access_ptr(src_ub, "r"),
                         T.access_ptr(dst_ub, "w"),
                         rows,

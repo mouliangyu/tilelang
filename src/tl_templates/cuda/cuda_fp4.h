@@ -44,6 +44,14 @@ struct fp4_e2_t {
   TL_DEVICE operator __half() const { return __half(float(*this)); }
 };
 
+// Tag for tcgen05 unpacked FP4 shared-memory layout. The hardware atom carries
+// 16 4-bit payload values in the low 64 bits of a 128-bit aligned region.
+// See:
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-packing-formats-mxf8f6f4-smem
+struct float4_e2m1_unpacked_t {
+  uint8_t __x;
+};
+
 class fp4_e2_2_t {
 public:
   __nv_fp4x2_storage_t __x;
@@ -166,9 +174,44 @@ TL_DEVICE fp4_e2_32_t make_fp4_e2_32_t(
 // ============================================================================
 // https://docs.nvidia.com/cuda/cuda-math-api/cuda_math_api/group__CUDA__MATH__FP4__MISC.html
 
+// Custom fp4_e2m1 -> half convertion for CUDA version < 13.0 to avoid using
+// `cvt.rn.relu.f16x2.e2m1x2`, as there are bugs in PTXAS related to
+// `cvt.rn.relu.f16x2.e2m1x2` between CUDA 12.6 and 12.9
+__device__ __half_raw __tl_cvt_fp4_to_halfraw_naive(
+    const __nv_fp4_storage_t x,
+    const __nv_fp4_interpretation_t fp4_interpretation) {
+  __half_raw res;
+  res.x = 0U;
+  // fp4_interpretation == __NV_E2M1
+  // convert to e2m3 first
+  __nv_fp6_storage_t fp6e2m3 = (x & 0xFU) << 2U;
+  res = __nv_cvt_fp6_to_halfraw(fp6e2m3, __NV_E2M3);
+  return res;
+}
+
+// Custom fp4_e2m1 -> half convertion for CUDA version < 13.0 to avoid using
+// `cvt.rn.relu.f16x2.e2m1x2`, as there are bugs in PTXAS related to
+// `cvt.rn.relu.f16x2.e2m1x2` between CUDA 12.6 and 12.9
+__device__ __half2_raw __tl_cvt_fp4x2_to_halfraw2_naive(
+    const __nv_fp4x2_storage_t x,
+    const __nv_fp4_interpretation_t fp4_interpretation) {
+  __half2_raw res;
+  res.x =
+      __tl_cvt_fp4_to_halfraw_naive((__nv_fp4_storage_t)x, fp4_interpretation)
+          .x;
+  res.y = __tl_cvt_fp4_to_halfraw_naive((__nv_fp4_storage_t)(x >> 4U),
+                                        fp4_interpretation)
+              .x;
+  return res;
+}
+
 // fp4_e2m1 -> half
 TL_DEVICE __half __tl_cvt_fp4_to_half(const __nv_fp4_storage_t src) {
+#if __CUDACC_VER_MAJOR__ >= 13
   __half_raw raw = __nv_cvt_fp4_to_halfraw(src, __NV_E2M1);
+#else
+  __half_raw raw = __tl_cvt_fp4_to_halfraw_naive(src, __NV_E2M1);
+#endif
   __half result;
   result = *reinterpret_cast<__half *>(&raw);
   return result;
@@ -176,7 +219,11 @@ TL_DEVICE __half __tl_cvt_fp4_to_half(const __nv_fp4_storage_t src) {
 
 // fp4_e2m1x2 (1 byte) -> half2
 TL_DEVICE half2 __tl_cvt_fp4x2_to_half2(const __nv_fp4x2_storage_t src) {
+#if __CUDACC_VER_MAJOR__ >= 13
   __half2_raw raw = __nv_cvt_fp4x2_to_halfraw2(src, __NV_E2M1);
+#else
+  __half2_raw raw = __tl_cvt_fp4x2_to_halfraw2_naive(src, __NV_E2M1);
+#endif
   half2 result;
   result = *reinterpret_cast<half2 *>(&raw);
   return result;
@@ -220,6 +267,46 @@ TL_DEVICE __nv_fp4_storage_t __tl_cvt_float_to_fp4(const float src) {
 // float2 -> fp4_e2m1x2 (1 byte)
 TL_DEVICE __nv_fp4x2_storage_t __tl_cvt_float2_to_fp4x2(const float2 src) {
   return __nv_cvt_float2_to_fp4x2(src, __NV_E2M1, cudaRoundNearest);
+}
+
+// ============================================================================
+// Inline PTX FP4 Conversions with Stochastic Rounding
+// ============================================================================
+//
+// PTX ISA: cvt.rs.satfinite.e2m1x4.f32 d, {a, b, e, f}, rbits
+//   Input:  4 x f32 + 1 x uint32 random bits
+//   Output: __nv_fp4x4_storage_t (uint16_t, 4 x 4-bit = 16 bits)
+//   Layout: d[15:12]=a, d[11:8]=b, d[7:4]=e, d[3:0]=f
+// To get little-endian nibble order (nibble0=elem0), pass elements in reverse.
+
+// Full 4-element version (float4 input)
+TL_DEVICE __nv_fp4x4_storage_t
+__tl_cvt_f32x4_to_e2m1x4_rs_sat(float4 src, unsigned int rbits) {
+  __nv_fp4x4_storage_t result;
+  asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;"
+      : "=h"(result)
+      : "f"(src.w), "f"(src.z), "f"(src.y), "f"(src.x), "r"(rbits));
+  return result;
+}
+
+// 2-element version: pass src.x as f, src.y as e, returns lower byte as fp4x2
+TL_DEVICE __nv_fp4x2_storage_t
+__tl_cvt_f32x2_to_e2m1x2_rs_sat(float2 src, unsigned int rbits) {
+  __nv_fp4x4_storage_t tmp;
+  asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;"
+      : "=h"(tmp)
+      : "f"(0.0f), "f"(0.0f), "f"(src.y), "f"(src.x), "r"(rbits));
+  return static_cast<__nv_fp4x2_storage_t>(tmp & 0xFF);
+}
+
+// 1-element version: pass src as f (lowest position), returns low nibble as fp4
+TL_DEVICE __nv_fp4_storage_t
+__tl_cvt_f32x1_to_e2m1x1_rs_sat(float src, unsigned int rbits) {
+  __nv_fp4x4_storage_t tmp;
+  asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;"
+      : "=h"(tmp)
+      : "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(src), "r"(rbits));
+  return static_cast<__nv_fp4_storage_t>(tmp & 0x0F);
 }
 
 // ============================================================================

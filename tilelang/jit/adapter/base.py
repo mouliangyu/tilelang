@@ -3,9 +3,22 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Callable
-from tilelang.engine.param import KernelParam
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
 import torch
+
+from tilelang.engine.param import KernelParam
+
+
+@dataclass(frozen=True)
+class CachedTextSource:
+    text: str | None = None
+    path: str | None = None
+
+
+CachedTextSourceLike = CachedTextSource | str | None
 
 
 class BaseKernelAdapter(ABC):
@@ -46,12 +59,12 @@ class BaseKernelAdapter(ABC):
     # --- Common helpers to align with PyTorch stream/device semantics ---
     @staticmethod
     def get_current_stream_functor() -> Callable[[], int]:
-        """Return a callable that reads Torch's current CUDA stream pointer.
+        """Return a callable that reads Torch's current device stream pointer.
 
-        The returned lambda yields the raw CUDA stream handle of the current
+        The returned lambda yields the raw stream handle of the current
         PyTorch stream on the active device. It's a thunk (evaluated at call
-        time) so that any upstream stream guards are respected. If CUDA is
-        unavailable, it returns a lambda that yields 0.
+        time) so that any upstream stream guards are respected. If no supported
+        device runtime is available, it returns a lambda that yields 0.
         """
         if hasattr(torch, "npu") and torch.npu.is_available():
             return lambda: int(torch.npu.current_stream().npu_stream)
@@ -75,15 +88,15 @@ class BaseKernelAdapter(ABC):
         fetches the current device according to PyTorch. On CPU or when CUDA is
         unavailable, returns ``torch.device('cpu')``.
         """
-        if torch.cuda.is_available():
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return lambda: torch.device("npu", torch.npu.current_device())
+        elif torch.cuda.is_available():
             try:
                 torch.cuda._lazy_init()
                 current_device = torch._C._cuda_getDevice
                 return lambda: torch.device("cuda", current_device())
             except Exception:
                 return lambda: torch.device("cuda", torch.cuda.current_device())
-        elif hasattr(torch, "npu") and torch.npu.is_available():
-            return lambda: torch.device("npu", torch.npu.current_device())
         # CPU fallback
         return lambda: torch.device("cpu")
 
@@ -98,3 +111,34 @@ class BaseKernelAdapter(ABC):
 
     def _post_init(self):
         self.func = self._convert_torch_func()
+
+    @staticmethod
+    def _normalize_cached_text_source(source: CachedTextSourceLike) -> CachedTextSource:
+        if isinstance(source, CachedTextSource):
+            return source
+        if source is None:
+            return CachedTextSource()
+        return CachedTextSource(text=source)
+
+    def _set_cached_text_source(self, source_attr: str, path_attr: str, source: CachedTextSourceLike) -> CachedTextSource:
+        source = self._normalize_cached_text_source(source)
+        setattr(self, source_attr, source.text)
+        setattr(self, path_attr, source.path)
+        return source
+
+    def _load_cached_text_source(self, source_attr: str, path_attr: str) -> str | None:
+        source = getattr(self, source_attr, None)
+        if source is not None:
+            return source
+
+        path = getattr(self, path_attr, None)
+        if path is None:
+            return None
+
+        try:
+            with open(path, encoding="utf-8") as file:
+                source = file.read()
+        except OSError:
+            return None
+        setattr(self, source_attr, source)
+        return source

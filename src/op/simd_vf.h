@@ -6,26 +6,26 @@
 #ifndef TVM_TL_OP_SIMD_VF_H_
 #define TVM_TL_OP_SIMD_VF_H_
 
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/stmt_functor.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/stmt_functor.h>
 
 #include "./operator.h"
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 class SimdVFOpNode : public TileOperatorNode {
 public:
-  Block root_;
+  SBlock root_;
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.SimdVFOp", SimdVFOpNode,
                                     TileOperatorNode);
 
   static void RegisterReflection();
 
-  explicit SimdVFOpNode(Block root) : root_(std::move(root)) {}
+  explicit SimdVFOpNode(SBlock root) : root_(std::move(root)) {}
 
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
 
@@ -40,7 +40,7 @@ public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(SimdVFOp, TileOperator,
                                              SimdVFOpNode);
 
-  explicit SimdVFOp(const Block &root) {
+  explicit SimdVFOp(const SBlock &root) {
     auto op = tvm::ffi::make_object<SimdVFOpNode>(root);
     data_ = std::move(op);
   }

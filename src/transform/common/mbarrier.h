@@ -3,15 +3,15 @@
 
 #include "../../op/builtin.h"
 #include <tvm/ir/expr.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/expr.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/expr.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt.h>
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 /*!
  * \brief Create an mbarrier buffer with shared.barrier storage scope.
@@ -25,6 +25,17 @@ inline Buffer CreateMBarrierBuffer(const std::string &name, int num_barriers) {
   return Buffer(data, DataType::UInt(64),
                 {IntImm(DataType::Int(32), num_barriers)}, {}, PrimExpr(), name,
                 0, 0, kDefault);
+}
+
+/*!
+ * \brief Create a BufferLoad reference to a specific barrier slot.
+ *
+ * \param barrier_buf The shared.barrier scope buffer.
+ * \param barrier_id  The index expression for the barrier slot.
+ * \return A BufferLoad expression referencing the barrier.
+ */
+inline PrimExpr MakeBarrierRef(const Buffer &barrier_buf, PrimExpr barrier_id) {
+  return BufferLoad(barrier_buf, {std::move(barrier_id)});
 }
 
 const std::string injected_mbarrier_name_ =

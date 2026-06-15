@@ -187,6 +187,13 @@ jobs:
           "${PYTEST[@]}" --maxfail=3 \
             ../examples/ascend
 
+      # Disabled on the asc branch while Ascend CI is split out from upstream multi-backend CI:
+      # - CUDA examples: ../examples
+      # - CUDA tests: testing/python
+      # - ROCm tests: testing/python
+      # - Metal tests: testing/python -k metal
+      # - CuTeDSL examples job
+
       - name: List generated files
         if: ${{ !cancelled() }}
         run: |

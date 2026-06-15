@@ -1,5 +1,6 @@
 from __future__ import annotations
 import importlib.metadata
+import math
 import sys
 import os
 import pathlib
@@ -7,8 +8,11 @@ import logging
 import shutil
 import glob
 from dataclasses import dataclass
+from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
+
+EnvVarDefault = str | None | Callable[[], str | None]
 
 # SETUP ENVIRONMENT VARIABLES
 CUTLASS_NOT_FOUND_MESSAGE = "CUTLASS is not installed or found in the expected path"
@@ -43,6 +47,47 @@ assert TL_LIBS and all(os.path.exists(i) for i in TL_LIBS), f"tilelang lib root 
 for lib in TL_LIBS:
     if lib not in sys.path:
         sys.path.insert(0, lib)
+
+
+def prepend_dll_search_path(paths: list[str]) -> None:
+    """Prepend ``paths`` to ``%PATH%`` on Windows, skipping entries already present.
+
+    Used by Windows DLL discovery: PATH is consulted by ``LoadLibrary`` and by
+    ``os.add_dll_directory``-registered directories alike. POSIX is a no-op.
+    """
+    if not sys.platform.startswith("win32") or not paths:
+        return
+    path_entries = os.environ.get("PATH", "").split(os.pathsep)
+    seen = {os.path.normcase(os.path.abspath(p)) for p in path_entries if p}
+    fresh = [p for p in paths if p and os.path.normcase(os.path.abspath(p)) not in seen]
+    if fresh:
+        os.environ["PATH"] = os.pathsep.join(fresh + path_entries)
+
+
+prepend_dll_search_path(TL_LIBS)
+
+# TVM's Python loader (3rdparty/tvm/python/tvm/base.py) ORs ``os.RTLD_LAZY``
+# into ``ctypes.CDLL`` mode unconditionally. Windows has no lazy dlopen mode,
+# so we expose a 0 sentinel to keep ``LoadLibrary``'s default behavior.
+if sys.platform.startswith("win32") and not hasattr(os, "RTLD_LAZY"):
+    os.RTLD_LAZY = 0  # type: ignore[attr-defined]
+
+    # tvm-ffi's Cython layer defaults to ``Py_BEGIN_ALLOW_THREADS`` around every
+    # global function call (see ``TVM_FFI_RELEASE_GIL_BY_DEFAULT`` in
+    # ``3rdparty/tvm/3rdparty/tvm-ffi/python/tvm_ffi/cython/function.pxi``).
+    # That default contradicts tvm-ffi's own ``TypeTable``/``GlobalFunctionTable``
+    # single-threaded contract: with the GIL released, two Python threads can
+    # enter the unsynchronized C++ registries concurrently. POSIX hides the race
+    # behind glibc/x86 luck; Windows MSVC turns it into access violations
+    # inside ``Map::find`` / vector reallocation under the autotuner ThreadPool.
+    #
+    # Pinning the default to "0" lets the GIL serialize tvm-ffi calls (matching
+    # the upstream contract). Subprocess work like ``nvcc`` still releases the
+    # GIL on its own via the ``subprocess`` module, so the autotuner pool keeps
+    # real concurrency exactly where it matters. Users that opt back into the
+    # upstream behavior can still set ``TVM_FFI_RELEASE_GIL_BY_DEFAULT=1`` in
+    # their environment.
+    os.environ.setdefault("TVM_FFI_RELEASE_GIL_BY_DEFAULT", "0")
 
 
 def _get_package_version(pkg: str) -> str | None:
@@ -206,13 +251,18 @@ class EnvVar:
     """
 
     key: str  # Environment variable name (e.g. "TILELANG_PRINT_ON_COMPILATION")
-    default: str  # Default value if the environment variable is not set
+    default: EnvVarDefault  # Default value if the environment variable is not set
     _forced_value: str | None = None  # Temporary runtime override (mainly for tests/debugging)
+
+    def _get_default(self):
+        return self.default() if callable(self.default) else self.default
 
     def get(self):
         if self._forced_value is not None:
             return self._forced_value
-        return os.environ.get(self.key, self.default)
+        if self.key in os.environ:
+            return os.environ[self.key]
+        return self._get_default()
 
     def __get__(self, instance, owner):
         """
@@ -260,7 +310,7 @@ class Environment:
     # TileLang resources
     TILELANG_TEMPLATE_PATH = EnvVar("TL_TEMPLATE_PATH", None)
     TILELANG_CACHE_DIR = EnvVar("TILELANG_CACHE_DIR", os.path.expanduser("~/.tilelang/cache"))
-    TILELANG_TMP_DIR = EnvVar("TILELANG_TMP_DIR", os.path.join(TILELANG_CACHE_DIR.get(), "tmp"))
+    TILELANG_TMP_DIR = EnvVar("TILELANG_TMP_DIR", lambda: os.path.join(Environment.TILELANG_CACHE_DIR, "tmp"))
 
     # Kernel Build options
     TILELANG_PRINT_ON_COMPILATION = EnvVar("TILELANG_PRINT_ON_COMPILATION", "1")  # print kernel name on compile
@@ -268,10 +318,12 @@ class Environment:
         "TILELANG_DISABLE_CACHE", "0"
     )  # disable kernel cache, usually for unit testing / debugging, high priority
     TILELANG_CLEAR_CACHE = EnvVar("TILELANG_CLEAR_CACHE", "0")  # DEPRECATED! clear cache automatically if set
-
-    # Kernel selection options
-    # Default to GEMM v2; set to "1"/"true"/"yes"/"on" to force v1
-    TILELANG_USE_GEMM_V1 = EnvVar("TILELANG_USE_GEMM_V1", "0")
+    TILELANG_CLEANUP_TEMP_FILES = EnvVar(
+        "TILELANG_CLEANUP_TEMP_FILES", "1"
+    )  # cleanup temporary compiler files/dirs after compilation (set to 0 to keep for debugging)
+    TILELANG_HIP_SAVE_TEMP_FILES = EnvVar("TILELANG_HIP_SAVE_TEMP_FILES", "0")  # save temporary files for HIP compilation
+    TILELANG_JIT_DIAGNOSTICS = EnvVar("TILELANG_JIT_DIAGNOSTICS", "0")  # enable JIT phase diagnostics
+    TILELANG_COMPILE_TIMEOUT_SECONDS = EnvVar("TILELANG_COMPILE_TIMEOUT_SECONDS", "")  # optional NVCC subprocess timeout in seconds
 
     # Auto-tuning settings
     TILELANG_AUTO_TUNING_DISABLE_CACHE = EnvVar("TILELANG_AUTO_TUNING_DISABLE_CACHE", "0")
@@ -295,7 +347,7 @@ class Environment:
         to ensure PyTorch extensions are built for the proper GPU arch.
         """
         from tilelang.contrib import nvcc
-        from tilelang.utils.target import determine_target
+        from tilelang.backend.target import determine_target
 
         target = determine_target(return_object=True)  # get target GPU
         compute_version = nvcc.get_target_compute_version(target)  # e.g. "8.6"
@@ -321,13 +373,23 @@ class Environment:
     def is_print_on_compilation_enabled(self) -> bool:
         return self.TILELANG_PRINT_ON_COMPILATION.lower() in ("1", "true", "yes", "on")
 
-    def use_gemm_v1(self) -> bool:
-        """Return True if GEMM v1 should be used based on env.
+    def should_cleanup_temp_files(self) -> bool:
+        return str(self.TILELANG_CLEANUP_TEMP_FILES).lower() in ("1", "true", "yes", "on")
 
-        Controlled by `TILELANG_USE_GEMM_V1`. Truthy values are one of
-        {"1", "true", "yes", "on"} (case-insensitive).
-        """
-        return str(self.TILELANG_USE_GEMM_V1).lower() in ("1", "true", "yes", "on")
+    def is_jit_diagnostics_enabled(self) -> bool:
+        return str(self.TILELANG_JIT_DIAGNOSTICS).lower() in ("1", "true", "yes", "on")
+
+    def get_compile_timeout_seconds(self) -> float | None:
+        value = str(self.TILELANG_COMPILE_TIMEOUT_SECONDS).strip()
+        if not value:
+            return None
+        try:
+            timeout = float(value)
+        except ValueError as exc:
+            raise ValueError("TILELANG_COMPILE_TIMEOUT_SECONDS must be empty or a non-negative number") from exc
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("TILELANG_COMPILE_TIMEOUT_SECONDS must be empty or a non-negative number")
+        return timeout if timeout > 0 else None
 
     def get_default_target(self) -> str:
         """Get default compilation target from environment."""
@@ -365,6 +427,56 @@ is_cache_enabled = env.is_cache_enabled  # CacheState.is_enabled
 # after initialization.
 CUDA_HOME = env.CUDA_HOME
 ROCM_HOME = env.ROCM_HOME
+
+
+def get_cuda_dll_search_dirs() -> list[str]:
+    """Return CUDA_HOME-derived DLL search directories (Windows only).
+
+    The CUDA_HOME value itself is auto-detected by ``_find_cuda_home`` (env vars,
+    ``nvcc`` on PATH, pip ``nvidia-cuda-nvcc`` package, or default install paths).
+    This helper expands it into the subdirectories that actually contain
+    ``nvcuda.dll`` / ``cudart64_*.dll`` / ``nvrtc64_*.dll`` / ``nvvm*.dll``.
+    """
+    if not sys.platform.startswith("win32") or not CUDA_HOME:
+        return []
+    cands = [
+        CUDA_HOME,
+        os.path.join(CUDA_HOME, "bin"),
+        os.path.join(CUDA_HOME, "bin", "x86_64"),
+        os.path.join(CUDA_HOME, "lib", "x64"),
+        os.path.join(CUDA_HOME, "nvvm", "bin"),
+    ]
+    return [os.path.abspath(p) for p in cands if os.path.isdir(p)]
+
+
+def get_windows_runtime_dll_dirs() -> list[str]:
+    """Return Windows-only DLL directories shipped with sibling Python packages.
+
+    Currently locates ``tvm_ffi`` and ``z3`` install dirs so their DLLs resolve
+    when TileLang is imported. Each lookup is best-effort; failures are ignored.
+    """
+    if not sys.platform.startswith("win32"):
+        return []
+    dirs: list[str] = []
+    try:
+        from tvm_ffi import libinfo as tvm_ffi_libinfo
+
+        dirs.append(os.path.dirname(tvm_ffi_libinfo.find_libtvm_ffi()))
+    except Exception:
+        pass
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec("z3")
+    except (ImportError, AttributeError, ValueError):
+        spec = None
+    if spec and spec.submodule_search_locations:
+        z3_root = next(iter(spec.submodule_search_locations), None)
+        if z3_root:
+            z3_lib = os.path.join(z3_root, "lib")
+            if os.path.isdir(z3_lib):
+                dirs.append(z3_lib)
+    return dirs
 
 
 def prepend_pythonpath(path):
@@ -417,3 +529,4 @@ if os.environ.get("TL_TEMPLATE_PATH", None) is None:
 CUTLASS_INCLUDE_DIR = env.CUTLASS_INCLUDE_DIR
 COMPOSABLE_KERNEL_INCLUDE_DIR = env.COMPOSABLE_KERNEL_INCLUDE_DIR
 TILELANG_TEMPLATE_PATH = env.TILELANG_TEMPLATE_PATH
+TILELANG_HIP_SAVE_TEMP_FILES = env.TILELANG_HIP_SAVE_TEMP_FILES

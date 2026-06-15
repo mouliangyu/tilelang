@@ -22,7 +22,7 @@ from .utils import (
 import re
 import logging
 import textwrap
-from tvm.tir.stmt_functor import post_order_visit
+from tvm.tirx.stmt_functor import post_order_visit
 
 PREDEF_ATTRIBUTE_SET_DYNAMIC_MEMORY = """
     cudaError_t result_{0} = cudaFuncSetAttribute({0}, cudaFuncAttributeMaxDynamicSharedMemorySize, {1});
@@ -59,14 +59,20 @@ PREDEF_ATTRIBUTE_SET_DYNAMIC_MEMORY_HIP = """
 """
 
 PREDEF_INIT_FUNC = """
+#ifdef _WIN32
+#define TL_EXPORT __declspec(dllexport)
+#else
+#define TL_EXPORT
+#endif
+
 #define ERROR_BUF_SIZE 1024
 static char error_buf[ERROR_BUF_SIZE];
 
-extern "C" const char* get_last_error() {{
+extern "C" TL_EXPORT const char* get_last_error() {{
     return error_buf;
 }}
 
-extern "C" int init() {{
+extern "C" TL_EXPORT int init() {{
     error_buf[0] = '\\0';
     {0}
     return 0;
@@ -74,7 +80,7 @@ extern "C" int init() {{
 """
 
 PREDEF_HOST_FUNC = """
-extern "C" int call({}) {{
+extern "C" TL_EXPORT int call({}) {{
 {}
 \treturn 0;
 }}
@@ -121,9 +127,7 @@ TMA_DESC_INIT_FUNC = """
     &{0}, {0}_type, {0}_tensorRank, {0}_globalAddress, {0}_globalDim, {0}_globalStride + 1, {0}_boxDim, {0}_elementStrides, {0}_interleave, {0}_swizzle, {0}_l2Promotion, {0}_oobFill);
 
 \tif ({0}_result != CUDA_SUCCESS) {{
-\t\tstd::stringstream ss;
-\t\tss << "Error: Failed to initialize the TMA descriptor {0}";
-\t\tsnprintf(error_buf, ERROR_BUF_SIZE, "%s", ss.str().c_str());
+\t\tsnprintf(error_buf, ERROR_BUF_SIZE, "Error: Failed to initialize the TMA descriptor {0}");
 \t\treturn -1;
 \t}}
 """
@@ -150,9 +154,7 @@ TMA_IM2COL_DESC_INIT_FUNC = """
     {0}_lowerCorner, {0}_upperCorner, {0}_channelsPerPixel, {0}_pixelsPerColumn, {0}_elementStrides, {0}_interleave, {0}_swizzle, {0}_l2Promotion, {0}_oobFill);
 
 \tif ({0}_result != CUDA_SUCCESS) {{
-\t\tstd::stringstream ss;
-\t\tss << "Error: Failed to initialize the TMA descriptor {0}";
-\t\tsnprintf(error_buf, ERROR_BUF_SIZE, "%s", ss.str().c_str());
+\t\tsnprintf(error_buf, ERROR_BUF_SIZE, "Error: Failed to initialize the TMA descriptor {0}");
 \t\treturn -1;
 \t}}
 """
@@ -169,6 +171,30 @@ KERNEL_LAUNCH_FUNC_CODE = """
 \t\tconfig.gridDim = {0};
 \t\tconfig.blockDim = {1};
 \t\tconfig.dynamicSmemBytes = {2};
+\t\tcudaLaunchKernelEx(&config, {4}, {3});
+\t}}
+"""
+
+# Cluster launch code for SM90+
+KERNEL_CLUSTER_LAUNCH_FUNC_CODE = """
+\t{{
+\t\tcudaLaunchConfig_t config;
+\t\tcudaLaunchAttribute attribute[2];
+\t\tattribute[0].id = cudaLaunchAttributeClusterDimension;
+\t\tattribute[0].val.clusterDim = {{{5}, {6}, {7}}};
+\t\tattribute[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+\t\tattribute[1].val.programmaticStreamSerializationAllowed = 1;
+\t\tconfig.attrs = attribute;
+\t\tconfig.numAttrs = 2;
+\t\tconfig.stream = stream;
+\t\tconfig.gridDim = {0};
+\t\tconfig.blockDim = {1};
+\t\tconfig.dynamicSmemBytes = {2};
+\t\tcudaError_t cluster_attr_result = cudaFuncSetAttribute({4}, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+\t\tif (cluster_attr_result != cudaSuccess) {{
+\t\t\tsnprintf(error_buf, ERROR_BUF_SIZE, "Failed to set cluster attribute for {4}: %s", cudaGetErrorString(cluster_attr_result));
+\t\t\treturn -1;
+\t\t}}
 \t\tcudaLaunchKernelEx(&config, {4}, {3});
 \t}}
 """
@@ -235,7 +261,7 @@ class TLCUDASourceWrapper:
         self.libpath: str | None = None
         self.lib_code: str | None = self.update_lib_code(source)
 
-    def _pythonic_expr(self, expr: tvm.tir.PrimExpr) -> str:
+    def _pythonic_expr(self, expr: tvm.tirx.PrimExpr) -> str:
         # This wrapper generates C/CUDA source. C/C++ integer division uses '/',
         # and '//' is not a valid operator in C/C++.
         return pythonic_expr(expr, self._TYPE_MAP, floor_div_op="/")
@@ -267,7 +293,7 @@ class TLCUDASourceWrapper:
                         "type": self._lookup_type(buffer.dtype) + "* __restrict__",
                     }
                 )
-            elif isinstance(param, tvm.tir.Var):
+            elif isinstance(param, tvm.tirx.Var):
                 function_args.append({"name": param.name, "type": self._lookup_type(param.dtype)})
             else:
                 raise ValueError(f"Parameter {param} is not in the buffer map of the primary function.")
@@ -291,7 +317,7 @@ class TLCUDASourceWrapper:
         if has_l2_persistent_map:
             kernel_launch_code += L2_PERSISTENT_MAP_CREATE_HANDLE
         desc_name_map: dict[str, str] = {}
-        desc_name_var_map: dict[str, tvm.tir.Var] = {}
+        desc_name_var_map: dict[str, tvm.tirx.Var] = {}
         for function_name, function_info in function_informations.items():
             block_info = function_info["block_info"]
             grid_info = function_info["grid_info"]
@@ -326,36 +352,24 @@ class TLCUDASourceWrapper:
                 call_args = f"\tvoid* {function_name}_args[] = {{{', '.join(args_array)}}};\n"
                 kernel_launch_code += call_args
                 # Using cudaLaunchCooperativeKernel to launch the kernel
+                assert self.cluster_dims[function_name] is None, "Cluster launch is not supported for cooperative groups"
                 kernel_launch_code += "\tTILELANG_CHECK(cudaLaunchCooperativeKernel((void*){}, {}, {}, {}, {}, stream));\n".format(
                     function_name, grid_str, block_str, function_name + "_args", smem_str
                 )
-            elif function_name in self.pdl_sync_map:
-                args_list = parse_function_call_args(declaration, function_args, function_params, desc_name_map, desc_name_var_map)
-                assert len(function_params) == len(args_list), (
-                    f"Function {function_name} has {len(function_params)} parameters, but {len(args_list)} arguments"
-                )
-
-                call_args = ", ".join(args_list)
-
-                kernel_code = KERNEL_LAUNCH_FUNC_CODE.format(
-                    grid_str,
-                    block_str,
-                    smem_str,
-                    call_args,
-                    function_name,
-                )
-
-                kernel_launch_code += kernel_code
-                kernel_launch_code += f'\tTILELANG_CHECK_LAST_ERROR("{function_name}");\n'
-
             else:
                 args_list = parse_function_call_args(declaration, function_args, function_params, desc_name_map, desc_name_var_map)
                 assert len(function_params) == len(args_list), (
                     f"Function {function_name} has {len(function_params)} parameters, but {len(args_list)} arguments"
                 )
+
                 call_args = ", ".join(args_list)
-                kernel_launch_code += f"\t{function_name}<<<{grid_str}, {block_str}, {smem_str}, stream>>>({call_args});\n"
+                kernel_code = self.get_kernel_launch_code(
+                    function_name, grid_str, block_str, smem_str, call_args, self.cluster_dims[function_name]
+                )
+
+                kernel_launch_code += kernel_code
                 kernel_launch_code += f'\tTILELANG_CHECK_LAST_ERROR("{function_name}");\n'
+
             if has_l2_persistent_map:
                 kernel_launch_code += L2_PERSISTENT_MAP_RESET_HANDLE
 
@@ -387,7 +401,7 @@ class TLCUDASourceWrapper:
 
         return init_l2_persistent_map
 
-    def generate_tma_descriptor_args(self, desc_name_map: dict[str, str], desc_name_var_map: dict[str, tvm.tir.Var]) -> str:
+    def generate_tma_descriptor_args(self, desc_name_map: dict[str, str], desc_name_var_map: dict[str, tvm.tirx.Var]) -> str:
         tma_descriptor_init = ""
         if self.tma_descriptor_args is None:
             return tma_descriptor_init
@@ -447,10 +461,12 @@ class TLCUDASourceWrapper:
         dynamic_smem_buf_map = {}
         function_names = []
         use_cooperative_groups_map = {}
+        cluster_dims_map = {}
         for g_var, func in self.device_mod.functions.items():
             # Default block and grid configurations
             block_info = [1, 1, 1]
             grid_info = [1, 1, 1]
+            cluster_dims = None
             function_name = g_var.name_hint
             attrs = func.attrs
             dynamic_smem_buf = None
@@ -467,6 +483,10 @@ class TLCUDASourceWrapper:
                         block_info["xyz".index(tag[-1])] = extent
                     elif "blockIdx" in tag:
                         grid_info["xyz".index(tag[-1])] = extent
+            if "cluster_dims" in attrs:
+                # Extract cluster dimensions for SM90+ cluster launch
+                cluster_dims_attr = attrs["cluster_dims"]
+                cluster_dims = [int(cluster_dims_attr[i]) for i in range(len(cluster_dims_attr))]
 
             if "has_cuda_pdl_sync" in attrs:
                 self.pdl_sync_map[function_name] = 0
@@ -476,6 +496,7 @@ class TLCUDASourceWrapper:
             grid_info_map[function_name] = grid_info
             dynamic_smem_buf_map[function_name] = dynamic_smem_buf
             use_cooperative_groups_map[function_name] = use_cooperative_groups
+            cluster_dims_map[function_name] = cluster_dims
             function_names.append(function_name)
 
         # Store the mappings for use in code generation
@@ -483,6 +504,7 @@ class TLCUDASourceWrapper:
         self.grid_info = grid_info_map
         self.dynamic_smem_buf = dynamic_smem_buf_map
         self.use_cooperative_groups = use_cooperative_groups_map
+        self.cluster_dims = cluster_dims_map
 
         function_names_index = {}
         for g_var, func in self.host_mod.functions.items():
@@ -494,7 +516,10 @@ class TLCUDASourceWrapper:
 
             host_code = str(func)
             for function_name in function_names:
-                index = host_code.index(f'T.call_packed("{function_name}"')
+                try:
+                    index = host_code.index(f'T.call_packed("{function_name}"')
+                except ValueError:
+                    index = host_code.index(f'value="{function_name}"')
                 function_names_index[function_name] = index
         # sort function_names
         function_names = sorted(function_names, key=lambda x: function_names_index[x])
@@ -514,7 +539,7 @@ class TLCUDASourceWrapper:
             if param in prim_func.buffer_map:
                 buffer = prim_func.buffer_map[param]
                 for dim in buffer.shape:
-                    if isinstance(dim, tvm.tir.Var):
+                    if isinstance(dim, tvm.tirx.Var):
                         unique_push_back(dim.name, str(dim.dtype))
 
         # Note: In buffer definitions, any dynamic symbols appearing in strides are listed after those in the shape.
@@ -522,10 +547,16 @@ class TLCUDASourceWrapper:
             if param in prim_func.buffer_map:
                 buffer = prim_func.buffer_map[param]
                 for stride in buffer.strides:
-                    if isinstance(stride, tvm.tir.Var):
+                    if isinstance(stride, tvm.tirx.Var):
                         unique_push_back(stride.name, str(stride.dtype))
 
         return list(dynamic_symbolic_set.items())
+
+    def get_kernel_launch_code(self, function_name, grid_str, block_str, smem_str, call_args, cluster_dims):
+        if cluster_dims is None:
+            return KERNEL_LAUNCH_FUNC_CODE.format(grid_str, block_str, smem_str, call_args, function_name)
+        else:
+            return KERNEL_CLUSTER_LAUNCH_FUNC_CODE.format(grid_str, block_str, smem_str, call_args, function_name, *cluster_dims)
 
     def get_init_func(self):
         # Initialize an empty string for the CUDA function call
@@ -560,8 +591,8 @@ class TLCUDASourceWrapper:
 
             def visitor(node, fn=function_name, param_cnt=kernel_params_cnt):
                 nonlocal function_params
-                if isinstance(node, tvm.tir.Call):
-                    if not (hasattr(node, "op") and node.op == tvm.ir.Op.get("tir.tvm_call_packed")):
+                if isinstance(node, tvm.tirx.Call):
+                    if not (hasattr(node, "op") and node.op == tvm.ir.Op.get("tirx.tvm_call_packed")):
                         return
                     args = node.args
                     if not args or args[0] != fn:
@@ -579,6 +610,7 @@ class TLCUDASourceWrapper:
                 "grid_info": self.grid_info[function_name],
                 "dynamic_smem_buf": self.dynamic_smem_buf[function_name],
                 "function_params": function_params,
+                "cluster_dims": self.cluster_dims.get(function_name, None),
             }
 
         # Create the host function wrapper for the CUDA kernel
@@ -587,7 +619,7 @@ class TLCUDASourceWrapper:
         lib_code = self.source + init_func + host_func
         return lib_code
 
-    def get_stream_type(self) -> dict[str, str]:
+    def get_stream_type(self) -> dict[str, str] | None:
         return {"name": "stream=cudaStreamDefault", "type": "cudaStream_t"}
 
     @property
@@ -673,6 +705,10 @@ class TLHIPSourceWrapper(TLCUDASourceWrapper):
         # HIP code dont have function declaration, so we use '{\n' to split
         # __global__ void __launch_bounds__(128) kernel_kernel(float* __restrict__ A) {\n
         return declare_kernel_code.split("{")[0]
+
+    def get_kernel_launch_code(self, function_name, grid_str, block_str, smem_str, call_args, cluster_dims):
+        # HIP does not support cudaLaunchKernelEx; use <<<>>> syntax (same as pre-cluster-launch behavior)
+        return f"\t{function_name}<<<{grid_str}, {block_str}, {smem_str}, stream>>>({call_args});\n"
 
     def get_init_func(self):
         # Initialize an empty string for the CUDA function call
@@ -766,7 +802,7 @@ class TLCPUSourceWrapper:
                         "type": self._lookup_type(buffer.dtype) + "*",
                     }
                 )
-            elif isinstance(param, tvm.tir.Var):
+            elif isinstance(param, tvm.tirx.Var):
                 function_args.append({"name": param.name, "type": self._lookup_type(param.dtype)})
             else:
                 raise ValueError(f"Parameter {param} is not in the buffer map of the primary function.")
@@ -806,13 +842,16 @@ class TLCPUSourceWrapper:
         return host_func
 
     def parse_source_information(self):
-        with tvm.transform.PassContext(opt_level=3, config=self.pass_configs):
-            device_mod, host_mod = get_annotated_mod(self.mod, self.target)
-        assert len(device_mod.functions) >= 1, "Device module should have at least one function."
-        assert len(host_mod.functions) == 1, "Only support one function in host module."
+        if self.device_mod is None or self.host_mod is None:
+            with tvm.transform.PassContext(opt_level=3, config=self.pass_configs), self.target:
+                device_mod, host_mod = get_annotated_mod(self.mod, self.target)
+            self.device_mod = device_mod
+            self.host_mod = host_mod
+        assert len(self.device_mod.functions) >= 1, "Device module should have at least one function."
+        assert len(self.host_mod.functions) == 1, "Only support one function in host module."
 
         function_names = []
-        for g_var, _ in device_mod.functions.items():
+        for g_var, _ in self.device_mod.functions.items():
             function_name = g_var.name_hint
             function_names.append(function_name)
 
@@ -825,7 +864,7 @@ class TLCPUSourceWrapper:
             if param in prim_func.buffer_map:
                 buffer = prim_func.buffer_map[param]
                 for dim in buffer.shape:
-                    if isinstance(dim, tvm.tir.Var) and (dim.name not in dynamic_symbolic_set):
+                    if isinstance(dim, tvm.tirx.Var) and (dim.name not in dynamic_symbolic_set):
                         dynamic_symbolic_set[dim.name] = str(dim.dtype)
         return list(dynamic_symbolic_set.items())
 
@@ -930,7 +969,7 @@ class TLAscendSourceWrapper(TLCUDASourceWrapper):
                         "type": self._lookup_type(buffer.dtype) + "* __restrict__",
                     }
                 )
-            elif isinstance(param, tvm.tir.Var):
+            elif isinstance(param, tvm.tirx.Var):
                 function_args.append({"name": param.name, "type": self._lookup_type(param.dtype)})
             else:
                 raise ValueError(f"Parameter {param} is not in the buffer map of the primary function.")
@@ -950,7 +989,7 @@ class TLAscendSourceWrapper(TLCUDASourceWrapper):
             dynamic_smem_buf = function_info["dynamic_smem_buf"]
             function_params = function_info["function_params"]
 
-            # Ascend kernel signature: __global__ __vector__ int32_t name(...)
+            # Ascend kernel signature: __global__ __vector__ <ret> name(...)
             # match_declare_kernel expects __global__ void, so find by name directly.
             func_decl_pos = code.index(function_name + "(")
             declaration = self.get_declaration(code[func_decl_pos:])
@@ -985,7 +1024,7 @@ class TLAscendSourceWrapper(TLCUDASourceWrapper):
         lib_code = super().update_lib_code(code)
         # The parent class combines source + init_func + host_func.
         # We need the header at the very beginning, so prepend it to the final result.
-        if not lib_code.strip().startswith("#include <tl_templates/ascend/common.h>"):
+        if ascend_header not in lib_code:
             lib_code = ascend_header + lib_code
         return lib_code
 

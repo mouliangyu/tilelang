@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from tvm.ffi import register_object
-from tvm.script.ir_builder.tir.frame import TIRFrame
+from tvm.tirx.script.builder.frame import TIRFrame
 from tilelang import _ffi_api
 
 
@@ -21,4 +21,4 @@ def Cube() -> CubeFrame:
     -------
     res : CubeFrame
     """
-    return _ffi_api.Cube()
+    return _ffi_api.Cube()  # type: ignore[attr-defined] # pylint: disable=no-member

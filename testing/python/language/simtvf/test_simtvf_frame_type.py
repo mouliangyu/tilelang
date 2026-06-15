@@ -2,7 +2,7 @@
 
 import tilelang.language as T
 from tilelang.language.vf import SimtVFFrame
-from tvm.script.ir_builder.tir.frame import TIRFrame, ForFrame
+from tvm.tirx.script.builder.frame import TIRFrame, ForFrame
 
 
 def test_simtvf_returns_simtvf_frame():

@@ -2,17 +2,14 @@ import pytest
 
 import tilelang.language as T
 from tilelang import tvm
-from tilelang.engine.phase import LowerAndLegalize, OptimizeForTarget, PreLowerSemanticCheck
-from tilelang.utils.target import determine_target
+from tilelang.backend.target import determine_target
+from tilelang.engine.lower import lower_to_host_device_ir
 
 
 def _run_to_optimize(func):
     target = determine_target("ascend", return_object=True)
     mod = tvm.IRModule({"main": func})
-    with target:
-        PreLowerSemanticCheck(mod)
-        lowered = LowerAndLegalize(mod, target)
-        return OptimizeForTarget(lowered, target)
+    return lower_to_host_device_ir(mod, target=target)
 
 
 def test_fragment_narrow_checker_fragment():

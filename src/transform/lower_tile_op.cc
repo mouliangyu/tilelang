@@ -3,12 +3,16 @@
  * \brief Lower the tile op for further codegen.
  */
 
-#include <tvm/ffi/reflection/registry.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
-#include <tvm/tir/utils.h>
+#include "support/check.h"
+#include <optional>
+#include <tvm/ir/cast.h>
+#include <tvm/runtime/logging.h>
+#include <tvm/s_tir/utils.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 #include <unordered_map>
 #include <vector>
 
@@ -21,17 +25,21 @@
 #include "../op/simd_vf.h"
 #include "../op/simt_vf.h"
 #include "../op/utils.h"
-#include "../target/utils.h"
+#include "backend/common/target_utils.h"
+#include "ptx_async_copy_injector.h"
 
 #include "arith/ir_mutator_with_analyzer.h"
 #include "common/attr.h"
+#include "common/mbarrier.h"
+#include "common/pipeline_utils.h"
 #include "layout_reducer.h"
 #include "loop_partition.h"
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
+using namespace ffi;
 
 static Buffer makeBufferWithLayout(const Buffer &buffer, const Layout &layout,
                                    Map<Var, Var> &var_remap) {
@@ -39,13 +47,13 @@ static Buffer makeBufferWithLayout(const Buffer &buffer, const Layout &layout,
       TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
   Type new_type;
   // convert fragments to normal local buffer
-  if (ptr_type->storage_scope == "local.fragment") {
+  if (IsFragmentBuffer(buffer)) {
     new_type = PointerType(ptr_type->element_type, "local");
   } else {
     new_type = buffer->data->type_annotation;
   }
   Var new_var;
-  if (ptr_type->storage_scope == "global") {
+  if (IsGlobalBuffer(buffer)) {
     new_var = buffer->data;
   } else {
     if (var_remap.count(buffer->data)) {
@@ -57,8 +65,7 @@ static Buffer makeBufferWithLayout(const Buffer &buffer, const Layout &layout,
   }
   Array<PrimExpr> layout_shape = layout->OutputShape();
   Array<PrimExpr> output_shape = layout_shape;
-  if (ptr_type->storage_scope == "shared" ||
-      ptr_type->storage_scope == "shared.dyn") {
+  if (IsSharedBuffer(buffer)) {
     int replicate_extent = 1;
     Array<PrimExpr> buffer_shape = buffer->shape;
     int buffer_extent = 1;
@@ -101,8 +108,8 @@ public:
 private:
   using arith::IRMutatorWithAnalyzer::IRMutatorWithAnalyzer;
 
-  Stmt VisitStmt_(const BlockNode *op) final {
-    auto block = Downcast<Block>(arith::IRMutatorWithAnalyzer::VisitStmt_(op));
+  Stmt VisitStmt_(const SBlockNode *op) final {
+    auto block = Downcast<SBlock>(arith::IRMutatorWithAnalyzer::VisitStmt_(op));
     if (op->annotations.count(attr::kLayoutMap)) {
       block.CopyOnWrite()->annotations.Set(attr::kLayoutMap, layout_remap_);
     }
@@ -130,26 +137,21 @@ public:
   static Stmt Substitute(const Stmt &stmt, Map<Buffer, Buffer> buffer_remap) {
     arith::Analyzer analyzer;
     RemapBufferRewriter substituter(&analyzer);
-    substituter.buffer_remap_ = std::move(buffer_remap);
+    substituter.remap_ = std::move(buffer_remap);
     return substituter.VisitStmt(stmt);
   }
 
 private:
   using arith::IRMutatorWithAnalyzer::IRMutatorWithAnalyzer;
 
-  Stmt VisitStmt_(const BlockNode *op) final {
+  Stmt VisitStmt_(const SBlockNode *op) final {
     if (op->annotations.count(attr::kSafeValueMap)) {
       return RewritePaddingMap(op);
     }
     return IRMutatorWithAnalyzer::VisitStmt_(op);
   }
 
-  /*!
-   * \brief Rewrite the padding map annotation of a block.
-   * \param op The block node to rewrite.
-   * \return The rewritten block.
-   */
-  Stmt RewritePaddingMap(const BlockNode *op) {
+  Stmt RewritePaddingMap(const SBlockNode *op) {
     auto safe_value_map = op->annotations.Get(attr::kSafeValueMap);
     if (!safe_value_map) {
       LOG(FATAL) << "Padding map annotation is missing";
@@ -159,30 +161,20 @@ private:
     Map<Var, PrimExpr> new_safe_value_map = RemapPaddingMap(
         Downcast<Map<Var, PrimExpr>>(safe_value_map.value()), var_remap);
 
-    auto block = Downcast<Block>(IRMutatorWithAnalyzer::VisitStmt_(op));
+    auto block = Downcast<SBlock>(IRMutatorWithAnalyzer::VisitStmt_(op));
     auto block_ptr = block.CopyOnWrite();
     block_ptr->annotations.Set(attr::kSafeValueMap, new_safe_value_map);
     return block;
   }
 
-  /*!
-   * \brief Create a mapping from old variables to new variables based on buffer
-   * remapping. \return A map from old variables to new variables.
-   */
   Map<Var, Var> CreateVarRemap() const {
     Map<Var, Var> var_remap;
-    for (const auto &[buffer, buffer_remap] : buffer_remap_) {
-      var_remap.Set(buffer->data, buffer_remap->data);
+    for (const auto &[buffer, remapped] : remap_) {
+      var_remap.Set(buffer->data, remapped->data);
     }
     return var_remap;
   }
 
-  /*!
-   * \brief Remap the padding map using the variable remapping.
-   * \param safe_value_map The original padding map.
-   * \param var_remap The variable remapping.
-   * \return The remapped padding map.
-   */
   Map<Var, PrimExpr> RemapPaddingMap(const Map<Var, PrimExpr> &safe_value_map,
                                      const Map<Var, Var> &var_remap) const {
     Map<Var, PrimExpr> new_safe_value_map;
@@ -196,7 +188,37 @@ private:
     return new_safe_value_map;
   }
 
-  Map<Buffer, Buffer> buffer_remap_;
+  Map<Buffer, Buffer> remap_;
+};
+
+/*! \brief Rewrite the synthetic CPU fallback thread variable to a constant.
+ *
+ * CPU `c` kernels use a degenerate fallback thread variable while fragment and
+ * tile-op lowering still share thread-oriented helper code. After this pass has
+ * consumed that helper variable, it should not remain in lowered CPU TIR.
+ */
+class CPUFallbackThreadVarCanonicalizer : public StmtExprMutator {
+public:
+  static Stmt Rewrite(Stmt stmt, Var fallback_thread_var) {
+    CPUFallbackThreadVarCanonicalizer canonicalizer(
+        std::move(fallback_thread_var));
+    return canonicalizer(std::move(stmt));
+  }
+
+private:
+  explicit CPUFallbackThreadVarCanonicalizer(Var fallback_thread_var)
+      : fallback_thread_var_(std::move(fallback_thread_var)) {}
+
+  PrimExpr VisitExpr_(const VarNode *op) final {
+    if (fallback_thread_var_.defined() &&
+        (op == fallback_thread_var_.get() ||
+         op->name_hint == fallback_thread_var_->name_hint)) {
+      return make_zero(op->dtype);
+    }
+    return StmtExprMutator::VisitExpr_(op);
+  }
+
+  Var fallback_thread_var_;
 };
 
 class LowerTileOpPass : arith::IRMutatorWithAnalyzer {
@@ -224,15 +246,82 @@ public:
         RemapBufferRewriter::Substitute(fptr->body, substituter.buffer_remap_);
     fptr->body =
         LayoutRemapRewriter::Substitute(fptr->body, substituter.layout_remap_);
-    tvm::transform::PassContext ctxt = tvm::transform::PassContext::Current();
-    Optional<Bool> opt_disable_tma_lower =
-        ctxt->GetConfig(kDisableTMALower, Optional<Bool>());
+    // Record whether TMA was actually used as a PrimFunc attribute so that
+    // later phases (OptimizeForTarget) can choose the right pass pipeline
+    // without relying on pass-context side-channel mutation.
+    f = WithAttr(std::move(f), kHasTMA, Bool(substituter.has_tma_));
+    fptr = f.CopyOnWrite();
 
-    if (!opt_disable_tma_lower.value_or(Bool(false))) {
-      // @lei: this is a workaround, as if we don't disable tma lower,
-      // cp async lowering won't be generated.
-      ctxt->config.Set(kDisableTMALower, Bool(!substituter.has_tma_));
+    // If any TMA copies allocated mbarriers, inject the barrier buffer
+    // into the tilelang_root block with a barrier_init annotation.
+    // Pipeline buffer versioning expands it for pipelining, and
+    // LowerSharedBarrier will process it into ptx_init_barrier_thread_count.
+    if (substituter.mbarrier_count_ > 0) {
+      ICHECK(substituter.mbarrier_buffer_.defined())
+          << "mbarrier_buffer_ must have been created by AllocMBarrier "
+             "callback";
+      Buffer mbar_buf = substituter.mbarrier_buffer_.value();
+      // Update buffer shape in-place to final count. We use const_cast
+      // because CopyOnWrite would create a new BufferNode, breaking identity
+      // with BufferLoad references already in the body. Pipeline buffer
+      // versioning relies on buffer identity to remap accesses correctly.
+      const_cast<BufferNode *>(mbar_buf.get())->shape = {
+          IntImm(DataType::Int(32), substituter.mbarrier_count_)};
+
+      Array<PrimExpr> counts;
+      counts.reserve(substituter.mbarrier_count_);
+      for (auto c : substituter.mbarrier_arrive_counts_)
+        counts.push_back(IntImm(DataType::Int(32), c));
+
+      // Walk the body to find the inner "tilelang_root" SBlockRealize
+      // (inside the threadIdx.x scope) and inject the barrier buffer
+      // + barrier_init annotation.
+      struct RootBlockInjector : public StmtMutator {
+        Buffer barrier_buf;
+        Array<PrimExpr> arrive_counts;
+        bool injected{false};
+
+        Stmt VisitStmt_(const SBlockRealizeNode *op) final {
+          if (injected)
+            return StmtMutator::VisitStmt_(op);
+          if (op->block->name_hint == "root") {
+            return StmtMutator::VisitStmt_(op);
+          }
+          injected = true;
+          SBlock block = op->block;
+          auto block_ptr = block.CopyOnWrite();
+          block_ptr->alloc_buffers.push_back(barrier_buf);
+          Map<Var, Array<PrimExpr>> barrier_init_map;
+          if (block_ptr->annotations.count("barrier_init")) {
+            barrier_init_map = Downcast<Map<Var, Array<PrimExpr>>>(
+                block_ptr->annotations.at("barrier_init"));
+          }
+          barrier_init_map.Set(barrier_buf->data, arrive_counts);
+          block_ptr->annotations.Set("barrier_init", barrier_init_map);
+          auto realize = GetRef<SBlockRealize>(op);
+          auto realize_ptr = realize.CopyOnWrite();
+          realize_ptr->block = block;
+          return realize;
+        }
+      };
+
+      RootBlockInjector injector;
+      injector.barrier_buf = mbar_buf;
+      injector.arrive_counts = counts;
+      fptr->body = injector(fptr->body);
+      ICHECK(injector.injected)
+          << "Failed to find root SBlockRealize for barrier injection";
     }
+
+    if (TargetIsCPU(substituter.target_) &&
+        !TargetIsAscend(substituter.target_)) {
+      // TODO(#2226): Remove the underlying CPU fallback-thread placeholder
+      // shared by LayoutInference/LowerTileOp. Until then, canonicalize the
+      // synthetic fallback after fragment/tile lowering has consumed it.
+      fptr->body = CPUFallbackThreadVarCanonicalizer::Rewrite(
+          std::move(fptr->body), substituter.thread_var_->var);
+    }
+
     return f;
   }
 
@@ -271,9 +360,9 @@ private:
     return InferThreadBoundsFromIterVar(thread_var_);
   }
 
-  void PushSimtVFThreadContext(const BlockNode *op) {
+  void PushSimtVFThreadContext(const SBlockNode *op) {
     const auto *attr = op->body.as<AttrStmtNode>();
-    ICHECK(attr && attr->attr_key == tir::attr::thread_extent)
+    ICHECK(attr && attr->attr_key == tirx::attr::thread_extent)
         << "SIMT_VF block body must start with thread_extent AttrStmt";
     const auto *iv = attr->node.as<IterVarNode>();
     ICHECK(iv && iv->thread_tag == "threadIdx.x")
@@ -292,7 +381,7 @@ private:
     simt_vf_thread_ctx_stack_.pop_back();
   }
 
-  Stmt VisitStmt_(const BlockNode *op) final {
+  Stmt VisitStmt_(const SBlockNode *op) final {
     bool is_simt_vf = (op->name_hint == "SIMT_VF");
     IterVar saved_thread_var;
     if (is_simt_vf) {
@@ -321,15 +410,42 @@ private:
         layout_map_.Set(buffer, layout);
       }
     }
+    // Extract cluster_size from cluster_dims annotation
+    if (op->annotations.count("cluster_dims")) {
+      if (auto arr =
+              op->annotations.Get("cluster_dims")->try_cast<Array<Integer>>()) {
+        int sz = 1;
+        for (auto d : arr.value())
+          sz *= static_cast<int>(d->value);
+        cluster_size_ = sz;
+      }
+    }
     // Begin a new workspace collection frame for this block scope
     workspace_stack_.emplace_back();
 
-    auto block = Downcast<Block>(arith::IRMutatorWithAnalyzer::VisitStmt_(op));
+    auto block = Downcast<SBlock>(arith::IRMutatorWithAnalyzer::VisitStmt_(op));
     auto block_ptr = block.CopyOnWrite();
     for (size_t i = 0; i < block->alloc_buffers.size(); i++) {
       auto buffer = block->alloc_buffers[i];
       if (buffer_remap_.count(buffer)) {
         block_ptr->alloc_buffers.Set(i, buffer_remap_[buffer]);
+      } else if (IsFragmentBuffer(buffer)) {
+        const auto *ptr_type =
+            TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
+        Type new_type = PointerType(ptr_type->element_type, "local");
+        Var new_var;
+        if (var_remap_.count(buffer->data)) {
+          new_var = var_remap_[buffer->data];
+        } else {
+          new_var = Var(buffer->data->name_hint, new_type);
+          var_remap_.Set(buffer->data, new_var);
+        }
+        Buffer new_buf(new_var, buffer->dtype, buffer->shape, buffer->strides,
+                       buffer->elem_offset, buffer->name,
+                       buffer->data_alignment, buffer->offset_factor,
+                       buffer->buffer_type);
+        buffer_remap_.Set(buffer, new_buf);
+        block_ptr->alloc_buffers.Set(i, new_buf);
       }
     }
     // Attach any workspaces requested within this block to its alloc_buffers
@@ -340,10 +456,36 @@ private:
       workspace_stack_.pop_back();
     }
 
+    // Apply arrive-count overrides before LowerSharedBarrier consumes them.
+    if (!barrier_arrive_updates_.empty() &&
+        block->annotations.count("barrier_init")) {
+      auto barrier_init_map = Downcast<Map<Var, Array<PrimExpr>>>(
+          block->annotations.Get("barrier_init").value());
+      bool updated = false;
+      for (auto it = barrier_arrive_updates_.begin();
+           it != barrier_arrive_updates_.end();) {
+        if (barrier_init_map.count(it->first)) {
+          auto old_counts = barrier_init_map.at(it->first);
+          Array<PrimExpr> new_counts;
+          for (size_t i = 0; i < old_counts.size(); i++) {
+            new_counts.push_back(it->second);
+          }
+          barrier_init_map.Set(it->first, new_counts);
+          updated = true;
+          it = barrier_arrive_updates_.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      if (updated) {
+        block_ptr->annotations.Set("barrier_init", barrier_init_map);
+      }
+    }
+
     if (is_simt_vf) {
-      Map<Var, PrimExpr> let_var_to_expr;
-      for (const auto &[var, expr] : let_bindings_) {
-        let_var_to_expr.Set(var, expr);
+      Map<Var, PrimExpr> bind_var_to_expr;
+      for (const auto &[var, expr] : bind_var_to_expr_) {
+        bind_var_to_expr.Set(var, expr);
       }
 
       Range thread_bounds = GetActiveThreadBounds();
@@ -360,10 +502,31 @@ private:
         return workspace.access_ptr(2);
       };
 
+      AllocMBarrierCallback mbarrier_callback =
+          [this](int arrive_count, std::optional<std::string> name) -> int {
+        if (!mbarrier_buffer_.defined()) {
+          mbarrier_buffer_ =
+              CreateMBarrierBuffer(name.value_or(injected_mbarrier_name_), 1);
+        }
+        int id = mbarrier_count_++;
+        mbarrier_arrive_counts_.push_back(arrive_count);
+        return id;
+      };
+
+      UpdateBarrierArriveCallback barrier_arrive_callback = [this](Var data_var,
+                                                                   PrimExpr n) {
+        barrier_arrive_updates_[data_var] = n;
+      };
+
       auto simt_vf_op = SimtVFOp(block);
       Stmt lowered = simt_vf_op->Lower(
           LowerArgs{target_, thread_bounds, active_thread_var->var, callback,
-                    layout_map_, buffer_remap_, let_var_to_expr},
+                    mbarrier_callback, barrier_arrive_callback, layout_map_,
+                    buffer_remap_, bind_var_to_expr,
+                    loop_mbar_phase_stack_.empty()
+                        ? PrimExpr(IntImm(DataType::Int(32), 0))
+                        : loop_mbar_phase_stack_.back(),
+                    &mbarrier_buffer_, cluster_size_},
           analyzer_);
       PopSimtVFThreadContext();
       thread_var_ = saved_thread_var;
@@ -371,9 +534,9 @@ private:
     }
 
     if (op->name_hint == "SIMD_VF") {
-      Map<Var, PrimExpr> let_var_to_expr;
-      for (const auto &[var, expr] : let_bindings_) {
-        let_var_to_expr.Set(var, expr);
+      Map<Var, PrimExpr> bind_var_to_expr;
+      for (const auto &[var, expr] : bind_var_to_expr_) {
+        bind_var_to_expr.Set(var, expr);
       }
 
       AddWorkspaceCallback callback = [this](int num_elem, DataType dtype) {
@@ -386,12 +549,28 @@ private:
         }
         return workspace.access_ptr(2);
       };
+      AllocMBarrierCallback mbarrier_callback =
+          [](int arrive_count, std::optional<std::string> name) -> int {
+        (void)arrive_count;
+        (void)name;
+        return 0;
+      };
+      UpdateBarrierArriveCallback barrier_arrive_callback = [](Var data_var,
+                                                               PrimExpr n) {
+        (void)data_var;
+        (void)n;
+      };
 
       auto simd_vf_op = SimdVFOp(block);
       Stmt lowered = simd_vf_op->Lower(
           LowerArgs{target_, Range::FromMinExtent(0, 1),
                     Var("simdvf_dummy", DataType::Int(32)), callback,
-                    layout_map_, buffer_remap_, let_var_to_expr},
+                    mbarrier_callback, barrier_arrive_callback, layout_map_,
+                    buffer_remap_, bind_var_to_expr,
+                    loop_mbar_phase_stack_.empty()
+                        ? PrimExpr(IntImm(DataType::Int(32), 0))
+                        : loop_mbar_phase_stack_.back(),
+                    &mbarrier_buffer_, cluster_size_},
           analyzer_);
       return lowered;
     }
@@ -400,7 +579,7 @@ private:
   }
 
   int CheckAndGetBufferRowSize(const Buffer &buffer) {
-    CHECK(buffer->shape.size() >= 2)
+    ICHECK(buffer->shape.size() >= 2)
         << "The dimension of Buffer \"" << buffer->name << "\" with shape "
         << buffer->shape << " should be at least 2";
 
@@ -421,7 +600,7 @@ private:
     AccessPtrResult result{access_ptr, false};
     // The 2th arg of T.tvm_access_ptr call is offset, we set it to 0 and
     // accumulate it to smem_offset
-    CHECK(access_ptr->IsInstance<CallNode>())
+    ICHECK(access_ptr->IsInstance<CallNode>())
         << "Invalid access ptr for permuted layout: " << access_ptr;
     auto access_ptr_call = Downcast<Call>(access_ptr);
     if (access_ptr_call->op.same_as(builtin::tvm_access_ptr())) {
@@ -523,7 +702,7 @@ private:
       Array<PrimExpr> indices = load->indices;
       Array<PrimExpr> old_shape = load->buffer->shape;
 
-      CHECK_EQ(indices.size(), old_shape.size())
+      ICHECK_EQ(indices.size(), old_shape.size())
           << "Indices size and shape size must match for general N-dimensional "
              "buffer "
           << "but got indices size: " << indices.size()
@@ -628,7 +807,7 @@ private:
       Array<PrimExpr> indices = load->indices;
       Array<PrimExpr> old_shape = load->buffer->shape;
 
-      CHECK_EQ(indices.size(), old_shape.size())
+      ICHECK_EQ(indices.size(), old_shape.size())
           << "Indices size and shape size must match for general N-dimensional "
              "buffer "
           << "but got indices size: " << indices.size()
@@ -720,9 +899,9 @@ private:
       return expr;
     }
     if (const auto *var_node = expr.as<VarNode>()) {
-      Var var = tvm::ffi::GetRef<Var>(var_node);
-      auto it = let_bindings_.find(var);
-      if (it != let_bindings_.end()) {
+      Var var = GetRef<Var>(var_node);
+      auto it = bind_var_to_expr_.find(var);
+      if (it != bind_var_to_expr_.end()) {
         return it->second;
       }
     }
@@ -767,9 +946,10 @@ private:
     return Optional<Layout>();
   }
 
-  PrimExpr VisitExpr_(const tir::CallNode *op) final {
+  PrimExpr VisitExpr_(const tirx::CallNode *op) final {
     if (op->op.same_as(tl::tma_load()) ||
         op->op.same_as(tl::tma_load_im2col()) ||
+        op->op.same_as(tl::tma_load_multicast()) ||
         op->op.same_as(tl::tma_store())) {
       // skip tma related calls, as they were transformed implicitly.
       has_tma_ = true;
@@ -777,6 +957,12 @@ private:
       auto call = Downcast<Call>(IRMutatorWithAnalyzer::VisitExpr_(op));
       in_tma_context_ = false;
       return call;
+    }
+    if (op->op.same_as(tl::tma_store_cluster())) {
+      // SM-to-SM bulk async copy does not use a tensor-map descriptor, so
+      // shared-memory swizzle must still be reflected in pointer/index
+      // remapping.
+      return Downcast<Call>(IRMutatorWithAnalyzer::VisitExpr_(op));
     }
 
     if (is_ptx_) {
@@ -1027,26 +1213,21 @@ private:
     return var;
   }
 
-  Stmt VisitStmt_(const LetStmtNode *op) final {
+  Stmt VisitStmt_(const BindNode *op) final {
     PrimExpr value = this->VisitExpr(op->value);
     bool recorded = false;
     if (value->IsInstance<BufferLoadNode>()) {
-      let_bindings_[op->var] = value;
+      bind_var_to_expr_[op->var] = value;
       recorded = true;
     }
     if (SideEffect(value) <= CallEffectKind::kPure) {
       analyzer_->Bind(op->var, value);
     }
-    Stmt body = this->VisitStmt(op->body);
-    if (recorded) {
-      let_bindings_.erase(op->var);
-    }
-    if (value.same_as(op->value) && body.same_as(op->body)) {
-      return tvm::ffi::GetRef<Stmt>(op);
+    if (value.same_as(op->value)) {
+      return GetRef<Stmt>(op);
     } else {
       auto n = this->CopyOnWrite(op);
       n->value = value;
-      n->body = body;
       return Stmt(n);
     }
   }
@@ -1077,13 +1258,42 @@ private:
    * @return Stmt The (possibly transformed) statement after lowering or base
    * visitor processing.
    */
+  Stmt VisitStmt_(const AllocBufferNode *op) final {
+    auto buffer = op->buffer;
+    if (buffer_remap_.count(buffer)) {
+      auto node = Downcast<AllocBuffer>(IRMutatorWithAnalyzer::VisitStmt_(op));
+      node.CopyOnWrite()->buffer = buffer_remap_[buffer];
+      return std::move(node);
+    }
+    if (IsFragmentBuffer(buffer)) {
+      const auto *ptr_type =
+          TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
+      Type new_type = PointerType(ptr_type->element_type, "local");
+      Var new_var;
+      if (var_remap_.count(buffer->data)) {
+        new_var = var_remap_[buffer->data];
+      } else {
+        new_var = Var(buffer->data->name_hint, new_type);
+        var_remap_.Set(buffer->data, new_var);
+      }
+      Buffer new_buf(new_var, buffer->dtype, buffer->shape, buffer->strides,
+                     buffer->elem_offset, buffer->name, buffer->data_alignment,
+                     buffer->offset_factor, buffer->buffer_type);
+      buffer_remap_.Set(buffer, new_buf);
+      auto node = Downcast<AllocBuffer>(IRMutatorWithAnalyzer::VisitStmt_(op));
+      node.CopyOnWrite()->buffer = new_buf;
+      return std::move(node);
+    }
+    return IRMutatorWithAnalyzer::VisitStmt_(op);
+  }
+
   Stmt VisitStmt_(const EvaluateNode *op) final {
     const CallNode *call = op->value.as<CallNode>();
     // Do not analysis the call node to the global function.
     if (call && call->op.as<GlobalVarNode>())
       return Downcast<Evaluate>(IRMutatorWithAnalyzer::VisitStmt_(op));
 
-    auto tile_op = ParseOperator(tvm::ffi::GetRef<Stmt>(op));
+    auto tile_op = ParseOperator(GetRef<Stmt>(op));
     if (!tile_op.defined())
       return IRMutatorWithAnalyzer::VisitStmt_(op);
     AddWorkspaceCallback callback = [this](int num_elem, DataType dtype) {
@@ -1104,21 +1314,46 @@ private:
     Range thread_bounds = GetActiveThreadBounds();
     IterVar active_thread_var = GetActiveThreadVar();
 
-    // Convert let_bindings_ to Map<Var, PrimExpr> for LowerArgs
-    Map<Var, PrimExpr> let_var_to_expr;
-    for (const auto &[var, expr] : let_bindings_) {
-      let_var_to_expr.Set(var, expr);
+    // Convert bind_var_to_expr_ to Map<Var, PrimExpr> for LowerArgs
+    Map<Var, PrimExpr> bind_var_to_expr;
+    for (const auto &[var, expr] : bind_var_to_expr_) {
+      bind_var_to_expr.Set(var, expr);
     }
+
+    AllocMBarrierCallback mbarrier_callback =
+        [this](int arrive_count, std::optional<std::string> name) -> int {
+      if (!mbarrier_buffer_.defined()) {
+        mbarrier_buffer_ =
+            CreateMBarrierBuffer(name.value_or(injected_mbarrier_name_), 1);
+      }
+      int id = mbarrier_count_++;
+      mbarrier_arrive_counts_.push_back(arrive_count);
+      return id;
+    };
+
+    UpdateBarrierArriveCallback barrier_arrive_callback = [this](Var data_var,
+                                                                 PrimExpr n) {
+      barrier_arrive_updates_[data_var] = n;
+    };
 
     auto lowered = tile_op->Lower(
         LowerArgs{target_, thread_bounds, active_thread_var->var, callback,
-                  layout_map_, buffer_remap_, let_var_to_expr},
+                  mbarrier_callback, barrier_arrive_callback, layout_map_,
+                  buffer_remap_, bind_var_to_expr,
+                  loop_mbar_phase_stack_.empty()
+                      ? PrimExpr(IntImm(DataType::Int(32), 0))
+                      : loop_mbar_phase_stack_.back(),
+                  &mbarrier_buffer_, cluster_size_},
         analyzer_);
+
     return IRMutatorWithAnalyzer::VisitStmt(lowered);
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tir::attr::thread_extent) {
+    if (op->attr_key == kPipelineContextNumStages) {
+      return VisitStmt(op->body);
+    }
+    if (op->attr_key == tirx::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
       ICHECK_NE(iv->thread_tag.length(), 0U);
       if (iv->thread_tag == "threadIdx.x") {
@@ -1158,6 +1393,29 @@ private:
    * @return Stmt The lowered statement.
    */
   Stmt VisitStmt_(const ForNode *op) final {
+    bool pushed_loop_mbar_phase = false;
+    if (op->kind == ForKind::kSerial) {
+      int num_stages = 1;
+      if (auto ns_anno = op->annotations.Get("num_stages")) {
+        if (const auto *ns_int = ns_anno.value().as<IntImmNode>()) {
+          if (ns_int->value > 1) {
+            num_stages = static_cast<int>(ns_int->value);
+          }
+        }
+      }
+      PrimExpr phase_expr;
+      DataType loop_dtype = op->loop_var.dtype();
+      PrimExpr two = make_const(loop_dtype, 2);
+      if (num_stages > 1) {
+        PrimExpr num_stages_expr = make_const(loop_dtype, num_stages);
+        phase_expr = FloorMod(FloorDiv(op->loop_var, num_stages_expr), two);
+      } else {
+        phase_expr = FloorMod(op->loop_var, two);
+      }
+      loop_mbar_phase_stack_.push_back(analyzer_->Simplify(phase_expr));
+      pushed_loop_mbar_phase = true;
+    }
+
     // Extract reducer info from annotations
     Map<Var, ReducerInfo> reducer_info;
     if (op->annotations.count(attr::kReducerInfo)) {
@@ -1166,8 +1424,11 @@ private:
                          .value();
     }
 
-    // First visit the body
+    // First visit the body.
     For for_node = Downcast<For>(arith::IRMutatorWithAnalyzer::VisitStmt_(op));
+    if (pushed_loop_mbar_phase) {
+      loop_mbar_phase_stack_.pop_back();
+    }
 
     // Only process parallel loops
     if (op->kind != ForKind::kParallel) {
@@ -1192,56 +1453,128 @@ private:
       predicate = Downcast<PrimExpr>(
           op->annotations.Get(attr::kParallelLoopPredicate).value());
     }
+    bool require_padding_guard = false;
+    if (auto padding_guard_anno =
+            op->annotations.Get(attr::kParallelLoopRequiresPaddingGuard)) {
+      if (auto padding_guard_bool =
+              padding_guard_anno.value().try_cast<Bool>()) {
+        require_padding_guard = padding_guard_bool.value()->value;
+      } else if (auto padding_guard_int =
+                     padding_guard_anno.value().as<IntImmNode>()) {
+        require_padding_guard = padding_guard_int->value != 0;
+      } else {
+        LOG(WARNING) << "Loop annotation `"
+                     << attr::kParallelLoopRequiresPaddingGuard
+                     << "` expects Bool value (True/False), but got "
+                     << padding_guard_anno.value().GetTypeKey()
+                     << ". Ignore override.";
+      }
+    }
+    bool parallel_prefer_async = false;
+    if (auto prefer_async_anno = op->annotations.Get(attr::kLoopPreferAsync)) {
+      if (auto prefer_async_bool = prefer_async_anno.value().try_cast<Bool>()) {
+        parallel_prefer_async = prefer_async_bool.value()->value;
+      } else {
+        LOG(WARNING) << "Loop annotation `" << attr::kLoopPreferAsync
+                     << "` expects Bool value (True/False), but got "
+                     << prefer_async_anno.value().GetTypeKey()
+                     << ". Ignore override.";
+      }
+    }
+    bool parallel_async_without_async_commit_wait = false;
+    if (auto no_commit_wait_anno =
+            op->annotations.Get(attr::kParallelAsyncWithoutAsyncCommitWait)) {
+      if (auto no_commit_wait_bool =
+              no_commit_wait_anno.value().try_cast<Bool>()) {
+        parallel_async_without_async_commit_wait =
+            no_commit_wait_bool.value()->value;
+      } else {
+        LOG(WARNING) << "Loop annotation `"
+                     << attr::kParallelAsyncWithoutAsyncCommitWait
+                     << "` expects Bool value (True/False), but got "
+                     << no_commit_wait_anno.value().GetTypeKey()
+                     << ". Ignore override.";
+      }
+    }
 
-    auto root = tvm::ffi::GetRef<For>(op);
+    auto root = GetRef<For>(op);
 
-    // Check if the loop stores into local buffers.
+    // Check if the loop writes to any non-local buffer or touches a fragment.
+    // Thread partitioning is unnecessary when all stores target local buffers
+    // and there are no fragment accesses.
     // For example:
     //   for i in T.Parallel(1024):
     //     A_local[i] = A_global[i]
     // Here, A_local is a register-local buffer held independently by each
     // thread, so explicit thread binding is not required.
-    bool store_into_local = false;
-    PostOrderVisit(root, [&](const ObjectRef &obj) {
-      if (const auto *store = obj.as<BufferStoreNode>()) {
-        if (IsLocalBuffer(store->buffer)) {
-          store_into_local = true;
-        }
-      }
-    });
 
-    // Check if the loop only manipulates "local" buffers.
-    // for i in T.Parallel(1024):
-    //     A_local[i] = B_local[i]
-    // This indicates register usage and justifies skipping thread binding.
-    bool local_register_only = true;
+    // NOTE: For cases when stores to both local and non-local buffers exist
+    // (mixed case), we still conservatively assume that thread partitioning is
+    // needed. In such case, the programmer should carefully consider the
+    // access patterns of the mixed accesses to ensure correctness.
+
+    // Element-level intrinsics (e.g. atomic_add) pass non-local buffer
+    // pointers via tvm_access_ptr / tl::access_ptr inside CallNodes.
+    bool has_non_local_store = false;
+    bool has_fragment_access = false;
     PostOrderVisit(root, [&](const ObjectRef &obj) {
-      if (const auto *store = obj.as<BufferStoreNode>()) {
-        if (!IsLocalBuffer(store->buffer)) {
-          local_register_only = false;
+      if (const auto *load = obj.as<BufferLoadNode>()) {
+        if (IsFragmentBuffer(load->buffer)) {
+          has_fragment_access = true;
         }
-      } else if (const auto *load = obj.as<BufferLoadNode>()) {
-        if (!IsLocalBuffer(load->buffer)) {
-          local_register_only = false;
+      } else if (const auto *store = obj.as<BufferStoreNode>()) {
+        if (IsFragmentBuffer(store->buffer)) {
+          has_fragment_access = true;
+        }
+        if (!IsLocalBuffer(store->buffer)) {
+          has_non_local_store = true;
         }
       } else if (const auto *call = obj.as<CallNode>()) {
         if (call->op.same_as(builtin::tvm_access_ptr())) {
           // tvm_access_ptr format: (dtype, data, offset, extent, rw_mask)
           auto buffer_var = call->args[1].as<VarNode>();
           if (buffer_var) {
-            Var var = tvm::ffi::GetRef<Var>(buffer_var);
+            Var var = GetRef<Var>(buffer_var);
             auto it = buffer_map_.find(var);
-            if (it != buffer_map_.end() && !IsLocalBuffer(it->second)) {
-              local_register_only = false;
+            if (it != buffer_map_.end()) {
+              if (IsFragmentBuffer(it->second)) {
+                has_fragment_access = true;
+              }
+              if (!IsLocalBuffer(it->second)) {
+                has_non_local_store = true;
+              }
+            }
+          }
+        } else if (call->op.same_as(tl::access_ptr())) {
+          // tl::access_ptr format: (BufferLoad, extent, rw_mask)
+          if (const auto *load = call->args[0].as<BufferLoadNode>()) {
+            if (IsFragmentBuffer(load->buffer)) {
+              has_fragment_access = true;
+            }
+            if (!IsLocalBuffer(load->buffer)) {
+              has_non_local_store = true;
+            }
+          }
+        } else if (call->op.same_as(builtin::address_of())) {
+          // call_extern may pass address_of(non-local-buffer) pointers, and
+          // PostOrderVisit reaches the address_of call directly.
+          if (const auto *load = call->args[0].as<BufferLoadNode>()) {
+            if (IsFragmentBuffer(load->buffer)) {
+              has_fragment_access = true;
+            }
+            if (!IsLocalBuffer(load->buffer)) {
+              has_non_local_store = true;
             }
           }
         }
       }
     });
 
-    // Determine if this is a true parallel loop requiring thread partitioning.
-    // Skip partitioning for loops that only operate on local/register buffers.
-    bool parallel_loop = !local_register_only && !store_into_local;
+    // Determine if this loop requires thread partitioning. Fragment accesses
+    // must be partitioned together with their layout rewrite: once a logical
+    // fragment index is lowered to a physical per-thread slot, the logical loop
+    // iteration has to be owned by the corresponding thread.
+    bool parallel_loop = has_non_local_store || has_fragment_access;
 
     // Check if there are non-local buffer accesses (for vectorization decision)
     bool has_non_local = false;
@@ -1305,9 +1638,30 @@ private:
         (has_non_local || has_cast_operations) && !has_reducer;
     IterVar active_thread_var = GetActiveThreadVar();
     // Lower the parallel loop using the common function
-    return LowerParallelLoop(for_node, loop_layout, active_thread_var->var,
-                             analyzer_, layout_map_, predicate, parallel_loop,
-                             should_vectorize);
+    Stmt lowered = LowerParallelLoop(
+        for_node, loop_layout, active_thread_var->var, analyzer_, layout_map_,
+        predicate, parallel_loop, should_vectorize, require_padding_guard);
+
+    // Only parallel-loop lowering needs PTX cp.async injection. Thread-level
+    // lowering does not require converting eligible global->shared copies to
+    // `tir.ptx_cp_async`.
+    if (TargetIsCuda(target_) && TargetHasAsyncCopy(target_)) {
+      tvm::transform::PassContext ctx = tvm::transform::PassContext::Current();
+      bool enable_auto_async_copy =
+          ctx->GetConfig<Bool>(kEnableAsyncCopy, Bool(true)).value();
+      bool should_enable_async_copy =
+          parallel_prefer_async ||
+          (enable_auto_async_copy && parallel_async_without_async_commit_wait);
+      auto inject_result =
+          InjectPTXAsyncCopy(lowered, should_enable_async_copy,
+                             parallel_async_without_async_commit_wait);
+      lowered = inject_result.stmt;
+    }
+    return lowered;
+  }
+
+  Range CurrentThreadBounds() const {
+    return ComputeThreadBounds(thread_var_, *analyzer_);
   }
 
   Target target_;
@@ -1321,13 +1675,24 @@ private:
                                 IterVarType::kDataPar);
   std::vector<SimtVFThreadContext> simt_vf_thread_ctx_stack_;
   size_t thread_block_size_ = 0;
+  // Product of cluster_dims from block annotation (default 1).
+  int cluster_size_ = 1;
   // Stack of per-Block workspace buffers gathered while visiting children
   std::vector<Array<Buffer>> workspace_stack_;
+  // Counter and arrive-counts for mbarrier allocation via
+  // AllocMBarrierCallback. Used to inject a barrier buffer with
+  // barrier_init annotation into the root block after all tile ops are lowered.
+  int mbarrier_count_{0};
+  std::vector<int> mbarrier_arrive_counts_;
+  // The shared.barrier scope buffer created lazily by AllocMBarrier callback.
+  Optional<Buffer> mbarrier_buffer_;
+  // Fallback mbarrier parity derived from the nearest enclosing serial loop.
+  std::vector<PrimExpr> loop_mbar_phase_stack_;
   // For ptx Node, we need to remap the buffer and indices
   // By access CallNode instead of BufferLoad Node.
   bool is_ptx_{false};
   std::unordered_map<Var, PrimExpr, ObjectPtrHash, ObjectPtrEqual>
-      let_bindings_;
+      bind_var_to_expr_;
   // Mapping from data Var of a Buffer to Buffer, for lookup
   std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual> buffer_map_;
   Map<Var, Var> var_remap_;
@@ -1337,11 +1702,14 @@ private:
   // without recomputing indices, since swizzle is encoded in TMA descriptor
   // parameters rather than in memory indices.
   bool in_tma_context_{false};
+  // Pending barrier arrive-count overrides from multi-TMA cluster copies.
+  std::unordered_map<Var, PrimExpr, ObjectPtrHash, ObjectPtrEqual>
+      barrier_arrive_updates_;
 };
 
 namespace transform {
 
-using namespace tir::transform;
+using namespace tirx::transform;
 
 tvm::transform::Pass LowerTileOp() {
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
@@ -1351,7 +1719,7 @@ tvm::transform::Pass LowerTileOp() {
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
-  namespace refl = tvm::ffi::reflection;
+  namespace refl = reflection;
   refl::GlobalDef().def("tl.transform.LowerTileOp", LowerTileOp);
 }
 } // namespace transform

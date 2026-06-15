@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 from collections import deque
-from tvm import tir
-from tvm.tir import Var
-from tvm.script.ir_builder.tir.frame import TIRFrame, BlockFrame
+import os
+from tvm import tirx
+from tvm.tirx import Var
+from tvm.tirx.script.builder import evaluate as T_evaluate
+from tvm.tirx.script.builder.frame import TIRFrame
+from tvm.tirx.script.builder.frame import SBlockFrame
+from tvm.target import Target
 from tvm.ffi import register_object
 from tilelang import _ffi_api
 from tilelang.jit.exceptions import JITNoBuilderError
@@ -124,18 +128,51 @@ def _normalize_bindings(bindings: list[Var]) -> Var | list[Var]:
     return bindings
 
 
-def check_ascend_availability() -> bool:
-    """
-    Check if Ascend is available on the system by checking torch.npu.
-    Returns:
-        bool: True if Ascend is available, False otherwise.
-    """
-    try:
-        import torch
+def _normalize_threads(
+    threads: int | list[int] | tuple | None,
+    *,
+    is_cpu: bool,
+) -> list[int] | None:
+    if not is_cpu and threads is None:
+        threads = 128  # default thread number
 
-        return hasattr(torch, "npu") and torch.npu.is_available()
-    except Exception:
+    if isinstance(threads, int):
+        return [threads, 1, 1]
+    if isinstance(threads, list):
+        return threads + [1] * (3 - len(threads))
+    if isinstance(threads, tuple):
+        return list(threads) + [1] * (3 - len(threads))
+
+    assert is_cpu, "threads must be an integer or a list of integers"
+    return None
+
+
+def _normalize_cluster_dims(
+    cluster_dims: int | tuple[int, int, int] | list[int] | None,
+) -> list[int] | None:
+    if cluster_dims is None:
+        return None
+
+    if isinstance(cluster_dims, (list, tuple)):
+        cluster_dims = list(cluster_dims) + [1] * (3 - len(cluster_dims))
+    elif isinstance(cluster_dims, int):
+        cluster_dims = [cluster_dims, 1, 1]
+    else:
+        raise ValueError("cluster_dims must be a list or tuple of integers")
+
+    return None if cluster_dims == [1, 1, 1] else cluster_dims
+
+
+def _current_target_is_ascend() -> bool:
+    current_target = Target.current(allow_none=True)
+    if current_target is None:
         return False
+    try:
+        from tilelang.ascend.target import target_is_ascend
+
+        return bool(target_is_ascend(current_target))
+    except Exception:
+        return current_target.kind.name == "ascend" or "ascend" in current_target.keys
 
 
 @register_object("tl.KernelLaunchFrame")
@@ -155,7 +192,7 @@ class KernelLaunchFrame(TIRFrame):
         _get_current_stack().push(self)
 
         last_block_frame = self.frames[-1]
-        assert isinstance(last_block_frame, BlockFrame), f"Last frame must be a block frame, got {last_block_frame}"
+        assert isinstance(last_block_frame, SBlockFrame), f"Last frame must be a block frame, got {last_block_frame}"
 
         maybe_cpu = last_block_frame.annotations.get("tilelang.is_cpu_kernel_frame", False)
         maybe_npu = last_block_frame.annotations.get("tilelang.is_npu_kernel_frame", False)
@@ -273,9 +310,11 @@ class KernelLaunchFrame(TIRFrame):
 
 
 def Kernel(
-    *blocks: int | tir.PrimExpr,
+    *blocks: int | tirx.PrimExpr,
     threads: int | list[int] | tuple | None = None,
+    cluster_dims: int | tuple[int, int, int] | list[int] | None = None,
     is_cpu: bool = False,
+    is_ascend: bool = False,
     prelude: str | None = None,
 ):
     """Tools to quickly construct a GPU kernel launch frame.
@@ -288,10 +327,16 @@ def Kernel(
         A integer representing blockDim.x
         Or a list of integers representing blockDim.(x|y|z)
         if the value is -1, we skip the threadIdx.x binding.
+    cluster_dims : int | tuple[int, int, int] | list[int] | None
+        The cluster dimensions for SM90+ cluster launch.
+        For example, use 2 or (2, 1, 1) to create 2-CTA clusters.
+        When specified, the kernel will be launched using cudaLaunchKernelEx
+        with cudaLaunchAttributeClusterDimension.
     is_cpu : bool
         Whether the kernel is running on CPU.
-        Thus we will not bind threadIdx.x, threadIdx.y, threadIdx.z.
-        and blockIdx.x, blockIdx.y, blockIdx.z.
+    is_ascend : bool
+        Explicitly force Ascend kernel-frame semantics when target inference is
+        not active.
     prelude : str
         The import c code of the kernel,
         will be injected before the generated kernel code.
@@ -334,33 +379,27 @@ def Kernel(
 
     if Builder.current() is None:
         raise JITNoBuilderError("T.Kernel() can only be used inside @tilelang.jit or @T.prim_func context. No Builder is available.")
-    is_ascend = check_ascend_availability()
 
     attrs: dict = {}
-    if not is_cpu:
-        if is_ascend:
-            if threads is not None:
-                raise ValueError(
-                    "Ascend backend does not support `threads=` in `T.Kernel(...)`. Use `T.SimtVF(threads=...)` to define thread domains."
-                )
-            if len(blocks) != 1:
-                raise ValueError(f"Ascend backend only supports 1-D grid in `T.Kernel(N)`. Got {len(blocks)}-D grid.")
-            attrs["tilelang.is_npu_kernel_frame"] = True
-        elif threads is None:
-            # Keep backward compatibility when target is not Ascend (or unknown).
-            threads = 128  # default thread number
+    if is_ascend and is_cpu:
+        raise ValueError("Uncertain backend behavior for `is_cpu=True` and `is_ascend=True`")
+
+    if (is_ascend or _current_target_is_ascend()) and not is_cpu:
+        if threads is not None:
+            raise ValueError(
+                "Ascend backend does not support `threads=` in `T.Kernel(...)`. Use `T.SimtVF(threads=...)` to define thread domains."
+            )
+        if len(blocks) != 1:
+            raise ValueError(f"Ascend backend only supports 1-D grid in `T.Kernel(N)`. Got {len(blocks)}-D grid.")
+        attrs["tilelang.is_npu_kernel_frame"] = True
+    elif not is_cpu and threads is None:
+        # Keep backward compatibility when target is not Ascend (or unknown).
+        threads = 128  # default thread number
 
     if threads is None:
         normalized_threads = None
-    elif isinstance(threads, int):
-        normalized_threads = [threads, 1, 1]
-    elif isinstance(threads, list):
-        normalized_threads = threads + [1] * (3 - len(threads))
-    elif isinstance(threads, tuple):
-        normalized_threads = list(threads) + [1] * (3 - len(threads))
     else:
-        assert is_cpu, "threads must be an integer or a list of integers"
-        normalized_threads = None
+        normalized_threads = _normalize_threads(threads, is_cpu=is_cpu)
 
     if is_cpu:
         attrs["tilelang.is_cpu_kernel_frame"] = True
@@ -368,11 +407,106 @@ def Kernel(
     if prelude is not None:
         attrs["pragma_import_c"] = prelude
 
+    cluster_dims = _normalize_cluster_dims(cluster_dims)
+    if cluster_dims is not None:
+        attrs["cluster_dims"] = cluster_dims
+
     return _ffi_api.KernelLaunch(blocks, normalized_threads, attrs)
 
 
+# For CUDA source kernels, we need to load the source code from a file or string.
+
+
+def _load_cuda_source(source_code_or_path: str | os.PathLike[str]) -> str:
+    source = os.fspath(source_code_or_path)
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("source_code_or_path must be a non-empty source string or source path")
+
+    expanded = os.path.expanduser(source)
+    if os.path.isfile(expanded):
+        with open(expanded, encoding="utf-8") as f:
+            return f.read()
+
+    source_markers = ("\n", "__global__", 'extern "C"', "#include")
+    if any(marker in source for marker in source_markers):
+        return source
+
+    contains_path_sep = os.path.sep in source or (os.path.altsep is not None and os.path.altsep in source)
+    if contains_path_sep or source.endswith((".cu", ".cuh", ".cuda", ".cpp", ".cc", ".c")):
+        raise FileNotFoundError(f"CUDA source file not found: {source}")
+
+    return source
+
+
+def CUDASourceCodeKernel(
+    *blocks: int | tirx.PrimExpr,
+    threads: int | list[int] | tuple | None = None,
+    source_code_or_path: str | os.PathLike[str],
+    entry_name: str = "main_kernel",
+    cluster_dims: int | tuple[int, int, int] | list[int] | None = None,
+    prelude: str | None = None,
+) -> None:
+    """Launch a kernel from CUDA source code or a CUDA source file.
+
+    The code must follows the following rules:
+    1. The kernel source must be a valid CUDA kernel which can be correctly compiled under TileLang's context.
+    2. The kernel source must either contains only one `__global__` function as an entry, or have a `__global__` entry function named `main_kernel`.
+
+    Parameters
+    ----------
+    source_code_or_path : str | os.PathLike[str]
+        Inline CUDA source code, or a path to a CUDA source file.
+        If the argument resolves to an existing file, the file contents are
+        loaded. Otherwise it is treated as inline CUDA source code.
+    blocks : int
+        A list of extent, can be 1-3 dimension, representing gridDim.(x|y|z)
+    entry_name : str | None
+        Optional name of the `__global__` CUDA entry function inside the
+        provided source. When specified, TileLang launches that external CUDA
+        entry directly.
+    threads : int
+        A integer representing blockDim.x
+        Or a list of integers representing blockDim.(x|y|z)
+        if the value is -1, we skip the threadIdx.x binding.
+    cluster_dims : int | tuple[int, int, int] | list[int] | None
+        The cluster dimensions for SM90+ cluster launch.
+        For example, use 2 or (2, 1, 1) to create 2-CTA clusters.
+        When specified, the kernel will be launched using cudaLaunchKernelEx
+        with cudaLaunchAttributeClusterDimension.
+    prelude : str
+        The import c code of the kernel,
+        will be injected before the generated kernel code.
+    """
+    from tilelang.language.eager.builder import Builder
+
+    if Builder.current() is None:
+        raise JITNoBuilderError(
+            "T.CUDASourceCodeKernel() can only be used inside @tilelang.jit or @T.prim_func context. No Builder is available."
+        )
+
+    source = _load_cuda_source(source_code_or_path)
+    if prelude is not None:
+        source = prelude + "\n" + source
+
+    attrs: dict = {"code_block_source": source}
+    if not isinstance(entry_name, str) or not entry_name.strip():
+        raise ValueError("entry_name must be a non-empty string when provided")
+    attrs["code_block_entry_name"] = entry_name
+
+    threads = _normalize_threads(threads, is_cpu=False)
+
+    cluster_dims = _normalize_cluster_dims(cluster_dims)
+    if cluster_dims is not None:
+        attrs["cluster_dims"] = cluster_dims
+
+    with _ffi_api.KernelLaunch(blocks, threads, attrs):
+        # Keep the launch frame alive until SplitHostDevice can lift the
+        # external CUDA source pragma onto the device PrimFunc.
+        T_evaluate(tirx.call_extern("int32", entry_name))
+
+
 def MixedKernel(
-    *blocks: int | tir.PrimExpr,
+    *blocks: int | tirx.PrimExpr,
     sids: int = 2,
     prelude: str | None = None,
 ):
@@ -406,6 +540,7 @@ def MixedKernel(
                 ...
     """
     from tilelang.language.eager.builder import Builder
+    from tilelang.ascend.target import check_ascend_availability
 
     if Builder.current() is None:
         raise JITNoBuilderError("T.MixedKernel() can only be used inside @tilelang.jit or @T.prim_func context. No Builder is available.")

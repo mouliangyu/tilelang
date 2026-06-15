@@ -2,13 +2,65 @@
 
 from __future__ import annotations
 from typing import Literal, Any
+
 from tilelang._typing import BufferLikeType
 from tilelang.utils.language import (
     to_buffer_region,
     legalize_pairwise_extents,
 )
-from tilelang.language.utils import get_extent
-from tvm import ir, tir
+from tilelang.utils.deprecated import deprecated
+from tilelang.language.utils import get_extent, buffer_region_to_tile_region
+import tvm
+from tvm import ir, tirx
+
+
+def _normalize_copy_regions_with_extents(
+    src: BufferLikeType, dst: BufferLikeType
+) -> tuple[
+    tirx.BufferRegion | tirx.BufferLoad | tirx.Buffer,
+    tirx.BufferRegion | tirx.BufferLoad | tirx.Buffer,
+    list[tirx.PrimExpr] | None,
+    list[tirx.PrimExpr] | None,
+]:
+    # If both side are buffers, we should make sure their shapes are equal
+    if isinstance(src, tirx.Buffer) and isinstance(dst, tirx.Buffer):
+        ir.assert_structural_equal(src.shape, dst.shape)
+
+    src_extent = get_extent(src)
+    dst_extent = get_extent(dst)
+
+    src_is_scalar_load = src_extent is None and isinstance(src, tirx.BufferLoad)
+    dst_is_scalar_load = dst_extent is None and isinstance(dst, tirx.BufferLoad)
+
+    # copy(buffer_a[i], buffer_b[i]) where both are BufferLoad nodes
+    # In this case, lower it to a simple BufferStore: buffer_b[i] = buffer_a[i]
+    if src_is_scalar_load and dst_is_scalar_load:
+        return src, dst, None, None
+
+    assert src_extent or dst_extent, "Can't deduce copy extents from args. Both src and dst miss extents info."
+    # Treat missing extent as length-matched ones for convenience. This provides limited
+    # broadcasting-like syntactic sugar, but does not implement general broadcasting support.
+    src_extent = list(src_extent) if src_extent else [1] * len(dst_extent)
+    dst_extent = list(dst_extent) if dst_extent else [1] * len(src_extent)
+
+    # Align and broadcast extents from the right (tail) side.
+    # This is majorly for supporting some syntactic sugar, not the whole broadcasting ability of copy op.
+    src_extent, dst_extent = legalize_pairwise_extents(src_extent, dst_extent)
+
+    # Use legalized extents for src and dst respectively.
+    src = to_buffer_region(src, access_type="r", extents=src_extent)
+    dst = to_buffer_region(dst, access_type="w", extents=dst_extent)
+    return src, dst, src_extent, dst_extent
+
+
+def _normalize_copy_regions(
+    src: BufferLikeType, dst: BufferLikeType
+) -> tuple[
+    tirx.BufferRegion | tirx.BufferLoad | tirx.Buffer,
+    tirx.BufferRegion | tirx.BufferLoad | tirx.Buffer,
+]:
+    src, dst, _, _ = _normalize_copy_regions_with_extents(src, dst)
+    return src, dst
 
 
 # Short-name → int mapping for L2 cache control.
@@ -78,88 +130,74 @@ def copy(
     coalesced_width: int | None = None,
     disable_tma: bool = False,
     eviction_policy: Literal["evict_normal", "evict_first", "evict_last"] | None = None,
+    prefer_instruction: str | None = None,
     annotations: dict | None = None,
     loop_layout: Any | None = None,
     transpose: bool = False,
     nd2nz: bool = False,
     l2_cache_ctrl: int | str | None = None,
     scale_factor: bool = False,
-) -> tir.PrimExpr | tir.Stmt:
+) -> tirx.PrimExpr | tirx.Stmt:
     """Copy data between memory regions.
 
     Args:
-        src (Union[tir.Buffer, tir.BufferLoad, tir.BufferRegion]): Source memory region
-        dst (Union[tir.Buffer, tir.BufferLoad, tir.BufferRegion]): Destination memory region
+        src (Union[tirx.Buffer, tirx.BufferLoad, tirx.BufferRegion]): Source memory region
+        dst (Union[tirx.Buffer, tirx.BufferLoad, tirx.BufferRegion]): Destination memory region
         coalesced_width (Optional[int], keyword-only): Width for coalesced memory access. Defaults to None.
         disable_tma (bool, keyword-only): Whether to disable TMA acceleration. Defaults to False.
         eviction_policy (Optional[str], keyword-only): Cache eviction policy. Defaults to None.
+        prefer_instruction (Optional[str], keyword-only): Backend-specific preferred lowering
+            instruction category. For CUDA, recognized values include "tma", "cp_async", and
+            "sync". For "tma", T.copy keeps synchronous copy semantics; global -> shared copies
+            lower through TMA with an automatically allocated barrier and wait when constraints
+            are satisfied.
         annotations (Optional[dict], keyword-only): Additional annotations dict. If provided,
-            coalesced_width, disable_tma, and eviction_policy can also be specified here.
+            coalesced_width, disable_tma, eviction_policy, and prefer_instruction can also
+            be specified here.
             Values in annotations take precedence over individual arguments.
         loop_layout (Optional[Fragment], keyword-only): A parallel loop layout hint for the SIMT copy
             (only valid for normal SIMT copy; incompatible with TMA/LDSM/STSM/TMem). When provided,
             it is attached to the outermost parallel loop generated by this copy.
+        transpose (bool, keyword-only): Ascend GM-to-L1 transpose hint for dn2nz layout.
         l2_cache_ctrl (Optional[int | str], keyword-only): Ascend L2 cache control
             policy for GM↔UB, GM↔L1, and UB↔GM DMA paths. Accepts an integer (hardware
             L2Ctrl value) or a case-insensitive string name.
-            Common values: ``0`` / ``"normal_fv"``, ``4`` / ``"notalloc_keep"``
+            Common values: ``0`` / ``"normal_fv"`` (default), ``4`` / ``"notalloc_keep"``
             (bypass L2 to stream past), ``5`` / ``"notalloc_clean"`` (bypass L2 to
-            avoid pollution). Defaults to None; Ascend UB→GM store paths use
-            default 4, while load paths use default 0.
+            avoid pollution). Defaults to None (hardware default 0).
             Ascend only; ignored on other backends.
-        scale_factor (bool, keyword-only): Whether the copied data is a scale factor.
-            A semantic marker passed through to the builtin call; currently no
-            behaviour difference in lowering/codegen. Defaults to False.
+        scale_factor (bool, keyword-only): Whether the copied data is an Ascend
+            scale-factor tile. The marker changes GM→L1 NZ stride setup for
+            scale-factor data. Defaults to False.
 
     Raises:
         TypeError: If copy extents cannot be deduced from arguments
 
     Returns:
-        tir.Call: A handle to the copy operation
+        tirx.Call: A handle to the copy operation
 
     Range handling notes:
     - Accepts `Buffer`/`BufferRegion`/`BufferLoad` on either side. Extents are
       derived as follows: `Buffer -> shape`, `BufferRegion -> [r.extent]`,
       `BufferLoad -> extents from its inferred/encoded region`.
-    - If both `src` and `dst` are scalar `BufferLoad` without region extents,
-      lowers to a direct store: `dst[...] = src`.
-    - If one side is missing extents, it is treated as all-ones with the other
-      side's rank to enable broadcasting.
-    - Extents are right-aligned and legalized via `legalize_pairwise_extents`:
-      per tail-dimension, equal keeps as-is, a `1` broadcasts to the other,
-      otherwise a conservative `tir.max` is used to remain safe for dynamic
-      shapes.
+    - Normally, we require the extents of both sides to be the same. If they
+      differ, the copy instruction follows an internal rule to select one side
+      as the base range and create iteration space. This may generate unexpected
+      code. And if some dimensions are 1, unexpected errors may happen.
+    - Small Optimization: If both `src` and `dst` are scalar `BufferLoad` without
+      region extents, lowers to a direct store: `dst[...] = src[...]`.
+    - Syntactic Sugar: TileLang supports passing the head address of a buffer to represent
+      the whole buffer if there are no ambiguity. For example, T.copy(A, A_shared[i, j]).
+      To support this, we need some special shape checking. But remember currently we don't
+      support something like "broadcast".
     - The finalized extents are encoded with `tl.region` via `to_buffer_region`
       and passed through to the backend; low-level loop construction and any
       scope-specific decisions happen during lowering.
     """
-    if isinstance(src, tir.Buffer) and isinstance(dst, tir.Buffer):
-        ir.assert_structural_equal(src.shape, dst.shape)
-
-    src_extent = get_extent(src)
-    dst_extent = get_extent(dst)
-    # Combine the nested if statements into a single if statement as suggested by SIM102
-    if src_extent is None and dst_extent is None and isinstance(src, tir.BufferLoad) and isinstance(dst, tir.BufferLoad):
-        # check if the case is like this:
-        # copy(buffer_a[i], buffer_b[i]) where both are BufferLoad nodes
-        # In this case, lower it to a simple BufferStore: buffer_b[i] = buffer_a[i]
-        return tir.BufferStore(dst.buffer, src, dst.indices)
-
-    assert src_extent or dst_extent, "Can't deduce copy extents from args"
-    # Treat missing extent as length-matched ones to enable broadcasting.
-    src_extent = list(src_extent) if src_extent else [1] * len(dst_extent)
-    dst_extent = list(dst_extent) if dst_extent else [1] * len(src_extent)
-
-    # Align and broadcast extents from the right (tail) side.
-    src_extent, dst_extent = legalize_pairwise_extents(src_extent, dst_extent)
-
-    # Capture originals before to_buffer_region rewrites src/dst — we need
-    # them later to size the nd2nz tmp UB scratch.
     src_orig, dst_orig = src, dst
-
-    # Use legalized extents for src and dst respectively.
-    src = to_buffer_region(src, access_type="r", extents=src_extent)
-    dst = to_buffer_region(dst, access_type="w", extents=dst_extent)
+    src, dst, src_extent, dst_extent = _normalize_copy_regions_with_extents(src, dst)
+    if isinstance(src, tirx.BufferLoad) and isinstance(dst, tirx.BufferLoad):
+        return tirx.BufferStore(dst.buffer, src, dst.indices)
 
     # Build annotations dict
     ann = annotations.copy() if annotations else {}
@@ -172,6 +210,10 @@ def copy(
     if "eviction_policy" not in ann and eviction_policy is not None:
         eviction_policy_map = {"evict_normal": 0, "evict_first": 1, "evict_last": 2}
         ann["eviction_policy"] = eviction_policy_map[eviction_policy]
+    if "prefer_instruction" not in ann and prefer_instruction is not None:
+        ann["prefer_instruction"] = prefer_instruction
+    if isinstance(ann.get("prefer_instruction"), str):
+        ann["prefer_instruction"] = tirx.StringImm(ann["prefer_instruction"])
 
     # Parallel loop layout hint (Fragment). Mirrors T.Parallel(loop_layout=...)
     if loop_layout is not None and "parallel_loop_layout" not in ann:
@@ -179,43 +221,40 @@ def copy(
 
     # Ascend GM→L1: use dn2nz (transpose N/D mapping) instead of nd2nz
     if transpose and "transpose" not in ann:
-        ann["transpose"] = 1
+        ann["transpose"] = tirx.IntImm("int32", 1)
 
     # Ascend UB→L1: fused ND→NZ scatter (+ optional cast) before raw DMA
     if nd2nz and "nd2nz" not in ann:
-        ann["nd2nz"] = 1
+        ann["nd2nz"] = tirx.IntImm("int32", 1)
 
-    # Ascend DMA: L2 cache control for GM↔L1 and UB↔GM paths
+    # Ascend DMA: L2 cache control for GM↔L1 and UB↔GM paths.
     if l2_cache_ctrl is not None and "l2_cache_ctrl" not in ann:
         ann["l2_cache_ctrl"] = l2_cache_ctrl
-
-    # Scale factor marker: indicates the copied data is a scale factor tensor
     if scale_factor and "scale_factor" not in ann:
-        ann["scale_factor"] = 1
-
-    # Normalize string l2_cache_ctrl values (may come from kwarg or annotations dict)
+        ann["scale_factor"] = tirx.IntImm("int32", 1)
     if "l2_cache_ctrl" in ann:
         ann["l2_cache_ctrl"] = _normalize_l2_cache_ctrl(ann["l2_cache_ctrl"])
 
-    # Ascend nd2nz: bypass tl.tileop.copy entirely and emit the scatter +
-    # post_copy intrinsics directly so each step is a separate TIR stmt that
-    # downstream passes (codegen, dump_ir) can see without LowerTileOp.
+    # Ascend nd2nz: bypass tl.tileop.copy entirely and emit scatter/post_copy
+    # intrinsics as separate TIR statements so later passes can schedule and
+    # inspect both steps.
     nd2nz_active = bool(ann.get("nd2nz", 0))
     if nd2nz_active:
+        assert src_extent is not None and dst_extent is not None
         return _emit_nd2nz_seq(src, dst, src_orig, dst_orig, src_extent, dst_extent, ann)
 
-    return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.copy"), src, dst, annotations=ann if ann else None)
+    return tirx.call_intrin("handle", tirx.op.Op.get("tl.tileop.copy"), src, dst, annotations=ann if ann else None)
 
 
 def _emit_nd2nz_seq(
-    src: tir.PrimExpr,
-    dst: tir.PrimExpr,
+    src: tirx.PrimExpr,
+    dst: tirx.PrimExpr,
     src_orig: BufferLikeType,
     dst_orig: BufferLikeType,
     src_extent: list,
     dst_extent: list,
     ann: dict,
-) -> tir.PrimExpr:
+) -> tirx.PrimExpr:
     """Emit the Ascend ND→NZ copy as a scatter + post_copy intrinsic pair.
 
     Emits a SimdVF scatter (ND → NZ reorder in UB tmp) followed by a
@@ -235,31 +274,24 @@ def _emit_nd2nz_seq(
     from tilelang.language.allocate import alloc_shared as _alloc_shared
 
     is_dual = bool(ann.get("double"))
-    # For dual_copy: src is half-size (per-AIV tile), dst is full-size. Rows/cols
-    # describe the per-AIV tile, so use src extents. Otherwise (regular nd2nz),
-    # src and dst extents match — pick dst as before.
-    rows_src = src_extent[-2]
-    cols_src = src_extent[-1]
-    rows_dst = dst_extent[-2]
-    cols_dst = dst_extent[-1]
+    rows_src, cols_src = src_extent[-2], src_extent[-1]
+    rows_dst, cols_dst = dst_extent[-2], dst_extent[-1]
     rows = rows_src if is_dual else rows_dst
     cols = cols_src if is_dual else cols_dst
 
-    # Look through the tl.tileop.region wrappers to recover the underlying
-    # buffers (for dtype + full L1 M dim).
     src_buf = src.args[0].buffer
     dst_buf = dst.args[0].buffer
     full_rows = dst_buf.shape[-2]
 
-    def _to_dtype_str(dt) -> str:
-        s = str(dt)
-        if "bfloat16" in s:
+    def _to_dtype_str(dtype) -> str:
+        dtype_str = str(dtype)
+        if "bfloat16" in dtype_str:
             return "bfloat16_t"
-        if "float16" in s:
+        if "float16" in dtype_str:
             return "half"
-        if s in ("float32", "float"):
+        if dtype_str in ("float32", "float"):
             return "float"
-        raise ValueError(f"Unsupported nd2nz dtype: {s}")
+        raise ValueError(f"Unsupported nd2nz dtype: {dtype_str}")
 
     src_ptr = _access_ptr(src_orig, "r")
     dst_ptr = _access_ptr(dst_orig, "w")
@@ -267,32 +299,33 @@ def _emit_nd2nz_seq(
     # Single D-group + same dtype: NZ == ND, scatter is a no-op → skip it.
     # If dtypes differ the scatter is still needed for the cast.
     _elem_bytes = dst_buf.dtype.bits // 8
-    cols_i = int(cols.value) if isinstance(cols, tir.IntImm) else None
+    if isinstance(cols, int):
+        cols_i = cols
+    elif isinstance(cols, tirx.IntImm):
+        cols_i = int(cols.value)
+    else:
+        cols_i = None
     single_dgroup = cols_i is not None and cols_i * _elem_bytes == 32
     same_dtype = src_buf.dtype == dst_buf.dtype
 
     src_dtype_str = _to_dtype_str(src_buf.dtype)
     dst_dtype_str = _to_dtype_str(dst_buf.dtype)
 
-    scatter_op = tir.op.Op.get("tl.ascend_nd2nz_scatter")
-    post_copy_op = tir.op.Op.get("tl.ascend_nd2nz_post_copy")
+    scatter_op = tirx.op.Op.get("tl.ascend_nd2nz_scatter")
+    post_copy_op = tirx.op.Op.get("tl.ascend_nd2nz_post_copy")
 
-    # Optional dual-split hint args appended to post_copy. dual_dst_ctl: 1=M, 2=N.
     dual_extras: list = []
     if is_dual:
-        dual_dst_ctl = int(ann.get("dual_dst_ctl", 0))
+        dual_dst_ctl_raw = ann.get("dual_dst_ctl", 0)
+        dual_dst_ctl = int(dual_dst_ctl_raw.value) if isinstance(dual_dst_ctl_raw, tirx.IntImm) else int(dual_dst_ctl_raw)
         if dual_dst_ctl not in (1, 2):
             raise ValueError(f"dual_copy(nd2nz=True) requires dual_dst_ctl in {{1, 2}}, got {dual_dst_ctl}")
-        # split_dim is along the trailing-2 axes (-2 = M, -1 = N).
-        split_dim_neg2 = 0 if dual_dst_ctl == 1 else 1  # 0 → M, 1 → N
+        split_dim_neg2 = 0 if dual_dst_ctl == 1 else 1
         half_extent = src_extent[-2 + split_dim_neg2]
-        dual_extras = [
-            tir.IntImm("int32", split_dim_neg2),
-            half_extent,
-        ]
+        dual_extras = [tirx.IntImm("int32", split_dim_neg2), half_extent]
 
     if single_dgroup and same_dtype:
-        return tir.call_intrin(
+        return tirx.call_intrin(
             "handle",
             post_copy_op,
             dst_ptr,
@@ -311,7 +344,7 @@ def _emit_nd2nz_seq(
     #       on Ascend 950 given no vscatterb instruction support.
     tmp_buf = _alloc_shared(((rows + 1) * cols,), dst_buf.dtype, "shared.dyn")
 
-    scatter = tir.call_intrin(
+    scatter = tirx.call_intrin(
         "handle",
         scatter_op,
         src_ptr,
@@ -323,7 +356,7 @@ def _emit_nd2nz_seq(
     )
     tb_tir.evaluate(scatter)
 
-    return tir.call_intrin(
+    return tirx.call_intrin(
         "handle",
         post_copy_op,
         dst_ptr,
@@ -336,21 +369,417 @@ def _emit_nd2nz_seq(
     )
 
 
-def _get_shape(buf):
-    """Extract shape list from Buffer, BufferLoad, or BufferRegion."""
-    if isinstance(buf, tir.Buffer):
-        return list(buf.shape)
-    elif isinstance(buf, tir.BufferLoad):
-        return list(buf.buffer.shape)
-    elif isinstance(buf, tir.BufferRegion):
-        return [r.extent for r in buf.region]
+def copy_cluster(
+    src: BufferLikeType,
+    dst: BufferLikeType,
+    *,
+    dst_block: int | tirx.PrimExpr | None = None,
+    cluster_mask: int | None = None,
+    remote_barrier: tirx.BufferLoad | None = None,
+    eviction_policy: Literal["evict_normal", "evict_first", "evict_last"] | None = None,
+    coalesced_width: int | None = None,
+    loop_layout: Any | None = None,
+) -> tirx.PrimExpr | tirx.Stmt:
+    """Cluster-aware copy for TMA multicast or SM-to-SM shared-memory copy.
+
+    Args:
+        src: Source memory region.
+        dst: Destination memory region.
+        dst_block: Destination CTA rank in the cluster for SM-to-SM copy.
+        cluster_mask: Bitmask of CTAs that participate in TMA multicast.
+        remote_barrier: Shared-memory mbarrier for asynchronous SM-to-SM copy
+            completion signalling.  The destination CTA should wait on its
+            local copy of this barrier.
+        eviction_policy: Cache eviction hint passed to the TMA instruction.
+            Only relevant for the TMA multicast path (``cluster_mask`` set).
+        coalesced_width: Vectorization width (in elements) for the SIMT loop
+            used on the SM-to-SM fallback path (``dst_block`` set, no fast
+            bulk-async route available).
+        loop_layout: Parallel loop layout hint (Fragment) for the SIMT loop on
+            the SM-to-SM fallback path. Incompatible with the TMA multicast
+            path (``cluster_mask`` set).
+
+    Returns:
+        tirx.Call: A handle to the copy operation.
+    """
+    src, dst = _normalize_copy_regions(src, dst)
+
+    ann: dict = {}
+    if dst_block is not None:
+        ann["dst_block"] = dst_block
+    if cluster_mask is not None:
+        ann["cluster_mask"] = cluster_mask
+    if remote_barrier is not None:
+        ann["barrier"] = remote_barrier
+    if eviction_policy is not None:
+        eviction_policy_map = {"evict_normal": 0, "evict_first": 1, "evict_last": 2}
+        ann["eviction_policy"] = eviction_policy_map[eviction_policy]
+    if coalesced_width is not None:
+        ann["coalesced_width"] = coalesced_width
+    if loop_layout is not None:
+        ann["parallel_loop_layout"] = loop_layout
+
+    return tirx.call_intrin("handle", tirx.op.Op.get("tl.tileop.copy"), src, dst, annotations=ann if ann else None)
+
+
+def async_copy(
+    src: BufferLikeType,
+    dst: BufferLikeType,
+    *,
+    coalesced_width: int | None = None,
+    annotations: dict | None = None,
+    loop_layout: Any | None = None,
+) -> tirx.PrimExpr | tirx.Stmt:
+    """Asynchronous copy primitive lowered through cp.async.
+
+    This operator is intended for explicitly asynchronous global->shared copy.
+    The backend enforces cp.async constraints and emits:
+      `ptx_cp_async(...)` + `ptx_commit_group()`.
+    No wait is auto-inserted for `T.async_copy`; synchronization is explicit.
+
+    Args:
+        src (Union[tirx.Buffer, tirx.BufferLoad, tirx.BufferRegion]): Source memory region
+        dst (Union[tirx.Buffer, tirx.BufferLoad, tirx.BufferRegion]): Destination memory region
+        coalesced_width (Optional[int], keyword-only): Width for coalesced memory access. Defaults to None.
+        annotations (Optional[dict], keyword-only): Additional annotations dict.
+        loop_layout (Optional[Fragment], keyword-only): A parallel loop layout hint for the SIMT copy loop.
+
+    Returns:
+        tirx.Call: A handle to the async copy operation
+    """
+    src, dst = _normalize_copy_regions(src, dst)
+    if isinstance(src, tirx.BufferLoad) and isinstance(dst, tirx.BufferLoad):
+        return tirx.BufferStore(dst.buffer, src, dst.indices)
+
+    ann = annotations.copy() if annotations else {}
+    if "coalesced_width" not in ann and coalesced_width is not None:
+        ann["coalesced_width"] = coalesced_width
+    if loop_layout is not None and "parallel_loop_layout" not in ann:
+        ann["parallel_loop_layout"] = loop_layout
+
+    return tirx.call_intrin(
+        "handle",
+        tirx.op.Op.get("tl.tileop.async_copy"),
+        src,
+        dst,
+        annotations=ann if ann else None,
+    )
+
+
+def tma_copy(
+    src: BufferLikeType,
+    dst: BufferLikeType,
+    *,
+    barrier=None,
+    leader_scope_threads: int | None = None,
+    eviction_policy: Literal["evict_normal", "evict_first", "evict_last"] | None = None,
+    annotations: dict | None = None,
+) -> tirx.PrimExpr | tirx.Stmt:
+    """TMA copy with user-managed synchronization.
+
+    For **loads** (global -> shared): issues expect_tx + tma_load (no wait).
+    Unlike T.copy() which emits a full synchronous TMA sequence (arrive + load + wait),
+    T.tma_copy() emits only the producer part (expect_tx + tma_load).
+    The user manages synchronization explicitly via T.barrier_arrive() and
+    T.mbarrier_wait_parity(). ``barrier`` is required for loads.
+
+    For **stores** (shared -> global): issues tma_store + tma_store_arrive (no wait).
+    Unlike T.copy() which emits tma_store + tma_store_arrive + tma_store_wait,
+    T.tma_copy() omits the wait so the user can batch multiple stores before
+    calling T.tma_store_wait() explicitly. ``barrier`` is not needed for stores.
+    FP4 unpacked shared-memory storage is load-only for TMA: packed global
+    ``float4_e2m1fn`` may be loaded into unpacked shared
+    ``float4_e2m1_unpacked``, but the reverse TMA store is not supported.
+
+    Args:
+        src: Source memory region (global or shared)
+        dst: Destination memory region (shared or global)
+        barrier: Mbarrier (from T.alloc_barrier()) for TMA load synchronization.
+            Required for loads (global -> shared). Not needed for stores.
+            The TMA load will arrive at this barrier with expected byte count.
+            The user must wait on the same barrier via T.mbarrier_wait_parity().
+        leader_scope_threads: Number of threads in each TMA leader-election scope
+            (e.g., 32 for per-warp). Defaults to the thread extend in the current context if not specified.
+        eviction_policy: Cache eviction policy. Defaults to None.
+        annotations: Additional annotations dict. Values in annotations take
+            precedence over individual arguments.
+
+    Returns:
+        tirx.Call: A handle to the tma_copy operation
+    """
+    # If both side are buffers, we should make sure their shapes are equal
+    if isinstance(src, tirx.Buffer) and isinstance(dst, tirx.Buffer):
+        ir.assert_structural_equal(src.shape, dst.shape)
+
+    src_extent = get_extent(src)
+    dst_extent = get_extent(dst)
+
+    assert src_extent or dst_extent, "Can't deduce copy extents from args. Both src and dst miss extents info."
+    src_extent = list(src_extent) if src_extent else [1] * len(dst_extent)
+    dst_extent = list(dst_extent) if dst_extent else [1] * len(src_extent)
+
+    src_extent, dst_extent = legalize_pairwise_extents(src_extent, dst_extent)
+
+    src = to_buffer_region(src, access_type="r", extents=src_extent)
+    dst = to_buffer_region(dst, access_type="w", extents=dst_extent)
+
+    ann = annotations.copy() if annotations else {}
+
+    if barrier is not None:
+        from .builtin import _mbar_to_buffer_load
+
+        ann["barrier"] = _mbar_to_buffer_load(barrier)
+
+    if leader_scope_threads is not None:
+        if not isinstance(leader_scope_threads, int) or leader_scope_threads <= 0:
+            raise ValueError(f"leader_scope_threads must be a positive int, got {leader_scope_threads}")
+        if leader_scope_threads % 32 != 0:
+            raise ValueError(f"leader_scope_threads must be a multiple of warp size (32), got {leader_scope_threads}")
+        if "leader_scope_threads" not in ann:
+            ann["leader_scope_threads"] = leader_scope_threads
+
+    if "eviction_policy" not in ann and eviction_policy is not None:
+        eviction_policy_map = {"evict_normal": 0, "evict_first": 1, "evict_last": 2}
+        ann["eviction_policy"] = eviction_policy_map[eviction_policy]
+
+    return tirx.call_intrin("handle", tirx.op.Op.get("tl.tileop.tma_copy"), src, dst, annotations=ann if ann else None)
+
+
+_TMA_SUPPORTED_DTYPES = frozenset(
+    {
+        "uint8",
+        "uint16",
+        "uint32",
+        "int32",
+        "uint64",
+        "int64",
+        "float16",
+        "float32",
+        "float64",
+        "bfloat16",
+    }
+)
+
+
+def tma_gather4(
+    src: tirx.Buffer,
+    dst: tirx.Buffer,
+    col: tirx.PrimExpr,
+    rows,
+    *,
+    barrier,
+    swizzle=None,
+    eviction_policy: Literal["evict_normal", "evict_first", "evict_last"] | None = None,
+):
+    """Issue a TMA tile::gather4 load (sm_100a, Blackwell).
+
+    Loads four arbitrary rows of a 2D global tensor ``src`` into a 2D shared
+    tile ``dst`` of shape ``(4, K_box)``. The CUtensorMap descriptor (dtype +
+    swizzle) is built by the compiler from buffer + layout info.
+
+    Caller must wrap this with ``T.shuffle_elect`` and pair it with
+    ``T.mbarrier_expect_tx`` (use :func:`tma_gather4_bytes`) before, and
+    ``barrier_arrive`` / ``mbarrier_wait_parity`` after.
+
+    The ``swizzle`` kwarg is deprecated; mark the shared tile via
+    ``T.annotate_layout`` for non-default swizzle.
+    """
+    if not isinstance(src, tirx.Buffer):
+        raise TypeError("tma_gather4 src must be a tirx.Buffer (global)")
+    if not isinstance(dst, tirx.Buffer):
+        raise TypeError("tma_gather4 dst must be a tirx.Buffer (shared)")
+    if src.scope() != "global":
+        raise ValueError(f"tma_gather4 src must be a global buffer, got scope={src.scope()}")
+    if dst.scope() not in ("shared", "shared.dyn"):
+        raise ValueError(f"tma_gather4 dst must be a shared buffer, got scope={dst.scope()}")
+    if len(src.shape) != 2:
+        raise ValueError(f"tma_gather4 expects rank-2 global buffer, got {len(src.shape)}")
+    if len(dst.shape) != 2:
+        raise ValueError(f"tma_gather4 expects rank-2 shared buffer (4 x K_box), got {len(dst.shape)}")
+    if src.dtype != dst.dtype:
+        raise ValueError(f"tma_gather4 dtype mismatch: src={src.dtype}, dst={dst.dtype}")
+    if not (isinstance(dst.shape[0], int) and dst.shape[0] == 4) and not (hasattr(dst.shape[0], "value") and int(dst.shape[0].value) == 4):
+        raise ValueError(f"tma_gather4 shared tile leading dim must be 4, got {dst.shape[0]}")
+    if src.strides:
+        inner = src.strides[1]
+        if not ((isinstance(inner, int) and inner == 1) or (hasattr(inner, "value") and int(inner.value) == 1)):
+            raise ValueError(f"tma_gather4 requires unit innermost global stride, got {inner}")
+    rows = list(rows)
+    if len(rows) != 4:
+        raise ValueError(f"tma_gather4 expects exactly 4 row indices, got {len(rows)}")
+    if swizzle not in (None, "none", 0):
+        import warnings
+
+        warnings.warn(
+            f"tma_gather4 swizzle={swizzle!r} is deprecated; use T.annotate_layout.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    from .builtin import _mbar_to_buffer_load
+
+    bar_load = _mbar_to_buffer_load(barrier)
+
+    eviction_policy_map = {"evict_normal": 0, "evict_first": 1, "evict_last": 2}
+    ep = 0 if eviction_policy is None else eviction_policy_map[eviction_policy]
+
+    # Matching (4, K_box) extents satisfy CopyNode's shape check; the actual
+    # access pattern lives in the gather4_rows / gather4_col annotations.
+    K_box = dst.shape[1]
+    src_region = to_buffer_region(src, access_type="r", extents=[4, K_box])
+    dst_region = to_buffer_region(dst, access_type="w", extents=[4, K_box])
+
+    ann = {
+        "is_gather4": True,
+        "gather4_rows": rows,
+        "gather4_col": col,
+        "barrier": bar_load,
+        "eviction_policy": ep,
+    }
+    return tirx.call_intrin(
+        "handle",
+        tirx.op.Op.get("tl.tileop.copy"),
+        src_region,
+        dst_region,
+        annotations=ann,
+    )
+
+
+def tma_gather4_bytes(K_box, dtype: str) -> int:
+    """Transaction byte count for a 4-row gather4 of width ``K_box``. Pass
+    to ``T.mbarrier_expect_tx`` immediately before ``T.tma_gather4``.
+    """
+    if dtype not in _TMA_SUPPORTED_DTYPES:
+        raise ValueError(f"Unsupported dtype: {dtype}")
+    dt = tvm.DataType(dtype)
+    if dt.is_float4_e2m1_unpacked():
+        elem_bits = 4
     else:
-        raise TypeError(f"Cannot get shape from {type(buf)}")
+        elem_bits = dt.bits
+    return (4 * K_box * elem_bits + 7) // 8
 
 
-def _is_half(full_dim, half_dim):
-    """Check if half_dim == full_dim // 2."""
-    if isinstance(full_dim, (int, tir.IntImm)) and isinstance(half_dim, (int, tir.IntImm)):
+def tma_scatter4(
+    src: tirx.Buffer,
+    dst: tirx.Buffer,
+    col: tirx.PrimExpr,
+    rows,
+    *,
+    swizzle=None,
+    eviction_policy: Literal["evict_normal", "evict_first", "evict_last"] | None = None,
+):
+    """Issue a TMA tile::scatter4 store (sm_100a, Blackwell).
+
+    Stores a 2D shared tile of shape ``(4, K_box)`` to four arbitrary rows of
+    a 2D global tensor ``dst``. Caller is responsible for ``tma_store_arrive``
+    / ``tma_store_wait`` and the ``T.shuffle_elect`` guard. See
+    :func:`tma_gather4` for descriptor / swizzle inference details.
+    """
+    if not isinstance(src, tirx.Buffer):
+        raise TypeError("tma_scatter4 src must be a tirx.Buffer (shared)")
+    if not isinstance(dst, tirx.Buffer):
+        raise TypeError("tma_scatter4 dst must be a tirx.Buffer (global)")
+    if src.scope() not in ("shared", "shared.dyn"):
+        raise ValueError(f"tma_scatter4 src must be a shared buffer, got scope={src.scope()}")
+    if dst.scope() != "global":
+        raise ValueError(f"tma_scatter4 dst must be a global buffer, got scope={dst.scope()}")
+    if len(src.shape) != 2:
+        raise ValueError(f"tma_scatter4 expects rank-2 shared buffer (4 x K_box), got {len(src.shape)}")
+    if len(dst.shape) != 2:
+        raise ValueError(f"tma_scatter4 expects rank-2 global buffer, got {len(dst.shape)}")
+    if src.dtype != dst.dtype:
+        raise ValueError(f"tma_scatter4 dtype mismatch: src={src.dtype}, dst={dst.dtype}")
+    if not (isinstance(src.shape[0], int) and src.shape[0] == 4) and not (hasattr(src.shape[0], "value") and int(src.shape[0].value) == 4):
+        raise ValueError(f"tma_scatter4 shared tile leading dim must be 4, got {src.shape[0]}")
+    if dst.strides:
+        inner = dst.strides[1]
+        if not ((isinstance(inner, int) and inner == 1) or (hasattr(inner, "value") and int(inner.value) == 1)):
+            raise ValueError(f"tma_scatter4 requires unit innermost global stride, got {inner}")
+    rows = list(rows)
+    if len(rows) != 4:
+        raise ValueError(f"tma_scatter4 expects exactly 4 row indices, got {len(rows)}")
+    if swizzle not in (None, "none", 0):
+        import warnings
+
+        warnings.warn(
+            f"tma_scatter4 swizzle={swizzle!r} is deprecated; use T.annotate_layout.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    eviction_policy_map = {"evict_normal": 0, "evict_first": 1, "evict_last": 2}
+    ep = 0 if eviction_policy is None else eviction_policy_map[eviction_policy]
+
+    K_box = src.shape[1]
+    src_region = to_buffer_region(src, access_type="r", extents=[4, K_box])
+    dst_region = to_buffer_region(dst, access_type="w", extents=[4, K_box])
+
+    ann = {
+        "is_scatter4": True,
+        "gather4_rows": rows,
+        "gather4_col": col,
+        "eviction_policy": ep,
+    }
+    return tirx.call_intrin(
+        "handle",
+        tirx.op.Op.get("tl.tileop.copy"),
+        src_region,
+        dst_region,
+        annotations=ann,
+    )
+
+
+def transpose(
+    src: BufferLikeType,
+    dst: BufferLikeType,
+) -> tirx.PrimExpr:
+    """Transpose a 2D buffer in shared memory: dst[j, i] = src[i, j].
+
+    Both src and dst should be shared memory buffers.
+    If src has shape (M, N), dst should have shape (N, M).
+
+    Args:
+        src: Source buffer or region of shape (..., M, N).
+        dst: Destination buffer or region of shape (..., N, M).
+
+    Returns:
+        tirx.Call: A handle to the transpose operation.
+    """
+    src_extent = get_extent(src)
+    dst_extent = get_extent(dst)
+
+    assert src_extent is not None, "Cannot deduce extent for transpose src."
+    assert dst_extent is not None, "Cannot deduce extent for transpose dst."
+    assert len(src_extent) >= 2, "Transpose requires at least 2D buffers."
+    assert len(dst_extent) >= 2, "Transpose requires at least 2D buffers."
+
+    src_region = to_buffer_region(src)
+    dst_region = to_buffer_region(dst)
+    src = buffer_region_to_tile_region(src_region, "r", list(src_extent))
+    dst = buffer_region_to_tile_region(dst_region, "w", list(dst_extent))
+
+    return tirx.call_intrin(
+        "handle",
+        tirx.op.Op.get("tl.tileop.transpose"),
+        src,
+        dst,
+    )
+
+
+def _get_shape(buf: BufferLikeType) -> list:
+    """Extract shape list from Buffer, BufferLoad, or BufferRegion."""
+    if isinstance(buf, tirx.Buffer):
+        return list(buf.shape)
+    if isinstance(buf, tirx.BufferLoad):
+        return list(buf.buffer.shape)
+    if isinstance(buf, tirx.BufferRegion):
+        return [r.extent for r in buf.region]
+    raise TypeError(f"Cannot get shape from {type(buf)}")
+
+
+def _is_half(full_dim, half_dim) -> bool:
+    """Check whether half_dim is full_dim // 2."""
+    if isinstance(full_dim, (int, tirx.IntImm)) and isinstance(half_dim, (int, tirx.IntImm)):
         full_val = full_dim if isinstance(full_dim, int) else full_dim.value
         half_val = half_dim if isinstance(half_dim, int) else half_dim.value
         return half_val == full_val // 2
@@ -369,7 +798,7 @@ def dual_copy(
     unit_flag_ctl: int = 0,
     nd2nz: bool = False,
     l2_cache_ctrl: int | str = 0,
-) -> tir.PrimExpr | tir.Stmt:
+) -> tirx.PrimExpr | tirx.Stmt:
     """Copy data between memory regions with dualDst (M-split or N-split across 2 AIVs).
 
     The split direction is auto-inferred from the shape mismatch between src and dst.
@@ -407,12 +836,13 @@ def dual_copy(
     n_halved = _is_half(src_n, dst_n) or _is_half(dst_n, src_n)
 
     if m_halved and not n_halved:
-        dual_dst_ctl = 1  # M-split (0b01)
+        dual_dst_ctl = 1
     elif n_halved and not m_halved:
-        dual_dst_ctl = 2  # N-split (0b10)
+        dual_dst_ctl = 2
     else:
         raise ValueError(
-            f"Cannot infer dual_copy split direction: src shape {src_shape} vs dst shape {dst_shape}. Exactly one dimension must be halved."
+            f"Cannot infer dual_copy split direction: src shape {src_shape} vs dst shape {dst_shape}. "
+            "Exactly one trailing dimension must be halved."
         )
 
     # Convert both to buffer regions to bypass the shape equality check in copy()
@@ -432,43 +862,78 @@ def dual_copy(
     return copy(src_region, dst_region, annotations=annotations)
 
 
-def c2d_im2col(
+def im2col(
     img: BufferLikeType,
     col: BufferLikeType,
-    nhw_step: tir.PrimExpr,
-    c_step: tir.PrimExpr,
+    nhw_step: tirx.PrimExpr,
+    c_step: tirx.PrimExpr,
     kernel: int,
     stride: int,
     dilation: int,
     pad: int,
     eviction_policy: Literal["evict_normal", "evict_first", "evict_last"] | None = None,
-) -> tir.PrimExpr:
+) -> tirx.PrimExpr:
     """Perform im2col transformation for 2D convolution.
 
     Args:
-        img (tir.Buffer): Input image buffer
-        col (tir.Buffer): Output column buffer
-        nhw_step (tir.PrimExpr): Step size for batch and spatial dimensions
-        c_step (tir.PrimExpr): Step size for channel dimension
+        img (tirx.Buffer): Input image buffer
+        col (tirx.Buffer): Output column buffer
+        nhw_step (tirx.PrimExpr): Step size for batch and spatial dimensions
+        c_step (tirx.PrimExpr): Step size for channel dimension
         kernel (int): Kernel size
         stride (int): Stride of the convolution
         dilation (int): Dilation rate
         pad (int): Padding size
 
     Returns:
-        tir.Call: A handle to the im2col operation
+        tirx.Call: A handle to the im2col operation
     """
     if eviction_policy is None:
         eviction_policy = 0
     else:
         eviction_policy = {"evict_normal": 0, "evict_first": 1, "evict_last": 2}[eviction_policy]
-    img_region = to_buffer_region(img, access_type="r")
-    col_region = to_buffer_region(col, access_type="w")
-    return tir.call_intrin(
+    img_region = to_buffer_region(img)
+    col_region = to_buffer_region(col)
+    img_extents = [r.extent for r in img_region.region]
+    col_extents = [r.extent for r in col_region.region]
+    img_region = buffer_region_to_tile_region(img_region, "r", img_extents)
+    col_region = buffer_region_to_tile_region(col_region, "w", col_extents)
+    return tirx.call_intrin(
         "handle",
-        tir.op.Op.get("tl.tileop.c2d_im2col"),
+        tirx.op.Op.get("tl.tileop.im2col"),
         img_region,
         col_region,
+        nhw_step,
+        c_step,
+        kernel,
+        stride,
+        dilation,
+        pad,
+        eviction_policy,
+    )
+
+
+@deprecated("T.c2d_im2col", "T.im2col", "0.14.0")
+def c2d_im2col(
+    img: BufferLikeType,
+    col: BufferLikeType,
+    nhw_step: tirx.PrimExpr,
+    c_step: tirx.PrimExpr,
+    kernel: int,
+    stride: int,
+    dilation: int,
+    pad: int,
+    eviction_policy: Literal["evict_normal", "evict_first", "evict_last"] | None = None,
+) -> tirx.PrimExpr:
+    """Deprecated alias for :func:`im2col`.
+
+    Deprecated:
+        Use :func:`im2col` instead. This alias is scheduled for removal in
+        TileLang 0.14.0.
+    """
+    return im2col(
+        img,
+        col,
         nhw_step,
         c_step,
         kernel,

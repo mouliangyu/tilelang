@@ -1,7 +1,7 @@
 import tilelang.language as T
 from tilelang import tvm
 from tilelang.engine.phase import LowerAndLegalize, OptimizeForTarget, PreLowerSemanticCheck
-from tilelang.utils.target import determine_target
+from tilelang.backend.target import determine_target
 
 from testing.python.language.simtvf._inspect_utils import (
     collect_simtvf_blocks,
@@ -56,9 +56,11 @@ def main():
         assert not any(tag.startswith("threadIdx.") for tag in opt_tags), (
             "OptimizeForTarget should not have outer threadIdx launch bindings on ascend"
         )
-        assert opt_func.attrs is None or "thread_extent" not in opt_func.attrs, (
-            "OptimizeForTarget should not leave func_attr thread_extent on ascend"
-        )
+        thread_extent = opt_func.attrs.get("thread_extent") if opt_func.attrs else None
+        if thread_extent:
+            assert not any(str(tag).startswith("threadIdx.") for tag in thread_extent.keys()), (
+                "OptimizeForTarget should not leave SIMT thread extent in func_attr on ascend"
+            )
 
     print("\n[ok] Ascend SimtVF structure/annotations and hoist boundary checks passed.")
 

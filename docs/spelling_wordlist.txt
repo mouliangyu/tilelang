@@ -1,6 +1,8 @@
 cancelled
 cann
+dout
 hsa
+inouts
 ist
 LOD
 nd

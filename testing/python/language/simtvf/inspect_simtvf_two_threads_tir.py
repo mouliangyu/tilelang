@@ -1,7 +1,7 @@
 import tilelang.language as T
 from tilelang import tvm
 from tilelang.engine.phase import LowerAndLegalize, OptimizeForTarget, PreLowerSemanticCheck
-from tilelang.utils.target import determine_target
+from tilelang.backend.target import determine_target
 
 from testing.python.language.simtvf._inspect_utils import (
     collect_simtvf_blocks,
@@ -54,6 +54,11 @@ def main():
         opt_func = optimized["simtvf_two_threads_demo"]
         opt_tags = collect_thread_extent_tags_outside_simtvf(opt_func.body)
         assert "blockIdx.x" in opt_tags, "OptimizeForTarget should keep blockIdx launch binding"
+        thread_extent = opt_func.attrs.get("thread_extent") if opt_func.attrs else None
+        if thread_extent:
+            assert not any(str(tag).startswith("threadIdx.") for tag in thread_extent.keys()), (
+                "OptimizeForTarget should not leave SIMT thread extent in func_attr on ascend"
+            )
         for block in optimized_blocks:
             block_tags = collect_thread_extent_tags(block.body)
             assert "threadIdx.x" in block_tags, "Each SimtVF region should contain local threadIdx.x thread_extent"

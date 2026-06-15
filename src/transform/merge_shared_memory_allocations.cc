@@ -19,46 +19,47 @@
 
 /*!
  * \file merge_shared_memory_allocations.cc
- * \brief Merge multiple shared-memory allocations into one, using
- * synchronization-graph-based liveness analysis for Ascend UB reuse.
+ * \brief Each GPU kernel is allowed to have only one dynamic or static shared
+ * memory allocation. This pass merges multiple TIR-level dynamic or static
+ * shared memory allocations into one allocation.
  */
-#include <tvm/arith/analyzer.h>
-#include <tvm/ffi/function.h>
-#include <tvm/ffi/reflection/registry.h>
+#include "support/check.h"
+#include <tvm/ir/cast.h>
 #include <tvm/runtime/logging.h>
-#include <tvm/tir/expr.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/s_tir/stmt.h>
+#include <tvm/target/target.h>
+#include <tvm/tirx/expr.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include <algorithm>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <queue>
 #include <sstream>
-#include <stack>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
-#include <vector>
 
 #include "../op/builtin.h"
-#include "../target/utils.h"
+#include "backend/common/target_utils.h"
 #include "runtime/thread_storage_scope.h"
 #include "tir/transforms/ir_utils.h"
-#include "tvm/tir/function.h"
+#include <tvm/tirx/function.h>
+#include <tvm/tirx/stmt.h>
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
+using namespace ffi;
 
 using runtime::StorageRank;
 using runtime::StorageScope;
 
 static bool IsDynamicSharedMemory(Var buffer_var) {
-  if (!buffer_var->type_annotation.as<PointerTypeNode>())
-    return false;
   StorageScope storage_scope =
       runtime::StorageScope::Create(GetPtrStorageScope(std::move(buffer_var)));
   return storage_scope.rank == runtime::StorageRank::kShared &&
@@ -66,1562 +67,305 @@ static bool IsDynamicSharedMemory(Var buffer_var) {
 }
 
 static bool IsStaticSharedMemory(Var buffer_var) {
-  if (!buffer_var->type_annotation.as<PointerTypeNode>())
-    return false;
   StorageScope storage_scope =
       runtime::StorageScope::Create(GetPtrStorageScope(std::move(buffer_var)));
   return storage_scope.rank == runtime::StorageRank::kShared &&
          storage_scope.tag.empty();
 }
 
-static bool IsScopeMemory(Var buffer_var, const std::string &target_scope) {
-  if (!buffer_var->type_annotation.as<PointerTypeNode>())
-    return false;
-  auto scope = GetPtrStorageScope(std::move(buffer_var));
-  return scope == target_scope;
-}
-
 /*!
- * \brief Collect the mapping from buffer var to its AllocateNode.
+ * \brief collect the mapping from the buffer var to its allocate
  */
-namespace {
 class AllocateCollector : public StmtExprVisitor {
 public:
-  void VisitStmt_(const AllocateNode *op) final {
-    if (IsDynamicSharedMemory(op->buffer_var)) {
-      const VarNode *key = op->buffer_var.get();
-      if (dyn_shmem_allocs_.emplace(key, op).second)
-        dyn_shmem_order_.push_back(key);
-    } else if (IsStaticSharedMemory(op->buffer_var)) {
-      const VarNode *key = op->buffer_var.get();
-      if (static_shmem_allocs_.emplace(key, op).second)
-        static_shmem_order_.push_back(key);
-    } else {
-      auto scope = GetPtrStorageScope(op->buffer_var);
-      for (const auto &s :
-           {"shared.l0a", "shared.l0b", "shared.l0c", "shared.l1"}) {
-        if (scope == s) {
-          const VarNode *key = op->buffer_var.get();
-          if (ascend_scope_allocs_[s].emplace(key, op).second)
-            ascend_scope_order_[s].push_back(key);
-          break;
-        }
-      }
+  void VisitStmt_(const AllocBufferNode *op) final {
+    if (IsDynamicSharedMemory(op->buffer->data)) {
+      dyn_shmem_allocs_[op->buffer->data.get()] = op;
+    } else if (IsStaticSharedMemory(op->buffer->data)) {
+      static_shmem_allocs_[op->buffer->data.get()] = op;
     }
     StmtExprVisitor::VisitStmt_(op);
   }
-  std::unordered_map<const VarNode *, const AllocateNode *> dyn_shmem_allocs_;
-  std::unordered_map<const VarNode *, const AllocateNode *>
+  // The dynamic mapping from the original buffer var to its allocate
+  std::unordered_map<const VarNode *, const AllocBufferNode *>
+      dyn_shmem_allocs_;
+  // The static mapping from the original buffer var to its allocate
+  std::unordered_map<const VarNode *, const AllocBufferNode *>
       static_shmem_allocs_;
-  std::unordered_map<std::string,
-                     std::unordered_map<const VarNode *, const AllocateNode *>>
-      ascend_scope_allocs_;
-  std::vector<const VarNode *> dyn_shmem_order_;
-  std::vector<const VarNode *> static_shmem_order_;
-  std::unordered_map<std::string, std::vector<const VarNode *>>
-      ascend_scope_order_;
-};
-} // namespace
-
-// Sync-Aware Linearizer
-
-enum class EventKind : uint8_t {
-  kBufferAccess,  // BufferLoad or BufferStore
-  kSetFlag,       // ascend_set_flag
-  kWaitFlag,      // ascend_wait_flag
-  kPipeBarrier,   // ascend_pipe_barrier
-  kCrossCoreSet,  // ascend_cross_core_set_flag
-  kCrossCoreWait, // ascend_cross_core_wait_flag
-  kForBegin,      // entry of a For loop body
-  kForEnd,        // exit of a For loop body
-  kIfBegin,       // entry of IfThenElse then-branch
-  kIfEnd,         // exit of IfThenElse
-  kElseBegin,     // entry of IfThenElse else-branch
 };
 
-struct LinearEvent {
-  EventKind kind;
-  int scope_level; // nesting depth
-
-  // Buffer access
-  std::vector<const VarNode *> touched;
-  std::vector<bool> is_write; // parallel to touched
-
-  // Sync primitives
-  std::string hard_event;
-  PrimExpr event_id_expr; // raw event_id expression (may contain loop vars)
-  std::string pipe_name;  // for pipe_barrier
-  int mode_id = 0;        // for cross_core
-  int wg_id = -1;         // warpgroup, if determinable
-
-  // Scope markers
-  const ForNode *for_node = nullptr;
-  const IfThenElseNode *if_node = nullptr;
-
-  // Alloc info
-  struct AllocInfo {
-    const AllocateNode *alloc = nullptr;
-    size_t scope_level = 0;
+// Find a linear pattern of storage access
+// Used for liveness analysis.
+// "linear" means fitting a complex access pattern into an array of StmtEntry
+//
+// Define "scope" as the body of For/thread_launch/IfThenElse
+// Composite scopes(loop/thread_launch/IfThen) is represented by three
+// StmtEntry: before_scope -> scope_body -> after_scope
+//
+// This pass tries to detect last point that we need to keep memory
+// alive under the same scope as Allocate.
+// The storage need to be kept alive between Allocate and last access.
+// The free point is only inserted at the same scope of Allocate.
+//
+class SharedMemLinearAccessPatternFinder final : public StmtExprVisitor {
+public:
+  explicit SharedMemLinearAccessPatternFinder(
+      bool is_dynamic = true, bool enable_aggressive_merge = false,
+      bool verbose = false)
+      : is_dynamic_(is_dynamic),
+        enable_aggressive_merge_(enable_aggressive_merge), verbose_(verbose) {}
+  /*! \brief record the touch list of statement. */
+  struct StmtEntry {
+    // The statement
+    const Object *stmt{};
+    // The index in the linear_seq_ to point to end of the nested scope.
+    // This is only set to non-zero if stmt is a nested scope.
+    // if offset > 0, means this is the begin, the end entry is current_index +
+    // offset if offset < 0, means this is the end, the begin entry is
+    // current_index + offset
+    int64_t scope_pair_offset{0};
+    // The buffer variables this statement touched.
+    std::vector<const VarNode *> touched;
   };
-  bool IsBufferAccess() const { return kind == EventKind::kBufferAccess; }
-  bool IsSync() const {
-    return kind == EventKind::kSetFlag || kind == EventKind::kWaitFlag ||
-           kind == EventKind::kPipeBarrier ||
-           kind == EventKind::kCrossCoreSet ||
-           kind == EventKind::kCrossCoreWait;
-  }
-};
+  // The scope of each allocation
+  struct AllocEntry {
+    // the level in the scope stack
+    size_t level{0};
+    // allocation stmt
+    const AllocBufferNode *alloc{nullptr};
+  };
 
-// Visitor that checks whether a PrimExpr references a Var with "sid" in its
-// name_hint — used to detect cross-core sid-dependent event_id expressions.
-class SidDetector : public ExprVisitor {
-public:
-  bool found = false;
-  void VisitExpr_(const VarNode *op) final {
-    if (std::string(op->name_hint).find("sid") != std::string::npos)
-      found = true;
-    ExprVisitor::VisitExpr_(op);
-  }
-};
+  struct StmtAttr {
+    // the level in the scope stack
+    size_t level{0};
+  };
 
-static bool ContainsSid(const PrimExpr &e) {
-  SidDetector d;
-  d(e);
-  return d.found;
-}
-
-class SyncAwareLinearizer : public StmtExprVisitor {
-public:
-  explicit SyncAwareLinearizer(bool is_dynamic, const std::string &target_scope)
-      : is_dynamic_(is_dynamic), target_scope_(target_scope) {}
-
-  std::vector<LinearEvent> linear_events;
-  std::unordered_map<const VarNode *, LinearEvent::AllocInfo> alloc_info;
-
-private:
-  bool IsTargetMemory(const Var &var) {
-    if (!target_scope_.empty())
-      return IsScopeMemory(var, target_scope_);
-    return is_dynamic_ ? IsDynamicSharedMemory(var) : IsStaticSharedMemory(var);
-  }
-
-  void VisitStmt_(const AllocateNode *op) final {
-    size_t level = scope_stack_.size();
-    const VarNode *buf = op->buffer_var.get();
-    if (IsTargetMemory(op->buffer_var)) {
-      LinearEvent::AllocInfo info;
-      info.alloc = op;
-      info.scope_level = level;
-      alloc_info[buf] = info;
-    }
-    StmtExprVisitor::VisitStmt_(op);
-  }
-
-  void VisitStmt_(const ForNode *op) final {
-    LinearEvent begin;
-    begin.kind = EventKind::kForBegin;
-    begin.scope_level = static_cast<int>(scope_stack_.size());
-    begin.for_node = op;
-    linear_events.push_back(begin);
-
-    loop_stack_.push_back(op);
-    StmtExprVisitor::VisitStmt_(op);
-    loop_stack_.pop_back();
-
-    LinearEvent end;
-    end.kind = EventKind::kForEnd;
-    end.scope_level = static_cast<int>(scope_stack_.size());
-    end.for_node = op;
-    linear_events.push_back(end);
-  }
-
-  void VisitStmt_(const IfThenElseNode *op) final {
-    LinearEvent if_begin;
-    if_begin.kind = EventKind::kIfBegin;
-    if_begin.scope_level = static_cast<int>(scope_stack_.size());
-    if_begin.if_node = op;
-    linear_events.push_back(if_begin);
-
-    StmtExprVisitor::VisitStmt(op->then_case);
-
-    if (op->else_case.defined()) {
-      LinearEvent else_begin;
-      else_begin.kind = EventKind::kElseBegin;
-      else_begin.scope_level = static_cast<int>(scope_stack_.size());
-      else_begin.if_node = op;
-      linear_events.push_back(else_begin);
-
-      StmtExprVisitor::VisitStmt(op->else_case.value());
-    }
-
-    LinearEvent if_end;
-    if_end.kind = EventKind::kIfEnd;
-    if_end.scope_level = static_cast<int>(scope_stack_.size());
-    if_end.if_node = op;
-    linear_events.push_back(if_end);
-  }
-
-  void VisitStmt_(const BlockNode *op) final {
-    // 0 = Vector (AIV), 1 = Cube (AIC).
-    int saved = current_wg_;
-    if (op->name_hint == "VECTOR")
-      current_wg_ = 0;
-    else if (op->name_hint == "CUBE")
-      current_wg_ = 1;
-    StmtExprVisitor::VisitStmt_(op);
-    current_wg_ = saved;
-  }
-
-  void VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tir::attr::thread_extent && !in_thread_env_) {
-      in_thread_env_ = true;
-      scope_stack_.push_back(op);
-      StmtExprVisitor::VisitStmt_(op);
-      scope_stack_.pop_back();
-      in_thread_env_ = false;
-    } else if (op->attr_key == tir::attr::extern_scope ||
-               op->attr_key == tir::attr::virtual_thread) {
-      scope_stack_.push_back(op);
-      StmtExprVisitor::VisitStmt_(op);
-      scope_stack_.pop_back();
+  void UpdateStmtAttr(const Object *stmt, size_t level) {
+    if (stmt_attrs_.find(stmt) == stmt_attrs_.end()) {
+      stmt_attrs_[stmt] = StmtAttr{level};
     } else {
-      StmtExprVisitor::VisitStmt_(op);
+      stmt_attrs_[stmt].level = level;
     }
+  }
+
+  void VisitStmt_(const AllocBufferNode *op) final {
+    size_t level = scope_.size();
+    const VarNode *buf = op->buffer->data.get();
+    alloc_info_[buf].alloc = op;
+    alloc_info_[buf].level = level;
+    StmtExprVisitor::VisitStmt_(op);
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
+    scope_.push_back(StmtEntry());
+    // visit subexpr
     StmtExprVisitor::VisitStmt_(op);
+    // Add write access.
     const VarNode *buf = op->buffer->data.get();
-    if (alloc_info.count(buf)) {
-      LinearEvent e;
-      e.kind = EventKind::kBufferAccess;
-      e.scope_level = static_cast<int>(scope_stack_.size());
-      e.touched.push_back(buf);
-      e.is_write.push_back(true);
-      linear_events.push_back(e);
+    auto it = alloc_info_.find(buf);
+    if (it != alloc_info_.end() && it->second.alloc) {
+      ICHECK_LT(it->second.level, scope_.size());
+      if (IsAppropriateSharedMemory(GetRef<Var>(buf))) {
+        // set into scope_.size() - 1 for aggressive memory reuse
+        auto enable_aggressive_merge = enable_aggressive_merge_;
+        if (enable_aggressive_merge) {
+          scope_[scope_.size() - 1].touched.push_back(buf);
+        } else {
+          scope_[it->second.level].touched.push_back(buf);
+        }
+      }
     }
-  }
 
-  void VisitExpr_(const BufferLoadNode *op) final {
-    StmtExprVisitor::VisitExpr_(op);
-    const VarNode *buf = op->buffer->data.get();
-    if (alloc_info.count(buf)) {
-      LinearEvent e;
-      e.kind = EventKind::kBufferAccess;
-      e.scope_level = static_cast<int>(scope_stack_.size());
-      e.touched.push_back(buf);
-      e.is_write.push_back(false);
-      linear_events.push_back(e);
-    }
-  }
-
-  void VisitExpr_(const VarNode *op) final {
-    // Direct variable references count as reads for liveness.
-    if (alloc_info.count(op)) {
-      LinearEvent e;
-      e.kind = EventKind::kBufferAccess;
-      e.scope_level = static_cast<int>(scope_stack_.size());
-      e.touched.push_back(op);
-      e.is_write.push_back(false);
-      linear_events.push_back(e);
+    StmtEntry e = scope_.back();
+    scope_.pop_back();
+    if (!e.touched.empty()) {
+      e.stmt = op;
+      UpdateStmtAttr(op, scope_level_);
+      linear_seq_.push_back(e);
     }
   }
 
   void VisitStmt_(const EvaluateNode *op) final {
-    // Check if this Evaluate wraps a sync Call.
-    if (auto *call = op->value.as<CallNode>()) {
-      if (TryRecordSync(call))
-        return;
-    }
+    scope_.push_back(StmtEntry());
+    // visit subexpr
     StmtExprVisitor::VisitStmt_(op);
+    StmtEntry e = scope_.back();
+    scope_.pop_back();
+    if (!e.touched.empty()) {
+      e.stmt = op;
+      UpdateStmtAttr(op, scope_level_);
+      linear_seq_.push_back(e);
+    }
   }
 
-  void VisitExpr_(const CallNode *op) final {
-    TryRecordSync(op);
+  void VisitExpr_(const BufferLoadNode *op) final {
+    // Add write access.
     StmtExprVisitor::VisitExpr_(op);
-  }
-
-  bool TryRecordSync(const CallNode *call) {
-    LinearEvent e;
-    e.scope_level = static_cast<int>(scope_stack_.size());
-
-    if (call->op.same_as(ascend_set_flag())) {
-      e.kind = EventKind::kSetFlag;
-      ICHECK_GE(call->args.size(), 2U);
-      if (auto *str_imm = call->args[0].as<StringImmNode>())
-        e.hard_event = str_imm->value;
-      e.event_id_expr = call->args[1];
-      e.wg_id = current_wg_;
-      linear_events.push_back(e);
-      return true;
-    }
-    if (call->op.same_as(ascend_wait_flag())) {
-      e.kind = EventKind::kWaitFlag;
-      ICHECK_GE(call->args.size(), 2U);
-      if (auto *str_imm = call->args[0].as<StringImmNode>())
-        e.hard_event = str_imm->value;
-      e.event_id_expr = call->args[1];
-      e.wg_id = current_wg_;
-      linear_events.push_back(e);
-      return true;
-    }
-    if (call->op.same_as(ascend_pipe_barrier())) {
-      e.kind = EventKind::kPipeBarrier;
-      ICHECK_GE(call->args.size(), 1U);
-      if (auto *str_imm = call->args[0].as<StringImmNode>())
-        e.hard_event = str_imm->value; // store pipe name in hard_event
-      linear_events.push_back(e);
-      return true;
-    }
-    if (call->op.same_as(ascend_cross_core_set_flag())) {
-      e.kind = EventKind::kCrossCoreSet;
-      ICHECK_GE(call->args.size(), 3U);
-      if (auto *int_imm = call->args[0].as<IntImmNode>())
-        e.mode_id = static_cast<int>(int_imm->value);
-      if (auto *str_imm = call->args[1].as<StringImmNode>())
-        e.hard_event = str_imm->value; // store pipe name
-      e.event_id_expr = call->args[2];
-      e.wg_id = current_wg_;
-      linear_events.push_back(e);
-      return true;
-    }
-    if (call->op.same_as(ascend_cross_core_wait_flag())) {
-      e.kind = EventKind::kCrossCoreWait;
-      ICHECK_GE(call->args.size(), 3U);
-      if (auto *int_imm = call->args[0].as<IntImmNode>())
-        e.mode_id = static_cast<int>(int_imm->value);
-      if (auto *str_imm = call->args[1].as<StringImmNode>())
-        e.hard_event = str_imm->value;
-      e.event_id_expr = call->args[2];
-      e.wg_id = current_wg_;
-      linear_events.push_back(e);
-      return true;
-    }
-    return false;
-  }
-
-  bool is_dynamic_;
-  std::string target_scope_;
-  bool in_thread_env_ = false;
-  int current_wg_ = -1; // 0=Vector(AIV), 1=Cube(AIC), -1=undetermined
-  std::vector<const Object *> scope_stack_; // generic scope tracking
-  std::vector<const ForNode *> loop_stack_; // active For loops
-};
-
-// Pipeline Unroller
-
-struct UnrollPlan {
-  // The For loop this plan covers (nullptr for non-loop / toplevel).
-  const ForNode *for_node = nullptr;
-  int phys_count = 1;
-  // phys_for_unrolled[u] = physical iteration index for unrolled iteration u.
-  std::vector<int> phys_for_unrolled;
-  // For each linear event index, the list of unrolled iterations where it
-  // executes (empty if not inside this loop).
-  std::unordered_map<int, std::vector<int>> event_unrolled_iters;
-  // The loop variable value at each unrolled iteration:
-  //   loop_var_val[u] = loop_start + phys_for_unrolled[u] * loop_step
-  std::vector<PrimExpr> loop_var_vals;
-
-  // For the outermost (non-loop) scope: the single unrolled iteration.
-  static UnrollPlan TopLevel() {
-    UnrollPlan p;
-    p.phys_for_unrolled.push_back(0);
-    return p;
-  }
-};
-
-// Describes the active physical-iteration range for a block of events.
-struct ActiveRange {
-  int first_phys = 0; // inclusive
-  int last_phys = 0;  // inclusive
-  bool valid = false;
-};
-
-// Parse a condition of the form  "loop_var >= loop_start + K"  or
-// "loop_var < loop_start + extent" to extract the pipeline offset.
-//
-// Returns the offset K (or 0 if the condition can't be parsed).
-static int ParseGuardOffset(const PrimExpr &cond, const ForNode *for_node,
-                            bool is_lower_bound) {
-  if (is_lower_bound) {
-    // Look for  loop_var >= loop_start + K  (or equivalent forms).
-    if (auto *ge = cond.as<GENode>()) {
-      auto *var = ge->a.as<VarNode>();
-      if (var && var == for_node->loop_var.get()) {
-        // b = loop_start + K*step  → offset K
-        if (auto *add = ge->b.as<AddNode>()) {
-          if (auto *c = add->b.as<IntImmNode>()) {
-            int64_t step_val = 1;
-            if (for_node->step.defined()) {
-              if (auto *step_imm = for_node->step.value().as<IntImmNode>())
-                step_val = step_imm->value;
-            }
-            if (step_val != 0)
-              return static_cast<int>(c->value / step_val);
-          }
-        }
-      }
-      // Also handle  loop_var >= loop_start  (K = 0).
-      if (var && var == for_node->loop_var.get() &&
-          ge->b.same_as(for_node->min))
-        return 0;
-    }
-    // Handle  loop_var >= start  where start was renamed.
-    if (auto *ge = cond.as<GENode>()) {
-      if (auto *var = ge->a.as<VarNode>()) {
-        for (const auto &kv : for_node->annotations) {
-          (void)kv;
-        }
-        // Try to match if var has been substituted.
-        // The condition in the emitted TIR may use the extended loop var.
-        // We check: is ge->a a Var and ge->b the loop_start?
-        if (ge->b.same_as(for_node->min))
-          return 0;
-      }
-    }
-  } else {
-    // Look for  loop_var < loop_start + extent + K*step
-    if (auto *lt = cond.as<LTNode>()) {
-      auto *var = lt->a.as<VarNode>();
-      if (var && var == for_node->loop_var.get()) {
-        if (auto *add = lt->b.as<AddNode>()) {
-          if (auto *c = add->b.as<IntImmNode>()) {
-            int64_t step_val = 1;
-            if (for_node->step.defined()) {
-              if (auto *step_imm = for_node->step.value().as<IntImmNode>())
-                step_val = step_imm->value;
-            }
-            if (step_val != 0)
-              return static_cast<int>(c->value / step_val);
-          }
-        }
-      }
-      // Handle  loop_var < loop_start + extent
-      if (var && var == for_node->loop_var.get()) {
-        if (auto *add = lt->b.as<AddNode>()) {
-          if (add->a.same_as(for_node->min))
-            return 0; // offset from original extent start
-        }
-      }
-    }
-  }
-  return 0;
-}
-
-// Build an UnrollPlan for a pipelined loop.
-//
-// We walk the linear events between kForBegin / kForEnd and examine
-// kIfBegin conditions to determine the stage active ranges.
-static UnrollPlan BuildLoopUnrollPlan(const ForNode *for_node,
-                                      const std::vector<LinearEvent> &events,
-                                      int begin_idx, int end_idx) {
-  UnrollPlan plan;
-  plan.for_node = for_node;
-
-  int64_t phys_extent_val = 1;
-  if (auto *ext_imm = for_node->extent.as<IntImmNode>())
-    phys_extent_val = ext_imm->value;
-  else
-    phys_extent_val = 256; // conservative fallback
-  plan.phys_count = static_cast<int>(phys_extent_val);
-
-  int64_t step_val = 1;
-  if (for_node->step.defined())
-    if (auto *s = for_node->step.value().as<IntImmNode>())
-      step_val = s->value;
-
-  int64_t loop_start_val = 0;
-  if (auto *s = for_node->min.as<IntImmNode>())
-    loop_start_val = s->value;
-
-  // Collect per-event active ranges from If-guards.
-  // For events not inside any If-guard, the range is [0, phys_count-1].
-  // We track the "current active range" that applies to events inside an
-  // If-block.
-  std::vector<ActiveRange> event_ranges(events.size());
-  std::vector<ActiveRange> range_stack; // stack of active ranges
-
-  for (int i = begin_idx; i <= end_idx; ++i) {
-    const LinearEvent &ev = events[i];
-    if (ev.kind == EventKind::kIfBegin) {
-      ActiveRange r;
-      r.first_phys = 0;
-      r.last_phys = plan.phys_count - 1;
-      r.valid = true;
-
-      // Try to parse stage guard from the if-condition.
-      if (ev.if_node) {
-        const PrimExpr &cond = ev.if_node->condition;
-        // Check for loop_var >= loop_start + K
-        int lb_off = ParseGuardOffset(cond, for_node, true);
-        int ub_off = ParseGuardOffset(cond, for_node, false);
-        // Check for conjunction
-        if (auto *and_node = cond.as<AndNode>()) {
-          lb_off = ParseGuardOffset(and_node->a, for_node, true);
-          if (lb_off == 0)
-            lb_off = ParseGuardOffset(and_node->b, for_node, true);
-          ub_off = ParseGuardOffset(and_node->a, for_node, false);
-          if (ub_off == 0)
-            ub_off = ParseGuardOffset(and_node->b, for_node, false);
-        }
-        if (lb_off > 0)
-          r.first_phys = std::max(r.first_phys, lb_off);
-        // For upper bound: condition "loop_var < loop_start + extent + K*step"
-        // means last_phys < extent + K, so last_phys = extent + K - 1.
-        // But if the condition is just a lower bound, leave last_phys as is.
-      }
-      r.valid = true;
-      range_stack.push_back(r);
-      event_ranges[i] = r;
-    } else if (ev.kind == EventKind::kIfEnd) {
-      if (!range_stack.empty())
-        range_stack.pop_back();
-      event_ranges[i] = range_stack.empty()
-                            ? ActiveRange{0, plan.phys_count - 1, true}
-                            : range_stack.back();
-    } else if (ev.kind == EventKind::kElseBegin) {
-      // For else branch, use the same range as the if-begin (conservative).
-      event_ranges[i] = range_stack.empty()
-                            ? ActiveRange{0, plan.phys_count - 1, true}
-                            : range_stack.back();
-    } else {
-      event_ranges[i] = range_stack.empty()
-                            ? ActiveRange{0, plan.phys_count - 1, true}
-                            : range_stack.back();
-    }
-  }
-
-  // Determine if this is a pipelined loop: check for sync events inside.
-  bool has_set = false, has_wait = false;
-  for (int i = begin_idx; i <= end_idx; ++i) {
-    if (events[i].kind == EventKind::kSetFlag ||
-        events[i].kind == EventKind::kCrossCoreSet)
-      has_set = true;
-    if (events[i].kind == EventKind::kWaitFlag ||
-        events[i].kind == EventKind::kCrossCoreWait)
-      has_wait = true;
-  }
-
-  if (!has_set || !has_wait) {
-    // Non-pipelined loop: single unrolled iteration.
-    plan.phys_for_unrolled.push_back(0);
-    int64_t start_val = 0;
-    if (auto *s = for_node->min.as<IntImmNode>())
-      start_val = s->value;
-    plan.loop_var_vals.push_back(IntImm(DataType::Int(32), start_val));
-    for (int i = begin_idx; i <= end_idx; ++i)
-      plan.event_unrolled_iters[i].push_back(0);
-    return plan;
-  }
-
-  // Pipelined: determine prologue / steady / epilogue boundaries.
-  int max_first = 0;
-  int min_last = plan.phys_count - 1;
-  for (int i = begin_idx; i <= end_idx; ++i) {
-    if (event_ranges[i].valid) {
-      max_first = std::max(max_first, event_ranges[i].first_phys);
-      min_last = std::min(min_last, event_ranges[i].last_phys);
-    }
-  }
-
-  int prologue_iters = max_first; // physical iters [0, max_first-1] are partial
-  int epilogue_iters = plan.phys_count - 1 - min_last;
-  constexpr int kSteadyIters = 2;
-
-  if (prologue_iters + kSteadyIters + epilogue_iters > plan.phys_count) {
-    // Clamp: unroll all physical iterations.
-    prologue_iters = plan.phys_count;
-    epilogue_iters = 0;
-  }
-
-  // Build phys_for_unrolled.
-  if (prologue_iters + kSteadyIters + epilogue_iters > plan.phys_count) {
-    // Unroll all.
-    for (int p = 0; p < plan.phys_count; ++p) {
-      plan.phys_for_unrolled.push_back(p);
-      plan.loop_var_vals.push_back(
-          IntImm(DataType::Int(32), loop_start_val + p * step_val));
-    }
-  } else {
-    // Prologue.
-    for (int p = 0; p < prologue_iters; ++p) {
-      plan.phys_for_unrolled.push_back(p);
-      plan.loop_var_vals.push_back(
-          IntImm(DataType::Int(32), loop_start_val + p * step_val));
-    }
-    // Steady state (2 iterations).
-    int steady_start = max_first;
-    for (int s = 0; s < kSteadyIters; ++s) {
-      int p = steady_start + s;
-      plan.phys_for_unrolled.push_back(p);
-      plan.loop_var_vals.push_back(
-          IntImm(DataType::Int(32), loop_start_val + p * step_val));
-    }
-    // Epilogue.
-    int epi_start = min_last - epilogue_iters + 1;
-    if (epi_start < steady_start + kSteadyIters)
-      epi_start = steady_start + kSteadyIters;
-    for (int e = 0; e < epilogue_iters; ++e) {
-      int p = epi_start + e;
-      if (p >= plan.phys_count)
-        break;
-      plan.phys_for_unrolled.push_back(p);
-      plan.loop_var_vals.push_back(
-          IntImm(DataType::Int(32), loop_start_val + p * step_val));
-    }
-  }
-
-  int total_unrolled = static_cast<int>(plan.phys_for_unrolled.size());
-
-  // Map each event to its unrolled iterations.
-  for (int i = begin_idx; i <= end_idx; ++i) {
-    const ActiveRange &r = event_ranges[i];
-    if (!r.valid)
-      continue;
-    for (int u = 0; u < total_unrolled; ++u) {
-      int phys = plan.phys_for_unrolled[u];
-      if (phys >= r.first_phys && phys <= r.last_phys)
-        plan.event_unrolled_iters[i].push_back(u);
-    }
-  }
-
-  return plan;
-}
-
-// Happens-Before Graph
-
-struct EventInstance {
-  int node_id;
-  int linear_idx;    // index into LinearEvent array
-  int unrolled_iter; // which unrolled iteration
-  int physical_iter; // physical loop iteration
-  PrimExpr loop_val; // loop variable value at this instance
-  EventKind kind;
-  std::vector<const VarNode *> touched;
-  std::vector<bool> is_write;
-  std::string hard_event;
-  PrimExpr event_id_expr;
-  int mode_id = 0;
-  int wg_id = -1;
-};
-
-// Recursively build unrolled event instances and the per-loop unroll plan.
-//
-// Scans the linear events top-down.  For each kForBegin/kForEnd pair,
-// builds an UnrollPlan and creates instances for events inside the loop.
-// Events at the top level (outside any loop) get a single instance.
-static void BuildEventInstancesRecursive(
-    const std::vector<LinearEvent> &events, int scope_begin, int scope_end,
-    const std::vector<int> &outer_unrolled_iters,
-    const std::vector<PrimExpr> &outer_loop_vals, int outer_physical_base,
-    std::vector<EventInstance> &instances) {
-
-  // Collect all event indices inside this scope that are NOT inside a nested
-  // For loop.  Nested For loops are handled recursively.
-  std::vector<int> local_event_indices;
-  int i = scope_begin;
-  while (i <= scope_end) {
-    const LinearEvent &ev = events[i];
-    if (ev.kind == EventKind::kForBegin) {
-      // Find matching kForEnd.
-      int depth = 1;
-      int j = i + 1;
-      for (; j <= scope_end && depth > 0; ++j) {
-        if (events[j].kind == EventKind::kForBegin)
-          ++depth;
-        else if (events[j].kind == EventKind::kForEnd)
-          --depth;
-      }
-      int for_end = j - 1; // points to kForEnd
-
-      UnrollPlan plan = BuildLoopUnrollPlan(ev.for_node, events, i, for_end);
-
-      // Build the set of unrolled iterations for this loop.
-      std::vector<int> local_unrolled;
-      std::vector<PrimExpr> local_loop_vals;
-      std::vector<int> local_phys;
-      for (int u = 0; u < static_cast<int>(plan.phys_for_unrolled.size());
-           ++u) {
-        // If this is inside an outer loop, we only instantiate for the
-        // matching outer unrolled iterations.
-        if (outer_unrolled_iters.empty()) {
-          local_unrolled.push_back(u);
-          local_loop_vals.push_back(plan.loop_var_vals[u]);
-          local_phys.push_back(plan.phys_for_unrolled[u]);
+    const VarNode *buf = op->buffer->data.get();
+    auto it = alloc_info_.find(buf);
+    if (it != alloc_info_.end() && it->second.alloc) {
+      // Earlier we required `alloc_level < scope_.size()`, assuming every load
+      // would occur strictly inside a nested scope.  In practice the lowering
+      // pipeline may materialise reads in the very same frame that owns the
+      // allocation (e.g. when the buffer value is passed directly to a call),
+      // which used to trigger the invariant check.  Treat same-level accesses
+      // as valid so the merged allocator can reason about their lifetime
+      // correctly.
+      ICHECK_LE(it->second.level, scope_.size())
+          << "Load memory in places other than store.";
+      if (IsAppropriateSharedMemory(GetRef<Var>(buf))) {
+        auto enable_aggressive_merge = enable_aggressive_merge_;
+        if (enable_aggressive_merge) {
+          scope_[scope_.size() - 1].touched.push_back(buf);
         } else {
-          // For now: only support single-level pipelined loops.
-          // If nested, just use the inner plan directly.
-          local_unrolled.push_back(u);
-          local_loop_vals.push_back(plan.loop_var_vals[u]);
-          local_phys.push_back(plan.phys_for_unrolled[u]);
+          // When the access happens in the same scope frame as the allocation
+          // we attribute it to that frame instead of the outer parent.  This
+          // keeps the liveness window tight while still accounting for nested
+          // scopes that legitimately touch the buffer deeper in the tree.
+          size_t access_level = std::min(it->second.level, scope_.size() - 1);
+          scope_[access_level].touched.push_back(buf);
         }
       }
+    }
+  }
 
-      // Recurse into the loop body (between kForBegin+1 and kForEnd).
-      BuildEventInstancesRecursive(events, i + 1, for_end - 1, local_unrolled,
-                                   local_loop_vals, 0, instances);
-      i = for_end + 1;
+  void VisitExpr_(const VarNode *buf) final {
+    // Directly reference to the variable count as a read.
+    auto it = alloc_info_.find(buf);
+    if (it != alloc_info_.end() && it->second.alloc) {
+      // Same rationale as the BufferLoad path above: direct references can be
+      // emitted at the allocation level after flattening, so accept them and
+      // record the touch for liveness planning.
+      ICHECK_LE(it->second.level, scope_.size());
+      if (IsAppropriateSharedMemory(GetRef<Var>(buf))) {
+        auto enable_aggressive_merge = enable_aggressive_merge_;
+        if (enable_aggressive_merge) {
+          scope_[scope_.size() - 1].touched.push_back(buf);
+        } else {
+          // Attribute same-level uses to the allocation frame, mirroring the
+          // BufferLoad handling to keep reuse decisions consistent.
+          size_t access_level = std::min(it->second.level, scope_.size() - 1);
+          scope_[access_level].touched.push_back(buf);
+        }
+      }
+    }
+  }
+
+  template <typename T> void VisitNewScope(const T *op) {
+    scope_.push_back(StmtEntry());
+    StmtEntry e;
+    e.stmt = op;
+    UpdateStmtAttr(op, scope_level_);
+    int64_t begin_index = static_cast<int64_t>(linear_seq_.size());
+    // before scope.
+    linear_seq_.push_back(e);
+    StmtExprVisitor::VisitStmt_(op);
+    // after scope.
+    e.touched = std::move(scope_.back().touched);
+    scope_.pop_back();
+    int64_t end_index = static_cast<int64_t>(linear_seq_.size());
+    ICHECK_GT(end_index, begin_index);
+    // The paired entries serve as scope sentinels once we flatten the
+    // control-flow tree.
+    e.scope_pair_offset = begin_index - end_index;
+    linear_seq_.push_back(e);
+    // record the pointer to end index.
+    ICHECK_NE(end_index, 0U);
+    linear_seq_[begin_index].scope_pair_offset = end_index - begin_index;
+  }
+
+  void VisitStmt_(const AttrStmtNode *op) final {
+    // Only record the outer most thread extent.
+    if (op->attr_key == tirx::attr::thread_extent && !in_thread_env_) {
+      in_thread_env_ = true;
+      VisitNewScope(op);
+      in_thread_env_ = false;
+    } else if (op->attr_key == tirx::attr::extern_scope) {
+      VisitNewScope(op);
+    } else if (op->attr_key == s_tir::attr::virtual_thread) {
+      VisitNewScope(op);
+    } else if (op->attr_key == "kWarpSpecializationScope") {
+      VisitWarpSpecializationBody(op->body);
     } else {
-      local_event_indices.push_back(i);
-      ++i;
+      StmtExprVisitor::VisitStmt_(op);
     }
   }
 
-  // Create instances for local events (not inside any nested For loop).
-  if (outer_unrolled_iters.empty()) {
-    // Top-level: single instance.
-    for (int idx : local_event_indices) {
-      const LinearEvent &ev = events[idx];
-      EventInstance inst;
-      inst.node_id = static_cast<int>(instances.size());
-      inst.linear_idx = idx;
-      inst.unrolled_iter = 0;
-      inst.physical_iter = 0;
-      inst.loop_val = IntImm(DataType::Int(32), 0);
-      inst.kind = ev.kind;
-      inst.touched = ev.touched;
-      inst.is_write = ev.is_write;
-      inst.hard_event = ev.hard_event;
-      inst.event_id_expr = ev.event_id_expr;
-      inst.mode_id = ev.mode_id;
-      inst.wg_id = ev.wg_id;
-      instances.push_back(inst);
-    }
-  } else {
-    for (int u = 0; u < static_cast<int>(outer_unrolled_iters.size()); ++u) {
-      for (int idx : local_event_indices) {
-        const LinearEvent &ev = events[idx];
-        // Check if this event is inside an If-guard that restricts its
-        // execution to specific unrolled iterations.  Since we're at the
-        // top level or inside a loop that has already been unrolled, all
-        // local events execute in all outer_unrolled_iters.
-        EventInstance inst;
-        inst.node_id = static_cast<int>(instances.size());
-        inst.linear_idx = idx;
-        inst.unrolled_iter = outer_unrolled_iters[u];
-        inst.physical_iter = outer_physical_base + outer_unrolled_iters[u];
-        inst.loop_val = outer_loop_vals[u];
-        inst.kind = ev.kind;
-        inst.touched = ev.touched;
-        inst.is_write = ev.is_write;
-        inst.hard_event = ev.hard_event;
-        inst.event_id_expr = ev.event_id_expr;
-        inst.mode_id = ev.mode_id;
-        inst.wg_id = ev.wg_id;
-        instances.push_back(inst);
-      }
-    }
-  }
-}
+  void VisitStmt_(const IfThenElseNode *op) final { VisitNewScope(op); }
 
-// Build the happens-before reachability matrix.
-//
-// Steps:
-// 1. Build event instances from LinearEvent + UnrollPlan.
-// 2. Add program-order edges.
-// 3. Add sync edges (set_flag → wait_flag with matching event_id).
-// 4. Add pipe_barrier edges.
-// 5. Add loop-carried edges between consecutive physical iterations.
-// 6. Floyd-Warshall for full reachability.
-struct HappensBeforeGraph {
-  std::vector<EventInstance> instances;
-  std::vector<std::vector<bool>> reachable; // [i][j]
-  int N = 0;
-
-  void Build(const std::vector<LinearEvent> &events) {
-    instances.clear();
-    BuildEventInstancesRecursive(events, 0, static_cast<int>(events.size()) - 1,
-                                 {}, {}, 0, instances);
-    N = static_cast<int>(instances.size());
-    if (N == 0)
-      return;
-
-    // Initialize reachability matrix.
-    reachable.assign(N, std::vector<bool>(N, false));
-    for (int i = 0; i < N; ++i)
-      reachable[i][i] = true;
-
-    AddProgramOrderEdges(events);
-    AddSyncEdges();
-    AddPipeBarrierEdges(events);
-    AddLoopCarriedEdges();
-    ComputeTransitiveClosure();
-  }
-
-  // Collect *every* node id that touches `var` — no per-iteration first/last
-  // collapsing. Used by the buffer DAG for the strict "all access pairs"
-  // edge rule.
-  void GetAllBufferAccessNodes(const VarNode *var,
-                               std::vector<int> &ids) const {
-    for (int i = 0; i < N; ++i) {
-      const EventInstance &inst = instances[i];
-      if (inst.kind != EventKind::kBufferAccess)
-        continue;
-      for (const VarNode *v : inst.touched) {
-        if (v == var) {
-          ids.push_back(i);
-          break;
-        }
-      }
-    }
-  }
-
-  // For each buffer, collect the node ids of its first and last accesses.
-  void GetBufferAccessNodes(const VarNode *var, std::vector<int> &first_ids,
-                            std::vector<int> &last_ids) const {
-    // Track the "earliest" and "latest" access per unrolled iteration.
-    // An access is a "first access" if it has no earlier access in the same
-    // iteration.  Since we only have happens-before edges (not linear time),
-    // we use the program order: among accesses to var in the same unrolled
-    // iteration, the one with smallest linear_idx is the first, largest is
-    // the last.
-    std::unordered_map<int, int> first_per_iter; // unrolled_iter → node_id
-    std::unordered_map<int, int> last_per_iter;  // unrolled_iter → node_id
-
-    for (int i = 0; i < N; ++i) {
-      const EventInstance &inst = instances[i];
-      if (inst.kind != EventKind::kBufferAccess)
-        continue;
-      bool touches = false;
-      for (const VarNode *v : inst.touched) {
-        if (v == var) {
-          touches = true;
-          break;
-        }
-      }
-      if (!touches)
-        continue;
-
-      int u = inst.unrolled_iter;
-      if (!first_per_iter.count(u) ||
-          instances[first_per_iter[u]].linear_idx > inst.linear_idx)
-        first_per_iter[u] = i;
-      if (!last_per_iter.count(u) ||
-          instances[last_per_iter[u]].linear_idx < inst.linear_idx)
-        last_per_iter[u] = i;
-    }
-
-    for (const auto &kv : first_per_iter)
-      first_ids.push_back(kv.second);
-    for (const auto &kv : last_per_iter)
-      last_ids.push_back(kv.second);
-
-    if (first_ids.empty()) {
-      // No access found: buffer is unused.
-      first_ids.clear();
-      last_ids.clear();
-    }
-  }
-
-private:
-  void AddEdge(int from, int to) {
-    if (from >= 0 && from < N && to >= 0 && to < N)
-      reachable[from][to] = true;
-  }
-
-  void AddProgramOrderEdges(const std::vector<LinearEvent> &events) {
-    // Within each unrolled iteration, model program order as release-acquire:
-    //   - Sync events (set/wait/pipe_barrier/cross_core_*) form a linear
-    //     chain in lin order.
-    //   - Each buffer_access is wired to the *nearest* preceding sync (sync
-    //     → access) and the *nearest* following sync (access → sync).
-    //   - buffer_access ↔ buffer_access edges are deliberately omitted.
-    //
-    // Why no access↔access edges: two memory accesses with no synchronization
-    // between them have NO happens-before relationship — they are racing
-    // unless an explicit sync event sits between them. If we drew a chain
-    // "access1 → access2 → access3 → ..." in pure lin order, the transitive
-    // closure would falsely report that access1 happens-before access3 even
-    // when nothing prevents reordering. That false closure is what made the
-    // buffer DAG add ordering edges (e.g. temp1 → temp3) in kernels that use
-    // mutex-style buffer-pool primitives like ascend_get_buf/rls_buf, which
-    // we do not model — leading to incorrect lifetime analysis and overlapping
-    // packing.
-    //
-    // With this model, two accesses can only reach each other through sync
-    // events between them. Code with no inter-access sync (e.g. the mutex
-    // example) yields fully unordered access pairs → the all-pair rule never
-    // fires → no buffer-DAG edges → buffers fall into independent SCCs that
-    // share no reuse paths → Pack falls back to sequential layout, which is
-    // the safe answer when synchronization is invisible to us.
-    auto is_sync = [&](int idx) {
-      EventKind k = instances[idx].kind;
-      return k == EventKind::kSetFlag || k == EventKind::kWaitFlag ||
-             k == EventKind::kPipeBarrier || k == EventKind::kCrossCoreSet ||
-             k == EventKind::kCrossCoreWait;
-    };
-
-    std::unordered_map<int, std::vector<int>> by_iter;
-    for (int i = 0; i < N; ++i)
-      by_iter[instances[i].unrolled_iter].push_back(i);
-
-    for (auto &kv : by_iter) {
-      auto &nodes = kv.second;
-      std::sort(nodes.begin(), nodes.end(), [this](int a, int b) {
-        return instances[a].linear_idx < instances[b].linear_idx;
-      });
-
-      // 1) Sync chain.
-      int prev_sync = -1;
-      for (int idx : nodes) {
-        if (!is_sync(idx))
-          continue;
-        if (prev_sync != -1)
-          AddEdge(prev_sync, idx);
-        prev_sync = idx;
-      }
-
-      // 2) Each access ← nearest preceding sync.
-      prev_sync = -1;
-      for (int idx : nodes) {
-        if (is_sync(idx)) {
-          prev_sync = idx;
-        } else if (prev_sync != -1) {
-          AddEdge(prev_sync, idx);
-        }
-      }
-
-      // 3) Each access → nearest following sync.
-      int next_sync = -1;
-      for (auto it = nodes.rbegin(); it != nodes.rend(); ++it) {
-        int idx = *it;
-        if (is_sync(idx)) {
-          next_sync = idx;
-        } else if (next_sync != -1) {
-          AddEdge(idx, next_sync);
-        }
-      }
-    }
-  }
-
-  void AddSyncEdges() {
-    // Pair each set_flag with the *next* wait_flag in program order that
-    // shares the same (hard_event, mode_id, is_cross_core, evaluated_event_id).
-    //
-    // Background: kernels often reuse the same event_id sequentially —
-    // e.g.   set V_MTE3,0 ; wait V_MTE3,0 ; ... ; set V_MTE3,0 ; wait V_MTE3,0
-    // A naive Cartesian-product match would draw an edge from the SECOND set
-    // to the FIRST wait, which combined with program order creates a HB cycle
-    // and makes everything reachable from everything → buffer DAG collapses
-    // and overlapping lifetimes become invisible.
-    //
-    // The hardware semantics is "next wait consumes the most recent matching
-    // set"; we model it the same way. For instances inside a pipelined loop,
-    // EvaluateEventId substitutes the (constant) loop_val so different
-    // unrolled iterations produce different numeric ids and naturally fall
-    // into distinct groups.
-    struct SyncKey {
-      std::string hard_event;
-      int mode_id;
-      bool is_cross_core;
-      int64_t event_id_val;
-      bool operator==(const SyncKey &o) const {
-        return hard_event == o.hard_event && mode_id == o.mode_id &&
-               is_cross_core == o.is_cross_core &&
-               event_id_val == o.event_id_val;
-      }
-    };
-    struct SyncKeyHash {
-      size_t operator()(const SyncKey &k) const {
-        size_t h = std::hash<std::string>()(k.hard_event);
-        h ^= std::hash<int>()(k.mode_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<bool>()(k.is_cross_core) + 0x9e3779b9 + (h << 6) +
-             (h >> 2);
-        h ^= std::hash<int64_t>()(k.event_id_val) + 0x9e3779b9 + (h << 6) +
-             (h >> 2);
-        return h;
-      }
-    };
-
-    // Bucket every set/wait instance by its fully-evaluated key. If sid is
-    // present we expand it (sid ∈ {0,1}) and put the instance into both
-    // buckets — sid is double-buffer state, so an event tagged "sid=*" can
-    // legitimately pair with either parity.
-    struct Endpoint {
-      int idx;
-      bool is_set;
-    };
-    std::unordered_map<SyncKey, std::vector<Endpoint>, SyncKeyHash> buckets;
-
-    auto add_endpoint = [&](int idx, bool is_set, bool is_cross,
-                            const std::string &hard_event, int mode_id) {
-      EventInstance &inst = instances[idx];
-      bool has_sid = ContainsSid(inst.event_id_expr);
-      int sid_lo = 0, sid_hi = has_sid ? 2 : 1;
-      for (int sid_val = sid_lo; sid_val < sid_hi; ++sid_val) {
-        int64_t val = 0;
-        if (!EvaluateEventId(inst.event_id_expr, inst.loop_val, sid_val,
-                             has_sid, &val))
-          continue;
-        SyncKey key{hard_event, mode_id, is_cross, val};
-        buckets[key].push_back(Endpoint{idx, is_set});
-      }
-    };
-
-    for (int i = 0; i < N; ++i) {
-      const EventInstance &inst = instances[i];
-      switch (inst.kind) {
-      case EventKind::kSetFlag:
-        add_endpoint(i, true, false, inst.hard_event, 0);
-        break;
-      case EventKind::kWaitFlag:
-        add_endpoint(i, false, false, inst.hard_event, 0);
-        break;
-      case EventKind::kCrossCoreSet:
-        // For cross-core flags the `pipe` arg of set/wait is LOCAL to each
-        // side (e.g. AIC sets through PIPE_FIX, AIV waits through PIPE_MTE3),
-        // so pipe name is intentionally excluded from the bucket key —
-        // pairing is by (mode_id, flag_id) only.
-        add_endpoint(i, true, true, "", inst.mode_id);
-        break;
-      case EventKind::kCrossCoreWait:
-        add_endpoint(i, false, true, "", inst.mode_id);
-        break;
-      default:
-        break;
-      }
-    }
-
-    // Within each bucket, pair endpoints by happens-before semantics. For
-    // intra-core flags the rule is purely textual ("next wait consumes the
-    // most recent set" within the single core). For cross-core flags, AIC
-    // and AIV are CONCURRENT tracks: a wait on one side may textually
-    // precede the set on the other side that releases it. We pair per-
-    // (setter_wg, waiter_wg) by position — the i-th set on the setter side
-    // pairs with the i-th wait on the waiter side, regardless of global
-    // textual order.
-    for (auto &kv : buckets) {
-      const SyncKey &key = kv.first;
-      auto &eps = kv.second;
-      std::sort(
-          eps.begin(), eps.end(), [this](const Endpoint &a, const Endpoint &b) {
-            return instances[a.idx].linear_idx < instances[b.idx].linear_idx;
-          });
-
-      if (key.is_cross_core) {
-        auto collect = [&](int wg, bool is_set) {
-          std::vector<int> out;
-          for (const Endpoint &e : eps) {
-            if (e.is_set == is_set && instances[e.idx].wg_id == wg)
-              out.push_back(e.idx);
-          }
-          return out; // already in per-track linear order
-        };
-        auto pair_across = [&](int setter_wg, int waiter_wg) {
-          std::vector<int> sets = collect(setter_wg, true);
-          std::vector<int> waits = collect(waiter_wg, false);
-          size_t n = std::min(sets.size(), waits.size());
-          for (size_t k = 0; k < n; ++k)
-            AddEdge(sets[k], waits[k]);
-        };
-        pair_across(/*Cube  */ 1, /*Vector*/ 0); // AIC set → AIV wait
-        pair_across(/*Vector*/ 0, /*Cube  */ 1); // AIV set → AIC wait
-
-        // Defensive fallback for cross-core endpoints outside any
-        // CUBE/VECTOR block (wg_id == -1): pair them among themselves by
-        // textual order, so we don't double-pair with the edges above.
-        std::vector<int> pending;
-        for (const Endpoint &ep : eps) {
-          if (instances[ep.idx].wg_id != -1)
-            continue;
-          if (ep.is_set) {
-            pending.push_back(ep.idx);
-          } else if (!pending.empty()) {
-            AddEdge(pending.front(), ep.idx);
-            pending.erase(pending.begin());
-          }
-        }
-      } else {
-        // Intra-core: each wait pairs with the most recent unmatched set
-        // on the same core.
-        std::vector<int> pending_sets;
-        for (const Endpoint &ep : eps) {
-          if (ep.is_set) {
-            pending_sets.push_back(ep.idx);
-          } else if (!pending_sets.empty()) {
-            int s_idx = pending_sets.front();
-            pending_sets.erase(pending_sets.begin());
-            AddEdge(s_idx, ep.idx);
-          }
-          // Dangling wait: leave unmatched.
-        }
-      }
-    }
-  }
-
-  void AddPipeBarrierEdges(const std::vector<LinearEvent> &events) {
-    // Collect pipe_barrier instances, grouped by unrolled iteration.
-    std::unordered_map<int, std::vector<int>> barriers_by_iter;
-    for (int i = 0; i < N; ++i) {
-      if (instances[i].kind == EventKind::kPipeBarrier)
-        barriers_by_iter[instances[i].unrolled_iter].push_back(i);
-    }
-
-    for (auto &kv : barriers_by_iter) {
-      int u = kv.first;
-      for (int b_node : kv.second) {
-        int b_linear = instances[b_node].linear_idx;
-
-        // All nodes before the barrier in this iteration → barrier.
-        for (int i = 0; i < N; ++i) {
-          if (instances[i].unrolled_iter == u &&
-              instances[i].linear_idx < b_linear)
-            AddEdge(i, b_node);
-        }
-        // Barrier → all nodes after the barrier in this iteration.
-        for (int i = 0; i < N; ++i) {
-          if (instances[i].unrolled_iter == u &&
-              instances[i].linear_idx > b_linear)
-            AddEdge(b_node, i);
-        }
-
-        // Barrier → all nodes in the next unrolled iteration.
-        for (int i = 0; i < N; ++i) {
-          if (instances[i].unrolled_iter == u + 1)
-            AddEdge(b_node, i);
-        }
-      }
-    }
-  }
-
-  void AddLoopCarriedEdges() {
-    // Between consecutive physical iterations, all events in iter u
-    // happen-before all events in iter u+1 (if the physical iterations
-    // are also consecutive).
-    std::unordered_map<int, std::vector<int>> nodes_by_iter;
-    for (int i = 0; i < N; ++i)
-      nodes_by_iter[instances[i].unrolled_iter].push_back(i);
-
-    // Determine the physical iteration for each unrolled iteration.
-    std::unordered_map<int, int> phys_for_unrolled;
-    for (int i = 0; i < N; ++i)
-      phys_for_unrolled[instances[i].unrolled_iter] =
-          instances[i].physical_iter;
-
-    for (int u = 0; u < static_cast<int>(nodes_by_iter.size()); ++u) {
-      if (!nodes_by_iter.count(u) || !nodes_by_iter.count(u + 1))
-        continue;
-      int phys_u = phys_for_unrolled[u];
-      int phys_next = phys_for_unrolled[u + 1];
-      // Only add loop-carried edge if physical iterations are consecutive.
-      if (phys_next != phys_u + 1)
-        continue;
-      for (int a : nodes_by_iter[u])
-        for (int b : nodes_by_iter[u + 1])
-          AddEdge(a, b);
-    }
-  }
-
-  void ComputeTransitiveClosure() {
-    // Floyd-Warshall.
-    for (int k = 0; k < N; ++k) {
-      for (int i = 0; i < N; ++i) {
-        if (!reachable[i][k])
-          continue;
-        for (int j = 0; j < N; ++j) {
-          if (reachable[k][j])
-            reachable[i][j] = true;
-        }
-      }
-    }
-  }
-
-  // Evaluate an event_id expression by substituting the loop variable value
-  // and (optionally) sid.  Returns true and writes the integer value if the
-  // expression simplified to a constant.
-  static bool EvaluateEventId(const PrimExpr &expr, const PrimExpr &loop_val,
-                              int sid_val, bool has_sid, int64_t *out) {
-    PrimExpr e = expr;
-    // Collect all Vars in the expression that look like loop variables
-    // (they appear in the expression as the For loop variable).
-    // Substitute them with loop_val.
-    class LoopVarFinder : public ExprVisitor {
-    public:
-      std::vector<Var> loop_vars;
-      void VisitExpr_(const VarNode *op) final {
-        if (std::string(op->name_hint).find("sid") == std::string::npos)
-          loop_vars.push_back(tvm::ffi::GetRef<Var>(op));
-        ExprVisitor::VisitExpr_(op);
-      }
-    };
-
-    LoopVarFinder finder;
-    finder(e);
-
-    Map<Var, PrimExpr> subs;
-    for (const Var &v : finder.loop_vars)
-      subs.Set(v, loop_val);
-
-    if (has_sid) {
-      // Find the sid Var and substitute it.
-      class SidVarFinder : public ExprVisitor {
-      public:
-        Var sid_var;
-        void VisitExpr_(const VarNode *op) final {
-          if (std::string(op->name_hint).find("sid") != std::string::npos)
-            sid_var = tvm::ffi::GetRef<Var>(op);
-          ExprVisitor::VisitExpr_(op);
-        }
-      };
-      SidVarFinder svf;
-      svf(e);
-      if (svf.sid_var.defined())
-        subs.Set(svf.sid_var, IntImm(DataType::Int(32), sid_val));
-    }
-
-    e = Substitute(e, subs);
-
-    arith::Analyzer analyzer;
-    e = analyzer.Simplify(e);
-
-    if (auto *imm = e.as<IntImmNode>()) {
-      *out = imm->value;
+  bool ContainsSeqStmt(const Stmt &stmt) {
+    if (stmt->IsInstance<SeqStmtNode>()) {
       return true;
+    }
+    if (const auto *if_node = stmt.as<IfThenElseNode>()) {
+      return ContainsSeqStmt(if_node->then_case) ||
+             (if_node->else_case.defined() &&
+              ContainsSeqStmt(if_node->else_case.value()));
     }
     return false;
   }
-};
 
-// Buffer DAG + SCC + Memory Allocation
-
-class BufferDAG {
-public:
-  int num_buffers = 0;
-  std::vector<const VarNode *> buffer_vars; // index → VarNode*
-  std::unordered_map<const VarNode *, int> var_to_idx;
-  std::vector<std::vector<bool>> adj; // adj[A][B] = A happens-before B
-
-  // SCC results.
-  std::vector<int> scc_id;                      // per buffer
-  std::vector<std::vector<int>> scc_members;    // per SCC
-  std::vector<std::vector<bool>> condensed_adj; // SCC DAG
-
-  void Build(const HappensBeforeGraph &hb,
-             const std::unordered_map<const VarNode *, const AllocateNode *>
-                 &shmem_allocs,
-             const std::vector<const VarNode *> &alloc_order) {
-    for (const VarNode *v : alloc_order) {
-      if (shmem_allocs.count(v))
-        buffer_vars.push_back(v);
+  void VisitStmt_(const ForNode *op) final {
+    if (ContainsSeqStmt(op->body)) {
+      scope_level_++;
+      VisitNewScope(op);
+      scope_level_--;
+    } else {
+      VisitNewScope(op);
     }
-    if (buffer_vars.size() < shmem_allocs.size()) {
-      std::unordered_set<const VarNode *> seen(buffer_vars.begin(),
-                                               buffer_vars.end());
-      std::vector<const VarNode *> tail;
-      for (const auto &kv : shmem_allocs)
-        if (!seen.count(kv.first))
-          tail.push_back(kv.first);
-      std::sort(tail.begin(), tail.end(),
-                [](const VarNode *a, const VarNode *b) {
-                  if (a->name_hint != b->name_hint)
-                    return a->name_hint < b->name_hint;
-                  return a < b;
-                });
-      buffer_vars.insert(buffer_vars.end(), tail.begin(), tail.end());
-    }
-    num_buffers = static_cast<int>(buffer_vars.size());
-    for (int i = 0; i < num_buffers; ++i)
-      var_to_idx[buffer_vars[i]] = i;
-
-    // Collect ALL access nodes per buffer (not first/last per iter): edge
-    // formation must consider every access point, otherwise per-iter
-    // aggregation can drop accesses that prove lifetime overlap.
-    std::vector<std::vector<int>> all_nodes(num_buffers);
-    for (int i = 0; i < num_buffers; ++i)
-      hb.GetAllBufferAccessNodes(buffer_vars[i], all_nodes[i]);
-
-    // Build buffer DAG.
-    //
-    // Edge A → B exists iff EVERY access pair (a ∈ accesses(A),
-    // b ∈ accesses(B)) is synchronized in the happens-before graph
-    // (i.e. a reaches b).  If any pair is unordered, A and B have
-    // overlapping lifetimes and must share an SCC instead.
-    adj.assign(num_buffers, std::vector<bool>(num_buffers, false));
-
-    for (int a = 0; a < num_buffers; ++a) {
-      if (all_nodes[a].empty())
-        continue;
-      for (int b = 0; b < num_buffers; ++b) {
-        if (a == b)
-          continue;
-        if (all_nodes[b].empty())
-          continue;
-        bool edge = true;
-        for (int na : all_nodes[a]) {
-          for (int nb : all_nodes[b]) {
-            if (na >= hb.N || nb >= hb.N || !hb.reachable[na][nb]) {
-              edge = false;
-              break;
-            }
-          }
-          if (!edge)
-            break;
-        }
-        if (edge)
-          adj[a][b] = true;
-      }
-    }
-
-    // SCC decomposition (Tarjan).
-    ComputeSCC();
   }
 
-  // Pack buffers into a merged arena using the condensed SCC DAG.
-  //
-  // Two SCCs S₁, S₂ can share memory if S₁ →* S₂ (one-way path in the
-  // condensed DAG).  The algorithm:
-  //   1. Computes transitive closure of the condensed DAG.
-  //   2. Processes SCCs in topological order.
-  //   3. When allocating SCC S, only memory from predecessors P (P →* S)
-  //      can be reused.  Unrelated SCCs (no path) can never share.
-  struct PackResult {
-    std::unordered_map<const VarNode *, size_t> byte_offsets;
-    size_t total_size;
-  };
+  void VisitStmt_(const WhileNode *op) final { VisitNewScope(op); }
 
-  PackResult
-  Pack(const std::unordered_map<const VarNode *, const AllocateNode *>
-           &shmem_allocs,
-       int align_bytes,
-       const std::unordered_map<const VarNode *, int> &alignment_map) {
-    PackResult result;
-    result.total_size = 0;
-    int ns = static_cast<int>(scc_members.size());
+  void VisitStmt_(const AssertStmtNode *op) final { VisitNewScope(op); }
 
-    // Compute per-SCC sizes, alignments, and per-buffer relative offsets.
-    //
-    // Buffers in the same SCC have overlapping (or cycle-related) lifetimes
-    // and therefore cannot share memory; they are packed sequentially within
-    // the SCC's region.  The per-SCC size MUST be the sum of the per-buffer
-    // footprints (accounting for per-buffer alignment), not the max of
-    // individual buffer sizes — otherwise the region pushed into
-    // free_regions and reused by successors would be undersized, and
-    // subsequent buffers laid out within the SCC would extend beyond it,
-    // overlapping the next SCC's region.
-    auto get_buf_size = [&](const VarNode *var) -> std::optional<size_t> {
-      auto it = shmem_allocs.find(var);
-      if (it == shmem_allocs.end())
-        return std::nullopt;
-      const AllocateNode *alloc = it->second;
-      int64_t const_ext = alloc->ConstantAllocationSize();
-      if (const_ext < 0)
-        return std::nullopt; // dynamic extent — handled separately upstream
-      int64_t bytes_per_elem = alloc->dtype.bytes() * alloc->dtype.lanes();
-      return static_cast<size_t>(const_ext * bytes_per_elem);
-    };
-    auto get_buf_align = [&](const VarNode *var) -> int {
-      auto al_it = alignment_map.find(var);
-      int al = align_bytes;
-      if (al_it != alignment_map.end())
-        al = std::max(al, al_it->second);
-      return al;
-    };
-
-    std::vector<size_t> scc_size(ns, 0);
-    std::vector<int> scc_align(ns, 1);
-    // Per-buffer offset relative to its SCC's region start.
-    std::unordered_map<const VarNode *, size_t> rel_offset;
-    for (int s = 0; s < ns; ++s) {
-      size_t off = 0;
-      for (int buf_idx : scc_members[s]) {
-        const VarNode *var = buffer_vars[buf_idx];
-        auto sz_opt = get_buf_size(var);
-        if (!sz_opt.has_value())
-          continue;
-        int al = get_buf_align(var);
-        scc_align[s] = std::max(scc_align[s], al);
-        off = AlignUp(off, static_cast<size_t>(al));
-        rel_offset[var] = off;
-        off += sz_opt.value();
-      }
-      scc_size[s] = AlignUp(off, static_cast<size_t>(align_bytes));
-    }
-
-    // Topological order of SCCs.
-    std::vector<int> topo_order = TopologicalSort();
-
-    // Transitive closure of the condensed DAG.
-    std::vector<std::vector<bool>> reach(ns, std::vector<bool>(ns, false));
-    for (int i = 0; i < ns; ++i)
-      reach[i][i] = true;
-    for (int i = 0; i < ns; ++i)
-      for (int j = 0; j < ns; ++j)
-        if (condensed_adj[i][j])
-          reach[i][j] = true;
-    for (int k = 0; k < ns; ++k)
-      for (int i = 0; i < ns; ++i)
-        for (int j = 0; j < ns; ++j)
-          if (reach[i][k] && reach[k][j])
-            reach[i][j] = true;
-
-    // Track memory regions available for reuse.
-    // Each region is owned by an SCC and can be claimed by that SCC's
-    // successors (SCCs T such that owner →* T).
-    struct Region {
-      size_t offset;
-      size_t size;
-      int owner_scc;
-      bool claimed; // already given to a successor
-    };
-    std::vector<Region> free_regions;
-
-    size_t arena_top = 0;
-
-    for (int s : topo_order) {
-      size_t alloc_size = AlignUp(scc_size[s], scc_align[s]);
-      if (alloc_size == 0)
-        continue;
-
-      // Find the best-fitting predecessor region whose owner reaches s.
-      int best_idx = -1;
-      size_t best_off = 0;
-      for (int fi = 0; fi < static_cast<int>(free_regions.size()); ++fi) {
-        Region &r = free_regions[fi];
-        if (r.claimed)
-          continue;
-        if (!reach[r.owner_scc][s])
-          continue; // no one-way path
-
-        size_t aligned = AlignUp(r.offset, scc_align[s]);
-        if (aligned + alloc_size <= r.offset + r.size) {
-          if (best_idx == -1 || aligned < best_off) {
-            best_idx = fi;
-            best_off = aligned;
-          }
-        }
-      }
-
-      if (best_idx >= 0) {
-        // Reuse the predecessor's memory.
-        free_regions[best_idx].claimed = true;
-      } else {
-        // Bump-allocate.
-        best_off = AlignUp(arena_top, scc_align[s]);
-        arena_top = best_off + alloc_size;
-      }
-
-      // Make this SCC's memory available for its successors.
-      free_regions.push_back({best_off, alloc_size, s, false});
-
-      // Assign offsets to all buffers in this SCC using the relative
-      // offsets pre-computed above so they exactly match `alloc_size`.
-      for (int buf_idx : scc_members[s]) {
-        const VarNode *var = buffer_vars[buf_idx];
-        auto it = rel_offset.find(var);
-        if (it == rel_offset.end())
-          continue;
-        result.byte_offsets[var] = best_off + it->second;
-      }
-    }
-
-    result.total_size = arena_top;
-    return result;
-  }
+  // linearized access sequence.
+  std::vector<StmtEntry> linear_seq_;
+  // The storage scope of each buffer
+  std::unordered_map<const VarNode *, AllocEntry> alloc_info_;
+  // The attribute of each statement
+  std::unordered_map<const Object *, StmtAttr> stmt_attrs_;
 
 private:
-  static size_t AlignUp(size_t value, size_t alignment) {
-    if (alignment == 0)
-      return value;
-    size_t rem = value % alignment;
-    return rem == 0 ? value : value + (alignment - rem);
-  }
-
-  void ComputeSCC() {
-    // Tarjan's algorithm.
-    scc_id.assign(num_buffers, -1);
-    std::vector<int> index(num_buffers, -1);
-    std::vector<int> lowlink(num_buffers, -1);
-    std::vector<bool> on_stack(num_buffers, false);
-    std::stack<int> stk;
-    int cur_index = 0;
-    scc_members.clear();
-
-    std::function<void(int)> strongconnect = [&](int v) {
-      index[v] = cur_index;
-      lowlink[v] = cur_index;
-      ++cur_index;
-      stk.push(v);
-      on_stack[v] = true;
-
-      for (int w = 0; w < num_buffers; ++w) {
-        if (!adj[v][w])
-          continue;
-        if (index[w] == -1) {
-          strongconnect(w);
-          lowlink[v] = std::min(lowlink[v], lowlink[w]);
-        } else if (on_stack[w]) {
-          lowlink[v] = std::min(lowlink[v], index[w]);
-        }
+  void VisitWarpSpecializationBody(const Stmt &stmt) {
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      for (const auto &sub_stmt : seq->seq) {
+        VisitWarpSpecializationBody(sub_stmt);
       }
-
-      if (lowlink[v] == index[v]) {
-        std::vector<int> member;
-        int w;
-        do {
-          w = stk.top();
-          stk.pop();
-          on_stack[w] = false;
-          scc_id[w] = static_cast<int>(scc_members.size());
-          member.push_back(w);
-        } while (w != v);
-        scc_members.push_back(std::move(member));
-      }
-    };
-
-    for (int v = 0; v < num_buffers; ++v)
-      if (index[v] == -1)
-        strongconnect(v);
-
-    // Build condensed DAG.
-    int ns = static_cast<int>(scc_members.size());
-    condensed_adj.assign(ns, std::vector<bool>(ns, false));
-    for (int a = 0; a < num_buffers; ++a) {
-      for (int b = 0; b < num_buffers; ++b) {
-        if (adj[a][b] && scc_id[a] != scc_id[b])
-          condensed_adj[scc_id[a]][scc_id[b]] = true;
-      }
+      return;
     }
-  }
-
-  std::vector<int> TopologicalSort() {
-    int ns = static_cast<int>(scc_members.size());
-    std::vector<int> indeg(ns, 0);
-    for (int i = 0; i < ns; ++i)
-      for (int j = 0; j < ns; ++j)
-        if (condensed_adj[i][j])
-          ++indeg[j];
-
-    std::queue<int> q;
-    for (int i = 0; i < ns; ++i)
-      if (indeg[i] == 0)
-        q.push(i);
-
-    std::vector<int> order;
-    while (!q.empty()) {
-      int v = q.front();
-      q.pop();
-      order.push_back(v);
-      for (int w = 0; w < ns; ++w) {
-        if (condensed_adj[v][w]) {
-          --indeg[w];
-          if (indeg[w] == 0)
-            q.push(w);
-        }
+    if (const auto *if_node = stmt.as<IfThenElseNode>()) {
+      this->VisitStmt(if_node->then_case);
+      if (if_node->else_case.defined()) {
+        this->VisitStmt(if_node->else_case.value());
       }
+      return;
     }
-    return order;
+    if (const auto *attr = stmt.as<AttrStmtNode>()) {
+      VisitWarpSpecializationBody(attr->body);
+      return;
+    }
+    StmtExprVisitor::VisitStmt(stmt);
   }
 
-  int TopoIndexToSCC(int ti, const std::vector<int> &topo) {
-    for (int s = 0; s < static_cast<int>(topo.size()); ++s)
-      if (topo[s] == ti)
-        return s;
-    return -1;
+  // Wrapper function to determine if the shared memory allocation for a
+  // variable is appropriate.
+  bool IsAppropriateSharedMemory(const Var &var) {
+    return is_dynamic_ ? IsDynamicSharedMemory(var) : IsStaticSharedMemory(var);
   }
+  // Whether do dynamic analysis.
+  bool is_dynamic_{true};
+  // Whether do aggressive merge.
+  bool enable_aggressive_merge_{false};
+  // Whether do verbose logging.
+  bool verbose_{false};
+  // Whether already in thread env.
+  bool in_thread_env_{false};
+  // The scope stack.
+  std::vector<StmtEntry> scope_;
+  // The size of the scope.
+  size_t scope_level_{0};
 };
-
-// SharedMemoryAlignmentPlanner
 
 class SharedMemoryAlignmentPlanner : public StmtExprVisitor {
 
@@ -1641,11 +385,21 @@ private:
     auto ptr_type = op->type_annotation.as<PointerTypeNode>();
     if (!ptr_type)
       return;
-    auto scope = GetPtrStorageScope(tvm::ffi::GetRef<Var>(op));
+    auto scope = GetPtrStorageScope(GetRef<Var>(op));
     if (scope == "shared" || scope == "shared.dyn") {
       auto target = Target::Current();
       ICHECK(target.defined()) << "Target is not defined";
-      const int alignment = TargetIsHopper(target) ? 1024 : 16;
+      // TMA bulk-copy operands have stricter shared-memory alignment than
+      // ordinary scalar/shared accesses. Hopper keeps the existing 1024-byte
+      // alignment used by the WGMMA/TMA path, while Blackwell/SM120 also needs
+      // TMA sources at least 128-byte aligned to avoid misaligned-address
+      // launch failures.
+      int alignment = 16;
+      if (TargetIsHopper(target)) {
+        alignment = 1024;
+      } else if (TargetHasBulkCopy(target)) {
+        alignment = 128;
+      }
       shmem_alignment_map_[op] = alignment;
     }
   }
@@ -1692,201 +446,218 @@ private:
 class SharedMemoryRewriter : public StmtExprMutator {
 public:
   explicit SharedMemoryRewriter(
-      const std::unordered_map<const VarNode *, const AllocateNode *>
+      const std::unordered_map<const VarNode *, const AllocBufferNode *>
           &shmem_allocs,
-      const std::vector<const VarNode *> &alloc_order, bool is_dynamic = true,
-      bool verbose = false, int align_bytes = 0,
-      const std::string &merged_name = "", const std::string &merged_scope = "",
-      const std::string &target_scope = "")
-      : is_dynamic_{is_dynamic}, shmem_allocs_{shmem_allocs},
-        alloc_order_{alloc_order}, verbose_{verbose}, align_bytes_{align_bytes},
-        target_scope_{target_scope} {
-    if (!merged_name.empty() && !merged_scope.empty()) {
-      merged_buf_var_ = Var(
-          merged_name, PointerType(PrimType(DataType::UInt(8)), merged_scope));
-    } else if (!is_dynamic) {
+      bool is_dynamic = true, bool verbose = false, int align_bytes = 0,
+      bool preserve_aliases = true)
+      : is_dynamic_{is_dynamic}, shmem_allocs_{shmem_allocs}, verbose_{verbose},
+        align_bytes_{align_bytes}, preserve_aliases_{preserve_aliases} {
+    if (!is_dynamic) {
       merged_buf_var_ =
           Var("buf_shmem", PointerType(PrimType(DataType::UInt(8)), "shared"));
     }
   }
 
   /*!
-   * \brief Plan memory reuse using sync-graph-based liveness analysis.
+   * \brief plan the memory reuse for all the buffer allocated in the statement
+   * \param stmt the statement
    */
-  void PlanReuse(const Stmt &stmt) {
-    // Step 1: Linearize TIR with sync detection.
-    SyncAwareLinearizer linearizer(is_dynamic_, target_scope_);
-    linearizer(stmt);
-
-    // Step 2: Build happens-before graph.
-    HappensBeforeGraph hb;
-    hb.Build(linearizer.linear_events);
-
-    // Step 3: Build buffer DAG and compute SCCs.
-    BufferDAG buf_dag;
-    buf_dag.Build(hb, shmem_allocs_, alloc_order_);
-
-    // Step 4: Get alignment info.
+  void PlanReuse(const Stmt &stmt, bool is_dynamic = true,
+                 bool enable_aggressive_merge = false, bool verbose = false,
+                 bool disable_reuse = false) {
+    SharedMemLinearAccessPatternFinder finder(is_dynamic,
+                                              enable_aggressive_merge, verbose);
+    finder(stmt);
     shmem_alignment_map_ = SharedMemoryAlignmentPlanner::Plan(stmt);
-
-    // Step 5: Pack buffers using SCC DAG.
-    auto pack_result =
-        buf_dag.Pack(shmem_allocs_, align_bytes_, shmem_alignment_map_);
-
-    // Store results.
-    for (const auto &kv : pack_result.byte_offsets) {
-      buffer_byte_offsets_[kv.first] =
-          make_const(DataType::Int(32), static_cast<int64_t>(kv.second));
-    }
-    merged_alloc_size_ = make_const(
-        DataType::Int(64), static_cast<int64_t>(pack_result.total_size));
-
-    if (verbose_) {
-      LOG(DEBUG) << "Sync-graph Memory Allocation Plan for "
-                 << (is_dynamic_ ? "Dynamic" : "Static") << " Shared Memory:";
-      LOG(DEBUG) << "  Total Merged Size: " << merged_alloc_size_ << " bytes";
-      LOG(DEBUG) << "  Buffer DAG SCCs: " << buf_dag.scc_members.size();
-      // Dump buffer-level adjacency edges (A -> B means A's lifetime ends
-      // before B's begins; basis for the SCC / packing decisions below).
-      for (int a = 0; a < buf_dag.num_buffers; ++a) {
-        std::stringstream ss;
-        ss << "    edges from " << buf_dag.buffer_vars[a]->name_hint << " -> {";
-        for (int b = 0; b < buf_dag.num_buffers; ++b)
-          if (buf_dag.adj[a][b])
-            ss << buf_dag.buffer_vars[b]->name_hint << " ";
-        ss << "}";
-        LOG(DEBUG) << ss.str();
-      }
-      for (size_t si = 0; si < buf_dag.scc_members.size(); ++si) {
-        std::stringstream ss;
-        for (int bi : buf_dag.scc_members[si])
-          ss << buf_dag.buffer_vars[bi]->name_hint << " ";
-        LOG(DEBUG) << "    SCC " << si << ": " << ss.str();
-      }
-      for (const auto &kv : buffer_byte_offsets_) {
-        LOG(DEBUG) << "    Buffer " << kv.first->name_hint
-                   << " offset=" << kv.second;
-      }
-    }
-  }
-
-  /*!
-   * \brief Plan layout WITHOUT any buffer reuse — every buffer gets its own
-   *        non-overlapping region in the merged arena (bump-allocate).
-   */
-  void PlanNoReuse(const Stmt &stmt) {
-    shmem_alignment_map_ = SharedMemoryAlignmentPlanner::Plan(stmt);
-
-    auto round_up = [](size_t value, size_t align) -> size_t {
-      if (align <= 1)
-        return value;
-      return (value + align - 1) / align * align;
-    };
-
-    size_t cursor = 0;
-    auto place = [&](const VarNode *var) {
-      auto it = shmem_allocs_.find(var);
-      if (it == shmem_allocs_.end())
-        return;
-      const AllocateNode *alloc = it->second;
-      int64_t const_ext = alloc->ConstantAllocationSize();
-      if (const_ext < 0)
-        return;
-      int64_t bytes_per_elem = alloc->dtype.bytes() * alloc->dtype.lanes();
-      size_t size_bytes = static_cast<size_t>(const_ext * bytes_per_elem);
-      int align = std::max(align_bytes_, 1);
-      auto align_it = shmem_alignment_map_.find(var);
-      if (align_it != shmem_alignment_map_.end())
-        align = std::max(align, align_it->second);
-      cursor = round_up(cursor, static_cast<size_t>(align));
-      buffer_byte_offsets_[var] =
-          make_const(DataType::Int(32), static_cast<int64_t>(cursor));
-      cursor += size_bytes;
-    };
-
-    std::unordered_set<const VarNode *> placed;
-    for (const VarNode *v : alloc_order_) {
-      if (shmem_allocs_.count(v) && placed.insert(v).second)
-        place(v);
-    }
-    // Defensive: cover any buffer the order vector missed.
-    if (placed.size() < shmem_allocs_.size()) {
-      std::vector<const VarNode *> tail;
-      for (const auto &kv : shmem_allocs_)
-        if (!placed.count(kv.first))
-          tail.push_back(kv.first);
-      std::sort(tail.begin(), tail.end(),
-                [](const VarNode *a, const VarNode *b) {
-                  if (a->name_hint != b->name_hint)
-                    return a->name_hint < b->name_hint;
-                  return a < b;
-                });
-      for (const VarNode *v : tail)
-        place(v);
-    }
-
-    merged_alloc_size_ =
-        make_const(DataType::Int(64), static_cast<int64_t>(cursor));
-
-    if (verbose_) {
-      LOG(DEBUG) << "No-Reuse Memory Allocation Plan for "
-                 << (is_dynamic_ ? "Dynamic" : "Static") << " Shared Memory:";
-      LOG(DEBUG) << "  Total Merged Size: " << merged_alloc_size_ << " bytes";
-      for (const auto &kv : buffer_byte_offsets_) {
-        LOG(DEBUG) << "    Buffer " << kv.first->name_hint
-                   << " offset=" << kv.second;
-      }
+    if (disable_reuse) {
+      this->PlanSequentialLayout();
+    } else {
+      // First compute liveness over the flattened schedule, then feed it into
+      // the arena packer.
+      this->LivenessAnalysis(finder.linear_seq_, finder.stmt_attrs_);
+      this->PlanMemory(finder.linear_seq_, finder.stmt_attrs_);
     }
   }
 
 private:
+  std::vector<Stmt> MakeAliasBindings() const {
+    struct AliasInfo {
+      const VarNode *var{nullptr};
+      PrimExpr byte_offset;
+    };
+
+    std::vector<AliasInfo> aliases;
+    aliases.reserve(buffer_byte_offsets_.size());
+    for (const auto &pair : buffer_byte_offsets_) {
+      if (shmem_allocs_.count(pair.first) == 0) {
+        continue;
+      }
+      aliases.push_back(AliasInfo{pair.first, pair.second});
+    }
+
+    std::sort(aliases.begin(), aliases.end(),
+              [](const AliasInfo &lhs, const AliasInfo &rhs) {
+                const auto *lhs_offset = lhs.byte_offset.as<IntImmNode>();
+                const auto *rhs_offset = rhs.byte_offset.as<IntImmNode>();
+                if (lhs_offset != nullptr && rhs_offset != nullptr &&
+                    lhs_offset->value != rhs_offset->value) {
+                  return lhs_offset->value < rhs_offset->value;
+                }
+                return lhs.var->name_hint < rhs.var->name_hint;
+              });
+
+    std::vector<Stmt> bindings;
+    bindings.reserve(aliases.size());
+    for (const AliasInfo &alias : aliases) {
+      Var buffer_var = GetRef<Var>(alias.var);
+      PrimExpr alias_ptr =
+          Call(DataType::Handle(), builtin::handle_add_byte_offset(),
+               {merged_buf_var_, alias.byte_offset});
+      bindings.push_back(tirx::Bind(buffer_var, alias_ptr));
+    }
+    return bindings;
+  }
+
+  /*!
+   * \brief Lay out all shared memory buffers sequentially without any reuse.
+   * Each buffer gets its own dedicated region in the merged allocation.
+   */
+  void PlanSequentialLayout() {
+    buffer_byte_offsets_.clear();
+
+    if (shmem_allocs_.empty()) {
+      merged_alloc_size_ = make_const(DataType::Int(64), 0);
+      return;
+    }
+
+    // Sort allocations deterministically by name.
+    std::vector<const VarNode *> sorted_vars;
+    sorted_vars.reserve(shmem_allocs_.size());
+    for (const auto &kv : shmem_allocs_) {
+      sorted_vars.push_back(kv.first);
+    }
+    std::sort(sorted_vars.begin(), sorted_vars.end(),
+              [](const VarNode *a, const VarNode *b) {
+                return a->name_hint < b->name_hint;
+              });
+
+    DataType offset_dtype = DataType::Int(32);
+    PrimExpr cursor = make_const(offset_dtype, 0);
+    PrimExpr total_size = make_const(offset_dtype, 0);
+
+    for (const VarNode *var : sorted_vars) {
+      const AllocBufferNode *alloc = shmem_allocs_.at(var);
+      int64_t bytes_per_elem = static_cast<int64_t>(
+          alloc->buffer->dtype.bytes() * alloc->buffer->dtype.lanes());
+
+      DataType size_dtype = DataType::Int(32);
+      if (!alloc->buffer->shape.empty()) {
+        size_dtype = alloc->buffer->shape[0].dtype();
+      }
+      if (!size_dtype.is_int() && !size_dtype.is_uint()) {
+        size_dtype = DataType::Int(32);
+      }
+
+      PrimExpr size_expr = make_const(size_dtype, bytes_per_elem);
+      for (const PrimExpr &extent : alloc->buffer->shape) {
+        PrimExpr e = extent;
+        if (e.dtype() != size_dtype) {
+          e = cast(size_dtype, e);
+        }
+        size_expr = size_expr * e;
+      }
+
+      int alignment = align_bytes_;
+      auto align_it = shmem_alignment_map_.find(var);
+      if (align_it != shmem_alignment_map_.end()) {
+        alignment = std::max(alignment, align_it->second);
+      }
+
+      cursor = AlignPrimExpr(cursor, alignment);
+      if (size_expr.dtype() != offset_dtype) {
+        size_expr = cast(offset_dtype, size_expr);
+      }
+      buffer_byte_offsets_[var] = cursor;
+      PrimExpr buf_end = cursor + size_expr;
+      total_size = max(total_size, buf_end);
+      cursor = buf_end;
+    }
+
+    merged_alloc_size_ = AlignPrimExpr(total_size, align_bytes_);
+  }
+
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tir::attr::thread_extent && !allocated_) {
+    if (op->attr_key == tirx::attr::thread_extent && !allocated_) {
+      // Allocate one dynamic shared memory allocation at the beginning of
+      // thread scope
+
       if (verbose_) {
+
         LOG(DEBUG) << "Memory Allocation Plan for "
                    << (is_dynamic_ ? "Dynamic" : "Static") << " Shared Memory:";
         LOG(DEBUG) << "  Merged Buffer Name: " << merged_buf_var_->name_hint;
         LOG(DEBUG) << "  Total Merged Size: " << merged_alloc_size_ << " bytes";
+        LOG(DEBUG) << "  Individual Buffer Allocations:";
         for (const auto &pair : buffer_byte_offsets_) {
           const VarNode *buffer_var_node = pair.first;
           PrimExpr byte_offset = pair.second;
           auto alloc_it = shmem_allocs_.find(buffer_var_node);
           if (alloc_it != shmem_allocs_.end()) {
-            const AllocateNode *alloc = alloc_it->second;
-            PrimExpr buffer_size_bytes =
-                alloc->extents[0] * alloc->dtype.bytes() * alloc->dtype.lanes();
+            const AllocBufferNode *alloc = alloc_it->second;
+            PrimExpr buffer_size_bytes = alloc->buffer->shape[0] *
+                                         alloc->buffer->dtype.bytes() *
+                                         alloc->buffer->dtype.lanes();
+            LOG(DEBUG) << "    Buffer: " << buffer_var_node->name_hint
+                       << " (Type: " << alloc->buffer->dtype << ")"
+                       << ", Start Offset: " << byte_offset
+                       << ", Size: " << buffer_size_bytes << " bytes"
+                       << ", End Offset: "
+                       << (byte_offset + buffer_size_bytes - 1);
+          } else {
             LOG(DEBUG) << "    Buffer: " << buffer_var_node->name_hint
                        << ", Start Offset: " << byte_offset
-                       << ", Size: " << buffer_size_bytes << " bytes";
+                       << " (Original allocation info not found)";
           }
         }
         LOG(DEBUG) << "End of Memory Allocation Plan.";
       }
 
       allocated_ = true;
-      Allocate new_body(merged_buf_var_, DataType::UInt(8),
-                        {merged_alloc_size_}, const_true(),
-                        StmtExprMutator::VisitStmt(op->body));
+      Buffer merged_buf(merged_buf_var_, DataType::UInt(8),
+                        {merged_alloc_size_}, {}, PrimExpr(),
+                        merged_buf_var_->name_hint, 0, 0, kDefault);
+      Array<Stmt> seq;
+      seq.push_back(AllocBuffer(merged_buf));
+      if (preserve_aliases_) {
+        for (const Stmt &alias_binding : MakeAliasBindings()) {
+          seq.push_back(alias_binding);
+        }
+      }
+      seq.push_back(StmtExprMutator::VisitStmt(op->body));
+      Stmt new_body = SeqStmt(seq);
       return AttrStmt(op->node, op->attr_key, op->value, new_body, op->span);
     }
     return StmtMutator::VisitStmt_(op);
   }
 
-  Stmt VisitStmt_(const AllocateNode *op) final {
-    if (IsAppropriateSharedMemory(op->buffer_var))
-      return StmtExprMutator::VisitStmt(op->body);
-    return StmtExprMutator::VisitStmt_(op);
-  }
-
-  Stmt VisitStmt_(const BlockNode *op) final {
+  Stmt VisitStmt_(const AllocBufferNode *op) final {
+    if (IsAppropriateSharedMemory(op->buffer->data)) {
+      // In the new flat model, AllocBuffer has no body.
+      // Simply remove this node from the tree (its sibling statements
+      // will be visited by the SeqStmt visitor).
+      return Evaluate(0);
+    }
     return StmtExprMutator::VisitStmt_(op);
   }
 
   Stmt VisitStmt_(const DeclBufferNode *op) final {
     auto node = Downcast<DeclBuffer>(StmtExprMutator::VisitStmt_(op));
-    auto new_buf = GetUpdatedBuffer(node->buffer);
-    if (!new_buf.same_as(node->buffer))
-      node.CopyOnWrite()->buffer = new_buf;
+    if (!preserve_aliases_) {
+      auto new_buf = GetUpdatedBuffer(node->buffer);
+      if (!new_buf.same_as(node->buffer)) {
+        node.CopyOnWrite()->buffer = new_buf;
+      }
+    }
     return std::move(node);
   }
 
@@ -1906,21 +677,26 @@ private:
           << "MergeSharedMemoryAllocations expects flat memory buffers, "
           << "and is to be run after "
           << "StorageFlatten (TE schedules) or FlattenBuffer (TIR schedules)";
-      Array<PrimExpr> indices = {
-          node->indices[0] +
-          this->GetBufferOffset(node->buffer->data, node->buffer->dtype)};
-      auto writer = node.CopyOnWrite();
-      writer->buffer = GetUpdatedBuffer(node->buffer);
-      writer->indices = indices;
+      if (!preserve_aliases_) {
+        Array<PrimExpr> indices = {
+            node->indices[0] +
+            this->GetBufferOffset(node->buffer->data, node->buffer->dtype)};
+
+        auto writer = node.CopyOnWrite();
+        writer->buffer = GetUpdatedBuffer(node->buffer);
+        writer->indices = indices;
+      }
     }
+
     return node;
   }
 
   Buffer GetUpdatedBuffer(Buffer buffer) {
     auto key = buffer.get();
     auto it = buffer_remap_.find(key);
-    if (it != buffer_remap_.end())
+    if (it != buffer_remap_.end()) {
       return it->second;
+    }
 
     if (IsAppropriateSharedMemory(buffer->data)) {
       ICHECK_EQ(buffer->shape.size(), 1)
@@ -1931,44 +707,82 @@ private:
       auto writer = buffer.CopyOnWrite();
       writer->data = merged_buf_var_;
     }
+
     buffer_remap_[key] = buffer;
     return buffer;
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
+    if (preserve_aliases_) {
+      return StmtExprMutator::VisitExpr_(op);
+    }
     if (op->op.same_as(builtin::tvm_access_ptr())) {
       ICHECK_EQ(op->args.size(), 5U);
       DataType dtype = op->args[0].dtype();
       Var buffer = Downcast<Var>(op->args[1]);
-      if (!IsAppropriateSharedMemory(buffer))
+      if (!IsAppropriateSharedMemory(buffer)) {
         return StmtExprMutator::VisitExpr_(op);
+      }
+      if (!IsManagedAllocation(buffer)) {
+        return StmtExprMutator::VisitExpr_(op);
+      }
+      ICHECK(HasBufferOffset(buffer))
+          << "Shared memory allocation " << buffer->name_hint
+          << " was collected for merging but was not assigned an offset.";
       PrimExpr extra_offset = GetBufferOffset(buffer, dtype);
+
       PrimExpr offset = this->VisitExpr(op->args[2]);
       PrimExpr extent = this->VisitExpr(op->args[3]);
       return Call(op->dtype, op->op,
                   {op->args[0], merged_buf_var_, extra_offset + offset, extent,
                    op->args[4]});
-    } else if (op->op.same_as(builtin::ptx_cp_async())) {
-      ICHECK_EQ(op->args.size(), 3U);
+    } else if (op->op.same_as(builtin::ptx_cp_async()) ||
+               op->op.same_as(tl::ptx_cp_async())) {
+      ICHECK(op->args.size() == 3U || op->args.size() == 4U)
+          << "ptx_cp_async expects 3 or 4 arguments (dst_access_ptr, "
+             "src_access_ptr, count[, predicate])";
+
+      // Extract dst_access_ptr and check if it needs merging
       Call dst_access_ptr = Downcast<Call>(op->args[0]);
-      ICHECK(dst_access_ptr->op.same_as(builtin::tvm_access_ptr()));
+      ICHECK(dst_access_ptr->op.same_as(builtin::tvm_access_ptr()))
+          << "First argument must be tvm_access_ptr";
+
+      // tvm_access_ptr(ptype, data, offset, extent, rw_mask)
       Var buffer = Downcast<Var>(dst_access_ptr->args[1]);
-      if (!IsAppropriateSharedMemory(buffer))
+      if (!IsAppropriateSharedMemory(buffer)) {
         return StmtExprMutator::VisitExpr_(op);
+      }
+      if (!IsManagedAllocation(buffer)) {
+        return StmtExprMutator::VisitExpr_(op);
+      }
+      ICHECK(HasBufferOffset(buffer))
+          << "Shared memory allocation " << buffer->name_hint
+          << " was collected for merging but was not assigned an offset.";
+
       DataType dtype = op->dtype;
-      PrimExpr extra_offset = GetBufferOffset(buffer, dtype);
+      DataType ptr_dtype = dst_access_ptr->args[0].dtype();
+      PrimExpr extra_offset = GetBufferOffset(buffer, ptr_dtype);
       PrimExpr offset = this->VisitExpr(dst_access_ptr->args[2]);
-      int index_factor = dtype.bytes();
+
+      // Create new dst_access_ptr with merged buffer and adjusted offset
       auto new_dst_access_ptr =
           Call(DataType::Handle(), builtin::tvm_access_ptr(),
-               {dst_access_ptr->args[0], merged_buf_var_,
-                mul(extra_offset + offset, PrimExpr(index_factor)),
-                dst_access_ptr->args[3], dst_access_ptr->args[4]});
-      return Call(dtype, op->op,
-                  {new_dst_access_ptr, op->args[1], op->args[2]});
-    } else {
-      return StmtExprMutator::VisitExpr_(op);
+               {
+                   dst_access_ptr->args[0], // ptype
+                   merged_buf_var_,         // merged buffer
+                   extra_offset + offset,   // adjusted offset
+                   dst_access_ptr->args[3], // extent
+                   dst_access_ptr->args[4]  // rw_mask
+               });
+
+      Array<PrimExpr> cp_async_args = {new_dst_access_ptr, op->args[1],
+                                       op->args[2]};
+      if (op->args.size() == 4U) {
+        cp_async_args.push_back(op->args[3]);
+      }
+      return Call(dtype, op->op, cp_async_args);
     }
+    return StmtExprMutator::VisitExpr_(op);
   }
 
   PrimExpr GetBufferOffset(const Var &buffer_var, DataType dtype) {
@@ -1978,95 +792,858 @@ private:
     return indexdiv(it->second, dtype.bytes() * dtype.lanes());
   }
 
+  bool HasBufferOffset(const Var &buffer_var) {
+    return buffer_byte_offsets_.find(buffer_var.get()) !=
+           buffer_byte_offsets_.end();
+  }
+
+  bool IsManagedAllocation(const Var &buffer_var) {
+    return shmem_allocs_.find(buffer_var.get()) != shmem_allocs_.end();
+  }
+
+  // Wrapper function to determine if the shared memory allocation for a
+  // variable is appropriate.
   bool IsAppropriateSharedMemory(const Var &var) {
-    if (!target_scope_.empty())
-      return IsScopeMemory(var, target_scope_);
     return is_dynamic_ ? IsDynamicSharedMemory(var) : IsStaticSharedMemory(var);
   }
 
+  using StmtEntry = SharedMemLinearAccessPatternFinder::StmtEntry;
+  using StmtAttr = SharedMemLinearAccessPatternFinder::StmtAttr;
+
+  // Metadata about a single shared-memory allocation prior to merging.  This
+  // is used to build lifetimes, alignment requirements, and final offsets.
+  struct BufInfo {
+    const VarNode *var{nullptr};
+    std::string name;
+    PrimExpr size_expr;
+    std::optional<int64_t> const_size_bytes; // in bytes if compile-time known.
+    int alignment{0};                        // required byte alignment.
+    int start{0}; // first statement index touching the buf.
+    int end{0};   // one-past-last statement index.
+    DataType size_dtype{DataType::Int(32)};
+  };
+
+  // Interval describing the liveness window of a (constant-sized) allocation.
+  struct Interval {
+    int start{0};
+    int end{0};
+    size_t size_bytes{0};
+    int alignment{0};
+    const VarNode *var{nullptr};
+  };
+
+  // Result of a linear-scan arena packing.  Offsets contain the byte offset for
+  // each constant-sized buffer, arena_size is the total constant footprint.
+  struct ArenaPlan {
+    size_t arena_size{0};
+    std::unordered_map<const VarNode *, size_t> offsets;
+  };
+
+  static size_t AlignUpSize(size_t value, size_t alignment) {
+    if (alignment == 0) {
+      return value;
+    }
+    size_t remainder = value % alignment;
+    if (remainder == 0) {
+      return value;
+    }
+    return value + (alignment - remainder);
+  }
+
+  struct FreeBlock {
+    size_t offset{0};
+    size_t size{0};
+  };
+
+  class FreeList {
+  public:
+    std::optional<size_t> Allocate(size_t need, size_t alignment) {
+      // Best-fit search: pick the slot that wastes the least space after
+      // alignment.
+      int best = -1;
+      size_t best_waste = std::numeric_limits<size_t>::max();
+      for (int i = 0, n = static_cast<int>(blocks_.size()); i < n; ++i) {
+        size_t aligned = AlignUpSize(blocks_[i].offset, alignment);
+        size_t head = aligned - blocks_[i].offset;
+        if (head > blocks_[i].size)
+          continue;
+        size_t usable = blocks_[i].size - head;
+        if (usable < need)
+          continue;
+        size_t waste = blocks_[i].size - need;
+        if (waste < best_waste) {
+          best_waste = waste;
+          best = i;
+        }
+      }
+      if (best < 0)
+        return std::nullopt;
+      return CarveBlock(best, need, alignment);
+    }
+
+    // Try to allocate from the free block whose end touches arena_top.
+    // The block may be smaller than need; the caller grows the arena to
+    // cover the deficit.  Returns the aligned start offset on success.
+    std::optional<size_t> AllocateFromTail(size_t need, size_t alignment,
+                                           size_t arena_top) {
+      if (blocks_.empty())
+        return std::nullopt;
+      int tail_idx = static_cast<int>(blocks_.size()) - 1;
+      if (blocks_[tail_idx].offset + blocks_[tail_idx].size != arena_top)
+        return std::nullopt;
+
+      size_t aligned = AlignUpSize(blocks_[tail_idx].offset, alignment);
+      if (aligned >= arena_top)
+        return std::nullopt;
+
+      FreeBlock blk = blocks_[tail_idx];
+      size_t head = aligned - blk.offset;
+
+      blocks_.erase(blocks_.begin() + tail_idx);
+      if (head) {
+        InsertBlock(blk.offset, head);
+      }
+      return aligned;
+    }
+
+    void Free(size_t offset, size_t size) {
+      if (size == 0)
+        return;
+      InsertBlock(offset, size);
+    }
+
+  private:
+    // Insert a block at the correct sorted position and merge with adjacent
+    // neighbours so the sorted-and-coalesced invariant is preserved.
+    void InsertBlock(size_t offset, size_t size) {
+      FreeBlock entry{offset, size};
+      auto it = std::lower_bound(
+          blocks_.begin(), blocks_.end(), offset,
+          [](const FreeBlock &b, size_t off) { return b.offset < off; });
+      it = blocks_.insert(it, entry);
+
+      // Merge with the next neighbour.
+      auto next = std::next(it);
+      if (next != blocks_.end() && it->offset + it->size >= next->offset) {
+        size_t merged_end =
+            std::max(it->offset + it->size, next->offset + next->size);
+        it->size = merged_end - it->offset;
+        blocks_.erase(next);
+      }
+      // Merge with the previous neighbour.
+      if (it != blocks_.begin()) {
+        auto prev = std::prev(it);
+        if (prev->offset + prev->size >= it->offset) {
+          size_t merged_end =
+              std::max(prev->offset + prev->size, it->offset + it->size);
+          prev->size = merged_end - prev->offset;
+          blocks_.erase(it);
+        }
+      }
+    }
+
+    // Remove blocks_[idx], allocate `need` bytes at the aligned offset
+    // within it, and return any head/tail fragments to the free list.
+    size_t CarveBlock(int idx, size_t need, size_t alignment) {
+      FreeBlock blk = blocks_[idx];
+      blocks_.erase(blocks_.begin() + idx);
+
+      size_t aligned = AlignUpSize(blk.offset, alignment);
+      size_t head = aligned - blk.offset;
+      size_t tail = blk.size - head - need;
+
+      // InsertBlock uses lower_bound + coalesce, so insertion order is
+      // irrelevant for correctness.
+      if (tail)
+        InsertBlock(aligned + need, tail);
+      if (head)
+        InsertBlock(blk.offset, head);
+      return aligned;
+    }
+
+    std::vector<FreeBlock> blocks_;
+  };
+
+  struct ActiveInterval {
+    int end{0};
+    size_t offset{0};
+    size_t size{0};
+    const VarNode *var{nullptr};
+    bool operator>(const ActiveInterval &other) const {
+      return end > other.end;
+    }
+  };
+
+  static ArenaPlan LinearScanPack(std::vector<Interval> intervals) {
+    // Process intervals in program order so lifetimes correspond to the
+    // linearised CFG.
+    std::sort(intervals.begin(), intervals.end(),
+              [](const Interval &lhs, const Interval &rhs) {
+                if (lhs.start != rhs.start) {
+                  return lhs.start < rhs.start;
+                }
+                if (lhs.size_bytes != rhs.size_bytes) {
+                  return lhs.size_bytes > rhs.size_bytes;
+                }
+                return lhs.var->name_hint < rhs.var->name_hint;
+              });
+
+    std::priority_queue<ActiveInterval, std::vector<ActiveInterval>,
+                        std::greater<ActiveInterval>>
+        active;
+    FreeList freelist;
+    size_t arena_top = 0;
+    std::unordered_map<const VarNode *, size_t> offsets;
+
+    auto retire = [&](int pc) {
+      while (!active.empty() && active.top().end <= pc) {
+        const ActiveInterval top = active.top();
+        active.pop();
+        freelist.Free(top.offset, top.size);
+      }
+    };
+
+    for (const Interval &interval : intervals) {
+      retire(interval.start);
+      size_t offset = 0;
+      // 1) Reuse a fully fitting free block (best-fit).
+      // 2) Extend the tail free block that touches arena_top.
+      // 3) Bump-allocate at arena_top (reclaim alignment gap).
+      if (auto slot =
+              freelist.Allocate(interval.size_bytes, interval.alignment)) {
+        offset = slot.value();
+      } else if (auto tail_slot = freelist.AllocateFromTail(
+                     interval.size_bytes, interval.alignment, arena_top)) {
+        offset = tail_slot.value();
+        arena_top = offset + interval.size_bytes;
+      } else {
+        offset = AlignUpSize(arena_top, interval.alignment);
+        // Reclaim the alignment gap [arena_top, offset) so future small
+        // allocations can reuse it.
+        if (offset > arena_top) {
+          freelist.Free(arena_top, offset - arena_top);
+        }
+        arena_top = offset + interval.size_bytes;
+      }
+      active.push(ActiveInterval{interval.end, offset, interval.size_bytes,
+                                 interval.var});
+      offsets[interval.var] = offset;
+    }
+
+    return ArenaPlan{arena_top, std::move(offsets)};
+  }
+
+  PrimExpr AlignPrimExpr(const PrimExpr &value, int alignment) const {
+    if (alignment <= 1) {
+      return value;
+    }
+    DataType dtype = value.dtype();
+    ICHECK(dtype.is_int() || dtype.is_uint())
+        << "Expected integer dtype for alignment, but got " << dtype;
+    PrimExpr align_expr = make_const(dtype, alignment);
+    PrimExpr adjust = make_const(dtype, alignment - 1);
+    return indexdiv(value + adjust, align_expr) * align_expr;
+  }
+
+  // Event entry in liveness analysis
+  struct EventEntry {
+    // variables we generate
+    std::vector<const VarNode *> gen;
+    // variables we kill
+    std::vector<const VarNode *> kill;
+  };
+
+  void PlanAlignment(const Stmt &stmt) {
+    DLOG(INFO) << "PlanAlignment";
+    PostOrderVisit(stmt, [&](const ObjectRef &node) {
+      if (const auto *call = node.as<CallNode>()) {
+        if (call->op.same_as(tl::tl_gemm()) ||
+            call->op.same_as(tl::tl_gemm_sp())) {
+          DLOG(INFO) << "PostOrderVisit CallNode tl_gemm and tl_gemm_sp: "
+                     << call->op;
+        }
+      }
+    });
+  }
+  /*!
+   * \brief Liveness analysis to find gen and kill point of each variable.
+   * \param seq the linear pattern of storage access
+   */
+  void LivenessAnalysis(
+      const std::vector<StmtEntry> &seq,
+      const std::unordered_map<const Object *, StmtAttr> &stmt_attrs) {
+    // find kill point, do a reverse linear scan.
+    std::unordered_set<const VarNode *> touched;
+    for (size_t i = seq.size(); i != 0; --i) {
+      const StmtEntry &s = seq[i - 1];
+      for (const VarNode *buffer : s.touched) {
+        if (!touched.count(buffer)) {
+          touched.insert(buffer);
+          event_map_[s.stmt].kill.push_back(buffer);
+        }
+      }
+    }
+    // find gen point, do forward scan
+    touched.clear();
+    for (size_t i = 0; i < seq.size(); ++i) {
+      int64_t offset = seq[i].scope_pair_offset;
+      if (offset < 0)
+        continue;
+      const StmtEntry &s = seq[i + offset];
+      for (const VarNode *buffer : s.touched) {
+        if (!touched.count(buffer)) {
+          touched.insert(buffer);
+          event_map_[s.stmt].gen.push_back(buffer);
+        }
+      }
+    }
+
+    if (verbose_) {
+      std::vector<const Object *> stmt_keys;
+      for (const auto &stmt_entry : seq) {
+        auto stmt = stmt_entry.stmt;
+        if (std::find(stmt_keys.begin(), stmt_keys.end(), stmt) ==
+            stmt_keys.end()) {
+          stmt_keys.push_back(stmt);
+        }
+      }
+      LOG(DEBUG) << "Before reorder kill points, Liveness Analysis Results for "
+                 << (is_dynamic_ ? "Dynamic" : "Static") << " Shared Memory:";
+      for (const auto &stmt_key : stmt_keys) {
+        auto it = event_map_.find(stmt_key);
+        if (it == event_map_.end())
+          continue;
+
+        const EventEntry &entry = it->second;
+        if (entry.gen.empty() && entry.kill.empty())
+          continue;
+        ICHECK(stmt_attrs.count(stmt_key))
+            << "stmt_key = " << stmt_key->GetTypeKey();
+        auto level = stmt_attrs.at(stmt_key).level;
+        LOG(DEBUG) << "  Statement: " << stmt_key->GetTypeKey()
+                   << " (scope_level: " << level << ")";
+
+        std::stringstream gen_vars_ss;
+        bool x_generated = false;
+        for (const VarNode *var : entry.gen) {
+          gen_vars_ss << var->name_hint << " ";
+          if (var->name_hint == "x") {
+            x_generated = true;
+          }
+        }
+        if (!entry.gen.empty()) {
+          std::string gen_log_msg = "    GEN: " + gen_vars_ss.str();
+          if (x_generated) {
+            gen_log_msg += " <-- Buffer 'x' generated";
+          }
+          LOG(DEBUG) << gen_log_msg;
+        }
+
+        std::stringstream kill_vars_ss;
+        bool x_killed = false;
+        for (const VarNode *var : entry.kill) {
+          kill_vars_ss << var->name_hint << " ";
+          if (var->name_hint == "x") {
+            x_killed = true;
+          }
+        }
+        if (!entry.kill.empty()) {
+          std::string kill_log_msg = "    KILL: " + kill_vars_ss.str();
+          if (x_killed) {
+            kill_log_msg += " <-- Buffer 'x' killed";
+          }
+          LOG(DEBUG) << kill_log_msg;
+        }
+      }
+      LOG(DEBUG) << "End of Liveness Analysis Results.";
+    }
+
+    // Reorder kill points:
+    // For each buffer, if its kill statement is at a deeper scope level than
+    // its gen statement, we need to move the kill point to the end of the gen
+    // statement's scope level. This ensures proper memory deallocation at the
+    // right scope boundary.
+    std::vector<StmtEntry> gen_kill_seq;
+    for (const auto &stmt_entry : seq) {
+      // if has gen and kill, add to gen_kill_seq
+      if (!event_map_[stmt_entry.stmt].gen.empty() ||
+          !event_map_[stmt_entry.stmt].kill.empty()) {
+        gen_kill_seq.push_back(stmt_entry);
+      }
+    }
+
+    // Pending kill insertions are deferred until after the per-event loop
+    // below: ``event_map_[last_stmt_at_level].kill.push_back(...)`` may
+    // target the very same vector we are currently iterating, in which case
+    // the push_back can reallocate the underlying storage and invalidate
+    // ``it``. MSVC's debug iterator verification catches this on the next
+    // ``it != event.kill.end()`` check ("vector iterators incompatible");
+    // release builds silently dereference freed memory. Buffering the
+    // push-backs and applying them later removes the aliasing entirely.
+    std::vector<std::pair<const Object *, const VarNode *>>
+        pending_kill_inserts;
+
+    for (auto &event_pair : event_map_) {
+      const Object *stmt = event_pair.first;
+      EventEntry &event = event_pair.second;
+
+      // Skip if no kill points to process
+      if (event.kill.empty())
+        continue;
+
+      // Get scope level of current statement
+      ICHECK(stmt_attrs.count(stmt));
+      int kill_level = stmt_attrs.at(stmt).level;
+
+      std::unordered_set<const VarNode *> visited_buffers;
+
+      // For each killed buffer, find its gen statement and check scope levels
+      for (auto it = event.kill.begin(); it != event.kill.end();) {
+        const VarNode *buffer = *it;
+        bool found_gen = false;
+        int gen_level = 0;
+
+        // Find the gen statement for this buffer
+        for (const auto &gen_pair : event_map_) {
+          const auto &gen_event = gen_pair.second;
+          if (std::find(gen_event.gen.begin(), gen_event.gen.end(), buffer) !=
+              gen_event.gen.end()) {
+            found_gen = true;
+            gen_level = stmt_attrs.at(gen_pair.first).level;
+            break;
+          }
+        }
+
+        if (found_gen && kill_level > gen_level) {
+          if (visited_buffers.count(buffer)) {
+            ++it;
+            continue;
+          }
+          // Need to move kill point - remove from current event
+          it = event.kill.erase(it);
+
+          // Find the last statement at gen_level and add kill point there
+          // Find the last statement at gen_level in the sequence
+          const Object *last_stmt_at_level = nullptr;
+          auto stmt_it = gen_kill_seq.begin();
+          for (; stmt_it != gen_kill_seq.end(); ++stmt_it) {
+            if (stmt_it->stmt == stmt) {
+              break;
+            }
+          }
+          // start from current statement and find the last statement at
+          // gen_level
+
+          for (; stmt_it != gen_kill_seq.end(); ++stmt_it) {
+            auto next_it = stmt_it + 1;
+            if (next_it == gen_kill_seq.end() ||
+                stmt_attrs.at(next_it->stmt).level == gen_level) {
+              last_stmt_at_level = stmt_it->stmt;
+              break;
+            }
+          }
+          if (last_stmt_at_level) {
+            // Defer: pushing into event.kill (the vector ``it`` iterates) or
+            // into any other event.kill while the outer ``event_map_`` range
+            // loop is live can invalidate iterators / dangling references.
+            pending_kill_inserts.emplace_back(last_stmt_at_level, buffer);
+            visited_buffers.insert(buffer);
+          }
+        } else {
+          ++it;
+        }
+      }
+    }
+
+    // Apply deferred kill insertions now that no iterator into ``event_map_``
+    // / ``event.kill`` is live.
+    for (const auto &insert : pending_kill_inserts) {
+      event_map_[insert.first].kill.push_back(insert.second);
+    }
+
+    std::vector<const Object *> stmt_keys;
+    for (const auto &stmt_entry : seq) {
+      auto stmt = stmt_entry.stmt;
+      if (std::find(stmt_keys.begin(), stmt_keys.end(), stmt) ==
+          stmt_keys.end()) {
+        stmt_keys.push_back(stmt);
+      }
+    }
+
+    if (verbose_) {
+      LOG(DEBUG) << "Liveness Analysis Results for "
+                 << (is_dynamic_ ? "Dynamic" : "Static") << " Shared Memory:";
+      for (const auto &stmt_key : stmt_keys) {
+        auto it = event_map_.find(stmt_key);
+        if (it == event_map_.end())
+          continue;
+
+        const EventEntry &entry = it->second;
+        if (entry.gen.empty() && entry.kill.empty())
+          continue;
+        ICHECK(stmt_attrs.count(stmt_key))
+            << "stmt_key = " << stmt_key->GetTypeKey();
+        auto level = stmt_attrs.at(stmt_key).level;
+        LOG(DEBUG) << "  Statement: " << stmt_key->GetTypeKey()
+                   << " (scope_level: " << level << ")";
+
+        std::stringstream gen_vars_ss;
+        bool x_generated = false;
+        for (const VarNode *var : entry.gen) {
+          gen_vars_ss << var->name_hint << " ";
+          if (var->name_hint == "x") {
+            x_generated = true;
+          }
+        }
+        if (!entry.gen.empty()) {
+          std::string gen_log_msg = "    GEN: " + gen_vars_ss.str();
+          if (x_generated) {
+            gen_log_msg += " <-- Buffer 'x' generated";
+          }
+          LOG(DEBUG) << gen_log_msg;
+        }
+
+        std::stringstream kill_vars_ss;
+        bool x_killed = false;
+        for (const VarNode *var : entry.kill) {
+          kill_vars_ss << var->name_hint << " ";
+          if (var->name_hint == "x") {
+            x_killed = true;
+          }
+        }
+        if (!entry.kill.empty()) {
+          std::string kill_log_msg = "    KILL: " + kill_vars_ss.str();
+          if (x_killed) {
+            kill_log_msg += " <-- Buffer 'x' killed";
+          }
+          LOG(DEBUG) << kill_log_msg;
+        }
+      }
+      LOG(DEBUG) << "End of Liveness Analysis Results.";
+    }
+  }
+
+  /*!
+   * \brief Memory plan algorithm
+   * \param seq the linear pattern of storage access
+   * \param alloc_info
+   */
+  void
+  PlanMemory(const std::vector<StmtEntry> &seq,
+             const std::unordered_map<const Object *, StmtAttr> &stmt_attrs) {
+    buffer_byte_offsets_.clear();
+    (void)stmt_attrs;
+
+    if (shmem_allocs_.empty()) {
+      merged_alloc_size_ = make_const(DataType::Int(64), 0);
+      return;
+    }
+
+    // Discover the first and last touch for every allocation.
+    std::unordered_map<const VarNode *, int> start_index;
+    std::unordered_map<const VarNode *, int> end_index;
+
+    for (size_t i = 0; i < seq.size(); ++i) {
+      auto it = event_map_.find(seq[i].stmt);
+      if (it == event_map_.end())
+        continue;
+      for (const VarNode *var : it->second.gen) {
+        start_index.emplace(var, static_cast<int>(i));
+      }
+      for (const VarNode *var : it->second.kill) {
+        end_index[var] = std::max(end_index[var], static_cast<int>(i) + 1);
+      }
+    }
+
+    const int seq_len = static_cast<int>(seq.size());
+    for (const auto &kv : start_index) {
+      if (!end_index.count(kv.first)) {
+        end_index[kv.first] = seq_len;
+      }
+    }
+
+    // Create a sorted vector of keys from shmem_allocs_ for deterministic
+    // iteration
+    std::vector<const VarNode *> sorted_vars;
+    sorted_vars.reserve(shmem_allocs_.size());
+    for (const auto &kv : shmem_allocs_) {
+      sorted_vars.push_back(kv.first);
+    }
+    std::sort(sorted_vars.begin(), sorted_vars.end(),
+              [](const VarNode *a, const VarNode *b) {
+                return a->name_hint < b->name_hint;
+              });
+
+    std::vector<BufInfo> buf_infos;
+    buf_infos.reserve(shmem_allocs_.size());
+    // Build a BufInfo for all allocations that participate in liveness.
+    for (const VarNode *var : sorted_vars) {
+      auto start_it = start_index.find(var);
+      if (start_it == start_index.end()) {
+        continue;
+      }
+
+      BufInfo info;
+      info.var = var;
+      info.name = var->name_hint;
+      info.start = start_it->second;
+      info.end = std::max(end_index[var], info.start + 1);
+      info.alignment = align_bytes_;
+      auto align_it = shmem_alignment_map_.find(var);
+      if (align_it != shmem_alignment_map_.end()) {
+        info.alignment = std::max(info.alignment, align_it->second);
+      }
+
+      const AllocBufferNode *alloc = shmem_allocs_.at(var);
+      int64_t bytes_per_elem = static_cast<int64_t>(
+          alloc->buffer->dtype.bytes() * alloc->buffer->dtype.lanes());
+      DataType size_dtype = DataType::Int(32);
+      if (!alloc->buffer->shape.empty()) {
+        size_dtype = alloc->buffer->shape[0].dtype();
+      }
+      if (!size_dtype.is_int() && !size_dtype.is_uint()) {
+        size_dtype = DataType::Int(32);
+      }
+
+      PrimExpr size_expr = make_const(size_dtype, bytes_per_elem);
+      for (const PrimExpr &extent : alloc->buffer->shape) {
+        PrimExpr e = extent;
+        if (e.dtype() != size_dtype) {
+          e = cast(size_dtype, e);
+        }
+        size_expr = size_expr * e;
+      }
+      info.size_dtype = size_dtype;
+      info.size_expr = size_expr;
+
+      auto const_size = GetRef<AllocBuffer>(alloc).ConstantAllocationSize();
+      if (const_size.has_value()) {
+        info.const_size_bytes = const_size.value() * bytes_per_elem;
+      }
+
+      buf_infos.push_back(std::move(info));
+    }
+
+    // Stable order so the later passes have deterministic behaviour.
+    std::sort(buf_infos.begin(), buf_infos.end(),
+              [](const BufInfo &a, const BufInfo &b) {
+                if (a.start != b.start)
+                  return a.start < b.start;
+                if (a.end != b.end)
+                  return a.end < b.end;
+                return a.name < b.name;
+              });
+
+    std::vector<Interval> intervals;
+    intervals.reserve(buf_infos.size());
+    for (const BufInfo &info : buf_infos) {
+      if (!info.const_size_bytes.has_value())
+        continue;
+      // Only constant-sized buffers participate in the arena packing because
+      // dynamic sizes must be placed sequentially later.
+      Interval interval;
+      interval.start = info.start;
+      interval.end = info.end;
+      interval.size_bytes = static_cast<size_t>(
+          std::max<int64_t>(0, info.const_size_bytes.value()));
+      interval.alignment = info.alignment;
+      interval.var = info.var;
+      intervals.push_back(interval);
+    }
+
+    ArenaPlan plan = LinearScanPack(std::move(intervals));
+    size_t arena_size_const = plan.arena_size;
+
+    if (verbose_) {
+      LOG(DEBUG) << "ArenaPlan (constant buffers): arena_size="
+                 << arena_size_const;
+      for (const auto &kv : plan.offsets) {
+        const VarNode *var = kv.first;
+        LOG(DEBUG) << "  " << var->name_hint << " -> offset=" << kv.second;
+      }
+    }
+
+    // Cursor tracks the running byte offset within the merged arena.
+    DataType offset_dtype =
+        buf_infos.empty() ? DataType::Int(32) : buf_infos.front().size_dtype;
+    PrimExpr total_size = make_const(offset_dtype, 0);
+    PrimExpr cursor = AlignPrimExpr(
+        make_const(offset_dtype, static_cast<int64_t>(arena_size_const)),
+        align_bytes_);
+
+    auto CastToOffset = [&](PrimExpr expr) -> PrimExpr {
+      if (expr.dtype() == offset_dtype) {
+        return expr;
+      }
+      return cast(offset_dtype, expr);
+    };
+
+    for (const BufInfo &info : buf_infos) {
+      PrimExpr offset_expr;
+      auto it = plan.offsets.find(info.var);
+      if (it != plan.offsets.end()) {
+        offset_expr =
+            make_const(offset_dtype, static_cast<int64_t>(it->second));
+      } else {
+        // Dynamic-sized buffers are appended after the constant arena.
+        cursor = AlignPrimExpr(cursor, info.alignment);
+        PrimExpr size_expr = CastToOffset(info.size_expr);
+        offset_expr = cursor;
+        cursor = offset_expr + size_expr;
+      }
+
+      buffer_byte_offsets_[info.var] = offset_expr;
+      PrimExpr buf_end = offset_expr + CastToOffset(info.size_expr);
+      total_size = max(total_size, buf_end);
+    }
+
+    merged_alloc_size_ = buf_infos.empty()
+                             ? make_const(offset_dtype, 0)
+                             : AlignPrimExpr(total_size, align_bytes_);
+
+    bool overlap_detected = false;
+
+    if (verbose_) {
+      LOG(DEBUG) << "Memory Allocation Plan for "
+                 << (is_dynamic_ ? "Dynamic" : "Static") << " Shared Memory:";
+      LOG(DEBUG) << "  Total Merged Size (aligned): " << merged_alloc_size_;
+      for (const BufInfo &info : buf_infos) {
+        const PrimExpr &offset = buffer_byte_offsets_.at(info.var);
+        LOG(DEBUG) << "    Buffer: " << info.name << " start=" << info.start
+                   << " end=" << info.end << " alignment=" << info.alignment
+                   << " offset=" << offset << " size=" << info.size_expr;
+      }
+      // Sanity check for overlapping constant buffers.
+      for (size_t i = 0; i < buf_infos.size(); ++i) {
+        const BufInfo &a = buf_infos[i];
+        auto a_off_imm = buffer_byte_offsets_.at(a.var).as<IntImmNode>();
+        if (!a.const_size_bytes.has_value() || a_off_imm == nullptr)
+          continue;
+        int64_t a_off = a_off_imm->value;
+        int64_t a_end = a_off + a.const_size_bytes.value();
+        for (size_t j = i + 1; j < buf_infos.size(); ++j) {
+          const BufInfo &b = buf_infos[j];
+          auto b_off_imm = buffer_byte_offsets_.at(b.var).as<IntImmNode>();
+          if (!b.const_size_bytes.has_value() || b_off_imm == nullptr)
+            continue;
+          bool live_overlap = !(a.end <= b.start || b.end <= a.start);
+          if (!live_overlap)
+            continue;
+          int64_t b_off = b_off_imm->value;
+          int64_t b_end = b_off + b.const_size_bytes.value();
+          bool mem_overlap = !(a_end <= b_off || b_end <= a_off);
+          if (mem_overlap) {
+            overlap_detected = true;
+            LOG(WARNING) << "Buffer overlap detected between " << a.name
+                         << " and " << b.name << " (lifetime overlap with "
+                         << "offset ranges [" << a_off << ", " << a_end
+                         << ") and [" << b_off << ", " << b_end << ")).";
+          }
+        }
+      }
+    }
+
+    if (overlap_detected) {
+      LOG(WARNING) << "Detected overlapping constant buffers; falling back to "
+                   << "sequential allocation without reuse.";
+      buffer_byte_offsets_.clear();
+      // In the fallback path we simply lay buffers out sequentially.
+      PrimExpr new_cursor = make_const(offset_dtype, 0);
+      PrimExpr new_total = make_const(offset_dtype, 0);
+      for (const BufInfo &info : buf_infos) {
+        new_cursor = AlignPrimExpr(new_cursor, info.alignment);
+        PrimExpr size_expr = CastToOffset(info.size_expr);
+        buffer_byte_offsets_[info.var] = new_cursor;
+        PrimExpr buf_end = new_cursor + size_expr;
+        new_total = max(new_total, buf_end);
+        new_cursor = buf_end;
+      }
+      merged_alloc_size_ = buf_infos.empty()
+                               ? make_const(offset_dtype, 0)
+                               : AlignPrimExpr(new_total, align_bytes_);
+    }
+  }
+
+  // Whether enable dynamic analysis.
   bool is_dynamic_{true};
+
+  // Whether enable verbose logging.
   bool verbose_{false};
+  // The alignment bytes for the merged buffer
   int align_bytes_{16};
+  // The var for the merged buffer
   Var merged_buf_var_{"buf_dyn_shmem",
                       PointerType(PrimType(DataType::UInt(8)), "shared.dyn")};
-  std::string target_scope_;
-  std::unordered_map<const VarNode *, const AllocateNode *> shmem_allocs_;
-  std::vector<const VarNode *> alloc_order_;
+  // The mapping from the original buffer var to its allocate
+  std::unordered_map<const VarNode *, const AllocBufferNode *> shmem_allocs_;
+  // The size of the merged buffer
   PrimExpr merged_alloc_size_{0};
+  // The mapping from the original buffer var to its offset in the merged buffer
   std::unordered_map<const VarNode *, PrimExpr> buffer_byte_offsets_;
+  // The mapping from the original buffer objects to their location in the
+  // merged buffer.
   std::unordered_map<const BufferNode *, Buffer> buffer_remap_;
+  // The flag indicating whether the merged buffer has been allocated
   bool allocated_{false};
+  // Locations of free ops.
+  std::unordered_map<const Object *, EventEntry> event_map_;
+  // The mapping of buffer bytes alignment
   std::unordered_map<const VarNode *, int> shmem_alignment_map_;
+  // Whether to preserve original buffer vars as handle aliases of the merged
+  // allocation. Some backends, such as WebGPU, cannot print handle-valued Bind
+  // nodes and use the direct merged-buffer rewrite path instead.
+  bool preserve_aliases_{true};
 };
 
 Stmt MergeSharedMemoryAllocations(Stmt stmt, bool merge_static_smem,
                                   bool enable_aggressive_merge,
-                                  int align_bytes = 16, bool verbose = false) {
+                                  int align_bytes = 16, bool verbose = false,
+                                  bool preserve_aliases = true,
+                                  bool disable_reuse = false) {
   AllocateCollector collector;
   collector(stmt);
-  auto run = [&](SharedMemoryRewriter &rewriter) {
-    if (enable_aggressive_merge) {
-      rewriter.PlanReuse(stmt);
-    } else {
-      rewriter.PlanNoReuse(stmt);
-    }
-    stmt = rewriter(std::move(stmt));
-  };
   if (collector.dyn_shmem_allocs_.size() > 1) {
-    SharedMemoryRewriter rewriter(collector.dyn_shmem_allocs_,
-                                  collector.dyn_shmem_order_, true, verbose,
-                                  align_bytes);
-    run(rewriter);
+    SharedMemoryRewriter rewriter(collector.dyn_shmem_allocs_, true, verbose,
+                                  align_bytes, preserve_aliases);
+    rewriter.PlanReuse(stmt, true,
+                       disable_reuse ? false : enable_aggressive_merge, false,
+                       disable_reuse);
+    stmt = rewriter(std::move(stmt));
   }
   if (merge_static_smem && collector.static_shmem_allocs_.size() > 1) {
-    SharedMemoryRewriter rewriter(collector.static_shmem_allocs_,
-                                  collector.static_shmem_order_, false, verbose,
-                                  align_bytes);
-    run(rewriter);
-  }
-  // Iterate scopes in name order so each scope's merged buffer is built
-  // deterministically and in a stable scope sequence.
-  std::vector<std::string> ascend_scopes;
-  ascend_scopes.reserve(collector.ascend_scope_allocs_.size());
-  for (const auto &kv : collector.ascend_scope_allocs_)
-    ascend_scopes.push_back(kv.first);
-  std::sort(ascend_scopes.begin(), ascend_scopes.end());
-  for (const std::string &scope : ascend_scopes) {
-    const auto &allocs = collector.ascend_scope_allocs_.at(scope);
-    if (allocs.size() <= 1)
-      continue;
-    const auto order_it = collector.ascend_scope_order_.find(scope);
-    const std::vector<const VarNode *> &order =
-        (order_it != collector.ascend_scope_order_.end())
-            ? order_it->second
-            : std::vector<const VarNode *>{};
-    std::string suffix = scope.substr(7);
-    std::string merged_name = "buf_dyn_" + suffix;
-    std::string merged_scope = scope + ".dyn";
-    SharedMemoryRewriter rewriter(allocs, order, true, verbose, align_bytes,
-                                  merged_name, merged_scope, scope);
-    run(rewriter);
+    SharedMemoryRewriter rewriter(collector.static_shmem_allocs_, false,
+                                  verbose, align_bytes, preserve_aliases);
+    rewriter.PlanReuse(stmt, false,
+                       disable_reuse ? false : enable_aggressive_merge, false,
+                       disable_reuse);
+    stmt = rewriter(std::move(stmt));
   }
   return stmt;
 }
 
-using namespace tir::transform;
+using namespace tirx::transform;
 
 namespace transform {
 
 Pass MergeSharedMemoryAllocations(bool enable_aggressive_merge = false,
-                                  int align_bytes = 16) {
-  auto pass_func = [enable_aggressive_merge, align_bytes](
+                                  int align_bytes = 16,
+                                  bool disable_reuse = false) {
+  auto pass_func = [enable_aggressive_merge, align_bytes, disable_reuse](
                        PrimFunc f, const IRModule &m, PassContext ctx) {
     bool merge_static_smem =
-        ctx->GetConfig<Bool>("tir.merge_static_smem", Bool(false)).value();
+        ctx->GetConfig<Bool>("tirx.merge_static_smem", Bool(false)).value();
     bool debug_merge_shared_memory_allocations =
         ctx->GetConfig<Bool>(kDebugMergeSharedMemoryAllocations, Bool(false))
             .value();
+    bool preserve_aliases = true;
+    if (auto target = f->GetAttr<Target>(tvm::attr::kTarget)) {
+      preserve_aliases = target.value()->kind->name != "webgpu";
+    }
     auto *n = f.CopyOnWrite();
     n->body = tl::MergeSharedMemoryAllocations(
         std::move(n->body), merge_static_smem, enable_aggressive_merge,
-        align_bytes, debug_merge_shared_memory_allocations);
+        align_bytes, debug_merge_shared_memory_allocations, preserve_aliases,
+        disable_reuse);
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.MergeSharedMemoryAllocations",
@@ -2074,7 +1651,7 @@ Pass MergeSharedMemoryAllocations(bool enable_aggressive_merge = false,
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
-  namespace refl = tvm::ffi::reflection;
+  namespace refl = reflection;
   refl::GlobalDef().def("tl.transform.MergeSharedMemoryAllocations",
                         MergeSharedMemoryAllocations);
 }

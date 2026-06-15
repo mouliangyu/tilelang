@@ -26,22 +26,27 @@
 #include "../config.h"
 #include "../op/builtin.h"
 #include "../op/utils.h"
-#include "../target/utils.h"
 #include "arith/int_operator.h"
 #include "arith/ir_visitor_with_analyzer.h"
+#include "backend/common/target_utils.h"
 #include "common/loop_vectorization_utils.h"
-#include "tvm/tir/analysis.h"
-#include "tvm/tir/var.h"
+#include "support/check.h"
 #include <iostream>
+#include <optional>
 #include <tvm/arith/iter_affine_map.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/stmt_functor.h>
+#include <tvm/ir/cast.h>
+#include <tvm/runtime/logging.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/var.h>
 #include <vector>
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
+using namespace ffi;
 
 /*!
  * \brief Check if buffer strides represent a contiguous (row-major) layout.
@@ -84,6 +89,7 @@ struct BufferVectorInfo {
   int vector_size;
   bool is_store;
   Array<PrimExpr> indices;
+  bool is_cast = false; // true for CastNode constraints (vs CallNode)
 };
 
 Array<PrimExpr> GetBufferStrides(const Buffer &buffer) {
@@ -263,6 +269,7 @@ public:
     int local_fragment_min = initial_vector_size_;
     int memory_min = initial_vector_size_;
     int call_node_min = initial_vector_size_;
+    int non_cast_call_node_min = initial_vector_size_;
     bool has_global_or_shared_buffer = false;
 
     auto is_local_or_fragment = [](const Buffer &buf) {
@@ -280,21 +287,47 @@ public:
                     << " -> vector_size=" << info.vector_size
                     << (info.is_store ? " [store]" : " [load]") << "\n";
         } else {
-          std::cerr << "  [cast/call] -> vector_size=" << info.vector_size
-                    << "\n";
+          std::cerr << "  [" << (info.is_cast ? "cast" : "call")
+                    << "] -> vector_size=" << info.vector_size << "\n";
         }
       }
       if (!buffer.defined()) {
-        // CastNode, CallNode do not have buffer defined.
         call_node_min = arith::ZeroAwareGCD(call_node_min, info.vector_size);
+        if (!info.is_cast) {
+          non_cast_call_node_min =
+              arith::ZeroAwareGCD(non_cast_call_node_min, info.vector_size);
+        }
       } else if (is_local_or_fragment(buffer)) {
         local_fragment_min =
             arith::ZeroAwareGCD(local_fragment_min, info.vector_size);
         local_fragment_buffers.push_back(info);
       } else {
         // global, shared, shared.dyn
-        memory_min = arith::ZeroAwareGCD(memory_min, info.vector_size);
-        has_global_or_shared_buffer = true;
+        // If a *load*'s indices don't depend on loop var (e.g. b[0]), treat
+        // as local — it will become a scalar broadcast, not a vector memory
+        // access, and DecoupleTypeCast won't create a cast buffer for it.
+        // Stores must stay in the memory bucket: a loop-invariant store is a
+        // reduction-like pattern where ComputeBufferVectorSize has already
+        // returned 1 to disable vectorization, and that constraint must not
+        // be dropped (memory strategy ignores local_fragment_min).
+        bool depends_on_loop_var = true;
+        if (!info.indices.empty() && inner_for_) {
+          Array<PrimExpr> strides = GetBufferStrides(info.buffer);
+          PrimExpr elem_offset = 0;
+          for (size_t i = 0; i < info.indices.size(); ++i) {
+            elem_offset += info.indices[i] * strides[i];
+          }
+          depends_on_loop_var = !IsExprInvariantInVectorBoundary(
+              elem_offset, inner_for_->loop_var, vector_size_, analyzer_);
+        }
+        if (depends_on_loop_var) {
+          memory_min = arith::ZeroAwareGCD(memory_min, info.vector_size);
+          has_global_or_shared_buffer = true;
+        } else {
+          local_fragment_min =
+              arith::ZeroAwareGCD(local_fragment_min, info.vector_size);
+          local_fragment_buffers.push_back(info);
+        }
       }
     }
 
@@ -317,12 +350,15 @@ public:
       }
     } else if (has_global_or_shared_buffer) {
       // Has memory buffers and simple case (no SeqStmt):
-      // ignore local/fragment constraints
-      vector_size_ = arith::ZeroAwareGCD(memory_min, call_node_min);
+      // ignore local/fragment constraints AND cast constraints.
+      // Cast constraints are ignored because DecoupleTypeCast will later
+      // split mixed-type operations into separate loops, allowing memory
+      // copies to use wider vectors independently of cast width limits.
+      vector_size_ = arith::ZeroAwareGCD(memory_min, non_cast_call_node_min);
       if (verbose) {
         std::cerr << "  [Strategy] Has memory buffers (simple case), using "
-                     "memory_min="
-                  << memory_min
+                  << "memory_min=" << memory_min
+                  << ", non_cast_call_node_min=" << non_cast_call_node_min
                   << " (ignoring local/fragment_min=" << local_fragment_min
                   << ")" << "\n";
       }
@@ -392,7 +428,7 @@ private:
       // tiling size is always static.
       if (!extent_ptr) {
         loop_extent_vector_size_ = 1;
-        return ffi::GetRef<Stmt>(node);
+        return GetRef<Stmt>(node);
       }
       loop_extent_vector_size_ =
           arith::ZeroAwareGCD(initial_vector_size_, *extent_ptr);
@@ -425,6 +461,69 @@ private:
   Stmt VisitStmt_(const IfThenElseNode *node) final {
     CheckConditionVectorized(node->condition);
     return arith::IRMutatorWithAnalyzer::VisitStmt_(node);
+  }
+
+  static std::optional<int> GetAccessPtrElementBits(const PrimExpr &expr) {
+    const auto *ptr_call = expr.as<CallNode>();
+    if (ptr_call == nullptr) {
+      return std::nullopt;
+    }
+    if (ptr_call->op.same_as(builtin::tvm_access_ptr())) {
+      ICHECK(!ptr_call->args.empty());
+      DataType dtype = ptr_call->args[0].dtype();
+      return dtype.bits() * dtype.lanes();
+    }
+    if (ptr_call->op.same_as(tl::access_ptr())) {
+      ICHECK_EQ(ptr_call->args.size(), 3U)
+          << "tl.access_ptr expects 3 args: (BufferLoad, extent, rw_mask)";
+      const auto *buffer_load = ptr_call->args[0].as<BufferLoadNode>();
+      ICHECK(buffer_load) << "tl.access_ptr arg0 must be BufferLoad";
+      DataType dtype = buffer_load->buffer->dtype;
+      return dtype.bits() * dtype.lanes();
+    }
+    return std::nullopt;
+  }
+
+  static std::optional<int> GetCPAsyncBitsPerCall(const CallNode *node) {
+    ICHECK_GE(node->args.size(), 3U)
+        << "cp.async expects at least 3 arguments, but got " << node->args;
+    const auto *count_imm = node->args[2].as<IntImmNode>();
+    ICHECK(count_imm) << "cp.async transfer count must be IntImm, but got "
+                      << node->args[2];
+    int count = static_cast<int>(count_imm->value);
+    if (count <= 0) {
+      return std::nullopt;
+    }
+    if (node->op.same_as(builtin::ptx_cp_async())) {
+      return count * 8;
+    }
+    ICHECK(node->op.same_as(tl::ptx_cp_async()));
+    auto dst_elem_bits = GetAccessPtrElementBits(node->args[0]);
+    auto src_elem_bits = GetAccessPtrElementBits(node->args[1]);
+    if (!dst_elem_bits.has_value() || !src_elem_bits.has_value()) {
+      return std::nullopt;
+    }
+    int dst_total_bits = count * dst_elem_bits.value();
+    int src_total_bits = count * src_elem_bits.value();
+    ICHECK_EQ(dst_total_bits, src_total_bits)
+        << "tl.ptx_cp_async requires src/dst transfer widths to match, but got "
+        << dst_total_bits << " vs " << src_total_bits << " bits";
+    return dst_total_bits;
+  }
+
+  static int GetMaxCPAsyncVectorizeLength(int per_call_bits) {
+    if (per_call_bits <= 0) {
+      return 1;
+    }
+    int vectorize_length = 1;
+    for (int target_bytes : {16, 8, 4}) {
+      int target_bits = target_bytes * 8;
+      if (target_bits % per_call_bits == 0) {
+        vectorize_length =
+            std::max(vectorize_length, target_bits / per_call_bits);
+      }
+    }
+    return vectorize_length;
   }
 
   PrimExpr VisitExpr_(const CallNode *node) final {
@@ -472,6 +571,15 @@ private:
 
       buffer_vector_infos_.push_back({Buffer(), vectorize_length, false, {}});
       return arith::IRMutatorWithAnalyzer::VisitExpr_(node);
+    } else if (node->op.same_as(builtin::ptx_cp_async()) ||
+               node->op.same_as(tl::ptx_cp_async())) {
+      // builtin::ptx_cp_async stores bytes, while tl::ptx_cp_async stores
+      // logical element counts. In both cases we pick the largest vector width
+      // whose eventual PTX payload is one of {4, 8, 16} bytes.
+      int vectorize_length =
+          GetMaxCPAsyncVectorizeLength(GetCPAsyncBitsPerCall(node).value_or(0));
+      buffer_vector_infos_.push_back({Buffer(), vectorize_length, false, {}});
+      return arith::IRMutatorWithAnalyzer::VisitExpr_(node);
     } else if (node->op == builtin::address_of() ||
                node->op == tl::access_ptr()) {
       // address_of and tl.access_ptr have buffer load value so we should
@@ -496,7 +604,7 @@ private:
       if (!inner_for_)
         return true;
       bool all_invariant = true;
-      PostOrderVisit(ffi::GetRef<PrimExpr>(node), [&](const ObjectRef &obj) {
+      PostOrderVisit(GetRef<PrimExpr>(node), [&](const ObjectRef &obj) {
         if (!all_invariant)
           return;
         if (auto *load = obj.as<BufferLoadNode>()) {
@@ -566,7 +674,7 @@ private:
         << "tvm_access_ptr requires at least 3 args";
 
     // args[0] is TypeAnnotation(dtype[/lanes]); dtype() encodes the element
-    // type. See tvm::tir::Buffer::access_ptr implementation.
+    // type. See tvm::tirx::Buffer::access_ptr implementation.
     DataType dtype = node->args[0].dtype();
     Var data_var;
     if (auto data_var_node = node->args[1].as<VarNode>()) {
@@ -670,10 +778,38 @@ private:
   }
 
   PrimExpr VisitExpr_(const CastNode *node) final {
-    int cast_vector_size = arith::ZeroAwareGCD(
-        vector_load_bits_max_ / node->dtype.bits(), initial_vector_size_);
+    // Consider both source and target types to ensure all intermediate
+    // vector types can be represented. For example, casting int32 to
+    // float8_e4m3fn: target allows 128/8=16 lanes but int32 only supports
+    // up to 128/32=4 lanes in CUDA vector types.
+    int target_lanes = vector_load_bits_max_ / node->dtype.bits();
+    int source_bits = node->value.dtype().bits();
+    int max_lanes = target_lanes;
+    if (source_bits > 0) {
+      int source_lanes = vector_load_bits_max_ / source_bits;
+      max_lanes = std::min(target_lanes, source_lanes);
+    }
+    int cast_vector_size = arith::ZeroAwareGCD(max_lanes, initial_vector_size_);
+    // For casts that carry a "rbits" annotation (stochastic rounding), the
+    // rbits operand must be invariant within the vectorized boundary so the
+    // same value can be shared across the lanes of each PTX cvt.rs.*
+    // instruction. Halve the vector size until invariance holds, mirroring
+    // the call-node fallback above.
+    if (inner_for_) {
+      auto it = node->annotations.find("rbits");
+      if (it != node->annotations.end()) {
+        PrimExpr rbits = Downcast<PrimExpr>((*it).second);
+        while (cast_vector_size > 1 &&
+               !IsExprInvariantInVectorBoundary(rbits, inner_for_->loop_var,
+                                                cast_vector_size, analyzer_)) {
+          cast_vector_size /= 2;
+        }
+      }
+    }
     // Record cast constraint (use empty buffer to indicate cast)
-    buffer_vector_infos_.push_back({Buffer(), cast_vector_size, false, {}});
+    // Mark is_cast=true so Plan() can distinguish cast from other call nodes
+    buffer_vector_infos_.push_back(
+        {Buffer(), cast_vector_size, false, {}, /*is_cast=*/true});
     return arith::IRMutatorWithAnalyzer::VisitExpr_(node);
   }
 
@@ -755,27 +891,24 @@ private:
         {buffer, buffer_vec_size, is_store, indices});
   }
 
-  // NOTE(wt): The base class IRMutatorWithAnalyzer::VisitStmt_(LetStmtNode*)
+  // NOTE(wt): The base class IRMutatorWithAnalyzer::VisitStmt_(BindNode*)
   // binds let variables, but this causes issues when the same variable name
   // appears multiple times with different values (e.g., in pipelined loops
   // where the body is duplicated). For this case, we allow the analyzer to
   // override the binding. Check the impl of
-  // IRMutatorWithAnalyzer::VisitStmt_(LetStmtNode*) in:
+  // IRMutatorWithAnalyzer::VisitStmt_(BindNode*) in:
   // tvm/src/arith/ir_mutator_with_analyzer.cc
-  Stmt VisitStmt_(const LetStmtNode *op) final {
+  Stmt VisitStmt_(const BindNode *op) final {
     PrimExpr value = this->VisitExpr(op->value);
     if (SideEffect(value) <= CallEffectKind::kPure) {
       // Allow override to handle duplicated loop bodies in pipelined loops
       analyzer_->Bind(op->var, value, /*allow_override=*/true);
     }
-    // Continue visiting the body to collect vectorization info
-    Stmt body = this->VisitStmt(op->body);
-    if (value.same_as(op->value) && body.same_as(op->body)) {
-      return ffi::GetRef<Stmt>(op);
+    if (value.same_as(op->value)) {
+      return GetRef<Stmt>(op);
     } else {
       auto n = this->CopyOnWrite(op);
       n->value = std::move(value);
-      n->body = std::move(body);
       return Stmt(n);
     }
   }
@@ -859,9 +992,8 @@ int GetVectorizeSize(const For &loop, arith::Analyzer *analyzer,
 bool CanProveIndependent(const PrimExpr &expr, Var var,
                          arith::Analyzer *analyzer) {
   // 1. if var doesn't exist, it is independent
-  bool used_var = UsesVar(expr, [&](const VarNode *v) {
-    return tvm::ffi::GetRef<Var>(v).same_as(var);
-  });
+  bool used_var = UsesVar(
+      expr, [&](const VarNode *v) { return GetRef<Var>(v).same_as(var); });
   if (!used_var) {
     return true;
   }

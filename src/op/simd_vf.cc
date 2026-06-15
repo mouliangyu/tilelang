@@ -5,12 +5,10 @@
 
 #include "simd_vf.h"
 
-#include <tvm/tir/analysis.h>
-
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 void SimdVFOpNode::RegisterReflection() {
   namespace refl = tvm::ffi::reflection;

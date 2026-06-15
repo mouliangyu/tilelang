@@ -57,7 +57,7 @@ def compile_ascend(
         The Ascend kernel source code.
 
     target_format : str
-        Output format — ``"o"`` for object file (default), ``"so"`` for shared
+        Output format - ``"o"`` for object file (default), ``"so"`` for shared
         library.
 
     npu_arch : str, optional

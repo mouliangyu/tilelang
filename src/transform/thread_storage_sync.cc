@@ -24,21 +24,24 @@
 #include "./common/constr_visitor.h"
 #include "./common/thread_sync_types.h"
 #include "arith/ir_mutator_with_analyzer.h"
+#include "common/attr.h"
 #include "runtime/thread_storage_scope.h"
+#include "support/check.h"
 #include "tir/transforms/ir_utils.h"
+#include <algorithm>
 #include <string>
 #include <tvm/arith/analyzer.h>
 #include <tvm/arith/int_set.h>
-#include <tvm/ffi/function.h>
-#include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/attrs.h>
-#include <tvm/target/target_info.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/expr.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/ir/cast.h>
+#include <tvm/runtime/logging.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/expr.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -46,56 +49,164 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 using namespace ffi;
 using arith::IRMutatorWithAnalyzer;
 using runtime::StorageRank;
 using runtime::StorageScope;
 
-// There are cases where necessary syncthreads is not inserted by
-// ThreadSyncInserter. For example, syncthreads is needed after async_wait_queue
-// in the second loop below, but since ThreadSyncInserter is not aware of the
-// asynchronous semantics, it cannot tell that the syncthreads is needed there.
+// Similar to ThreadSyncAfterWaitQueueInserter, but for explicit cp.async
+// synchronization intrinsics (ptx_wait_group).
 //
-// // Pipeline prologue
-// for i in range(125):
-//    async_commit_queue(0):
-//       async_scope:
-//          shared[(i + 3) % 4] = ...
-// ...
+// In TileLang, cp.async copies may be lowered to explicit ptx_cp_async +
+// ptx_commit_group, and pipelining can move ptx_wait_group away from the copy
+// statement it originally guarded. tvm_storage_sync barriers inserted by
+// ThreadSyncPlanner are based on memory conflicts and may end up *before* the
+// wait_group, which is incorrect for cp.async because __syncthreads() does not
+// wait for outstanding asynchronous copies.
 //
-// // Pipeline Epilogue
-// for i in range(3):
-//    async_wait_queue(0, 2 - i):
-//       local[...] = shared[(i + 125) % 4]
-
-// This class adds syncthreads after all async_wait_queue. That includes
-// syncthreads that can be inserted by ThreadSyncInserter as well, but
-// ThreadSyncInserter will not insert duplicate syncthreads if it finds an
-// existing one at the synchronization point.
-class ThreadSyncAfterWaitQueueInserter : public StmtExprMutator {
+// Correct usage requires:
+//   ptx_wait_group(N);
+//   tvm_storage_sync("shared");   // __syncthreads()
+// before any cross-thread consumption of the shared memory written by cp.async.
+//
+// This rewriter conservatively inserts a shared-memory storage sync
+// immediately after every ptx_wait_group statement unless an identical sync
+// already follows.
+class ThreadSyncAfterWaitGroupInserter : public StmtExprMutator {
 public:
-  explicit ThreadSyncAfterWaitQueueInserter(StorageScope sync_scope)
+  explicit ThreadSyncAfterWaitGroupInserter(StorageScope sync_scope)
       : sync_scope_(std::move(sync_scope)) {}
 
-  Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tvm::tir::attr::async_wait_queue_scope) {
-      auto sync = Evaluate(Call(DataType::Int(32), builtin::tvm_storage_sync(),
-                                {StringImm(sync_scope_.to_string())}));
-      auto inner = op->body.as<AttrStmtNode>();
-      ICHECK(inner &&
-             inner->attr_key == tvm::tir::attr::async_wait_inflight_count);
-      auto zero = make_zero(DataType::Int(32));
-      auto new_body = SeqStmt({sync, inner->body});
-      return AttrStmt(zero, tvm::tir::attr::async_wait_queue_scope, op->value,
-                      AttrStmt(zero, tvm::tir::attr::async_wait_inflight_count,
-                               inner->value, new_body));
+  Stmt VisitStmt_(const SeqStmtNode *op) final {
+    Array<Stmt> visited;
+    visited.reserve(op->seq.size());
+    for (const Stmt &stmt : op->seq) {
+      visited.push_back(this->VisitStmt(stmt));
     }
-    return StmtExprMutator::VisitStmt_(op);
+
+    Array<Stmt> rewritten;
+    rewritten.reserve(visited.size());
+    for (int i = 0, n = static_cast<int>(visited.size()); i < n; ++i) {
+      const Stmt &stmt = visited[i];
+      rewritten.push_back(stmt);
+      if (IsWaitGroupStmt(stmt)) {
+        bool next_is_sync = false;
+        if (i + 1 < n && IsStorageSyncStmt(visited[i + 1])) {
+          next_is_sync = true;
+        }
+        if (!next_is_sync) {
+          rewritten.push_back(MakeStorageSyncStmt());
+        }
+      }
+    }
+
+    if (rewritten.empty()) {
+      return Evaluate(0);
+    }
+    if (rewritten.size() == 1) {
+      return rewritten[0];
+    }
+    return SeqStmt(rewritten);
   }
 
 private:
   StorageScope sync_scope_;
+
+  Stmt MakeStorageSyncStmt() const {
+    return Evaluate(Call(DataType::Int(32), builtin::tvm_storage_sync(),
+                         {StringImm(sync_scope_.to_string())}));
+  }
+
+  bool IsWaitGroupStmt(const Stmt &stmt) const {
+    if (stmt.as<BindNode>()) {
+      return false;
+    }
+    if (const auto *attr = stmt.as<AttrStmtNode>()) {
+      return IsWaitGroupStmt(attr->body);
+    }
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      if (seq->seq.size() == 1) {
+        return IsWaitGroupStmt(seq->seq[0]);
+      }
+      return false;
+    }
+    if (const auto *block = stmt.as<SBlockNode>()) {
+      return IsWaitGroupStmt(block->body);
+    }
+    if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
+      if (is_one(realize->predicate)) {
+        return IsWaitGroupStmt(realize->block->body);
+      }
+      return false;
+    }
+    if (const auto *iff = stmt.as<IfThenElseNode>()) {
+      if (!iff->else_case.defined()) {
+        return IsWaitGroupStmt(iff->then_case);
+      }
+      return false;
+    }
+
+    const auto *eval = stmt.as<EvaluateNode>();
+    if (!eval) {
+      return false;
+    }
+    const auto *call = eval->value.as<CallNode>();
+    if (!call) {
+      return false;
+    }
+    return call->op.same_as(builtin::ptx_wait_group());
+  }
+
+  bool IsStorageSyncStmt(const Stmt &stmt) const {
+    if (stmt.as<BindNode>()) {
+      return false;
+    }
+    if (const auto *attr = stmt.as<AttrStmtNode>()) {
+      return IsStorageSyncStmt(attr->body);
+    }
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      if (seq->seq.size() == 1) {
+        return IsStorageSyncStmt(seq->seq[0]);
+      }
+      return false;
+    }
+    if (const auto *block = stmt.as<SBlockNode>()) {
+      return IsStorageSyncStmt(block->body);
+    }
+    if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
+      if (is_one(realize->predicate)) {
+        return IsStorageSyncStmt(realize->block->body);
+      }
+      return false;
+    }
+    if (const auto *iff = stmt.as<IfThenElseNode>()) {
+      if (!iff->else_case.defined()) {
+        return IsStorageSyncStmt(iff->then_case);
+      }
+      return false;
+    }
+
+    const auto *eval = stmt.as<EvaluateNode>();
+    if (!eval) {
+      return false;
+    }
+    const auto *call = eval->value.as<CallNode>();
+    if (!call) {
+      return false;
+    }
+    if (!call->op.same_as(builtin::tvm_storage_sync())) {
+      return false;
+    }
+    if (call->args.size() != 1) {
+      return false;
+    }
+    const auto *scope = call->args[0].as<StringImmNode>();
+    if (!scope) {
+      return false;
+    }
+    return scope->value == sync_scope_.to_string();
+  }
 };
 
 class ThreadSyncInserter : public StmtExprMutator {
@@ -108,13 +219,9 @@ public:
     if (syncs_.empty())
       return stmt;
     if (syncs_.count(stmt.get())) {
-      Stmt barrier;
-      if (sync_scope_.rank == StorageRank::kGlobal) {
-        barrier = MakeGlobalBarrier();
-      } else {
-        barrier = Evaluate(Call(DataType::Int(32), builtin::tvm_storage_sync(),
-                                {StringImm(sync_scope_.to_string())}));
-      }
+      Stmt barrier =
+          Evaluate(Call(DataType::Int(32), builtin::tvm_storage_sync(),
+                        {StringImm(sync_scope_.to_string())}));
       // Mutate after query, to avoid stmt change.
       auto ret = StmtExprMutator::VisitStmt(stmt);
       ret = SeqStmt({barrier, ret});
@@ -123,150 +230,11 @@ public:
       return StmtExprMutator::VisitStmt(stmt);
     }
   }
-  PrimExpr VisitExpr_(const BufferLoadNode *op) final {
-    if (sync_scope_.rank == StorageRank::kGlobal &&
-        GetScope(op->buffer->data).rank == StorageRank::kGlobal) {
-      ++rw_stats_[op->buffer->data].read_count;
-    }
-    return StmtExprMutator::VisitExpr_(op);
-  }
-  Stmt VisitStmt_(const BufferStoreNode *op) final {
-    if (sync_scope_.rank == StorageRank::kGlobal &&
-        GetScope(op->buffer->data).rank == StorageRank::kGlobal) {
-      ++rw_stats_[op->buffer->data].write_count;
-    }
-    return StmtExprMutator::VisitStmt_(op);
-  }
-  Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tvm::tir::attr::thread_extent) {
-      bool temp = true;
-      std::swap(temp, in_thread_env_);
-      thread_extents_.push_back(op);
-      Stmt ret = StmtExprMutator::VisitStmt_(op);
-      thread_extents_.pop_back();
-      std::swap(temp, in_thread_env_);
-      // first thread scope.
-      if (!in_thread_env_ && sync_scope_.rank == StorageRank::kGlobal) {
-        ret = InitGlobalBarrier(ret.as<AttrStmtNode>());
-        num_blocks_ = PrimExpr();
-        is_lead_ = PrimExpr();
-      }
-      return ret;
-    } else {
-      return StmtExprMutator::VisitStmt_(op);
-    }
-  }
-
-  PrimExpr VisitExpr_(const CallNode *op) final {
-    if (op->op.same_as(builtin::tvm_access_ptr())) {
-      PrimExpr expr = StmtExprMutator::VisitExpr_(op);
-      op = expr.as<CallNode>();
-      ICHECK_EQ(op->args.size(), 5U);
-      Var buffer_var(Downcast<Var>(op->args[1]));
-      const IntImmNode *flag = op->args[4].as<IntImmNode>();
-      if ((flag->value & 1) && sync_scope_.rank == StorageRank::kGlobal &&
-          GetScope(buffer_var).rank == StorageRank::kGlobal) {
-        ++rw_stats_[buffer_var].read_count;
-      }
-      if (flag->value & 2 && sync_scope_.rank == StorageRank::kGlobal &&
-          GetScope(buffer_var).rank == StorageRank::kGlobal) {
-        ++rw_stats_[buffer_var].write_count;
-      }
-      return expr;
-    } else if (op->op.same_as(builtin::address_of())) {
-      PrimExpr expr = StmtExprMutator::VisitExpr_(op);
-      op = expr.as<CallNode>();
-      ICHECK_EQ(op->args.size(), 1U)
-          << "address_of should only have one argument (Buffer)";
-
-      if (auto load = op->args[0].as<BufferLoadNode>()) {
-        Var buffer_var(Downcast<Var>(load->buffer->data));
-        if (sync_scope_.rank == StorageRank::kGlobal &&
-            GetScope(buffer_var).rank == StorageRank::kGlobal) {
-          ++rw_stats_[buffer_var].read_count;
-        }
-        if (sync_scope_.rank == StorageRank::kGlobal &&
-            GetScope(buffer_var).rank == StorageRank::kGlobal) {
-          ++rw_stats_[buffer_var].write_count;
-        }
-        return expr;
-      } else {
-        return StmtExprMutator::VisitExpr_(op);
-      }
-    } else {
-      return StmtExprMutator::VisitExpr_(op);
-    }
-  }
 
 private:
-  // RW statistics about data
-  struct Entry {
-    int read_count{0};
-    int write_count{0};
-  };
-
-  // Get current storage scope.
-  StorageScope GetScope(Var buffer_var) const {
-    return StorageScope::Create(GetPtrStorageScope(std::move(buffer_var)));
-  }
-
-  // private functions.
-  Stmt InitGlobalBarrier(const AttrStmtNode *op) {
-    ICHECK(op != nullptr);
-    Array<PrimExpr> pargs = {
-        StringImm(runtime::symbol::tvm_prepare_global_barrier)};
-    Stmt prep =
-        Evaluate(Call(DataType::Int(32), builtin::tvm_call_packed(), pargs));
-    Stmt body = op->body;
-    for (const auto &kv : rw_stats_) {
-      const auto &e = kv.second;
-      if (e.read_count != 0 && e.write_count != 0) {
-        body = AttrStmt(kv.first, tvm::tir::attr::volatile_scope, 1, body);
-      }
-    }
-    rw_stats_.clear();
-    Stmt kinit = Evaluate(
-        Call(DataType::Int(32), builtin::tvm_global_barrier_kinit(), {}));
-    body = SeqStmt({kinit, body});
-    body = AttrStmt(op->node, op->attr_key, op->value, body);
-    return SeqStmt({prep, body});
-  }
-  Stmt MakeGlobalBarrier() {
-    ICHECK(sync_scope_.rank == StorageRank::kGlobal);
-    if (!num_blocks_.defined()) {
-      ICHECK(!is_lead_.defined());
-      num_work_dim_ = thread_extents_.size();
-      for (const AttrStmtNode *attr : thread_extents_) {
-        IterVar iv = Downcast<IterVar>(attr->node);
-        runtime::ThreadScope s = runtime::ThreadScope::Create(iv->thread_tag);
-        if (s.rank == 0) {
-          num_blocks_ =
-              (num_blocks_.defined() ? attr->value * num_blocks_ : attr->value);
-        } else if (s.rank == 1) {
-          PrimExpr cond = iv->var == make_zero(iv->var.dtype());
-          is_lead_ = is_lead_.defined() ? (is_lead_ && cond) : cond;
-        }
-      }
-    } else {
-      ICHECK_EQ(num_work_dim_, thread_extents_.size());
-    }
-    return Evaluate(
-        Call(DataType::Int(32), builtin::tvm_storage_sync(),
-             {StringImm(sync_scope_.to_string()), is_lead_, num_blocks_}));
-  }
   // data structure.
   StorageScope sync_scope_;
   const std::unordered_set<const Object *> &syncs_;
-
-  // The read write statistics of storage
-  std::unordered_map<Var, Entry, ObjectPtrHash, ObjectPtrEqual> rw_stats_;
-  // The statistics for global barrier
-  bool in_thread_env_{false};
-  // memorized results
-  std::vector<const AttrStmtNode *> thread_extents_;
-  size_t num_work_dim_{0};
-  PrimExpr num_blocks_;
-  PrimExpr is_lead_;
 };
 
 class ThreadPartialSyncRewriter : public IRMutatorWithAnalyzer {
@@ -392,7 +360,7 @@ private:
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tvm::tir::attr::thread_extent) {
+    if (op->attr_key == tvm::tirx::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
       if (iv->thread_tag == "threadIdx.x") {
         tx_ = iv;
@@ -436,42 +404,62 @@ private:
   std::unordered_map<ThreadBoundKey, size_t> thread_count_map_;
 };
 
+struct ConditionThreadProperty {
+  bool depends_on_runtime{false};
+  bool is_block_uniform{true};
+  bool requires_hoist{false};
+
+  void Merge(const ConditionThreadProperty &other) {
+    depends_on_runtime = depends_on_runtime || other.depends_on_runtime;
+    is_block_uniform = is_block_uniform && other.is_block_uniform;
+    requires_hoist = requires_hoist || other.requires_hoist;
+  }
+};
+
 /*!
- * \brief Check if an if-condition depends on runtime-variable values.
+ * \brief Analyze whether an if-condition is runtime-dependent and/or uniform
+ * across all threads in a block.
  *
- * For sync hoisting decisions, we distinguish two types of non-uniform
- * conditions:
+ * For sync hoisting decisions we care about two independent properties:
  *
- * 1. Conditions that only depend on threadIdx (e.g., `threadIdx.x >= 512`):
- *    - The number of threads entering the if can be determined at compile time
- *    - ThreadPartialSyncRewriter can handle this by computing the thread count
- *    - No need to hoist sync
+ * 1. Does the condition depend on runtime values such as memory loads?
+ * 2. Even if it does, is it still block-uniform, i.e. identical for every
+ *    thread in the block?
  *
- * 2. Conditions that depend on runtime values (e.g., `shared_mem[tx] != -1`):
- *    - Cannot determine at compile time how many threads will enter
- *    - Must hoist sync to before the if to avoid potential deadlock
+ * Example:
+ * - `token_ids[tx] != -1` is runtime-dependent and non-uniform.
+ * - `batch_sizes[bx] > 0` is runtime-dependent but block-uniform.
  *
- * This checker identifies case (2) - conditions that depend on runtime values.
+ * Only runtime-dependent, non-uniform conditions need to force sync hoisting.
+ * In addition, some non-uniform threadIdx-only conditions still need hoisting
+ * when ThreadPartialSyncRewriter cannot handle them.
  */
-class RuntimeDependentConditionChecker : public IRMutatorWithAnalyzer {
+class ConditionThreadPropertyChecker : public IRMutatorWithAnalyzer {
 public:
-  explicit RuntimeDependentConditionChecker(arith::Analyzer *analyzer,
-                                            int warp_size = 32)
-      : IRMutatorWithAnalyzer(analyzer), warp_size_(warp_size) {}
+  explicit ConditionThreadPropertyChecker(
+      arith::Analyzer *analyzer, const Array<IterVar> &env_threads,
+      const std::unordered_map<const VarNode *, ConditionThreadProperty>
+          &let_var_properties,
+      int warp_size = 32)
+      : IRMutatorWithAnalyzer(analyzer), env_threads_(env_threads),
+        let_var_properties_(let_var_properties), warp_size_(warp_size) {}
 
   /*!
-   * \brief Check if expression depends on runtime-variable values.
-   * \return true if the expression depends on values that cannot be determined
-   *         at compile time (e.g., shared memory loads), false if it only
-   *         depends on compile-time known values (constants, threadIdx,
-   * blockIdx).
+   * \brief Analyze condition properties relevant to thread-sync hoisting.
    */
-  bool DependsOnRuntimeValue(const PrimExpr &expr, const IterVar &iv) {
-    depends_on_runtime_ = false;
+  ConditionThreadProperty AnalyzeExpr(const PrimExpr &expr) {
+    current_ = ConditionThreadProperty();
+    this->VisitExpr(expr);
+    return current_;
+  }
+
+  ConditionThreadProperty AnalyzeCondition(const PrimExpr &expr,
+                                           const IterVar &iv) {
+    current_ = ConditionThreadProperty();
     this->VisitExpr(expr);
     auto extent_opt = as_const_int(iv->dom->extent);
     ICHECK(extent_opt != nullptr)
-        << "DependsOnRuntimeValue: thread extent must be a "
+        << "AnalyzeCondition: thread extent must be a "
            "constant, but got: "
         << iv->dom->extent;
     int64_t thread_extent = *extent_opt;
@@ -480,36 +468,98 @@ public:
       auto count = analyzer_->z3_prover.CountSatisfyingValues(
           iv->var, thread_extent, /*min_consecutive=*/warp_size_);
       if (count < 0) {
-        // failed to count satisfying values, return true
-        depends_on_runtime_ = true;
+        // ThreadPartialSyncRewriter cannot safely lower this condition.
+        current_.requires_hoist = true;
       }
     }
-    return depends_on_runtime_;
+    return current_;
   }
 
 private:
+  StorageScope GetScope(Var buffer_var) const {
+    return StorageScope::Create(GetPtrStorageScope(std::move(buffer_var)));
+  }
+
+  bool IsThreadVar(const VarNode *op) const {
+    for (const auto &iv : env_threads_) {
+      if (iv->var.get() == op &&
+          runtime::ThreadScope::Create(iv->thread_tag).rank == 1) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool IsThreadLocalScope(const StorageScope &scope) const {
+    switch (scope.rank) {
+    case StorageRank::kWarp:
+    case StorageRank::kLocal:
+    case StorageRank::kWMMAMatrixA:
+    case StorageRank::kWMMAMatrixB:
+    case StorageRank::kWMMAAccumulator:
+    case StorageRank::kAMXTMM:
+    case StorageRank::kMMAMatrixA:
+    case StorageRank::kMMAMatrixB:
+    case StorageRank::kMMAMatrixC:
+    case StorageRank::kMetalSimdGroup:
+      return true;
+    case StorageRank::kGlobal:
+    case StorageRank::kShared:
+    case StorageRank::kTexture:
+      return false;
+    }
+    return false;
+  }
+
+  PrimExpr VisitExpr_(const VarNode *op) final {
+    if (IsThreadVar(op)) {
+      current_.is_block_uniform = false;
+    }
+    auto it = let_var_properties_.find(op);
+    if (it != let_var_properties_.end()) {
+      current_.Merge(it->second);
+    }
+    return GetRef<Var>(op);
+  }
+
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
-    // Any buffer load introduces runtime dependency
-    // (we don't know the buffer contents at compile time)
-    depends_on_runtime_ = true;
+    current_.depends_on_runtime = true;
+    // Do not mark local-scope loads as non-block-uniform solely based on
+    // storage scope.  Thread-local buffers (fragments) commonly hold
+    // block-uniform data when populated from block-uniform global addresses
+    // (e.g., T.copy(BlockMask[blockIdx.y, :], fragment)).  If the load
+    // indices actually depend on threadIdx, the recursive visit of indices
+    // below (via IRMutatorWithAnalyzer::VisitExpr_) will correctly set
+    // is_block_uniform = false through VisitExpr_(VarNode*).
     return IRMutatorWithAnalyzer::VisitExpr_(op);
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
-    // Check tvm_access_ptr and address_of - if used in condition, it's reading
-    // memory
     if (op->op.same_as(builtin::tvm_access_ptr()) ||
         op->op.same_as(builtin::address_of())) {
-      depends_on_runtime_ = true;
-      return IRMutatorWithAnalyzer::VisitExpr_(op);
+      current_.depends_on_runtime = true;
+      // Do not mark local-scope tvm_access_ptr loads as non-block-uniform
+      // solely based on storage scope.  Thread-local buffers (fragments)
+      // commonly hold block-uniform data when populated from block-uniform
+      // global addresses (e.g., a per-thread fragment that every thread
+      // fills with the same global value).  If the access indices actually
+      // depend on threadIdx, the recursive visit of args below (via
+      // IRMutatorWithAnalyzer::VisitExpr_) will correctly mark the
+      // condition as non-block-uniform through VisitExpr_(VarNode*).
+      //
+      // Mirrors the BufferLoadNode handling above(#90299d68); without this,
+      // conditions like `T.any_of(local_fragment[:])` get hoisted out of the
+      // if-body and break write-before-read sync between shared-memory loads
+      // and mma/tma reads.
     }
-    // Other calls might also introduce runtime dependency
-    // but we'll be conservative and check children
     return IRMutatorWithAnalyzer::VisitExpr_(op);
   }
 
 private:
-  bool depends_on_runtime_{false};
+  ConditionThreadProperty current_;
+  const Array<IterVar> &env_threads_;
+  const std::unordered_map<const VarNode *, ConditionThreadProperty>
+      &let_var_properties_;
   int warp_size_;
 };
 
@@ -557,6 +607,14 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
      *         (e.g., inside a TMA load) and therefore multiple writes
      *         among themselves should not force barriers between them. */
     bool is_async_copy = false;
+    /*! \brief Whether this access is part of an atomic RMW (e.g., atomic_add).
+     *
+     * If both sides of a dependency are atomic, we should not insert a thread
+     * barrier between them. A barrier would artificially serialize atomics
+     * across threads (and can even change observable results for atomics with
+     * return values).
+     */
+    bool is_atomic = false;
   };
   /*! \brief Access pattern about a single statement */
   struct StmtEntry {
@@ -567,8 +625,65 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
   };
   // access scope
   std::vector<std::vector<StmtEntry>> scope_;
+  std::unordered_map<const VarNode *, PrimExpr>
+      shared_memory_alias_byte_offsets_;
   StorageScope GetScope(Var buffer_var) const {
     return StorageScope::Create(GetPtrStorageScope(std::move(buffer_var)));
+  }
+  bool IsSharedDynPointer(const Var &buffer_var) const {
+    return buffer_var->type_annotation.as<PointerTypeNode>() &&
+           GetPtrStorageScope(buffer_var) == "shared.dyn";
+  }
+  PrimExpr AliasElemOffset(Var buffer_var, DataType dtype,
+                           DataType index_dtype) const {
+    auto it = shared_memory_alias_byte_offsets_.find(buffer_var.get());
+    if (it == shared_memory_alias_byte_offsets_.end()) {
+      return make_const(index_dtype, 0);
+    }
+    int elem_bytes = dtype.bytes() * dtype.lanes();
+    ICHECK_GT(elem_bytes, 0);
+    PrimExpr byte_offset = it->second;
+    if (byte_offset.dtype() != index_dtype) {
+      byte_offset = Cast(index_dtype, byte_offset);
+    }
+    return indexdiv(byte_offset, make_const(index_dtype, elem_bytes));
+  }
+  PrimExpr AddAliasElemOffset(Var buffer_var, DataType dtype,
+                              PrimExpr index) const {
+    DataType index_dtype = index.dtype();
+    DataType scalar_index_dtype =
+        index_dtype.is_scalar() ? index_dtype : index_dtype.element_of();
+    PrimExpr elem_offset =
+        AliasElemOffset(std::move(buffer_var), dtype, scalar_index_dtype);
+    if (is_zero(elem_offset)) {
+      return index;
+    }
+    if (!index_dtype.is_scalar()) {
+      elem_offset = Broadcast(elem_offset,
+                              IntImm(DataType::Int(32), index_dtype.lanes()));
+    }
+    return index + elem_offset;
+  }
+  void RecordSharedMemoryAlias(const Var &alias_var, const PrimExpr &value) {
+    const auto *call = value.as<CallNode>();
+    if (call == nullptr ||
+        !call->op.same_as(builtin::handle_add_byte_offset()) ||
+        call->args.size() != 2U) {
+      return;
+    }
+    if (!IsSharedDynPointer(alias_var)) {
+      return;
+    }
+    const auto *base = call->args[0].as<VarNode>();
+    if (base == nullptr) {
+      return;
+    }
+    PrimExpr byte_offset = call->args[1];
+    auto base_it = shared_memory_alias_byte_offsets_.find(base);
+    if (base_it != shared_memory_alias_byte_offsets_.end()) {
+      byte_offset = byte_offset + base_it->second;
+    }
+    shared_memory_alias_byte_offsets_[alias_var.get()] = byte_offset;
   }
   IterVar GetThreadVar(const std::string &tag) const {
     for (const auto &iv : env_threads_) {
@@ -582,19 +697,21 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
 
   void VisitExpr_(const BufferLoadNode *op) final {
     Var buf = op->buffer->data;
-    buffer_data_to_buffer_.Set(tvm::ffi::GetRef<Var>(buf.get()), op->buffer);
+    buffer_data_to_buffer_.Set(GetRef<Var>(buf.get()), op->buffer);
     StorageScope scope = GetScope(buf);
     if (Enabled(buf.get(), scope)) {
       ICHECK(allow_append_)
-          << tvm::ffi::GetRef<BufferLoad>(op) << " " << scope.to_string();
+          << GetRef<BufferLoad>(op) << " " << scope.to_string();
       AccessEntry e{.cset = {constr_stack_}};
       e.threads = env_threads();
       e.buffer = buf;
       e.buffer_name = op->buffer;
-      e.buffer_indices = op->indices;
       e.dtype = op->dtype.element_of();
       for (const auto &index : op->indices) {
-        e.touched.push_back(arith::IntSet::Vector(index));
+        PrimExpr physical_index =
+            AddAliasElemOffset(buf, op->buffer->dtype, index);
+        e.buffer_indices.push_back(physical_index);
+        e.touched.push_back(arith::IntSet::Vector(physical_index));
       }
       e.type = kRead;
       e.scope = scope;
@@ -609,17 +726,19 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
     curr_stmt_.stmt = op;
 
     Var buf = op->buffer->data;
-    buffer_data_to_buffer_.Set(tvm::ffi::GetRef<Var>(buf.get()), op->buffer);
+    buffer_data_to_buffer_.Set(GetRef<Var>(buf.get()), op->buffer);
     StorageScope scope = GetScope(buf);
     if (Enabled(buf.get(), scope)) {
       AccessEntry e{.cset = {constr_stack_}};
       e.threads = env_threads();
       e.buffer = buf;
       e.buffer_name = op->buffer;
-      e.buffer_indices = op->indices;
       e.dtype = op->value.dtype().element_of();
       for (const auto &index : op->indices) {
-        e.touched.push_back(arith::IntSet::Vector(index));
+        PrimExpr physical_index =
+            AddAliasElemOffset(buf, op->buffer->dtype, index);
+        e.buffer_indices.push_back(physical_index);
+        e.touched.push_back(arith::IntSet::Vector(physical_index));
       }
       e.type = kWrite;
       e.scope = scope;
@@ -646,24 +765,23 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
     allow_append_ = false;
   }
 
-  void VisitStmt_(const LetStmtNode *op) final {
+  void VisitStmt_(const BindNode *op) final {
     allow_append_ = true;
     ICHECK_EQ(curr_stmt_.access.size(), 0U);
     curr_stmt_.stmt = op;
+    RecordSharedMemoryAlias(op->var, op->value);
     this->VisitExpr(op->value);
     // push to the scope
     scope_.back().push_back(curr_stmt_);
     // clear access entry.
     curr_stmt_.access.clear();
     allow_append_ = false;
-    // traverse body block
-    {
-      auto guard = MakeGuard(op->var, op->value);
-      this->VisitStmt(op->body);
-    }
+    // Record let var properties
+    auto let_prop = AnalyzeExprProperty(op->value);
+    let_var_properties_[op->var.get()] = let_prop;
   }
-  void VisitStmt_(const BlockNode *op) final {
-    auto block = Downcast<Block>(op);
+  void VisitStmt_(const SBlockNode *op) final {
+    auto block = Downcast<SBlock>(op);
     for (const auto &buffer : block->alloc_buffers) {
       ICHECK(buffer->IsInstance<BufferNode>());
       buffer_data_to_buffer_.Set(buffer->data, buffer);
@@ -671,12 +789,12 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
     ConstrVisitor::VisitStmt_(op);
   }
   void VisitStmt_(const AttrStmtNode *op) override {
-    if (op->attr_key == tvm::tir::attr::coproc_scope) {
+    if (op->attr_key == tvm::tl::attr::coproc_scope) {
       IterVar iv = Downcast<IterVar>(op->node);
       env_threads_.push_back(iv);
       ConstrVisitor::VisitStmt_(op);
       env_threads_.pop_back();
-    } else if (op->attr_key == tvm::tir::attr::thread_extent) {
+    } else if (op->attr_key == tvm::tirx::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
       env_threads_.push_back(iv);
       ICHECK_NE(iv->thread_tag.length(), 0U);
@@ -782,7 +900,7 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
     }
 
     if (op->else_case) {
-      auto guard = MakeGuard(tir::Not(op->condition));
+      auto guard = MakeGuard(tirx::Not(op->condition));
       scope_.push_back(std::vector<StmtEntry>());
       {
         this->VisitStmt(op->else_case.value());
@@ -810,29 +928,26 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
     bool has_syncs_inside = !syncs_in_then.empty() || !syncs_in_else.empty();
 
     if (has_syncs_inside) {
-      // Check if the condition depends on runtime values (e.g., shared memory
-      // loads). If so, we cannot determine at compile time how many threads
-      // will enter the if, so we must hoist the sync to before the if to avoid
-      // potential deadlock.
+      // Runtime-dependent conditions are only problematic when they can differ
+      // across threads in the same block. Block-uniform runtime conditions
+      // such as `batch_sizes[blockIdx.z] > 0` are safe to keep in-place.
       //
-      // If the condition only depends on threadIdx (e.g., `threadIdx.x >=
-      // 512`), we use Z3 to check if the thread count is a multiple of 32.
-      // If not, ThreadPartialSyncRewriter cannot handle it properly, so we
-      // must also hoist the sync.
+      // Separately, some threadIdx-only non-uniform conditions still need
+      // hoisting when ThreadPartialSyncRewriter cannot lower them safely.
       arith::Analyzer analyzer;
       ConstrSet constr_set = GetConstrSet();
       constr_set.Populate(analyzer);
-      RuntimeDependentConditionChecker checker(&analyzer, warp_size_);
+      ConditionThreadPropertyChecker checker(&analyzer, env_threads_,
+                                             let_var_properties_, warp_size_);
       IterVar tx = GetThreadVar("threadIdx.x");
-      bool depends_on_runtime =
-          checker.DependsOnRuntimeValue(op->condition, tx);
+      auto condition_prop = checker.AnalyzeCondition(op->condition, tx);
 
-      if (depends_on_runtime) {
-        // Condition depends on runtime values - must hoist sync
-        // Condition depends on runtime values - must hoist sync
+      if ((condition_prop.depends_on_runtime &&
+           !condition_prop.is_block_uniform) ||
+          condition_prop.requires_hoist) {
         LOG(WARNING)
             << "[ThreadSync] Hoisting sync from inside if to before if. "
-            << "Condition depends on runtime value: " << op->condition;
+            << "Condition is not safe for in-if sync: " << op->condition;
         for (const auto &sync : syncs_in_then) {
           syncs_inserted_.erase(sync);
         }
@@ -879,7 +994,8 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
       if (auto opt = op->op.as<Op>()) {
         const Op &call_op = opt.value();
         return call_op.same_as(tl::tma_load()) ||
-               call_op.same_as(tl::tma_load_im2col());
+               call_op.same_as(tl::tma_load_im2col()) ||
+               call_op.same_as(tl::tma_load_multicast());
       }
       return false;
     }();
@@ -891,21 +1007,72 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
       tma_depth_--;
       return;
     }
+
+    // Mark async cp.async load context so that tvm_access_ptr within the call
+    // can be tagged accordingly. This allows the sync planner to avoid
+    // inserting unnecessary barriers between back-to-back cp.async writes.
+    auto is_cp_async = [&]() {
+      if (auto opt = op->op.as<Op>()) {
+        const Op &call_op = opt.value();
+        return call_op.same_as(builtin::ptx_cp_async()) ||
+               call_op.same_as(tl::ptx_cp_async());
+      }
+      return false;
+    }();
+    if (is_cp_async) {
+      cp_async_depth_++;
+      for (const auto &a : op->args) {
+        this->VisitExpr(a);
+      }
+      cp_async_depth_--;
+      return;
+    }
+
+    // Mark the pointer argument of atomic ops as atomic so the sync planner
+    // doesn't insert barriers between atomics.
+    auto is_atomic_op = [&]() {
+      if (auto opt = op->op.as<Op>()) {
+        const Op &call_op = opt.value();
+        return call_op.same_as(tl::atomic_add_elem_op()) ||
+               call_op.same_as(tl::atomic_add_ret_elem_op()) ||
+               call_op.same_as(tl::atomic_addx2_elem_op()) ||
+               call_op.same_as(tl::atomic_addx4_elem_op()) ||
+               call_op.same_as(tl::atomic_load_elem_op()) ||
+               call_op.same_as(tl::atomic_store_elem_op()) ||
+               call_op.same_as(tl::atomic_max_elem_op()) ||
+               call_op.same_as(tl::atomic_max_ret_elem_op()) ||
+               call_op.same_as(tl::atomic_min_elem_op()) ||
+               call_op.same_as(tl::atomic_min_ret_elem_op());
+      }
+      return false;
+    }();
+    if (is_atomic_op) {
+      if (!op->args.empty()) {
+        atomic_dst_ptr_depth_++;
+        this->VisitExpr(op->args[0]);
+        atomic_dst_ptr_depth_--;
+        for (size_t i = 1; i < op->args.size(); ++i) {
+          this->VisitExpr(op->args[i]);
+        }
+      }
+      return;
+    }
     if (op->op.same_as(builtin::address_of())) {
       ICHECK_EQ(op->args.size(), 1U);
       if (auto load = op->args[0].as<BufferLoadNode>()) {
         Buffer buffer = load->buffer;
         DataType dtype = buffer->dtype;
         const VarNode *buffer_var = buffer->data.as<VarNode>();
-        buffer_data_to_buffer_.Set(tvm::ffi::GetRef<Var>(buffer_var), buffer);
-        StorageScope scope = GetScope(tvm::ffi::GetRef<Var>(buffer_var));
+        buffer_data_to_buffer_.Set(GetRef<Var>(buffer_var), buffer);
+        StorageScope scope = GetScope(GetRef<Var>(buffer_var));
         Array<Range> buffer_ranges;
         // from indices to buffer indices
         ICHECK(buffer->shape.size() == load->indices.size());
         // Use buffer shape and indices to compute the buffer_ranges for each
         // dimension.
         for (size_t i = 0; i < buffer->shape.size(); ++i) {
-          PrimExpr min = load->indices[i];
+          PrimExpr min = AddAliasElemOffset(GetRef<Var>(buffer_var),
+                                            buffer->dtype, load->indices[i]);
           PrimExpr extent = make_const(buffer->shape[i].dtype(), 1);
           buffer_ranges.push_back(Range::FromMinExtent(min, extent));
         }
@@ -918,9 +1085,12 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
           e.buffer_name = buffer;
           e.buffer_ranges = buffer_ranges;
           for (const auto &index : load->indices) {
-            e.touched.push_back(arith::IntSet::Vector(index));
+            PrimExpr physical_index = AddAliasElemOffset(
+                GetRef<Var>(buffer_var), buffer->dtype, index);
+            e.touched.push_back(arith::IntSet::Vector(physical_index));
           }
           e.is_pointer_access = true;
+          e.is_atomic = (atomic_dst_ptr_depth_ > 0);
           e.type = kRead;
           e.scope = scope;
           curr_stmt_.access.emplace_back(e);
@@ -933,31 +1103,39 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
       ICHECK_EQ(op->args.size(), 5U);
       DataType dtype = op->args[0].dtype();
       const VarNode *buffer_var = op->args[1].as<VarNode>();
-      PrimExpr offset = op->args[2];
+      PrimExpr offset =
+          AddAliasElemOffset(GetRef<Var>(buffer_var), dtype, op->args[2]);
       PrimExpr extent = op->args[3];
       const IntImmNode *flag = op->args[4].as<IntImmNode>();
-      StorageScope scope = GetScope(tvm::ffi::GetRef<Var>(buffer_var));
+      StorageScope scope = GetScope(GetRef<Var>(buffer_var));
       // The buffer scope.
       if (Enabled(buffer_var, scope)) {
         ICHECK(allow_append_);
         Array<Range> buffer_ranges;
-        if (buffer_data_to_buffer_.find(tvm::ffi::GetRef<Var>(buffer_var)) ==
+        if (buffer_data_to_buffer_.find(GetRef<Var>(buffer_var)) ==
             buffer_data_to_buffer_.end()) {
           // cannot find buffer map, use the default buffer
           buffer_ranges = {Range::FromMinExtent(offset, extent)};
         } else {
-          Buffer buffer =
-              buffer_data_to_buffer_.at(tvm::ffi::GetRef<Var>(buffer_var));
+          Buffer buffer = buffer_data_to_buffer_.at(GetRef<Var>(buffer_var));
           auto buffer_shape = buffer->shape;
           // convert 1d offset to multi-dimensional index
-          auto linear_to_indices = [this](PrimExpr offset,
-                                          const Array<PrimExpr> &shape) {
+          auto linear_to_indices = [](PrimExpr offset,
+                                      const Array<PrimExpr> &shape) {
             Array<PrimExpr> indices;
+            DataType index_dtype = offset.dtype();
+            ICHECK(index_dtype.is_int() || index_dtype.is_uint())
+                << "Expected integer offset dtype in tvm_access_ptr, but got "
+                << index_dtype;
             PrimExpr remaining = std::move(offset);
             for (size_t i = 0; i < shape.size(); ++i) {
-              PrimExpr stride = make_const(DataType::Int(32), 1);
+              PrimExpr stride = make_const(index_dtype, 1);
               for (size_t j = i + 1; j < shape.size(); ++j) {
-                stride = stride * shape[j];
+                PrimExpr dim = shape[j];
+                if (dim.dtype() != index_dtype) {
+                  dim = tirx::Cast(index_dtype, dim);
+                }
+                stride = stride * dim;
               }
               PrimExpr idx = FloorDiv(remaining, stride);
               remaining = FloorMod(remaining, stride);
@@ -977,20 +1155,21 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
         AccessEntry e{.cset = {constr_stack_}};
         e.threads = env_threads();
         e.dtype = dtype;
-        e.buffer = tvm::ffi::GetRef<Var>(buffer_var);
+        e.buffer = GetRef<Var>(buffer_var);
         e.buffer_ranges = buffer_ranges;
         e.is_pointer_access = true;
+        e.is_atomic = (atomic_dst_ptr_depth_ > 0);
         e.touched = {
             arith::IntSet::FromRange(Range::FromMinExtent(offset, extent))};
         e.scope = scope;
         if (flag->value & 1) {
           e.type = kRead;
-          e.is_async_copy = (tma_depth_ > 0);
+          e.is_async_copy = (tma_depth_ > 0 || cp_async_depth_ > 0);
           curr_stmt_.access.emplace_back(e);
         }
         if (flag->value & 2) {
           e.type = kWrite;
-          e.is_async_copy = (tma_depth_ > 0);
+          e.is_async_copy = (tma_depth_ > 0 || cp_async_depth_ > 0);
           curr_stmt_.access.emplace_back(e);
         }
       }
@@ -998,7 +1177,7 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
     } else if (op->op.same_as(builtin::tvm_storage_sync())) {
       ICHECK(allow_append_);
       const std::string &s = op->args[0].as<StringImmNode>()->value;
-      if (s != "warp") {
+      if (s != "warp" && s != "cluster") {
         StorageScope scope = StorageScope::Create(s);
         AccessEntry e{.cset = {constr_stack_}};
         e.threads = env_threads();
@@ -1206,6 +1385,15 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
   const Array<IterVar> &env_threads() const { return env_threads_; }
 
 private:
+  ConditionThreadProperty AnalyzeExprProperty(const PrimExpr &expr) const {
+    arith::Analyzer analyzer;
+    ConstrSet constr_set = GetConstrSet();
+    constr_set.Populate(analyzer);
+    ConditionThreadPropertyChecker checker(&analyzer, env_threads_,
+                                           let_var_properties_, warp_size_);
+    return checker.AnalyzeExpr(expr);
+  }
+
   bool Enabled(const VarNode *buf, const StorageScope &scope) {
     return in_device_env() && scope == sync_scope_;
   }
@@ -1218,10 +1406,20 @@ private:
   bool in_device_env_{false};
   // Nesting depth of tma_load/tma_load_im2col calls
   int tma_depth_{0};
+  // Nesting depth of cp.async calls (ptx_cp_async)
+  int cp_async_depth_{0};
+  // Whether we're visiting the pointer argument expression of an atomic call
+  // (e.g., atomic_add/atomic_max/atomic_load). When > 0, accesses produced by
+  // the pointer metadata ops are tagged as atomic.
+  int atomic_dst_ptr_depth_{0};
   // the current free stmt entry.
   StmtEntry curr_stmt_;
   // The involving threads
   Array<IterVar> env_threads_;
+  // Thread-uniform/runtime properties for let-bound vars visible in the
+  // current lexical scope.
+  std::unordered_map<const VarNode *, ConditionThreadProperty>
+      let_var_properties_;
   // The buffer map
   Map<Var, Buffer> buffer_data_to_buffer_;
   // synchronization scope
@@ -1403,6 +1601,13 @@ private:
       return false;
     }
 
+    // Atomic ops already provide correctness for concurrent access.
+    // Inserting a barrier between atomics is unnecessary and can change
+    // program behavior (e.g., atomics with return values).
+    if (prev.is_atomic && curr.is_atomic) {
+      return false;
+    }
+
     if (prev.is_pointer_access || curr.is_pointer_access) {
       // For accesses created via tvm_access_ptr we may still be able to prove
       // disjointness using their byte ranges. If both sides expose a touched
@@ -1424,7 +1629,7 @@ private:
     // For loop-carry, we compare: Iter(i) vs Iter(i+step)
     // prev represents access at iteration i (end of loop body)
     // curr represents access at iteration i+step (beginning of next iteration)
-    ffi::Map<Var, PrimExpr> loop_shift_sub;
+    Map<Var, PrimExpr> loop_shift_sub;
     if (loop != nullptr) {
       // Get loop step, default to 1 if not specified
       PrimExpr step = make_const(loop->loop_var.dtype(), 1);
@@ -1449,7 +1654,14 @@ private:
       }
     }
 
-    if (has_same_index && false) {
+    // When shared-memory allocation reuse aliases buffers with different
+    // element sizes, equal logical indices do not imply equal byte addresses
+    // (e.g. float32 index i aliases fp8 index 4*i). Fall through to byte-range
+    // analysis in that case so cross-thread WAR/RAW hazards are not missed.
+    bool same_index_means_same_byte = prev.dtype.bytes() == curr.dtype.bytes();
+    bool enable_same_index_equivalence_shortcut = false;
+    if (has_same_index && same_index_means_same_byte &&
+        enable_same_index_equivalence_shortcut) {
       // Use Z3 to check if prev and curr constraints are equivalent.
       // If equivalent, the same set of threads execute both accesses, so no
       // sync is needed.
@@ -1475,10 +1687,10 @@ private:
 
       // Check P => C: ¬P ∨ C
       bool prev_implies_curr = analyzer.z3_prover.CanProve(
-          tir::Or(tir::Not(prev_constr), curr_constr));
+          tirx::Or(tirx::Not(prev_constr), curr_constr));
       // Check C => P: ¬C ∨ P
       bool curr_implies_prev = analyzer.z3_prover.CanProve(
-          tir::Or(tir::Not(curr_constr), prev_constr));
+          tirx::Or(tirx::Not(curr_constr), prev_constr));
 
       if (prev_implies_curr && curr_implies_prev) {
         // If constraints are equivalent, they are not in conflict
@@ -1533,7 +1745,7 @@ private:
                               (prev.type == kRead && curr.type == kRead);
 
       PrimExpr thread_condition = Bool(false);
-      ffi::Map<Var, PrimExpr> prev_sub, curr_sub;
+      Map<Var, PrimExpr> prev_sub, curr_sub;
 
       const char *thread_names[] = {"tx", "ty", "tz"};
       for (unsigned idx = 0; idx != 3; ++idx) {
@@ -1553,7 +1765,7 @@ private:
           Var curr_var(std::string(thread_names[idx]) + "2",
                        old_curr_var.dtype());
           thread_condition =
-              tir::Or(thread_condition, tir::NE(prev_var, curr_var));
+              tirx::Or(thread_condition, tirx::NE(prev_var, curr_var));
           prev_sub.Set(old_prev_var, prev_var);
           curr_sub.Set(old_curr_var, curr_var);
         }
@@ -1572,13 +1784,16 @@ private:
 
       // Handle Ramp expressions by creating a new index variable
       if (const RampNode *prev_ramp = prev_indice_bytes.as<RampNode>()) {
-        Var prev_idx("prev_idx", DataType::Int(32));
+        DataType prev_index_dtype = prev_ramp->base.dtype();
+        Var prev_idx("prev_idx", prev_index_dtype);
         analyzer.Bind(prev_idx, Range::FromMinExtent(0, prev_ramp->lanes));
+
         prev_indice_bytes = prev_ramp->base + prev_idx * prev_ramp->stride;
       }
 
       if (const RampNode *curr_ramp = curr_indice_bytes.as<RampNode>()) {
-        Var curr_idx("curr_idx", DataType::Int(32));
+        DataType curr_index_dtype = curr_ramp->base.dtype();
+        Var curr_idx("curr_idx", curr_index_dtype);
         analyzer.Bind(curr_idx, Range::FromMinExtent(0, curr_ramp->lanes));
         curr_indice_bytes = curr_ramp->base + curr_idx * curr_ramp->stride;
       }
@@ -1590,15 +1805,15 @@ private:
           if (prev_indice_bytes.dtype().bits() <
               curr_indice_bytes.dtype().bits()) {
             prev_indice_bytes =
-                tir::Cast(curr_indice_bytes.dtype(), prev_indice_bytes);
+                tirx::Cast(curr_indice_bytes.dtype(), prev_indice_bytes);
           } else {
             curr_indice_bytes =
-                tir::Cast(prev_indice_bytes.dtype(), curr_indice_bytes);
+                tirx::Cast(prev_indice_bytes.dtype(), curr_indice_bytes);
           }
         }
         ICHECK(prev_indice_bytes.dtype() == curr_indice_bytes.dtype());
         provably_disjoint =
-            analyzer.CanProve(tir::NE(prev_indice_bytes, curr_indice_bytes));
+            analyzer.CanProve(tirx::NE(prev_indice_bytes, curr_indice_bytes));
       } else {
         try {
           auto prev_min = analyzer.Simplify(
@@ -1610,7 +1825,7 @@ private:
           auto curr_max = analyzer.Simplify(
               Substitute(curr.touched[i].max() * curr_dtype.bytes(), curr_sub));
           provably_disjoint = analyzer.CanProve(analyzer.Simplify(
-              tir::Or(prev_min > curr_max, curr_min > prev_max)));
+              tirx::Or(prev_min > curr_max, curr_min > prev_max)));
         } catch (const std::exception &e) {
           auto prev_bound = analyzer.const_int_bound(prev_indice_bytes);
           auto curr_bound = analyzer.const_int_bound(curr_indice_bytes);
@@ -1625,7 +1840,7 @@ private:
         // if (!provably_disjoint) {
         //   LOG(WARNING) << analyzer.z3_prover.GetStats();
         //   LOG(WARNING) <<
-        //   analyzer.z3_prover.GetSMTLIB2(tir::Not(tir::Or(prev_min >
+        //   analyzer.z3_prover.GetSMTLIB2(tirx::Not(tirx::Or(prev_min >
         //   curr_max, curr_min > prev_max)));
         // }
       }
@@ -1652,9 +1867,11 @@ private:
 
 PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
   StorageScope sync_scope = StorageScope::Create(storage_scope);
+  if (sync_scope.rank == StorageRank::kGlobal) {
+    return func;
+  }
   auto *n = func.CopyOnWrite();
   auto stmt = n->body;
-
   // Get warp size from target, defaulting to 32 if not available
   int warp_size = 32;
   bool is_ascend = false;
@@ -1680,7 +1897,7 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
                               int warp_size)
           : scope(std::move(scope)), buf_map(std::move(buf_map)),
             warp_size(warp_size) {}
-      Stmt VisitStmt_(const BlockNode *op) final {
+      Stmt VisitStmt_(const SBlockNode *op) final {
         if (op->name_hint == "SIMT_VF") {
           TileLangThreadSyncPlanner planner(scope, warp_size);
           for (const auto &[_, buffer] : buf_map) {
@@ -1689,9 +1906,9 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
           Stmt body = op->body;
           planner(body);
           body = ThreadSyncInserter(scope, planner.syncs_inserted_)(body);
-          ObjectPtr<BlockNode> new_block = make_object<BlockNode>(*op);
-          new_block->body = body;
-          return Block(new_block);
+          SBlock block = Downcast<SBlock>(StmtExprMutator::VisitStmt_(op));
+          block.CopyOnWrite()->body = body;
+          return block;
         }
         return StmtExprMutator::VisitStmt_(op);
       }
@@ -1703,7 +1920,7 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
 
   // Original non-Ascend path
   if (sync_scope.rank == StorageRank::kShared && sync_scope.tag.empty()) {
-    stmt = ThreadSyncAfterWaitQueueInserter(sync_scope)(stmt);
+    stmt = ThreadSyncAfterWaitGroupInserter(sync_scope)(stmt);
   }
   TileLangThreadSyncPlanner planner(sync_scope, warp_size);
   for (const auto &[_, buffer] : func->buffer_map) {
@@ -1716,7 +1933,7 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
   return func;
 }
 
-using namespace tir::transform;
+using namespace tirx::transform;
 
 namespace transform {
 
@@ -1737,7 +1954,7 @@ tvm::transform::Pass ThreadSync(const String &storage_scope) {
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
-  namespace refl = tvm::ffi::reflection;
+  namespace refl = reflection;
   refl::GlobalDef().def("tl.transform.ThreadSync", ThreadSync);
 }
 
