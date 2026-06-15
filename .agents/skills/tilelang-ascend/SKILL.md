@@ -415,7 +415,8 @@ Two levels of SIMD programming:
   are emitted. See `examples/ascend/example_simdvf_vecadd_lower.py`.
 
 - **High-level SIMD**: Use `T.Parallel` inside `T.SimdVF()`, letting the
-  compiler auto-lower to vector operations.
+  compiler auto-lower to vector operations. See
+  `examples/ascend/example_simdvf_vecadd.py`.
 
   **Warning: High-level SIMD lowering is not fully reliable.** The
   `AscendSimdVFLowerParallel` pass may fail on non-trivial patterns
@@ -665,7 +666,8 @@ All examples are in `examples/ascend/`. Key files organized by category:
 ### SIMD VF (register-level vector operations)
 | File | Description |
 |---|---|
-| `example_simdvf_vecadd_lower.py` | Auto-scheduled SIMD vector add using T.simd.* intrinsics |
+| `example_simdvf_vecadd.py` | High-level SIMD vector add using T.Parallel in SimdVF |
+| `example_simdvf_vecadd_lower.py` | SIMD vector add using raw T.simd.* intrinsics |
 | `example_simdvf_vintlv.py` | SIMD vintlv/vdintlv interleave operations |
 | `example_simdvf_per_token_cast_to_fp8.py` | Per-token fp8 type conversion with SimdVF |
 | `example_simdvf_topk_gate.py` | TopK-gate for MoE routing with SimdVF selection loop |
@@ -674,6 +676,7 @@ All examples are in `examples/ascend/`. Key files organized by category:
 | File | Description |
 |---|---|
 | `example_simtvf_vecadd.py` | Auto-scheduled SIMT vector add |
+| `example_simtvf_vecadd_mutex.py` | Mutex-based get_buf/rls_buf sync (teaching reference) |
 | `example_simtvf_auto_sync.py` | Auto thread sync demonstration |
 | `example_simtvf_ubuf_multi.py` | Multi-buffer UB with pipe barriers in SIMT |
 | `example_simtvf_per_token_cast_to_fp8.py` | Per-token fp8 cast with SimtVF + reduce |
