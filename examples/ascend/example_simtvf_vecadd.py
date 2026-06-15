@@ -1,10 +1,9 @@
 import tilelang
 import tilelang.language as T
-
 from tilelang.profiler import do_bench
 
 
-def vector_add(N, dtype="float32"):
+def vector_add(N):
     NUM_BLOCKS = 64  # AI cores
     NUM_THREADS = 2048  # SIMT threads per core
     TILE_ELEMS = NUM_THREADS * 4  # 8192 floats = 32 KB per tile
@@ -14,62 +13,35 @@ def vector_add(N, dtype="float32"):
 
     @T.prim_func
     def main(
-        A: T.Buffer((N,), dtype),
-        B: T.Buffer((N,), dtype),
-        C: T.Buffer((N,), dtype),
+        A: T.Buffer((N,), "float32"),
+        B: T.Buffer((N,), "float32"),
+        C: T.Buffer((N,), "float32"),
     ):
         with T.Kernel(NUM_BLOCKS) as bx:
             temp1 = T.alloc_shared(
-                (
-                    NUM_STAGES,
-                    TILE_ELEMS,
-                ),
-                dtype,
+                (TILE_ELEMS,),
+                "float32",
             )
             temp2 = T.alloc_shared(
-                (
-                    NUM_STAGES,
-                    TILE_ELEMS,
-                ),
-                dtype,
+                (TILE_ELEMS,),
+                "float32",
             )
             temp3 = T.alloc_shared(
-                (
-                    NUM_STAGES,
-                    TILE_ELEMS,
-                ),
-                dtype,
+                (TILE_ELEMS,),
+                "float32",
             )
+            T.annotate_buffer_versions({temp1: NUM_STAGES, temp2: NUM_STAGES, temp3: NUM_STAGES})
 
-            for f in range(NUM_STAGES):
-                T.ascend_set_flag("MTE3_V", f)
-                T.ascend_set_flag("V_MTE2", f)
-
-            for iter in range(TOTAL_TILES):
+            for iter in T.Pipelined(TOTAL_TILES, num_stages=NUM_STAGES):
                 begin = (iter * NUM_BLOCKS + bx) * TILE_ELEMS
                 end = (iter * NUM_BLOCKS + bx + 1) * TILE_ELEMS
-                stage = iter % NUM_STAGES
 
-                T.ascend_wait_flag("V_MTE2", stage)
-                T.copy(A[begin:end], temp1[stage, :])
-                T.copy(B[begin:end], temp2[stage, :])
-                T.ascend_set_flag("MTE2_V", stage)
-
-                T.ascend_wait_flag("MTE2_V", stage)
-                T.ascend_wait_flag("MTE3_V", stage)
+                T.copy(A[begin:end], temp1)
+                T.copy(B[begin:end], temp2)
                 with T.SimtVF(threads=NUM_THREADS):
                     for i in T.Parallel(TILE_ELEMS):
-                        temp3[stage, i] = temp1[stage, i] + temp2[stage, i]
-                T.ascend_set_flag("V_MTE3", stage)
-                T.ascend_set_flag("V_MTE2", stage)
-
-                T.ascend_wait_flag("V_MTE3", stage)
-                T.copy(temp3[stage, :], C[begin:end])
-                T.ascend_set_flag("MTE3_V", stage)
-
-            for f in range(NUM_STAGES):
-                T.ascend_wait_flag("MTE3_V", f)
-                T.ascend_wait_flag("V_MTE2", f)
+                        temp3[i] = temp1[i] + temp2[i]
+                T.copy(temp3, C[begin:end])
 
     return main
 
@@ -79,18 +51,19 @@ def ref_program(a, b):
     return a + b
 
 
+NUM_REPEATS = 100
+
 if __name__ == "__main__":
     import torch
 
     N = 2**30
     dtype = torch.float32
-    tl_dtype = "float32"
     device = torch.device("npu")
 
     # Create and compile kernel
-    print(f"Compiling vector_add kernel (N={N}, dtype={tl_dtype})...")
-    program = vector_add(N, tl_dtype)
-    kernel = tilelang.compile(program, out_idx=-1, pass_configs={tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False})
+    print(f"Compiling vector_add kernel (N={N})...")
+    program = vector_add(N)
+    kernel = tilelang.compile(program, out_idx=-1)
     print("Compilation succeeded!")
 
     # Print generated source code
@@ -114,10 +87,5 @@ if __name__ == "__main__":
     print("\nVerification passed!")
 
     # Benchmark
-    def run_kernel_only():
-        kernel(a, b)
-
-    profile = do_bench(run_kernel_only, backend="msprof_detail", _n_warmup=30, _n_repeat=100)
-    print(profile)
-    latency_ms = do_bench(run_kernel_only, backend="msprof", _n_warmup=30, _n_repeat=100)
+    latency_ms = do_bench(lambda: kernel(a, b), backend="msprof", _n_warmup=30, _n_repeat=NUM_REPEATS)
     print(f"{latency_ms:.1f} ms/iter  |  {(N * a.element_size() * 3) / (latency_ms / 1e3) / 1e9:.1f} GB/s")

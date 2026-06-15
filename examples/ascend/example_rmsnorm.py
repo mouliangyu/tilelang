@@ -39,38 +39,23 @@ def rms_norm_fwd(batch, d, dtype="float32"):
         with T.Kernel(N_CORES) as core_id:
             # Double-buffered shared buffers
             w_ub = T.alloc_shared((d,), dtype)
-            x_ub = T.alloc_shared((2, TILE), "float32")
-            y_ub = T.alloc_shared((2, TILE), "float32")
-            z_rstd_ub = T.alloc_shared((2, 8), "float32")
+            x_ub = T.alloc_shared((TILE), "float32")
+            y_ub = T.alloc_shared((TILE), "float32")
+            z_rstd_ub = T.alloc_shared((8), "float32")
 
             # Load weights once
             T.copy(W[:d], w_ub[:d])
-            T.ascend_set_flag("MTE2_V", 3)
-            T.ascend_wait_flag("MTE2_V", 3)
 
-            # Init double-buffer flags
-            T.ascend_set_flag("V_MTE2", 0)
-            T.ascend_set_flag("MTE3_V", 0)
-            T.ascend_set_flag("V_MTE2", 1)
-            T.ascend_set_flag("MTE3_V", 1)
-
-            for t in T.serial(n_tokens_per_core):
+            for t in T.Pipelined(n_tokens_per_core, num_stages=2):
                 base = (t * N_CORES + core_id) * d
-                eid = t % 2
 
-                # MTE2: load x[token] from GM to UB
-                T.ascend_wait_flag("V_MTE2", eid)
-                T.copy(X[base : base + d], x_ub[eid, :d])
-                T.ascend_set_flag("MTE2_V", eid)
+                T.copy(X[base : base + d], x_ub[:d])
 
-                # VEC: compute RMSNorm
-                T.ascend_wait_flag("MTE2_V", eid)
-                T.ascend_wait_flag("MTE3_V", eid)
                 with T.SimtVF(threads=threads):
                     # Fragment: vectorized float4 load from UB to registers
                     x_frag = T.alloc_fragment((TILE,), "float32")
                     for i in T.Parallel(TILE):
-                        x_frag[i] = x_ub[eid, i]
+                        x_frag[i] = x_ub[i]
 
                     # Reduce: sum(x^2) from registers (no UB load)
                     sum_sq = T.alloc_reducer((1,), "float32", op="sum", replication="all")
@@ -83,28 +68,17 @@ def rms_norm_fwd(batch, d, dtype="float32"):
                     # Compute rstd
                     var = sum_sq[0] / d + eps
                     rstd_val = T.rsqrt(var)
-                    z_rstd_ub[eid, 0] = rstd_val
+                    z_rstd_ub[0] = rstd_val
 
                     # Output: y = x * rstd * w (reuse x_frag, no x reload)
                     for i in T.Parallel(TILE):
                         if i < d:
-                            y_ub[eid, i] = x_frag[i] * rstd_val * w_ub[i]
-
-                T.ascend_set_flag("V_MTE3", eid)
-                T.ascend_set_flag("V_MTE2", eid)
+                            y_ub[i] = x_frag[i] * rstd_val * w_ub[i]
 
                 # MTE3: store y[token] and rstd from UB to GM
                 row_id = t * N_CORES + core_id
-                T.ascend_wait_flag("V_MTE3", eid)
-                T.copy(y_ub[eid, :d], Y[base : base + d])
-                T.copy(z_rstd_ub[eid, :1], RSTD[row_id : row_id + 1])
-                T.ascend_set_flag("MTE3_V", eid)
-
-            # Drain pipeline
-            T.ascend_wait_flag("MTE3_V", 0)
-            T.ascend_wait_flag("MTE3_V", 1)
-            T.ascend_wait_flag("V_MTE2", 0)
-            T.ascend_wait_flag("V_MTE2", 1)
+                T.copy(y_ub[:d], Y[base : base + d])
+                T.copy(z_rstd_ub[:1], RSTD[row_id : row_id + 1])
 
     return main
 
@@ -129,7 +103,7 @@ if __name__ == "__main__":
         print(f"\n--- d={d}, batch={batch} ---")
         program = rms_norm_fwd(batch, d, str(dtype)[len("torch.") :])
         # Y (idx 1) and RSTD (idx 3) are outputs; X, W, eps are inputs
-        kernel = tilelang.compile(program, out_idx=[1, 3], pass_configs={tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False})
+        kernel = tilelang.compile(program, out_idx=[1, 3])
 
         x_flat = x.view(-1).contiguous()
 

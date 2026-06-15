@@ -1,5 +1,5 @@
 ---
-name: ascend-programming
+name: tilelang-ascend
 description: >
 Guide for writing TileLang programs targeting the Huawei Ascend NPU.
 Covers Ascend-specific concepts (AIC/AIV dual-core, Cube/Vector engines,
@@ -153,7 +153,7 @@ with T.Kernel(NUM_BLOCKS) as bx:
         ...
 ```
 
-Reference: `examples/ascend/example_gemm_mix.py`
+Reference: `examples/ascend/example_gemm_mix_manual.py`
 
 ---
 
@@ -209,10 +209,6 @@ T.annotate_buffer_versions({buf1: 2, buf2: 2})
 
 Without manual annotation, the compiler may misjudge buffer lifetimes,
 leading to suboptimal pipelining or correctness issues.
-
-Old-style manual double buffering: explicitly allocate a leading
-dimension for stages and manage with manual flags (see
-`examples/ascend/example_gemm.py`).
 
 ---
 
@@ -329,7 +325,7 @@ Key points:
 - Buffers do **not** need a leading `STAGES` dimension; the compiler
   auto-multi-buffers.
 - No manual SetFlag/WaitFlag calls needed.
-- Reference: `examples/ascend/example_gemm_auto.py`
+- Reference: `examples/ascend/example_gemm.py`
 
 **Buffer version annotation**: The auto-schedule pass estimates
 operation latency to determine buffer lifetimes and pipelining strategy.
@@ -346,45 +342,16 @@ T.annotate_buffer_versions({buf1: 2, buf2: 2})
 Without this hint, the compiler may misjudge buffer lifetimes, leading
 to suboptimal pipelining or correctness issues.
 
-### 7.2 Legacy: Manual Flag Pipelining
+### 7.2 Legacy: Manual Flag Pipelining (Deprecated)
 
-Used in older examples. Requires explicit flags coordinated between
-DMA engines (MTE1, MTE2, MTE3) and compute engines (V, M):
+Manual `T.ascend_set_flag`/`T.ascend_wait_flag` pipelining and
+`T.ascend_cross_core_set_flag`/`T.ascend_cross_core_wait_flag` cross-core
+sync are **deprecated**. Use auto-schedule (Section 7.1) instead. The
+low-level API functions still exist in the DSL for advanced users who
+need full manual control, but example files demonstrating these patterns
+have been removed from the tree.
 
-```python
-# Pipeline events (hardware signal names):
-#   MTE1_MTE2, MTE2_MTE1  -- Cube Engine ↔ MTE2 DMA
-#   MTE2_V, V_MTE2         -- Vector Engine ↔ MTE2 DMA
-#   MTE3_V, V_MTE3         -- Vector Engine ↔ MTE3 DMA
-#   FIX_M, M_FIX           -- Cube Engine fixed-point sync
-
-for f in range(NUM_STAGES):
-    T.ascend_set_flag("MTE1_MTE2", f)   # signal "ready to produce"
-
-for kt in range(K_TILES):
-    f = kt % NUM_STAGES
-    T.ascend_wait_flag("MTE1_MTE2", f)  # wait for DMA done
-    T.copy(X[...], x_l1[f, :, :])
-    T.ascend_set_flag("MTE2_MTE1", f)   # signal "data ready"
-
-    T.ascend_wait_flag("MTE2_MTE1", f)  # wait for data
-    T.gemm(x_l1[f], w_l1[f], res, transpose_B=True)
-    T.ascend_set_flag("MTE1_MTE2", f)   # signal "buffer free"
-```
-
-Reference: `examples/ascend/example_gemm.py`
-
-### 7.3 Cross-Core Synchronization
-
-Used in MixedKernel with manual sync:
-
-```python
-T.ascend_cross_core_set_flag(4, "PIPE_MTE3", flag_id)
-T.ascend_cross_core_wait_flag(4, "PIPE_MTE3", flag_id)
-T.ascend_pipe_barrier("PIPE_V")
-```
-
-### 7.4 Pipe Barrier
+### 7.3 Pipe Barrier
 
 ```python
 T.ascend_pipe_barrier("PIPE_ALL")   # all pipes
@@ -445,12 +412,10 @@ Two levels of SIMD programming:
 - **SIMD Lower (Recommended)**: Use raw `T.simd.*` intrinsics with
   manual loop unrolling (`for i in range(TILE // 64)`). This is the
   reliable approach -- you have full control over which instructions
-  are emitted. See `examples/ascend/example_simdvf_vecadd_lower.py`
-  and `examples/ascend/example_simdvf_vecadd_lower_auto.py`.
+  are emitted. See `examples/ascend/example_simdvf_vecadd_lower.py`.
 
 - **High-level SIMD**: Use `T.Parallel` inside `T.SimdVF()`, letting the
-  compiler auto-lower to vector operations. See
-  `examples/ascend/example_simdvf_vecadd.py`.
+  compiler auto-lower to vector operations.
 
   **Warning: High-level SIMD lowering is not fully reliable.** The
   `AscendSimdVFLowerParallel` pass may fail on non-trivial patterns
@@ -469,10 +434,10 @@ or correctness issues.
 
 ```bash
 # Measure all VF blocks in a kernel and write latency= back to source
-python measure_vf_latency.py examples/ascend/example_simdvf_vecadd.py
+python measure_vf_latency.py examples/ascend/example_simdvf_vecadd_lower.py
 
 # Preview without modifying the file
-python measure_vf_latency.py examples/ascend/example_simdvf_vecadd.py --dry-run
+python measure_vf_latency.py examples/ascend/example_simdvf_vecadd_lower.py --dry-run
 ```
 
 This tool compiles the kernel, extracts generated VF functions from
@@ -523,7 +488,7 @@ def main(X: T.Buffer((M, K), dtype),
             T.dual_copy(temp, C[m_slice, n_slice])
 ```
 
-Reference: `examples/ascend/example_gemm_auto.py`
+Reference: `examples/ascend/example_gemm.py`
 
 ### Pattern 2: MixedKernel GEMM (Auto-Scheduled, sid Access)
 
@@ -549,14 +514,7 @@ with T.MixedKernel(NUM_BLOCKS) as (bx, sid):
 
 Reference: `examples/ascend/example_gemm_mixedkernel.py`
 
-### Pattern 3: Manual Mixed (Cube + Vector with Manual Flags)
-
-Explicit `T.Cube()` and `T.Vector()` scopes with manual cross-core
-sync. More code but full control.
-
-Reference: `examples/ascend/example_gemm_mix.py`
-
-### Pattern 4: SIMD VF (Register-Level Vector)
+### Pattern 3: SIMD VF (Register-Level Vector)
 
 Element-wise operations using `T.SimdVF()`. No threads -- uses CCE
 MicroAPI vector instructions directly.
@@ -572,9 +530,9 @@ with T.Kernel(NUM_BLOCKS) as bx:
         T.copy(temp3, C[begin:end])
 ```
 
-Reference: `examples/ascend/example_simdvf_vecadd.py`
+Reference: `examples/ascend/example_simdvf_vecadd_lower.py`
 
-### Pattern 5: SIMT VF (Thread-Parallel Vector)
+### Pattern 4: SIMT VF (Thread-Parallel Vector)
 
 Element-wise operations distributed across threads.
 
@@ -586,7 +544,7 @@ with T.SimtVF(threads=NUM_THREADS):
 
 Reference: `examples/ascend/example_simtvf_vecadd.py`
 
-### Pattern 6: RMSNorm with Fragment Trick
+### Pattern 5: RMSNorm with Fragment Trick
 
 Uses `T.alloc_fragment` for register-level vectorized loads (float4
 chunks) and `T.alloc_reducer` + `T.finalize_reducer` for cross-warp
@@ -594,13 +552,12 @@ reduction of `sum(x^2)`.
 
 Reference: `examples/ascend/example_rmsnorm.py`
 
-### Pattern 7: L0-Staged GEMM
+### Pattern 6: L0-Staged GEMM
 
 Double-buffers L0A and L0B within each K-tile for maximum Cube
 utilization. Adds an inner `SUB_K` tiling loop.
 
-Reference: `examples/ascend/example_gemm_l0.py` (manual),
-`examples/ascend/example_gemm_l0_auto.py` (auto-scheduled)
+Reference: `examples/ascend/example_gemm_l0.py`
 
 ---
 
@@ -697,45 +654,35 @@ All examples are in `examples/ascend/`. Key files organized by category:
 ### GEMM variants
 | File | Description |
 |---|---|
-| `example_gemm.py` | Manual flag pipelining (legacy reference) |
-| `example_gemm_auto.py` | **Recommended**: auto-scheduled with T.Persistent + T.Pipelined |
-| `example_gemm_mix.py` | Manual MixedKernel (Cube + Vector with cross-core flags) |
+| `example_gemm.py` | **Recommended**: auto-scheduled GEMM with T.Persistent + T.Pipelined |
 | `example_gemm_mixedkernel.py` | Auto-scheduled MixedKernel GEMM |
-| `example_gemm_l0.py` | L0-staged GEMM (L1 → L0A/L0B sub-tiling) |
-| `example_gemm_l0_auto.py` | Auto-scheduled L0-staged GEMM |
+| `example_gemm_mix_manual.py` | Manual Cube+Vector mix with flags and cross-core sync (teaching reference) |
+| `example_gemm_l0.py` | Auto-scheduled L0-staged GEMM with nested pipelining |
 | `example_gemm_bypass_l2.py` | GEMM with L2 cache bypass |
-| `example_gemm_padded_copy.py` | Padded DMA copy for alignment |
-| `example_gemm_ub_merge.py` | UB shared memory merging optimization |
-| `example_gemm_various_shapes.py` | Different tile shape configurations |
+| `example_gemm_various_shapes.py` | DeepGEMM-style auto-config with multiple tile shapes |
+| `example_blockscaled_gemm.py` | Block-scaled GEMM (MXFP8) with per-group scale factors |
 
 ### SIMD VF (register-level vector operations)
 | File | Description |
 |---|---|
-| `example_simdvf_vecadd.py` | High-level SIMD vector add (T.Parallel in SimdVF) |
-| `example_simdvf_vecadd_lower.py` | Raw T.simd.* intrinsics (manual unrolling) |
-| `example_simdvf_vecadd_lower_auto.py` | Auto-scheduled SIMD lower |
+| `example_simdvf_vecadd_lower.py` | Auto-scheduled SIMD vector add using T.simd.* intrinsics |
 | `example_simdvf_vintlv.py` | SIMD vintlv/vdintlv interleave operations |
-| `example_simdvf_per_token_cast_to_fp8.py` | Per-token fp8 type conversion |
-| `example_simd_mem_bar.py` | SIMD memory barrier usage |
+| `example_simdvf_per_token_cast_to_fp8.py` | Per-token fp8 type conversion with SimdVF |
+| `example_simdvf_topk_gate.py` | TopK-gate for MoE routing with SimdVF selection loop |
 
 ### SIMT VF (thread-parallel operations)
 | File | Description |
 |---|---|
-| `example_simtvf_vecadd.py` | Thread-parallel vector add |
-| `example_simtvf_vecadd_auto.py` | Auto-scheduled SIMT vector add |
-| `example_simtvf_vecadd_mutex.py` | SIMT mutex synchronization |
+| `example_simtvf_vecadd.py` | Auto-scheduled SIMT vector add |
 | `example_simtvf_auto_sync.py` | Auto thread sync demonstration |
-| `example_simtvf_copy.py` | SIMT copy patterns |
-| `example_simtvf_ubuf.py` | UB buffer usage in SIMT |
-| `example_simtvf_ubuf_multi.py` | Multi-buffer UB in SIMT |
-| `example_simtvf_per_token_cast_to_fp8.py` | Per-token fp8 cast in SIMT |
+| `example_simtvf_ubuf_multi.py` | Multi-buffer UB with pipe barriers in SIMT |
+| `example_simtvf_per_token_cast_to_fp8.py` | Per-token fp8 cast with SimtVF + reduce |
 | `example_simtvf_vector_add.py` | Minimal SIMT vector add |
 
 ### Normalization
 | File | Description |
 |---|---|
-| `example_rmsnorm.py` | RMSNorm with fragment trick + reducer |
-| `example_rmsnorm_auto.py` | Auto-scheduled RMSNorm |
+| `example_rmsnorm.py` | Auto-scheduled RMSNorm with fragment trick + reducer |
 
 ### Attention
 | File | Description |

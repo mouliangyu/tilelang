@@ -18,61 +18,25 @@ def vector_add(N):
         C: T.Buffer((N,), "float32"),
     ):
         with T.Kernel(NUM_BLOCKS) as bx:
-            temp1 = T.alloc_shared(
-                (
-                    NUM_STAGES,
-                    TILE,
-                ),
-                "float32",
-            )
-            temp2 = T.alloc_shared(
-                (
-                    NUM_STAGES,
-                    TILE,
-                ),
-                "float32",
-            )
-            temp3 = T.alloc_shared(
-                (
-                    NUM_STAGES,
-                    TILE,
-                ),
-                "float32",
-            )
+            temp1 = T.alloc_shared((TILE,), "float32")
+            temp2 = T.alloc_shared((TILE,), "float32")
+            temp3 = T.alloc_shared((TILE,), "float32")
+            T.annotate_buffer_versions({temp1: NUM_STAGES, temp2: NUM_STAGES, temp3: NUM_STAGES})
 
-            for f in range(NUM_STAGES):
-                T.ascend_set_flag("MTE3_V", f)
-                T.ascend_set_flag("V_MTE2", f)
-
-            for iter in range(TOTAL_TILES):
+            for iter in T.Pipelined(TOTAL_TILES, num_stages=NUM_STAGES):
                 begin = (iter * NUM_BLOCKS + bx) * TILE
                 end = (iter * NUM_BLOCKS + bx + 1) * TILE
-                stage = iter % NUM_STAGES
 
-                T.ascend_wait_flag("V_MTE2", stage)
-                T.copy(A[begin:end], temp1[stage, :])
-                T.copy(B[begin:end], temp2[stage, :])
-                T.ascend_set_flag("MTE2_V", stage)
-
-                T.ascend_wait_flag("MTE2_V", stage)
-                T.ascend_wait_flag("MTE3_V", stage)
+                T.copy(A[begin:end], temp1)
+                T.copy(B[begin:end], temp2)
                 with T.SimdVF():
                     mask = T.simd.pset(32)
                     for i in range(TILE // 64):
-                        r0 = T.simd.vld(temp1[stage, i * 64])
-                        r1 = T.simd.vld(temp2[stage, i * 64])
+                        r0 = T.simd.vld(temp1[i * 64])
+                        r1 = T.simd.vld(temp2[i * 64])
                         r2 = T.simd.vadd(r0, r1, mask)
-                        T.simd.vsts(temp3[stage, i * 64], r2, mask)
-                T.ascend_set_flag("V_MTE3", stage)
-                T.ascend_set_flag("V_MTE2", stage)
-
-                T.ascend_wait_flag("V_MTE3", stage)
-                T.copy(temp3[stage, :], C[begin:end])
-                T.ascend_set_flag("MTE3_V", stage)
-
-            for f in range(NUM_STAGES):
-                T.ascend_wait_flag("MTE3_V", f)
-                T.ascend_wait_flag("V_MTE2", f)
+                        T.simd.vsts(temp3[i * 64], r2, mask)
+                T.copy(temp3, C[begin:end])
 
     return main
 
@@ -94,7 +58,7 @@ if __name__ == "__main__":
     # Create and compile kernel
     print(f"Compiling vector_add kernel (N={N})...")
     program = vector_add(N)
-    kernel = tilelang.compile(program, out_idx=-1, pass_configs={tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False})
+    kernel = tilelang.compile(program, out_idx=-1)
     print("Compilation succeeded!")
 
     # Print generated source code

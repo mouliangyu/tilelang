@@ -1,3 +1,4 @@
+import pytest
 import torch
 import tilelang
 import tilelang.language as T
@@ -79,10 +80,11 @@ def compare_result(name: str, x: torch.Tensor, y: torch.Tensor, ref: torch.Tenso
     return ok
 
 
-def run_case(case, elems_per_thread: int) -> bool:
+@pytest.mark.parametrize("case", CASES, ids=[c[0] for c in CASES])
+@pytest.mark.parametrize("elems_per_thread", COUNTS)
+def test_simtvf_cast(case, elems_per_thread):
     name, in_tl_dtype, out_tl_dtype, in_torch_dtype, out_torch_dtype, value_kind = case
     n = THREADS * elems_per_thread
-    print(f"\n=== SimtVF {name}: elems_per_thread={elems_per_thread}, n={n} ===")
 
     kernel = cast_kernel(n, in_tl_dtype, out_tl_dtype)
     x = make_input(n, in_torch_dtype, value_kind)
@@ -90,23 +92,4 @@ def run_case(case, elems_per_thread: int) -> bool:
     torch.npu.synchronize()
 
     ref = x.to(out_torch_dtype)
-    ok = compare_result(name, x, y, ref)
-    print(f"{name}, elems_per_thread={elems_per_thread}: {'PASS' if ok else 'FAIL'}")
-    return ok
-
-
-def test_simtvf_cast():
-    results = []
-    for case in CASES:
-        for elems_per_thread in COUNTS:
-            results.append((case[0], elems_per_thread, run_case(case, elems_per_thread)))
-
-    print("\n=== SimtVF cast summary ===")
-    for name, elems_per_thread, ok in results:
-        print(f"{name}, elems_per_thread={elems_per_thread}: {'PASS' if ok else 'FAIL'}")
-
-    assert all(ok for _, _, ok in results)
-
-
-if __name__ == "__main__":
-    test_simtvf_cast()
+    assert compare_result(name, x, y, ref), f"{name}, elems_per_thread={elems_per_thread}: FAIL"

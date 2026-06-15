@@ -2,7 +2,7 @@
 
 import torch
 import tilelang
-from example_blockscaled_gemm_auto import gemm, ref_program
+from example_blockscaled_gemm import gemm, ref_program
 
 
 def _make_sf_data(M, K, N, device):

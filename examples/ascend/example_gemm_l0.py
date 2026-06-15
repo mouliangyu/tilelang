@@ -14,7 +14,6 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
     N_TILES = N_DIM // TILE_N
     K_TILES = K_DIM // TILE_K
     OUT_TILES = M_TILES * N_TILES
-    TILES_PER_CORE = OUT_TILES // NUM_BLOCKS
     WINDOW = min(4, M_TILES)
     NUM_STAGES = 2
     MAIN_ROW = M_TILES // WINDOW - 1
@@ -43,50 +42,24 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
         C: T.Buffer((M_DIM, N_DIM), "float32"),
     ):
         with T.Kernel(NUM_BLOCKS) as bx:
-            x_l0 = T.alloc_l0a((NUM_STAGES, TILE_M, TILE_K_SUB), "bfloat16")
-            w_l0 = T.alloc_l0b((NUM_STAGES, TILE_N, TILE_K_SUB), "bfloat16")
+            x_l0 = T.alloc_l0a((TILE_M, TILE_K_SUB), "bfloat16")
+            w_l0 = T.alloc_l0b((TILE_N, TILE_K_SUB), "bfloat16")
             res = T.alloc_l0c((TILE_M, TILE_N), "float32")
-            x_l1 = T.alloc_l1((NUM_STAGES, TILE_M, TILE_K), "bfloat16")
-            w_l1 = T.alloc_l1((NUM_STAGES, TILE_N, TILE_K), "bfloat16")
-            for f in T.Serial(NUM_STAGES):
-                T.ascend_set_flag("M_MTE1", f + NUM_STAGES)
-                T.ascend_set_flag("MTE1_MTE2", f)
-            T.ascend_set_flag("FIX_M", 0)
-            for out_tile in T.Serial(TILES_PER_CORE):
-                tile_idx = out_tile * NUM_BLOCKS + bx
+            x_l1 = T.alloc_l1((TILE_M, TILE_K), "bfloat16")
+            w_l1 = T.alloc_l1((TILE_N, TILE_K), "bfloat16")
+            temp = T.alloc_shared((TILE_M // 2, TILE_N), "float32")
+            # T.annotate_buffer_versions({x_l0: NUM_STAGES, w_l0: NUM_STAGES, x_l1: NUM_STAGES, w_l1: NUM_STAGES})
+            for tile_idx in T.Persistent([OUT_TILES], NUM_BLOCKS, bx):
                 m_tile, n_tile = aswt_swizzle(tile_idx)
-
-                for kt in T.Serial(K_TILES):
-                    f = kt % NUM_STAGES
-                    T.ascend_wait_flag("MTE1_MTE2", f)
-
-                    T.copy(X[m_tile * TILE_M : (m_tile + 1) * TILE_M, kt * TILE_K : (kt + 1) * TILE_K], x_l1[f, :, :])
-                    T.copy(W[n_tile * TILE_N : (n_tile + 1) * TILE_N, kt * TILE_K : (kt + 1) * TILE_K], w_l1[f, :, :])
-                    T.ascend_set_flag("MTE2_MTE1", f)
-
-                    T.ascend_wait_flag("MTE2_MTE1", f)
-                    for sk in T.Serial(SUB_K):
-                        sf = sk % NUM_STAGES
-                        T.ascend_wait_flag("M_MTE1", sf + NUM_STAGES)
-                        T.copy(x_l1[f, :, sk * TILE_K_SUB : (sk + 1) * TILE_K_SUB], x_l0[sf, :, :])
-                        T.copy(w_l1[f, :, sk * TILE_K_SUB : (sk + 1) * TILE_K_SUB], w_l0[sf, :, :])
-                        T.ascend_set_flag("MTE1_M", sf + 2)
-                        T.ascend_wait_flag("MTE1_M", sf + 2)
-                        if kt == 0 and sk == 0:
-                            T.ascend_wait_flag("FIX_M", 0)
-                        T.gemm(x_l0[sf, :, :], w_l0[sf, :, :], res, transpose_B=True, clear_accum=(kt == 0 and sk == 0))
-                        T.ascend_set_flag("M_MTE1", sf + 2)
-
-                    T.ascend_set_flag("MTE1_MTE2", f)
-
-                T.ascend_set_flag("M_FIX", 0)
-                T.ascend_wait_flag("M_FIX", 0)
-                T.copy(res, C[m_tile * TILE_M, n_tile * TILE_N])
-                T.ascend_set_flag("FIX_M", 0)
-            for f in T.Serial(NUM_STAGES):
-                T.ascend_wait_flag("M_MTE1", f + NUM_STAGES)
-                T.ascend_wait_flag("MTE1_MTE2", f)
-            T.ascend_wait_flag("FIX_M", 0)
+                for kt in T.Pipelined(K_TILES, num_stages=NUM_STAGES):
+                    T.copy(X[m_tile * TILE_M : (m_tile + 1) * TILE_M, kt * TILE_K : (kt + 1) * TILE_K], x_l1)
+                    T.copy(W[n_tile * TILE_N : (n_tile + 1) * TILE_N, kt * TILE_K : (kt + 1) * TILE_K], w_l1)
+                    for sk in T.Pipelined(SUB_K, num_stages=NUM_STAGES):
+                        T.copy(x_l1[:, sk * TILE_K_SUB : (sk + 1) * TILE_K_SUB], x_l0)
+                        T.copy(w_l1[:, sk * TILE_K_SUB : (sk + 1) * TILE_K_SUB], w_l0)
+                        T.gemm(x_l0, w_l0, res, transpose_B=True, clear_accum=(kt == 0 and sk == 0))
+                T.dual_copy(res, temp)
+                T.dual_copy(temp, C[m_tile * TILE_M : (m_tile + 1) * TILE_M, n_tile * TILE_N : (n_tile + 1) * TILE_N])
 
     return main
 
@@ -110,7 +83,7 @@ if __name__ == "__main__":
     # Create and compile kernel
     print("Compiling gemm kernel...")
     program = gemm(M_DIM, K_DIM, N_DIM)
-    kernel = tilelang.compile(program, out_idx=-1, pass_configs={tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False})
+    kernel = tilelang.compile(program, out_idx=-1)
     print("Compilation succeeded!")
 
     # Print generated source code

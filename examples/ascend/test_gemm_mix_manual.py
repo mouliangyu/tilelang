@@ -1,12 +1,15 @@
-"""pytest test for example_gemm_l0.py — L0-staged GEMM (W is N x K)."""
+"""pytest test for example_gemm_mix_manual.py — manual Cube+Vector mix GEMM with flags.
+
+Tests the manual flag pipelining and cross-core sync pattern at M=K=N=8192 with bfloat16.
+"""
 
 import torch
 import tilelang
 
-from example_gemm_l0 import gemm, ref_program
+from example_gemm_mix_manual import gemm, ref_program
 
 
-def test_gemm_l0():
+def test_gemm_mix_manual():
     M, K, N = 8192, 8192, 8192
     kernel = tilelang.compile(
         gemm(M, K, N),
@@ -18,11 +21,12 @@ def test_gemm_l0():
     w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
     c = kernel(x, w)
     torch.npu.synchronize()
+
     expected = ref_program(x, w)
-    max_diff = (c - expected).abs().max().item()
-    assert max_diff < 1e-2, f"max_diff={max_diff:.2e}"
+    max_diff = torch.max(torch.abs(c - expected)).item()
+    assert max_diff < 1e-2, f"Results mismatch! Max diff: {max_diff}"
 
 
 if __name__ == "__main__":
-    test_gemm_l0()
-    print("PASS: test_gemm_l0")
+    test_gemm_mix_manual()
+    print("PASS: test_gemm_mix_manual")

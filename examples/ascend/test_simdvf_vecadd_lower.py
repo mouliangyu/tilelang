@@ -1,7 +1,8 @@
 """pytest test for example_simdvf_vecadd_lower.py.
 
-Note: the SimdVF kernel is currently incompatible with the Z3 auto-scheduler
-(reports 'no feasible II found'); we compile with auto-schedule disabled.
+This variant exercises the SimdVF kernel with the Z3 auto-scheduler enabled
+(the default), which requires AutoSchedule's MemoryAccessDetector to recognize
+the simd vld/vsts buffer accesses (now emitted via tl.access_ptr).
 """
 
 import torch
@@ -10,13 +11,9 @@ import tilelang
 from example_simdvf_vecadd_lower import ref_program, vector_add
 
 
-def test_simdvf_vecadd_lower():
+def test_simdvf_vecadd_lower_auto():
     N = 2**30
-    kernel = tilelang.compile(
-        vector_add(N),
-        out_idx=-1,
-        pass_configs={tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False},
-    )
+    kernel = tilelang.compile(vector_add(N), out_idx=-1)
     device = torch.device("npu")
     a = torch.randn(N, dtype=torch.float32, device=device)
     b = torch.randn(N, dtype=torch.float32, device=device)
@@ -26,5 +23,5 @@ def test_simdvf_vecadd_lower():
 
 
 if __name__ == "__main__":
-    test_simdvf_vecadd_lower()
-    print("PASS: test_simdvf_vecadd_lower")
+    test_simdvf_vecadd_lower_auto()
+    print("PASS: test_simdvf_vecadd_lower_auto")

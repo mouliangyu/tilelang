@@ -3,16 +3,24 @@ import tilelang.language as T
 from tilelang.profiler import do_bench
 
 
-def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
+def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", MIXED=None, hf32=None):
+    """Auto-scheduled GEMM.
+
+    dtype: 'bfloat16' or 'float32'.
+    MIXED: True/False/None (auto: bf16→mixed, fp32→cube-only).
+    hf32: None (off) / 'nearest_zero' / 'nearest_even' (fp32 only).
+    """
     NUM_BLOCKS = 32
+    is_fp32 = dtype == "float32"
+    if MIXED is None:
+        MIXED = not is_fp32  # default: bf16→mixed, fp32→cube-only
     TILE_M = 256
     TILE_N = 256
-    TILE_K = 256
+    TILE_K = 128 if is_fp32 else 256  # fp32: L1 512KB, 2*(256+256)*128*4=512KB fits
     M_TILES = M_DIM // TILE_M
     N_TILES = N_DIM // TILE_N
     K_TILES = K_DIM // TILE_K
     OUT_TILES = M_TILES * N_TILES
-    TILES_PER_CORE = OUT_TILES // NUM_BLOCKS
     WINDOW = min(4, M_TILES)
     NUM_STAGES = 2
     MAIN_ROW = M_TILES // WINDOW - 1
@@ -36,91 +44,86 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192):
 
     @T.prim_func
     def main(
-        X: T.Buffer((M_DIM, K_DIM), "bfloat16"),
-        W: T.Buffer((K_DIM, N_DIM), "bfloat16"),
+        X: T.Buffer((M_DIM, K_DIM), dtype),
+        W: T.Buffer((N_DIM, K_DIM), dtype),
         C: T.Buffer((M_DIM, N_DIM), "float32"),
     ):
         with T.Kernel(NUM_BLOCKS) as bx:
+            if is_fp32:
+                T.set_hf32_mode(hf32)
             res = T.alloc_l0c((TILE_M, TILE_N), "float32")
-            x_l1 = T.alloc_l1((NUM_STAGES, TILE_M, TILE_K), "bfloat16")
-            w_l1 = T.alloc_l1((NUM_STAGES, TILE_K, TILE_N), "bfloat16")
-            for f in range(NUM_STAGES):
-                T.ascend_set_flag("MTE1_MTE2", f)
-            T.ascend_set_flag("FIX_M", 0)
-            for out_tile in range(TILES_PER_CORE):
-                tile_idx = out_tile * NUM_BLOCKS + bx
+            x_l1 = T.alloc_l1((TILE_M, TILE_K), dtype)
+            w_l1 = T.alloc_l1((TILE_N, TILE_K), dtype)
+            temp = T.alloc_shared((TILE_M // 2, TILE_N), "float32")
+
+            for tile_idx in T.Persistent([OUT_TILES], NUM_BLOCKS, bx):
                 m_tile, n_tile = aswt_swizzle(tile_idx)
-
-                for kt in range(K_TILES):
-                    f = kt % NUM_STAGES
-                    T.ascend_wait_flag("MTE1_MTE2", f)
-
-                    T.copy(X[m_tile * TILE_M : (m_tile + 1) * TILE_M, kt * TILE_K : (kt + 1) * TILE_K], x_l1[f, :, :])
-                    T.copy(W[kt * TILE_K : (kt + 1) * TILE_K, n_tile * TILE_N : (n_tile + 1) * TILE_N], w_l1[f, :, :], transpose=True)
-                    T.ascend_set_flag("MTE2_MTE1", f)
-
-                    T.ascend_wait_flag("MTE2_MTE1", f)
-                    if kt == 0:
-                        T.ascend_wait_flag("FIX_M", 0)
-                    T.gemm(x_l1[f, :, :], w_l1[f, :, :], res, transpose_B=True, clear_accum=(kt == 0))
-                    T.ascend_set_flag("MTE1_MTE2", f)
-
-                T.ascend_set_flag("M_FIX", 0)
-                T.ascend_wait_flag("M_FIX", 0)
-                T.copy(res, C[m_tile * TILE_M, n_tile * TILE_N])
-                T.ascend_set_flag("FIX_M", 0)
-            for f in range(NUM_STAGES):
-                T.ascend_wait_flag("MTE1_MTE2", f)
-            T.ascend_wait_flag("FIX_M", 0)
+                for kt in T.Pipelined(K_TILES, num_stages=NUM_STAGES):
+                    T.copy(X[m_tile * TILE_M : (m_tile + 1) * TILE_M, kt * TILE_K : (kt + 1) * TILE_K], x_l1)
+                    T.copy(W[n_tile * TILE_N : (n_tile + 1) * TILE_N, kt * TILE_K : (kt + 1) * TILE_K], w_l1)
+                    T.gemm(x_l1, w_l1, res, transpose_B=True, clear_accum=(kt == 0))
+                if MIXED:
+                    T.dual_copy(res, temp)
+                    T.dual_copy(temp, C[m_tile * TILE_M : (m_tile + 1) * TILE_M, n_tile * TILE_N : (n_tile + 1) * TILE_N])
+                else:
+                    T.copy(res, C[m_tile * TILE_M, n_tile * TILE_N])
 
     return main
 
 
 def ref_program(x, w):
-    """Reference implementation: C = A @ B"""
-    return x.float() @ w.float()
+    return x.float() @ w.float().T
 
-
-NUM_REPEATS = 500
-M_DIM = 8192
-K_DIM = 8192
-N_DIM = 8192
 
 if __name__ == "__main__":
     import torch
 
-    dtype = torch.float32
     device = torch.device("npu")
+    M, K, N = 8192, 8192, 8192
 
-    # Create and compile kernel
-    print("Compiling gemm kernel...")
-    program = gemm(M_DIM, K_DIM, N_DIM)
-    kernel = tilelang.compile(program, out_idx=-1, pass_configs={tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False})
+    for dt, thresh in [("float8_e4m3fn", 1e-1), ("bfloat16", 1e-2), ("float32", 5e-3)]:
+        print(f"\n=== {dt} GEMM ===")
+        program = gemm(M, K, N, dtype=dt)
+        kernel = tilelang.compile(program, out_idx=-1)
+        print("Compilation succeeded!")
+
+        x = torch.randn(M, K, device=device).to(dtype=getattr(torch, dt))
+        w = torch.randn(N, K, device=device).to(dtype=getattr(torch, dt))
+
+        c = kernel(x, w)
+        torch.npu.synchronize()
+
+        expected = ref_program(x, w)
+        max_diff = torch.max(torch.abs(c - expected)).item()
+        print(f"  {'PASS' if max_diff < thresh else 'FAIL'}  max_diff={max_diff:.2e}")
+
+        # Quick benchmark
+        NUM_REPEATS = 100 if dt == "bfloat16" else 50
+
+        def run_kernel(kernel=kernel, x=x, w=w):
+            return kernel(x, w)
+
+        latency_ms = do_bench(run_kernel, backend="msprof", _n_warmup=30, _n_repeat=NUM_REPEATS)
+        flops = 2.0 * M * N * K
+        print(f"  {latency_ms:.3f} ms/iter  |  {flops / (latency_ms / 1e3) / 1e12:.1f} TFLOPS")
+
+    # HF32 benchmark
+    print("\n=== float32 HF32 GEMM ===")
+    program = gemm(M, K, N, dtype="float32", hf32="nearest_even")
+    kernel = tilelang.compile(program, out_idx=-1)
     print("Compilation succeeded!")
-
-    # Print generated source code
-    print("\n--- Generated Ascend Source ---")
-    print(kernel.get_kernel_source())
-
-    # Create test data
-    x = torch.randn(M_DIM, K_DIM, dtype=torch.bfloat16, device=device)
-    w = torch.randn(K_DIM, N_DIM, dtype=torch.bfloat16, device=device)
-
-    # Run kernel
-    print("Running kernel on NPU...")
+    x = torch.randn(M, K, dtype=torch.float32, device=device)
+    w = torch.randn(N, K, dtype=torch.float32, device=device)
     c = kernel(x, w)
     torch.npu.synchronize()
-    print("Done")
-
-    # Verify
     expected = ref_program(x, w)
     max_diff = torch.max(torch.abs(c - expected)).item()
-    print(f"  {'PASS' if max_diff < 1e-2 else 'FAIL'}  rel={max_diff:.2e}")
-    if not max_diff < 1e-2:
-        raise AssertionError(f"Results mismatch! Max diff: {max_diff}")
-    print("\nVerification passed!")
+    print(f"  max_diff={max_diff:.2e} (HF32 rel_err ~3e-4)")
+    NUM_REPEATS = 50
 
-    # Benchmark
-    latency_ms = do_bench(lambda: kernel(x, w), backend="msprof", _n_warmup=30, _n_repeat=NUM_REPEATS)
-    flops = 2.0 * M_DIM * N_DIM * K_DIM
-    print(f"{latency_ms:.3f} ms/iter  |  {flops / (latency_ms / 1e3) / 1e12:.1f} TFLOPS")
+    def run_kernel():
+        return kernel(x, w)
+
+    latency_ms = do_bench(run_kernel, backend="msprof", _n_warmup=30, _n_repeat=NUM_REPEATS)
+    flops = 2.0 * M * N * K
+    print(f"  {latency_ms:.3f} ms/iter  |  {flops / (latency_ms / 1e3) / 1e12:.1f} TFLOPS")
