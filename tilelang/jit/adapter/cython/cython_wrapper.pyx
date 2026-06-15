@@ -11,6 +11,7 @@ cdef class CythonKernelWrapper:
     # Class attributes to store kernel configuration and library reference
     cdef:
         object dynamic_symbolic_map    # Maps dynamic dimensions to their corresponding tensor indices
+        object dynamic_symbolic_sources  # Maps dynamic var names to ALL buffer carriers for cascaded None resolution
         object buffer_device_map       # Maps buffer variables to their corresponding devices
         object buffer_dtype_map        # Maps buffer variables to their corresponding dtypes
         object static_shape_map        # Maps buffer variables to their corresponding static shapes
@@ -49,6 +50,10 @@ cdef class CythonKernelWrapper:
 
     def set_dynamic_symbolic_map(self, dynamic_symbolic_map):
         self.dynamic_symbolic_map = dynamic_symbolic_map
+        return self
+
+    def set_dynamic_symbolic_sources(self, dynamic_symbolic_sources):
+        self.dynamic_symbolic_sources = dynamic_symbolic_sources
         return self
 
     def set_buffer_dtype_map(self, buffer_dtype_map):
@@ -199,9 +204,12 @@ cdef class CythonKernelWrapper:
                 for s in self.param_shapes[i]:
                     if isinstance(s, tirx.Var):
                         for key in self.dynamic_symbolic_map:
-                            if(str(s) == str(key)):
-                                ref_id, ref_tensor_idx, ref_shape_idx, _stride_scale = self.dynamic_symbolic_map[key]
-                                shape.append(tensor_list[ref_tensor_idx].shape[ref_shape_idx])
+                            if str(s) == str(key):
+                                ref_id, ref_tensor_idx, ref_shape_idx, stride_scale = self.dynamic_symbolic_map[key]
+                                if ref_id == 0:
+                                    shape.append(tensor_list[ref_tensor_idx].shape[ref_shape_idx])
+                                else:
+                                    shape.append(tensor_list[ref_tensor_idx].stride(ref_shape_idx) * stride_scale)
                     else:  # Already converted to Python int during initialization
                         shape.append(s)
 
@@ -267,11 +275,20 @@ cdef class CythonKernelWrapper:
             self._check_static_contiguous(tensor_list)
 
         # Add dynamic dimension values to kernel arguments
-        for _, (ref_id, buffer_idx, shape_idx, stride_scale) in self.dynamic_symbolic_map.items():
-            if ref_id == 0:
-                call_args.append(ctypes.c_int64(tensor_list[buffer_idx].shape[shape_idx]))
-            else:
-                call_args.append(ctypes.c_int64(tensor_list[buffer_idx].stride(shape_idx) * stride_scale))
+        for var, (ref_id, buffer_idx, shape_idx, stride_scale) in self.dynamic_symbolic_map.items():
+            # Cascaded resolution across all carrier buffers to handle None
+            var_key = str(var)
+            sources = self.dynamic_symbolic_sources.get(var_key, [(buffer_idx, shape_idx, stride_scale)])
+            value = 0
+            for src_buf_idx, src_dim_idx, src_stride_scale in sources:
+                tensor = tensor_list[src_buf_idx]
+                if tensor is not None:
+                    if ref_id == 0:
+                        value = tensor.shape[src_dim_idx]
+                    else:
+                        value = tensor.stride(src_dim_idx) * src_stride_scale
+                    break
+            call_args.append(ctypes.c_int64(value))
 
         # Add CUDA stream to kernel arguments
         call_args.append(ctypes.c_void_p(stream))
