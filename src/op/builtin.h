@@ -818,7 +818,6 @@ TVM_DLL const Op &simd_vrsqrt();
 TVM_DLL const Op &simd_vabs();
 TVM_DLL const Op &simd_vneg();
 TVM_DLL const Op &simd_vrelu();
-TVM_DLL const Op &simd_vrec();
 
 // -- Broadcast
 TVM_DLL const Op &simd_vdup();

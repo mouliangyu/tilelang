@@ -316,13 +316,6 @@ __simd_callee__ inline SrcVec vrelu(SrcVec src, vector_bool mask, Mode mode) {
 }
 
 template <typename SrcVec, typename Mode>
-__simd_callee__ inline SrcVec vrec(SrcVec src, vector_bool mask, Mode mode) {
-  SrcVec dst;
-  vrec(dst, src, mask, mode);
-  return dst;
-}
-
-template <typename SrcVec, typename Mode>
 __simd_callee__ inline SrcVec vexp(SrcVec src, vector_bool mask, Mode mode) {
   SrcVec dst;
   ::vexp(dst, src, mask, mode);

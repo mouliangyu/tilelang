@@ -1332,8 +1332,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
            op->op.same_as(tl::simd_vsqrt()) ||
            op->op.same_as(tl::simd_vrsqrt()) ||
            op->op.same_as(tl::simd_vabs()) || op->op.same_as(tl::simd_vneg()) ||
-           op->op.same_as(tl::simd_vrelu()) ||
-           op->op.same_as(tl::simd_vrec())) {
+           op->op.same_as(tl::simd_vrelu())) {
     ICHECK_EQ(op->args.size(), 3);
     const char *name = nullptr;
     if (op->op.same_as(tl::simd_vexp()))
@@ -1348,8 +1347,6 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       name = "vabs";
     else if (op->op.same_as(tl::simd_vrelu()))
       name = "vrelu";
-    else if (op->op.same_as(tl::simd_vrec()))
-      name = "vrec";
     else
       name = "vneg";
     os << "simd_inst::" << name << "(";

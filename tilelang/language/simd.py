@@ -203,10 +203,6 @@ def vrelu(src, mask, mode="MODE_ZEROING"):
     return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vrelu"), src, mask, mode)
 
 
-def vrec(src, mask, mode="MODE_ZEROING"):
-    return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vrec"), src, mask, mode)
-
-
 # -- Broadcast --------------------------------------------------------------------
 
 

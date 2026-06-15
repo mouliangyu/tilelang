@@ -434,7 +434,7 @@ with T.SimdVF():
 
 Full list of available SIMD intrinsics: `vld`, `vsts`, `vsstb`, `vadd`, `vsub`,
 `vmul`, `vdiv`, `vmax`, `vmin`, `vand`, `vexp`, `vln`, `vsqrt`,
-`vrsqrt`, `vabs`, `vneg`, `vrelu`, `vrec`, `vdup`, `vdupv`, `vcadd`,
+`vrsqrt`, `vabs`, `vneg`, `vrelu`, `vdup`, `vdupv`, `vcadd`,
 `vcmax`, `vcgadd`, `vintlv`, `vdintlv`, `vpack`, `vgatherb`, `vcvt`,
 `vsel`, `vmuls`, `vadds`, `pset`, `mem_bar`.
 
