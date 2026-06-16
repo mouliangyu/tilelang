@@ -53,6 +53,7 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.VerifyParallelLoop()(mod)
     mod = tilelang.transform.InjectAssumes()(mod)
     mod = tilelang.transform.Simplify()(mod)
+    tilelang.ascend.analysis.VFParallelChecker()(mod)
 
     if allow_autoschedule(pass_ctx=pass_ctx):
         mod = ascend_transform.AnnotateMultiBufferEligible()(mod)
@@ -64,17 +65,6 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = ascend_transform.AscendSimdVFLowerParallel()(mod)
 
     mod = tilelang.transform.LayoutReducer()(mod)
-
-    # Normalize if-without-else wrappers before pipeline planning. This keeps
-    # pipeline body extraction focused on canonical SeqStmt bodies.
-    mod = tilelang.transform.IfStmtBinding()(mod)
-
-    # Run pipeline planning and software-pipeline rewriting before layout
-    # inference so inferred layouts see the final pipelined structure directly.
-    mod = tilelang.transform.PipelinePlanning()(mod)
-    mod = tilelang.transform.InjectSoftwarePipeline()(mod)
-    mod = tilelang.transform.Simplify()(mod)
-
     mod = tilelang.transform.LayoutInference()(mod)
     LayoutVisual(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
@@ -90,6 +80,7 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.HoistGlobalBufferAllocations()(mod)
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     mod = tilelang.transform.Simplify()(mod)
+    mod = tilelang.ascend.analysis.VFParallelChecker()(mod)
     mod = tirx.transform.NarrowDataType(32)(mod)
     mod = tilelang.transform.FlattenBuffer()(mod)
     mod = tilelang.transform.ConfigIndexBitwidth()(mod)
@@ -97,8 +88,7 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.VectorizeLoop(enable_vectorize=allow_vectorize(pass_ctx=pass_ctx))(mod)
     mod = tilelang.transform.StorageRewrite()(mod)
 
-    has_vf = _has_vf_region(mod)
-    if not has_vf:
+    if not _has_vf_region(mod):
         mod = tilelang.transform.LoopUnswitching()(mod)
     mod = tilelang.transform.UnrollLoop()(mod)
     mod = s_tir.transform.RenormalizeSplitPattern()(mod)

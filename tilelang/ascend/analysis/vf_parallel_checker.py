@@ -13,14 +13,14 @@ class _VFParallelCheckVisitor(PyStmtExprVisitor):
         super().__init__()
         self.inside_vf = False
 
-    def visit_block_(self, op: tirx.SBlock) -> None:
+    def visit_sblock_(self, op: tirx.SBlock) -> None:
         if op.name_hint in _VF_BLOCK_NAMES:
             was_inside = self.inside_vf
             self.inside_vf = True
             self.visit_stmt(op.body)
             self.inside_vf = was_inside
         else:
-            super().visit_block_(op)
+            super().visit_sblock_(op)
 
     def visit_for_(self, op: For) -> None:
         if op.kind == tirx.ForKind.PARALLEL and not self.inside_vf:
