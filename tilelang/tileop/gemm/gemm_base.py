@@ -205,6 +205,11 @@ class GemmBase:
         return self.sf_k_start
 
     @property
+    def unit_flag_ctrl(self) -> PrimExpr:
+        ann = getattr(self.gemm_node, "annotations", {})
+        return ann.get("unit_flag_ctrl", tvm.tirx.const(0, T.int32))
+
+    @property
     def is_blockscaled(self) -> bool:
         return self.SFARegion is not None and self.SFBRegion is not None
 

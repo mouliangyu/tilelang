@@ -137,6 +137,7 @@ def copy(
     nd2nz: bool = False,
     l2_cache_ctrl: int | str | None = None,
     scale_factor: bool = False,
+    unit_flag_ctrl: int = 0,
 ) -> tirx.PrimExpr | tirx.Stmt:
     """Copy data between memory regions.
 
@@ -233,6 +234,8 @@ def copy(
         ann["l2_cache_ctrl"] = l2_cache_ctrl
     if scale_factor and "scale_factor" not in ann:
         ann["scale_factor"] = tirx.IntImm("int32", 1)
+    if unit_flag_ctrl and "unit_flag_ctrl" not in ann:
+        ann["unit_flag_ctrl"] = unit_flag_ctrl
     if "l2_cache_ctrl" in ann:
         ann["l2_cache_ctrl"] = _normalize_l2_cache_ctrl(ann["l2_cache_ctrl"])
 
@@ -796,7 +799,7 @@ def dual_copy(
     src: BufferLikeType,
     dst: BufferLikeType,
     *,
-    unit_flag_ctl: int = 0,
+    unit_flag_ctrl: int = 0,
     nd2nz: bool = False,
     l2_cache_ctrl: int | str = 0,
 ) -> tirx.PrimExpr | tirx.Stmt:
@@ -814,7 +817,7 @@ def dual_copy(
     Args:
         src: Source buffer (L0C ``__cc__`` or UB ``__ubuf__``), shape ``[M, N]``
         dst: Destination buffer (UB ``__ubuf__`` or L1 ``__cbuf__``), shape ``[M/2, N]`` or ``[M, N/2]``
-        unit_flag_ctl: Unit flag control (0=manual sync, 3=pipelined with mad)
+        unit_flag_ctrl: Unit flag control (0=manual sync, 3=pipelined with mad)
         nd2nz: If True, fuse ND→NZ scatter for UB→L1 copy (Ascend only).
         l2_cache_ctrl (int | str): Ascend L2 cache control policy for the UB→GM
             store path. Accepts an integer or case-insensitive string name
@@ -852,7 +855,7 @@ def dual_copy(
     dst_region = to_buffer_region(dst)
     annotations = {
         "dual_dst_ctl": dual_dst_ctl,
-        "unit_flag_ctl": unit_flag_ctl,
+        "unit_flag_ctrl": unit_flag_ctrl,
         "l2_cache_ctrl": l2_cache_ctrl,
     }
     if nd2nz:

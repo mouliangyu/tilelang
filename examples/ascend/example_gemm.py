@@ -3,7 +3,7 @@ import tilelang.language as T
 from tilelang.profiler import do_bench
 
 
-def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", MIXED=None, hf32=None):
+def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", MIXED=None, hf32=None, enable_unit_flag=True):
     """Auto-scheduled GEMM.
 
     dtype: 'bfloat16' or 'float32'.
@@ -25,6 +25,12 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", MIXED=None, hf32=
     NUM_STAGES = 2
     MAIN_ROW = M_TILES // WINDOW - 1
     TAIL_WIN = M_TILES - MAIN_ROW * WINDOW
+    if enable_unit_flag:
+        UF_2 = 2
+        UF_3 = 3
+    else:
+        UF_2 = 0
+        UF_3 = 0
 
     @T.macro
     def aswt_swizzle(tile_idx):
@@ -61,12 +67,12 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", MIXED=None, hf32=
                 for kt in T.Pipelined(K_TILES, num_stages=NUM_STAGES):
                     T.copy(X[m_tile * TILE_M : (m_tile + 1) * TILE_M, kt * TILE_K : (kt + 1) * TILE_K], x_l1)
                     T.copy(W[n_tile * TILE_N : (n_tile + 1) * TILE_N, kt * TILE_K : (kt + 1) * TILE_K], w_l1)
-                    T.gemm(x_l1, w_l1, res, transpose_B=True, clear_accum=(kt == 0))
+                    T.gemm(x_l1, w_l1, res, transpose_B=True, clear_accum=(kt == 0), unit_flag_ctrl=T.Select(kt == K_TILES - 1, UF_3, UF_2))
                 if MIXED:
-                    T.dual_copy(res, temp)
+                    T.dual_copy(res, temp, unit_flag_ctrl=UF_3)
                     T.dual_copy(temp, C[m_tile * TILE_M : (m_tile + 1) * TILE_M, n_tile * TILE_N : (n_tile + 1) * TILE_N])
                 else:
-                    T.copy(res, C[m_tile * TILE_M, n_tile * TILE_N])
+                    T.copy(res, C[m_tile * TILE_M, n_tile * TILE_N], unit_flag_ctrl=UF_3)
 
     return main
 

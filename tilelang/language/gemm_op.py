@@ -176,6 +176,7 @@ def gemm(
     clear_accum: bool = False,
     k_pack: int = 1,
     mbar: BarrierType | None = None,
+    unit_flag_ctrl: int = 0,
 ) -> tirx.PrimExpr:
     """TileLang GEMM operator.
 
@@ -199,10 +200,13 @@ def gemm(
         k_pack (int): Numbers of packed matrix cores, for ROCm only. Defaults to 1.
         mbar (BarrierType, i.e. Buffer | BufferLoad, or Var, optional): Mbarrier in Blackwell.
             Required when this GEMM lowers to TCGEN5MMA. Defaults to None.
+        unit_flag_ctrl (int): Unit flag control for the instruction. Defaults to 0.
 
     Returns:
         tirx.Call: A handle to the GEMM operation.
     """
+
+    ann = {"unit_flag_ctrl": unit_flag_ctrl}
     return _gemm_impl(
         "tl.tileop.gemm",
         A,
@@ -215,6 +219,7 @@ def gemm(
         k_pack,
         0,
         mbar,
+        annotations=ann,
     )
 
 
@@ -520,8 +525,11 @@ def blockscaled_gemm(
     transpose_B: bool = False,
     clear_accum: bool = False,
     sf_k_within_chunk: int | tirx.PrimExpr = 0,
+    unit_flag_ctrl: int = 0,
 ) -> tirx.PrimExpr:
     """Ascend block-scaled MXFP8 GEMM with L1 data and scale-factor tiles."""
+
+    ann = {"unit_flag_ctrl": unit_flag_ctrl}
     return _gemm_impl(
         "tl.tileop.gemm",
         A,
@@ -537,4 +545,5 @@ def blockscaled_gemm(
         sfa=sfa,
         sfb=sfb,
         sf_k_start=sf_k_within_chunk,
+        annotations=ann,
     )

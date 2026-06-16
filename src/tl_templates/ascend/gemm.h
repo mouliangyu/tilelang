@@ -41,7 +41,8 @@ template <int M, int K, int N, int TILE_K_SUB, bool TRANS_B, typename InT,
           typename AccumT>
 __aicore__ inline void
 ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
-               __cbuf__ InT *cbuf_b_ptr, int clear_accum, int buf_offset = 0) {
+               __cbuf__ InT *cbuf_b_ptr, int clear_accum, int buf_offset = 0,
+               int unit_flag_ctrl = 0) {
   // C0 = 32B / sizeof(InT): 16 for bf16/fp16, 8 for fp32, 32 for int8.
   // FRAC_N = 16: row-block size in the n-direction, dtype-independent.
   constexpr int C0 = 32 / sizeof(InT);
@@ -89,9 +90,17 @@ ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
     }
     rls_buf(PIPE_MTE1, buf_offset + (sk & 1), false);
     get_buf(PIPE_M, buf_offset + (sk & 1), false);
+
+    bool is_first = (sk == 0);
+    bool is_last = (sk == SUB_K - 1);
+    uint32_t uf_ctrl = unit_flag_ctrl;
+    if (uf_ctrl == 3 && !is_last) {
+      uf_ctrl = 2;
+    }
+
     mad(cc_ptr, (__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)),
-        (__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), M, TILE_K_SUB, N, 0, 0, 0,
-        clear_accum && (sk == 0));
+        (__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), M, TILE_K_SUB, N, uf_ctrl,
+        0, 0, clear_accum && is_first);
     rls_buf(PIPE_M, buf_offset + (sk & 1), false);
   }
 }
@@ -124,11 +133,10 @@ ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
  */
 template <int M, int K, int N, int TILE_K_SUB, bool TRANS_B,
           int SF_LOAD_INTERVAL, typename InT, typename SFT, typename AccumT>
-__aicore__ inline void
-ascend_blockscaled_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
-                           __cbuf__ InT *cbuf_b_ptr, __cbuf__ SFT *cbuf_sfa_ptr,
-                           __cbuf__ SFT *cbuf_sfb_ptr, int clear_accum,
-                           int buf_offset = 0, int sf_k_within_chunk = 0) {
+__aicore__ inline void ascend_blockscaled_gemm_l1(
+    __cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr, __cbuf__ InT *cbuf_b_ptr,
+    __cbuf__ SFT *cbuf_sfa_ptr, __cbuf__ SFT *cbuf_sfb_ptr, int clear_accum,
+    int buf_offset = 0, int sf_k_within_chunk = 0, int unit_flag_ctrl = 0) {
   constexpr int C0 = 32 / sizeof(InT);
   constexpr int FRAC_N = 16;
 
@@ -198,10 +206,15 @@ ascend_blockscaled_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
     get_buf(PIPE_M, buf_offset + (sk & 1), false);
 
     bool is_first = (sk == 0);
+    bool is_last = (sk == SUB_K - 1);
+    uint32_t uf_ctrl = unit_flag_ctrl;
+    if (uf_ctrl == 3 && !is_last) {
+      uf_ctrl = 2;
+    }
 
     mad_mx(cc_ptr, (__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)),
-           (__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), M, TILE_K_SUB, N, 0,
-           false, false, clear_accum && is_first);
+           (__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), M, TILE_K_SUB, N,
+           uf_ctrl, false, false, clear_accum && is_first);
 
     rls_buf(PIPE_M, buf_offset + (sk & 1), false);
   }

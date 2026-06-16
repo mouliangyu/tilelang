@@ -443,6 +443,25 @@ static TaskNode *GetInnerTask(ScheduleUnit *unit) {
   }
 }
 
+// Check if a TaskNode's operation has unit_flag_ctl/ctrl != 0.
+static bool HasUnitFlagCtrl(const TaskNode *task) {
+  if (!task || task->stmts.size() != 1)
+    return false;
+  auto *eval = task->stmts[0].as<EvaluateNode>();
+  if (!eval)
+    return false;
+  auto *call = eval->value.as<CallNode>();
+  if (!call)
+    return false;
+
+  if (auto ann = call->annotations.Get("unit_flag_ctrl")) {
+    if (auto imm = ann->as<IntImmNode>())
+      return imm->value != 0;
+    return true; // non-IntImm → dynamic → enabled
+  }
+  return false;
+}
+
 // --- Ascend set_flag / wait_flag helpers ---
 
 static Stmt makeAscendSetFlag(const std::string &hard_event,
@@ -833,7 +852,27 @@ static bool SyncDominates(const SyncPoint &x, const SyncPoint &y) {
 }
 
 static std::vector<SyncPoint>
-OptimizeSyncPoints(const std::vector<SyncPoint> &sync_points) {
+FilterUnitFlagFixSyncs(const std::vector<SyncPoint> &sync_points) {
+  std::vector<SyncPoint> result;
+  result.reserve(sync_points.size());
+  for (const auto &sp : sync_points) {
+    if (sp.type == SyncType::IntraCore &&
+        sp.hard_event.find("FIX") != std::string::npos) {
+      auto *prod_task = GetInnerTask(sp.prod_unit);
+      auto *cons_task = GetInnerTask(sp.cons_unit);
+      if ((prod_task && HasUnitFlagCtrl(prod_task)) ||
+          (cons_task && HasUnitFlagCtrl(cons_task)))
+        continue;
+    }
+    result.push_back(sp);
+  }
+  return result;
+}
+
+static std::vector<SyncPoint>
+OptimizeSyncPoints(const std::vector<SyncPoint> &raw_sync_points) {
+  std::vector<SyncPoint> sync_points = FilterUnitFlagFixSyncs(raw_sync_points);
+
   std::vector<bool> keep(sync_points.size(), true);
 
   // Pairwise domination within a group

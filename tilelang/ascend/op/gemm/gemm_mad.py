@@ -123,9 +123,9 @@ class GemmMAD(GemmBase):
             _to_int32(self.M),
             _to_int32(self.K),
             _to_int32(self.N),
-            _to_int32(0),
-            _to_int32(0),
-            _to_int32(0),
+            _to_int32(self.unit_flag_ctrl),
+            _to_int32(0),  # gemv_ctrl
+            _to_int32(0),  # BTbuf_ctrl
             self.clear_accum,
         )
 
@@ -174,6 +174,7 @@ class GemmMAD(GemmBase):
             self.clear_accum,
             tirx.StringImm(dtype_str),
             _to_int32(0),  # buf_offset
+            _to_int32(self.unit_flag_ctrl),
         )
 
         @T.prim_func
@@ -258,6 +259,7 @@ class GemmMAD(GemmBase):
             _to_int32(0),  # buf_offset
             _to_int32(self.sf_k_within_chunk),
             _to_int32(sf_load_chunk_size),
+            _to_int32(self.unit_flag_ctrl),
         )
 
         @T.prim_func

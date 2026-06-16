@@ -90,12 +90,13 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", MIXED=None, hf32=
                         sf_k_within_chunk=(kt % sf_int),
                         transpose_B=True,
                         clear_accum=(kt == 0),
+                        unit_flag_ctrl=T.Select(kt == K_TILES - 1, 3, 2),
                     )
                 if MIXED:
-                    T.dual_copy(res, temp)
+                    T.dual_copy(res, temp, unit_flag_ctrl=3)
                     T.dual_copy(temp, C[m_tile * TILE_M : (m_tile + 1) * TILE_M, n_tile * TILE_N : (n_tile + 1) * TILE_N])
                 else:
-                    T.copy(res, C[m_tile * TILE_M, n_tile * TILE_N])
+                    T.copy(res, C[m_tile * TILE_M, n_tile * TILE_N], unit_flag_ctrl=3)
 
     return main
 

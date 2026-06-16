@@ -65,7 +65,7 @@ public:
   }
 
   int GetUnitFlagCtl() const {
-    if (auto val = annotations.Get("unit_flag_ctl")) {
+    if (auto val = annotations.Get("unit_flag_ctrl")) {
       if (auto int_val = val->as<IntImmNode>()) {
         return int_val->value;
       }

@@ -270,12 +270,32 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
                 {dst_ptr, src_ptr, zero, n_burst_val, I(1), zero, zero});
   } else if (dma_path == 7) {
     PrimExpr dst_last_dim = op.dst->shape[op.dst->shape.size() - 1];
-    call =
-        Call(DataType::Void(), ascend_copy_matrix_cc_to_gm(),
-             {dst_ptr, src_ptr, sid,  inner_elems, n_rows, dst_last_dim, n_rows,
-              zero,    zero,    zero, zero,        zero,   zero,         I(1),
-              zero,    zero,    zero, zero,        zero,   zero,         zero,
-              zero,    zero,    zero, zero});
+    call = Call(DataType::Void(), ascend_copy_matrix_cc_to_gm(),
+                {dst_ptr,
+                 src_ptr,
+                 sid,
+                 inner_elems,
+                 n_rows,
+                 dst_last_dim,
+                 n_rows,
+                 I(op.GetL2CacheCtrl()), // [7] l2_cache_ctl
+                 zero,                   // [8] clip_relu_pre
+                 I(op.GetUnitFlagCtl()), // [9] unit_flag_ctl
+                 zero,                   // [10] quant_pre
+                 zero,                   // [11] relu_pre
+                 zero,                   // [12] split_en
+                 I(1),                   // [13] NZ2ND_en
+                 zero,                   // [14] quant_post
+                 zero,                   // [15] relu_post
+                 zero,                   // [16] clip_relu_post
+                 zero,                   // [17] loop_enhance_en
+                 zero,                   // [18] eltwise_op
+                 zero,                   // [19] eltwise_antq_en
+                 zero,                   // [20] loop_enhance_merge_en
+                 zero,                   // [21] C0_pad_en
+                 zero,                   // [22] wino_post_en
+                 zero,                   // [23] broadcast_en
+                 zero});                 // [24] NZ2DN_en
   } else {
     LOG(FATAL) << "Unknown Ascend DMA path: " << dma_path;
   }
