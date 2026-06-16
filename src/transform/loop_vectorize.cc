@@ -105,53 +105,6 @@ Array<PrimExpr> GetBufferStrides(const Buffer &buffer) {
   return Array<PrimExpr>{strides.rbegin(), strides.rend()};
 }
 
-PrimExpr GetVectorizedIndexExpr(const PrimExpr &expr, const Var &var,
-                                const PrimExpr &iter_var_size,
-                                int target_vectorized_size,
-                                arith::Analyzer *analyzer) {
-  PrimExpr target_size_for_var =
-      make_const(var.dtype(), target_vectorized_size);
-  PrimExpr zero = make_const(var.dtype(), 0);
-
-  Var v0("v0", var.dtype()), v1("v1", var.dtype());
-  analyzer->Bind(v0, Range(zero, target_size_for_var));
-  analyzer->Bind(v1, Range(zero, analyzer->Simplify(FloorDiv(
-                                     iter_var_size, target_size_for_var))));
-  Map<Var, PrimExpr> vmap;
-  vmap.Set(var, v0 + v1 * target_size_for_var);
-  PrimExpr expr_transformed = analyzer->Simplify(Substitute(expr, vmap));
-  Vectorizer vectorizer(v0, target_size_for_var);
-  return analyzer->Simplify(vectorizer.VisitExpr(expr_transformed));
-}
-
-bool TargetSupportsVectorizedIndexDType(DataType dtype, Target target) {
-  if (dtype.is_scalar() || !TargetIsAscend(target)) {
-    return true;
-  }
-  if (!(dtype.is_int() || dtype.is_uint())) {
-    return true;
-  }
-
-  // Keep this in sync with CodeGenTileLangAscend::PrintType. Ascend supports
-  // vector integer CCE types only for 32-bit lanes (int2/int4, uint2/uint4).
-  // Scalar int64 indexing is fine, but int64xN cannot be printed as a valid
-  // CCE vector type.
-  return dtype.bits() == 32 && (dtype.lanes() == 2 || dtype.lanes() == 4);
-}
-
-bool TargetSupportsVectorizedIndexExpr(const PrimExpr &expr, const Var &var,
-                                       const PrimExpr &iter_var_size,
-                                       int target_vectorized_size,
-                                       Target target,
-                                       arith::Analyzer *analyzer) {
-  if (target_vectorized_size == 1) {
-    return true;
-  }
-  PrimExpr vectorized = GetVectorizedIndexExpr(
-      expr, var, iter_var_size, target_vectorized_size, analyzer);
-  return TargetSupportsVectorizedIndexDType(vectorized.dtype(), target);
-}
-
 class VectorizeFindMemoryAccess : public StmtExprVisitor {
 public:
   VectorizeFindMemoryAccess() = default;
@@ -872,13 +825,10 @@ private:
       return arith::ZeroAwareGCD(buffer_vec_size, min_vec_size);
     }
     // 4. Try to find max vectorize size for this buffer
-    while (
-        buffer_vec_size > 1 &&
-        (!IndicesCanVectorize(elem_offset, inner_for_->loop_var,
-                              inner_for_->extent, buffer_vec_size, analyzer_) ||
-         !TargetSupportsVectorizedIndexExpr(
-             elem_offset, inner_for_->loop_var, inner_for_->extent,
-             buffer_vec_size, Target::Current(false), analyzer_))) {
+    while (buffer_vec_size > 1 &&
+           !IndicesCanVectorize(elem_offset, inner_for_->loop_var,
+                                inner_for_->extent, buffer_vec_size,
+                                analyzer_)) {
       buffer_vec_size /= 2;
     }
     return buffer_vec_size;
@@ -1041,6 +991,8 @@ bool IndicesCanVectorize(const PrimExpr &expr, Var var,
       make_const(iter_var_size.dtype(), target_vectorized_size);
   PrimExpr target_size_for_expr =
       make_const(expr.dtype(), target_vectorized_size);
+  PrimExpr target_size_for_var =
+      make_const(var.dtype(), target_vectorized_size);
   PrimExpr zero = make_const(var.dtype(), 0);
 
   if (!analyzer->CanProveEqual(FloorMod(iter_var_size, target_size_for_iter),
@@ -1059,8 +1011,19 @@ bool IndicesCanVectorize(const PrimExpr &expr, Var var,
     return false;
   }
 
-  PrimExpr expr_vectorized = GetVectorizedIndexExpr(
-      expr, var, iter_var_size, target_vectorized_size, analyzer);
+  // Bind thread range
+  Var v0("v0", var.dtype()), v1("v1", var.dtype());
+  analyzer->Bind(v0, Range(zero, target_size_for_var));
+  analyzer->Bind(v1, Range(zero, analyzer->Simplify(FloorDiv(
+                                     iter_var_size, target_size_for_iter))));
+  PrimExpr expr_transformed = analyzer->Simplify(
+      Substitute(expr, {{var, v0 + v1 * target_size_for_var}}));
+  Vectorizer vectorizer(v0, target_size_for_var);
+  PrimExpr expr_vectorized = vectorizer.VisitExpr(expr_transformed);
+
+  // This simplify is necessary for thread region specified
+  // optimizations.
+  expr_vectorized = analyzer->Simplify(expr_vectorized);
   auto ramp_node = expr_vectorized.as<RampNode>();
   if (!ramp_node) {
     // Broadcast value

@@ -2,6 +2,7 @@
 #define TVM_TL_ASCEND_CODEGEN_CODEGEN_ASCEND_H_
 
 #include "target/source/codegen_c.h"
+#include <tvm/arith/analyzer.h>
 
 namespace tvm {
 namespace codegen {
@@ -72,6 +73,14 @@ private:
   AscendKernelMode kernel_mode_{AscendKernelMode::kVector};
   int mix_aiv_count_{2};
   bool enable_fast_math_{false};
+
+  // Accumulates constraints along the traversal
+  arith::Analyzer analyzer_;
+
+  bool VectorAccessIsAligned(const PrimExpr &index, int lanes);
+
+  void EmitScalarizedLoad(const BufferLoadNode *op, std::ostream &os);
+  bool EmitScalarizedStore(const BufferStoreNode *op);
 };
 
 } // namespace codegen

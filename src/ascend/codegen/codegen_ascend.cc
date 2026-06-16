@@ -6,12 +6,15 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/ir/transform.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/s_tir/stmt.h>
 #include <tvm/tirx/analysis.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/stmt_functor.h>
+
+#include "arith/pattern_match.h"
 
 #include "backend/common/target_utils.h"
 #include "op/builtin.h"
@@ -1687,7 +1690,67 @@ void CodeGenTileLangAscend::VisitExpr_(const BufferLoadNode *op,
     }
   }
 
+  // emit a real vector load when provably aligned, otherwise a brute-force
+  // per-lane scalar gather.
+  DataType element_dtype = op->buffer->dtype;
+  if (value_dtype.lanes() > 1 && value_dtype.lanes() != element_dtype.lanes() &&
+      op->indices.size() == 1) {
+    EmitScalarizedLoad(op, os);
+    return;
+  }
+
   CodeGenC::VisitExpr_(op, os);
+}
+
+bool CodeGenTileLangAscend::VectorAccessIsAligned(const PrimExpr &index,
+                                                  int lanes) {
+  // Only a unit-stride ramp can become a reinterpret-cast vector access.
+  arith::PVar<PrimExpr> base;
+  if (!arith::ramp(base, 1, lanes).Match(index)) {
+    return false;
+  }
+  // Prove the ramp base is divisible by the vector width.
+  PrimExpr ramp_base = base.Eval();
+  PrimExpr lanes_const = make_const(ramp_base.dtype(), lanes);
+  return analyzer_.CanProveEqual(floormod(ramp_base, lanes_const),
+                                 make_zero(ramp_base.dtype()));
+}
+
+void CodeGenTileLangAscend::EmitScalarizedLoad(const BufferLoadNode *op,
+                                               std::ostream &os) {
+  DataType value_dtype = op->dtype;
+  int lanes = value_dtype.lanes();
+  PrimExpr index = op->indices[0];
+
+  // Provably aligned: a single reinterpret-cast vector load (fast path).
+  if (VectorAccessIsAligned(index, lanes)) {
+    arith::PVar<PrimExpr> base;
+    ICHECK(arith::ramp(base, 1, lanes).Match(index));
+    std::string ref = GetVecLoad(value_dtype, op->buffer.get(), base.Eval());
+    HandleVolatileLoads(ref, op, os);
+    return;
+  }
+
+  // Otherwise scalarize: load each lane from its scalar element offset and pack
+  // with a brace-initializer (which bisheng accepts, unlike `T(a, b)`).
+  DataType elem_dtype = value_dtype.element_of();
+  const RampNode *ramp = index.as<RampNode>();
+  std::ostringstream init;
+  PrintType(value_dtype, init);
+  init << "{";
+  for (int i = 0; i < lanes; ++i) {
+    if (i != 0) {
+      init << ", ";
+    }
+    PrimExpr lane_index =
+        ramp ? (ramp->base + ramp->stride * make_const(ramp->base.dtype(), i))
+             : index;
+    std::string lane_ref = GetBufferRef(elem_dtype, op->buffer.get(),
+                                        analyzer_.Simplify(lane_index));
+    init << lane_ref;
+  }
+  init << "}";
+  os << init.str();
 }
 
 void CodeGenTileLangAscend::VisitStmt_(const BufferStoreNode *op) {
@@ -1747,7 +1810,45 @@ void CodeGenTileLangAscend::VisitStmt_(const BufferStoreNode *op) {
     }
   }
 
+  if (value_dtype.lanes() > 1 && value_dtype.lanes() != element_dtype.lanes() &&
+      op->indices.size() == 1) {
+    if (EmitScalarizedStore(op)) {
+      return;
+    }
+  }
+
   CodeGenC::VisitStmt_(op);
+}
+
+bool CodeGenTileLangAscend::EmitScalarizedStore(const BufferStoreNode *op) {
+  DataType value_dtype = op->value.dtype();
+  int lanes = value_dtype.lanes();
+  PrimExpr index = op->indices[0];
+
+  // Provably aligned: let the base class emit a single reinterpret vector
+  // store.
+  if (VectorAccessIsAligned(index, lanes)) {
+    return false;
+  }
+
+  // Otherwise scalarize: evaluate the value once, then store each lane to its
+  // scalar element offset. PrintVecElemLoad reads lane i from the value temp;
+  // no vector index is constructed.
+  const RampNode *ramp = index.as<RampNode>();
+  ICHECK(ramp) << "scalarized store expects a ramp index, got " << index;
+  DataType elem_dtype = value_dtype.element_of();
+  std::string value = SSAGetID(PrintExpr(op->value), value_dtype);
+  for (int i = 0; i < lanes; ++i) {
+    PrimExpr lane_index =
+        ramp->base + ramp->stride * make_const(ramp->base.dtype(), i);
+    std::string lane_ref = GetBufferRef(elem_dtype, op->buffer.get(),
+                                        analyzer_.Simplify(lane_index));
+    std::ostringstream lane_val;
+    PrintVecElemLoad(value, value_dtype, i, lane_val);
+    PrintIndent();
+    stream << lane_ref << " = " << lane_val.str() << ";\n";
+  }
+  return true;
 }
 
 void CodeGenTileLangAscend::VisitStmt_(const ForNode *op) {
@@ -1759,6 +1860,13 @@ void CodeGenTileLangAscend::VisitStmt_(const ForNode *op) {
 }
 
 void CodeGenTileLangAscend::VisitStmt_(const AttrStmtNode *op) {
+  // Push tl.assume facts (e.g. `stride % N == 0`) into analyzer
+  if (op->attr_key == tirx::attr::tilelang_assume) {
+    With<arith::ConstraintContext> cctx(&analyzer_,
+                                        Downcast<PrimExpr>(op->node));
+    this->VisitStmt(op->body);
+    return;
+  }
   // Ascend text-only backend currently does not lower thread binding attrs into
   // executable launch semantics. Keep generating the enclosed body instead of
   // failing in the generic C backend.
@@ -2094,21 +2202,22 @@ void CodeGenTileLangAscend::VisitExpr_(const CastNode *op,
   }
 
   // Handle conversion from bfloat16 to float32
-  if (from_ty.is_bfloat16() && from_ty.lanes() == 2 && target_ty.is_float() &&
-      target_ty.bits() == 32 && target_ty.lanes() == 2) {
-    os << "__bfloat1622float2(";
-    PrintExpr(op->value, os);
-    os << ")";
-    return;
+  if (from_ty.is_bfloat16() && target_ty.is_float() && target_ty.bits() == 32) {
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__bfloat1622float2", "bfloat16x2_t", "float2", "",
+                          /*src_needs_reinterpret=*/true);
+      return;
+    }
   }
 
   // Handle conversion from float32 to bfloat16
-  if (from_ty.is_float() && from_ty.bits() == 32 && from_ty.lanes() == 2 &&
-      target_ty.is_bfloat16() && target_ty.lanes() == 2) {
-    os << "__float22bfloat162_rn(";
-    PrintExpr(op->value, os);
-    os << ")";
-    return;
+  if (from_ty.is_float() && from_ty.bits() == 32 && target_ty.is_bfloat16()) {
+    if (lanes == 2 || lanes == 4 || lanes == 8) {
+      PrintVectorizedCast("__float22bfloat162_rn", "float2", "bfloat16x2_t", "",
+                          /*src_needs_reinterpret=*/false,
+                          /*dst_needs_reinterpret=*/true);
+      return;
+    }
   }
 
   // Handle conversion from float32 to float8 (E4M3/E5M2)
