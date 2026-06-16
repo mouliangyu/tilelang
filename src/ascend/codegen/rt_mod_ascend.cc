@@ -1,5 +1,6 @@
 #include "codegen_ascend.h"
 
+#include "support/check.h"
 #include <tvm/ffi/extra/module.h>
 #include <tvm/ffi/reflection/registry.h>
 

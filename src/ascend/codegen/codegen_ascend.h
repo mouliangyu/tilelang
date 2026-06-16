@@ -1,14 +1,14 @@
 #ifndef TVM_TL_ASCEND_CODEGEN_CODEGEN_ASCEND_H_
 #define TVM_TL_ASCEND_CODEGEN_CODEGEN_ASCEND_H_
 
-#include "backend/common/codegen/codegen_c.h"
+#include "target/source/codegen_c.h"
 
 namespace tvm {
 namespace codegen {
 
-class CodeGenTileLangAscend final : public CodeGenTileLangC {
+class CodeGenTileLangAscend final : public CodeGenC {
 public:
-  using CodeGenTileLangC::PrintType;
+  using CodeGenC::PrintType;
 
   void Init(bool output_ssa);
   void AddFunction(const PrimFunc &f);

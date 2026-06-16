@@ -121,12 +121,11 @@ std::string CCEUBufType(DataType dtype) {
 } // namespace
 
 void CodeGenTileLangAscend::Init(bool output_ssa) {
-  CodeGenTileLangC::Init(output_ssa, /*emit_asserts=*/false,
-                         /*emit_fwd_func_decl=*/false, "ascend", {},
-                         "#include <tl_templates/ascend/common.h>\n");
+  CodeGenC::Init(output_ssa);
   auto pass_ctx = tvm::transform::PassContext::Current();
   enable_fast_math_ =
       pass_ctx->GetConfig<Bool>(tl::kEnableFastMath, Bool(false)).value();
+  decl_stream << "#include <tl_templates/ascend/common.h>\n";
 }
 
 void CodeGenTileLangAscend::PrintCCEVectorSuffix(DataType t, std::ostream &os) {
@@ -1889,7 +1888,7 @@ void CodeGenTileLangAscend::VisitStmt_(const AllocBufferNode *op) {
   }
 
   // For other scopes, use parent class implementation
-  CodeGenTileLangC::VisitStmt_(op);
+  CodeGenC::VisitStmt_(op);
 }
 
 void CodeGenTileLangAscend::VisitStmt_(const BindNode *op) {
