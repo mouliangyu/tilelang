@@ -7,7 +7,7 @@ import torch
 import tilelang
 import tilelang.language as T
 
-from bench import bench_msprof
+from tilelang.profiler import do_bench
 
 
 def enumerate_shapes() -> Generator:
@@ -308,7 +308,7 @@ def run(m: int, n: int, k: int) -> None:
 
     # Bench
     flops = 2.0 * m * n * k
-    prof = bench_msprof(lambda: kernel(a, b), kernel_names="main")
+    prof = do_bench(lambda: kernel(a, b), backend="msprof_detail")
 
     print(f"m={m:5}, n={n:5}, k={k:5}:  PASS  max_diff={max_diff:.2e}  |  {prof.dur_us:6.1f} us  |  {prof.tflops(flops):5.1f} TFLOPS")
 

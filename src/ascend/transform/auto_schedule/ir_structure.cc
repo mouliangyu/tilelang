@@ -907,255 +907,6 @@ bool SequenceNode::CollectLastAccessPoints(
   return r;
 }
 
-// ============================================================================
-// RegionPartition implementation
-// ============================================================================
-
-namespace {
-
-// Collect every (unit, task, region, is_write) from each owner subtree.
-// Tasks contribute the (already-relaxed) regions stored in their read/write
-// region lists; the regions' index expressions reference only vars from above
-// the task (inner loop vars were relaxed by MemoryAccessDetector).
-void CollectRegionEntries(IRStructure *node, IRStructure *owner_unit,
-                          std::vector<RegionEntry> &out) {
-  if (!node)
-    return;
-  if (node->IsTask()) {
-    auto *task = static_cast<const TaskNode *>(node);
-    for (const auto &r : task->GetReadRegions()) {
-      out.push_back({owner_unit, task, r, /*is_write=*/false});
-    }
-    for (const auto &r : task->GetWriteRegions()) {
-      out.push_back({owner_unit, task, r, /*is_write=*/true});
-    }
-    return;
-  }
-  if (node->IsControl()) {
-    auto *ctrl = static_cast<ControlNode *>(node);
-    if (ctrl->task)
-      CollectRegionEntries(ctrl->task.get(), owner_unit, out);
-    if (ctrl->child)
-      CollectRegionEntries(ctrl->child.get(), owner_unit, out);
-    return;
-  }
-  if (node->IsSequence()) {
-    auto *seq = static_cast<SequenceNode *>(node);
-    for (auto &c : seq->children)
-      CollectRegionEntries(c.get(), owner_unit, out);
-    return;
-  }
-  if (node->IsWrapper()) {
-    auto *w = static_cast<WrapperNode *>(node);
-    if (w->task)
-      CollectRegionEntries(w->task.get(), owner_unit, out);
-    if (w->child)
-      CollectRegionEntries(w->child.get(), owner_unit, out);
-    return;
-  }
-  if (node->IsScheduleUnit()) {
-    auto *u = static_cast<ScheduleUnit *>(node);
-    if (u->child)
-      CollectRegionEntries(u->child.get(), owner_unit, out);
-    return;
-  }
-  if (node->IsIf()) {
-    auto *ifn = static_cast<IfNode *>(node);
-    if (ifn->task)
-      CollectRegionEntries(ifn->task.get(), owner_unit, out);
-    if (ifn->then_child)
-      CollectRegionEntries(ifn->then_child.get(), owner_unit, out);
-    if (ifn->else_child)
-      CollectRegionEntries(ifn->else_child.get(), owner_unit, out);
-    return;
-  }
-}
-
-// Single-predicate overlap test.
-//
-// Returns true if regions a and b *may* refer to the same element under some
-// pair of loop-iteration values. Returns false only when the prover can rule
-// out overlap for *every* pair of values.
-//
-// At a ControlNode level the loop var `lv` is replaced on both sides by
-// fresh Vars `lv_a`, `lv_b`, each Bound to `[min, min+extent)`. The prover
-// then asks "for ALL (lv_a, lv_b) in the iteration space, are the regions
-// disjoint?" — covering same-iter (lv_a == lv_b is one of the assignments)
-// and any cross-iter distance in a single test, no `d` enumeration.
-//
-// Each entry's surrounding ConstrSet (ancestor For ranges, Let bindings,
-// thread_extent, tilelang_assume, branch guards) is taken from
-// `entry.task->outer_ctx`, snapshot at IRStructure-build time
-// (auto_schedule.cc::IRStructureBuilder, which inherits ConstrVisitor).
-// Each side's ctx is `Substitute`d with that side's lv -> fresh-Var map
-// before being populated into the analyzer, mirroring
-// thread_storage_sync.cc:1564-1565.
-//
-// Lifted from src/transform/thread_storage_sync.cc:1493-1639, simplified:
-//   - drop async-copy WAW special-case
-//   - drop pointer-access conservatism
-//   - drop shared.dyn Var redirection
-//   - drop per-thread renaming (auto_schedule reasons at unit granularity)
-//   - work in element units, not bytes (regions are already element-indexed)
-bool MayOverlap(const RegionEntry &a, const RegionEntry &b,
-                std::optional<For> current_loop) {
-  if (!a.region->buffer.same_as(b.region->buffer))
-    return false;
-  const Array<Range> &a_rng = a.region->region;
-  const Array<Range> &b_rng = b.region->region;
-  if (a_rng.size() != b_rng.size())
-    return true; // shape mismatch — be safe
-  const size_t ndim = a_rng.size();
-
-  arith::Analyzer ana;
-  Map<Var, PrimExpr> a_sub, b_sub;
-  if (current_loop.has_value()) {
-    const ForNode *fn = current_loop->get();
-    Var lv = fn->loop_var;
-    Var lv_a(lv->name_hint + "_a", lv.dtype());
-    Var lv_b(lv->name_hint + "_b", lv.dtype());
-    ana.Bind(lv_a, Range::FromMinExtent(fn->min, fn->extent));
-    ana.Bind(lv_b, Range::FromMinExtent(fn->min, fn->extent));
-    a_sub.Set(lv, lv_a);
-    b_sub.Set(lv, lv_b);
-  }
-  // Feed each side's surrounding-scope ConstrSet to the prover, after
-  // substituting the current_loop var with that side's fresh Var.
-  if (a.task)
-    a.task->outer_ctx.Substitute(a_sub).Populate(ana);
-  if (b.task)
-    b.task->outer_ctx.Substitute(b_sub).Populate(ana);
-
-  for (size_t i = 0; i < ndim; ++i) {
-    PrimExpr a_min = Substitute(a_rng[i]->min, a_sub);
-    PrimExpr a_max = Substitute(a_rng[i]->min + a_rng[i]->extent - 1, a_sub);
-    PrimExpr b_min = Substitute(b_rng[i]->min, b_sub);
-    PrimExpr b_max = Substitute(b_rng[i]->min + b_rng[i]->extent - 1, b_sub);
-    try {
-      a_min = ana.Simplify(a_min);
-      a_max = ana.Simplify(a_max);
-      b_min = ana.Simplify(b_min);
-      b_max = ana.Simplify(b_max);
-      if (ana.CanProve(a_max < b_min) || ana.CanProve(b_max < a_min)) {
-        return false; // disjoint on this dim ⇒ regions disjoint
-      }
-    } catch (...) {
-      // conservative — treat this dim as non-disjoint
-    }
-  }
-  return true; // no dim proved disjoint ⇒ conservatively overlap
-}
-
-// Union-find helpers — flat parent array.
-int UFFind(std::vector<int> &parent, int x) {
-  while (parent[x] != x) {
-    parent[x] = parent[parent[x]];
-    x = parent[x];
-  }
-  return x;
-}
-void UFUnion(std::vector<int> &parent, int x, int y) {
-  x = UFFind(parent, x);
-  y = UFFind(parent, y);
-  if (x != y)
-    parent[x] = y;
-}
-
-} // namespace
-
-RegionPartition RegionPartition::Build(const std::vector<IRStructure *> &units,
-                                       std::optional<For> current_loop) {
-  RegionPartition p;
-  for (auto *u : units) {
-    if (!u)
-      continue;
-    // When `u` is a ScheduleUnit we descend into its child; otherwise we
-    // descend into `u` itself (pre-schedule callers pass raw children).
-    IRStructure *root = u;
-    if (u->IsScheduleUnit()) {
-      auto *unit = static_cast<ScheduleUnit *>(u);
-      root = unit->child.get();
-    }
-    if (root)
-      CollectRegionEntries(root, u, p.entries_);
-  }
-  const int n = static_cast<int>(p.entries_.size());
-
-  // Build lookup_ table.
-  for (int i = 0; i < n; ++i) {
-    p.lookup_[p.entries_[i].task][p.entries_[i].region.get()] = i;
-  }
-
-  // Union-find on pairwise MayOverlap.
-  std::vector<int> parent(n);
-  for (int i = 0; i < n; ++i)
-    parent[i] = i;
-  for (int i = 0; i < n; ++i) {
-    for (int j = i + 1; j < n; ++j) {
-      if (!p.entries_[i].region->buffer.same_as(p.entries_[j].region->buffer))
-        continue;
-      if (UFFind(parent, i) == UFFind(parent, j))
-        continue;
-      if (MayOverlap(p.entries_[i], p.entries_[j], current_loop)) {
-        UFUnion(parent, i, j);
-      }
-    }
-  }
-
-  // Compact roots -> dense group ids.
-  std::unordered_map<int, int> root_to_gid;
-  p.entry_group_.assign(n, -1);
-  for (int i = 0; i < n; ++i) {
-    int r = UFFind(parent, i);
-    auto it = root_to_gid.find(r);
-    int gid;
-    if (it == root_to_gid.end()) {
-      gid = static_cast<int>(p.group_buffer_.size());
-      root_to_gid[r] = gid;
-      p.group_buffer_.push_back(p.entries_[i].region->buffer);
-    } else {
-      gid = it->second;
-    }
-    p.entry_group_[i] = gid;
-  }
-  p.num_groups_ = static_cast<int>(p.group_buffer_.size());
-  return p;
-}
-
-int RegionPartition::LookupRegionGroup(const TaskNode *task,
-                                       const BufferRegion &region) const {
-  auto it = lookup_.find(task);
-  if (it == lookup_.end())
-    return -1;
-  auto jt = it->second.find(region.get());
-  if (jt == it->second.end())
-    return -1;
-  return entry_group_[jt->second];
-}
-
-Buffer RegionPartition::GetRepresentativeBuffer(int region_group_id) const {
-  ICHECK_GE(region_group_id, 0);
-  ICHECK_LT(region_group_id, num_groups_);
-  return group_buffer_[region_group_id];
-}
-
-void RegionPartition::RemapUnits(
-    const std::unordered_map<IRStructure *, IRStructure *> &old_to_new) {
-  for (auto &e : entries_) {
-    auto it = old_to_new.find(e.unit);
-    if (it != old_to_new.end())
-      e.unit = it->second;
-  }
-}
-
-// ----------------------------------------------------------------------------
-// TaskAccessPredicate factory functions.
-//
-// Both factories bake (is_write, wg_id) into the returned predicate. The
-// wg_id filter is checked first — a task with a non-broadcast warpgroup id
-// other than the requested wg_id can never match.
-// ----------------------------------------------------------------------------
-
 inline bool WarpgroupMatches(const TaskNode *task, int wg_id) {
   int task_wg = task->GetWarpgroupId();
   return IsWarpgroupBroadcast(wg_id) || IsWarpgroupBroadcast(task_wg) ||
@@ -1177,22 +928,177 @@ TaskAccessPredicate MakeBufferAccessPredicate(const Buffer &buffer,
   };
 }
 
-TaskAccessPredicate
-MakeRegionGroupAccessPredicate(int region_group_id,
-                               const RegionPartition &partition, bool is_write,
-                               int wg_id) {
-  return [region_group_id, &partition, is_write,
-          wg_id](const TaskNode *task) -> bool {
-    if (!WarpgroupMatches(task, wg_id))
-      return false;
-    const auto &regions =
-        is_write ? task->GetWriteRegions() : task->GetReadRegions();
-    for (const auto &region : regions) {
-      if (partition.LookupRegionGroup(task, region) == region_group_id)
-        return true;
-    }
+// ============================================================================
+// Dependency analysis implementation
+// ============================================================================
+
+bool RegionsMayConflict(const TaskNode *a_task, const BufferRegion &a_region,
+                        const TaskNode *b_task, const BufferRegion &b_region,
+                        std::optional<For> current_loop, bool cross) {
+  if (!a_region->buffer.same_as(b_region->buffer))
     return false;
-  };
+  const Array<Range> &a_rng = a_region->region;
+  const Array<Range> &b_rng = b_region->region;
+  if (a_rng.size() != b_rng.size())
+    return true; // shape mismatch — be safe
+  const size_t ndim = a_rng.size();
+
+  arith::Analyzer ana;
+  Map<Var, PrimExpr> a_sub, b_sub;
+  if (current_loop.has_value()) {
+    const ForNode *fn = current_loop->get();
+    Var lv = fn->loop_var;
+    if (!cross) {
+      // Same iteration: producer and consumer share one loop-var value.
+      Var lv_s(lv->name_hint + "_s", lv.dtype());
+      ana.Bind(lv_s, Range::FromMinExtent(fn->min, fn->extent));
+      a_sub.Set(lv, lv_s);
+      b_sub.Set(lv, lv_s);
+    } else {
+      // Loop back-edge: consumer runs d>=1 iterations after the producer.
+      // lv_p ranges the loop; lv_c = lv_p + d with d in [1, extent-1].
+      Var lv_p(lv->name_hint + "_p", lv.dtype());
+      Var d(lv->name_hint + "_d", lv.dtype());
+      ana.Bind(lv_p, Range::FromMinExtent(fn->min, fn->extent));
+      // d in [1, extent-1]: at least one later iteration exists.
+      ana.Bind(
+          d, Range::FromMinExtent(IntImm(lv.dtype(), 1),
+                                  max(fn->extent - 1, IntImm(lv.dtype(), 1))));
+      a_sub.Set(lv, lv_p);
+      b_sub.Set(lv, lv_p + d);
+    }
+  }
+  // Feed each side's surrounding-scope ConstrSet to the prover, after
+  // substituting the current_loop var with that side's loop-var map.
+  if (a_task) {
+    a_task->outer_ctx.Substitute(a_sub).Populate(ana);
+  }
+  if (b_task) {
+    b_task->outer_ctx.Substitute(b_sub).Populate(ana);
+  }
+
+  for (size_t i = 0; i < ndim; ++i) {
+    PrimExpr a_min = Substitute(a_rng[i]->min, a_sub);
+    PrimExpr a_max = Substitute(a_rng[i]->min + a_rng[i]->extent - 1, a_sub);
+    PrimExpr b_min = Substitute(b_rng[i]->min, b_sub);
+    PrimExpr b_max = Substitute(b_rng[i]->min + b_rng[i]->extent - 1, b_sub);
+    try {
+      a_min = ana.Simplify(a_min);
+      a_max = ana.Simplify(a_max);
+      b_min = ana.Simplify(b_min);
+      b_max = ana.Simplify(b_max);
+      if (ana.CanProve(a_max < b_min || b_max < a_min)) {
+        return false; // disjoint on this dim ⇒ regions disjoint
+      }
+    } catch (...) {
+      // conservative — treat this dim as non-disjoint
+    }
+  }
+  return true; // no dim proved disjoint ⇒ conservatively overlap
+}
+
+BufferRegion TaskRegionFor(const TaskNode *task, const Buffer &buffer,
+                           bool is_write) {
+  const auto &regions =
+      is_write ? task->GetWriteRegions() : task->GetReadRegions();
+  std::optional<BufferRegion> found;
+  for (const auto &r : regions) {
+    if (r->buffer.same_as(buffer)) {
+      ICHECK(!found) << "Buffer " << buffer->name
+                     << " appears in more than one region of the task";
+      found = r;
+    }
+  }
+  ICHECK(found) << "Buffer " << buffer->name << " not found in task regions";
+  return *found;
+}
+
+std::vector<DepInfo>
+AnalyzeDependencies(const std::vector<ScheduleUnit *> &units,
+                    std::optional<For> current_loop) {
+  const size_t n = units.size();
+  std::vector<DepInfo> deps;
+
+  std::set<Buffer> buffers;
+  for (size_t i = 0; i < n; ++i) {
+    for (const auto &region : units[i]->GetReadRegions()) {
+      buffers.insert(region->buffer);
+    }
+    for (const auto &region : units[i]->GetWriteRegions()) {
+      buffers.insert(region->buffer);
+    }
+  }
+
+  for (const auto &buffer : buffers) {
+    auto touches = [&](size_t u) {
+      for (const auto &region : units[u]->GetReadRegions()) {
+        if (region->buffer.same_as(buffer))
+          return true;
+      }
+      for (const auto &region : units[u]->GetWriteRegions()) {
+        if (region->buffer.same_as(buffer))
+          return true;
+      }
+      return false;
+    };
+
+    for (size_t i = 0; i < n; ++i) {
+      if (!touches(i))
+        continue;
+      for (size_t j = 0; j < n; ++j) {
+        if (i == j && !current_loop.has_value())
+          continue;
+        if (!touches(j))
+          continue;
+        bool same_iter = (i < j);
+        bool cross = current_loop.has_value() && (i >= j);
+        if (!same_iter && !cross)
+          continue;
+
+        auto a_w = units[i]->GetLastAccessPoints(buffer, /*is_write=*/true);
+        auto a_r = units[i]->GetLastAccessPoints(buffer, /*is_write=*/false);
+        auto b_r = units[j]->GetFirstAccessPoints(buffer, /*is_write=*/false);
+        auto b_w = units[j]->GetFirstAccessPoints(buffer, /*is_write=*/true);
+
+        std::set<BufferAccessPoint> prod_pts, cons_pts;
+        int64_t latency = -1;
+
+        auto consider = [&](const std::set<BufferAccessPoint> &a_pts,
+                            bool a_write,
+                            const std::set<BufferAccessPoint> &b_pts,
+                            bool b_write) {
+          for (const auto &a : a_pts) {
+            BufferRegion rA = TaskRegionFor(a.task(), buffer, a_write);
+            for (const auto &b : b_pts) {
+              BufferRegion rB = TaskRegionFor(b.task(), buffer, b_write);
+              if (!RegionsMayConflict(a.task(), rA, b.task(), rB, current_loop,
+                                      cross))
+                continue;
+              prod_pts.insert(a);
+              cons_pts.insert(b);
+              int64_t l = a.timestamp + a.task()->GetLatency() - b.timestamp;
+              if (l < 0)
+                l = 0;
+              if (l > latency)
+                latency = l;
+            }
+          }
+        };
+        consider(a_w, /*a_write=*/true, b_r, /*b_write=*/false);
+        consider(a_w, /*a_write=*/true, b_w, /*b_write=*/true);
+        consider(a_r, /*a_write=*/false, b_w, /*b_write=*/true);
+
+        if (latency >= 0) {
+          deps.push_back(
+              {units[i], units[j], buffer,
+               std::vector<BufferAccessPoint>(prod_pts.begin(), prod_pts.end()),
+               std::vector<BufferAccessPoint>(cons_pts.begin(), cons_pts.end()),
+               cross, latency});
+        }
+      }
+    }
+  }
+  return deps;
 }
 
 } // namespace tl

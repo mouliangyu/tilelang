@@ -14,7 +14,11 @@
  *    2) it is not referenced anywhere outside L (siblings or ancestors),
  *    3) inside L's body it is always written before being read.
  *
- *  Frontend may pre-set the annotation; we never overwrite an existing value.
+ *  Frontend may pre-set the annotation. We treat it as a seed rather than a
+ *  veto: the frontend-listed buffers are always kept, and any buffer the
+ *  analysis additionally proves eligible is unioned in. A buffer the user does
+ *  NOT want multi-buffered can be pinned to a single version via
+ *  T.annotate_buffer_versions({buf: 1}) instead of being omitted here.
  */
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/container/array.h>
@@ -519,17 +523,25 @@ private:
     Stmt new_body = VisitStmt(op->body);
     used_buffers_ = parent_used;
 
-    // Frontend-provided annotation wins.
-    if (op->annotations.count("multi_buffer_eligible")) {
-      auto for_node = GetRef<For>(op);
-      for_node.CopyOnWrite()->body = new_body;
-      return for_node;
+    // Seed the eligible set with any frontend-provided annotation, then union
+    // in everything the analysis proves safe. The frontend list is a hint of
+    // buffers the user definitely wants multi-buffered; it does not suppress
+    // additional candidates (the user pins unwanted ones to a single version
+    // via T.annotate_buffer_versions instead).
+    Array<Buffer> eligible;
+    BufferSet already;
+    if (auto v = op->annotations.Get("multi_buffer_eligible")) {
+      for (const auto &b : v.value().cast<Array<Buffer>>()) {
+        if (already.insert(b).second)
+          eligible.push_back(b);
+      }
     }
 
     auto touched = CollectTouched(new_body);
     auto inner_claimed = CollectInnerClaimed(new_body);
-    Array<Buffer> eligible;
     for (const auto &buf : touched) {
+      if (already.count(buf))
+        continue;
       if (!IsOnChipMultiBufferScope(buf))
         continue;
       if (parent_used.count(buf))

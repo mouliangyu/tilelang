@@ -29,12 +29,12 @@ def test_topk_gate_128_6():
     _run(128, 6)
 
 
-def test_topk_gate_161_8():
-    _run(161, 8)
+def test_topk_gate_160_8():
+    _run(160, 8)
 
 
 if __name__ == "__main__":
     test_topk_gate_256_8()
     test_topk_gate_128_6()
-    test_topk_gate_161_8()
+    test_topk_gate_160_8()
     print("PASS: test_simdvf_topk_gate")

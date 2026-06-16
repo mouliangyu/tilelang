@@ -17,9 +17,9 @@ This is a per-token "k selection-sort steps" approach; works well when k is
 small (e.g. 6-8) and the inner-axis is short enough to stay in registers.
 
 Performance (float32 scores, 4096 tokens, NPU):
-  experts=256 topk=8:  ~22 us   (~190 GB/s)
-  experts=128 topk=6:  ~18 us   (~120 GB/s)
-  experts=161 topk=8:  ~23 us
+  experts=256 topk=8:  ~22.4 us
+  experts=128 topk=6:  ~17.6 us
+  experts=160 topk=8:  ~22.3 us
 """
 
 import tilelang
@@ -63,17 +63,20 @@ def topk_gate(num_experts: int, num_topk: int):
             out_ub = T.alloc_shared((NUM_TOPK_8,), T.int32)
             T.annotate_buffer_versions({s_ub: NUM_STAGES, out_ub: NUM_STAGES})
 
-            for w in T.Pipelined(T.ceildiv(M, N_CORES), num_stages=NUM_STAGES):
+            # Pad the unused tail (experts..TILE_E) with -inf so the selection
+            # loop's max can never pick a padding lane. When num_experts is
+            # 8-aligned the per-row copy below is vectorization-aligned and
+            # never touches the tail, so we can prime it just once here. The
+            # buffer is multi-buffered (NUM_STAGES versions); the prologue fill
+            # is broadcast to ALL versions, so every version's tail stays -inf
+            # for the whole kernel. (TILE_E-aligned experts have no tail.)
+            if num_experts < TILE_E:
+                with T.SimdVF():
+                    T.fill(s_ub, -T.infinity(T.float32))
+            for w in T.Pipelined(T.ceildiv(M, N_CORES), num_stages=NUM_STAGES, annotations={"multi_buffer_eligible": [s_ub]}):
                 row = w * N_CORES + core_id
                 if row < M:
                     T.copy(scores[row, :], s_ub[:num_experts])
-                    # Pad the unused tail with -inf so the selection loop's max
-                    # cannot pick a padding lane. Skip on the steady-state iters
-                    # when num_experts is a multiple of 8 (the prior version's
-                    # write has not been overwritten yet).
-                    if num_experts < TILE_E and (w < NUM_STAGES or num_experts % 8 != 0):
-                        with T.SimtVF(TILE_E - num_experts):
-                            T.fill(s_ub[num_experts:], -T.infinity(T.float32))
 
                     with T.SimdVF():
                         v0 = T.simd.alloc_var("float32")
@@ -131,7 +134,7 @@ if __name__ == "__main__":
     device = torch.device("npu")
     num_tokens = 4096
 
-    for num_experts, num_topk in [(256, 8), (128, 6), (161, 8)]:
+    for num_experts, num_topk in [(256, 8), (128, 6), (160, 8)]:
         print(f"\n--- experts={num_experts}, topk={num_topk}, tokens={num_tokens} ---")
         program = topk_gate(num_experts, num_topk)
         kernel = tilelang.compile(program, out_idx=-1)
@@ -153,9 +156,3 @@ if __name__ == "__main__":
         total_bytes = num_tokens * (num_experts + num_topk) * 4
         bw_gbs = total_bytes / (elapsed_us * 1e-6) / 1e9
         print(f"  {elapsed_us:.1f} us  {bw_gbs:.0f} GB/s  {verdict}")
-
-    # Print kernel source for inspection
-    print("\n--- Generated Ascend Source (experts=256, topk=8) ---")
-    program = topk_gate(256, 8)
-    kernel = tilelang.compile(program, out_idx=-1)
-    print(kernel.get_kernel_source())

@@ -25,32 +25,6 @@ using namespace tirx;
 using ffi::Array;
 using ffi::Map;
 
-// Structure to store synchronization dependency information
-struct SyncInfo {
-  int distance;
-  Buffer buffer;
-  BufferAccessPoint producer_pt;
-  BufferAccessPoint consumer_pt;
-  int num_versions;
-
-  SyncInfo(int distance, Buffer buffer, BufferAccessPoint producer_pt,
-           BufferAccessPoint consumer_pt, int num_versions)
-      : distance(distance), buffer(buffer), producer_pt(std::move(producer_pt)),
-        consumer_pt(std::move(consumer_pt)), num_versions(num_versions) {}
-
-  bool operator<(const SyncInfo &other) const {
-    if (distance != other.distance)
-      return distance < other.distance;
-    if (buffer != other.buffer)
-      return buffer.get() < other.buffer.get();
-    if (producer_pt != other.producer_pt)
-      return producer_pt < other.producer_pt;
-    if (consumer_pt != other.consumer_pt)
-      return consumer_pt < other.consumer_pt;
-    return num_versions < other.num_versions;
-  }
-};
-
 // Calculate the size in bytes of a buffer. Returns 0 if the size cannot be
 // determined at compile time.
 inline size_t GetBufferSize(const Buffer &buffer) {
@@ -153,19 +127,17 @@ struct SyncPoint {
   int prod_wg;
   ScheduleUnit *prod_insertion_unit;
   PrimExpr prod_guard;
-  int prod_idx;
   ScheduleUnit *cons_unit;
   int cons_wg;
   ScheduleUnit *cons_insertion_unit;
   PrimExpr cons_guard;
-  int cons_idx;
   int distance;
   int num_versions;
-  std::set<SyncInfo> sync_info_set;
+  std::vector<DepInfo> deps;
   std::string hard_event;
-  // CrossCore-specific
   std::string prod_pipe;
   std::string cons_pipe;
+  // CrossCore-specific
   int mode_id;
 };
 
@@ -197,11 +169,11 @@ AnalyzeControlNodeBarriers(ControlNode *ctrl, EventIdMap &event_id_map,
                            FlagInfoList &flag_infos, Var sid,
                            LoopNestingInfo &loop_info,
                            std::vector<MultiVersionBufferInfo> &buffer_infos);
-static std::vector<SyncPoint> CollectSyncPoints(
-    const std::vector<ScheduleUnit *> &units,
-    const std::map<std::pair<ScheduleUnit *, int>,
-                   std::map<std::pair<ScheduleUnit *, int>, std::set<SyncInfo>>>
-        &sync_infos);
+static std::vector<SyncPoint>
+CollectSyncPoints(const std::vector<ScheduleUnit *> &units, int num_wgs,
+                  std::optional<For> current_loop,
+                  const std::map<Buffer, int64_t> &buffer_num_versions = {},
+                  bool is_loop = false);
 static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
                              FlagInfoList &flag_infos, EventIdMap &event_id_map,
                              LoopNestingInfo &loop_info);
@@ -292,6 +264,79 @@ private:
   const std::unordered_map<Buffer, Buffer, ObjectPtrHash, ObjectPtrEqual>
       &multi_buffer_;
   PrimExpr iteration_;
+};
+
+// Rewrites accesses to a multi-buffered buffer that live OUTSIDE the annotated
+// loop (e.g. a prologue T.fill before the pipelined loop). Unlike the in-loop
+// MultiBufferAccessRewriter — which targets a single version per iteration
+// (start = indexmod(iteration, N), version-dim extent = 1) — these outside
+// accesses have no loop variable in scope, so they are broadcast to version 0
+// with the version dimension fully covered: index 0, region version-dim extent
+// = num_versions. This makes a prologue init touch all N versions at once.
+//
+// Keyed on the ORIGINAL (un-expanded) buffer objects: in-loop accesses were
+// already swapped to the expanded buffer by RewriteTaskNodeBuffers, so keying
+// on the original buffer naturally hits only the outside-loop occurrences and
+// never double-rewrites the in-loop ones.
+class BroadcastMultiBufferRewriter : public StmtExprMutator {
+public:
+  explicit BroadcastMultiBufferRewriter(
+      const std::vector<MultiVersionBufferInfo> &buffer_infos) {
+    for (const auto &info : buffer_infos) {
+      multi_buffer_[info.buffer] = info.new_buffer;
+    }
+  }
+
+private:
+  PrimExpr VisitExpr_(const BufferLoadNode *op) override {
+    BufferLoad load = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
+    auto it = multi_buffer_.find(load->buffer);
+    if (it != multi_buffer_.end()) {
+      auto *n = load.CopyOnWrite();
+      n->buffer = it->second;
+      n->indices.insert(n->indices.begin(), IntImm(DataType::Int(32), 0));
+    }
+    return load;
+  }
+
+  Stmt VisitStmt_(const BufferStoreNode *op) override {
+    BufferStore store = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
+    auto it = multi_buffer_.find(store->buffer);
+    if (it != multi_buffer_.end()) {
+      auto *n = store.CopyOnWrite();
+      n->buffer = it->second;
+      n->indices.insert(n->indices.begin(), IntImm(DataType::Int(32), 0));
+    }
+    return store;
+  }
+
+  PrimExpr VisitExpr_(const CallNode *op) override {
+    static const auto region_op = Op::Get("tl.tileop.region");
+    if (op->op.same_as(region_op) && op->args.size() >= 2) {
+      if (const auto *buffer_load = op->args[0].as<BufferLoadNode>()) {
+        auto it = multi_buffer_.find(buffer_load->buffer);
+        if (it != multi_buffer_.end()) {
+          // Cover the full version dimension: extent = num_versions, not 1.
+          auto num_versions = it->second->shape[0];
+          Array<PrimExpr> new_args;
+          // args[0]: BufferLoad rewritten by VisitExpr_ above (swap + index 0).
+          new_args.push_back(VisitExpr(op->args[0]));
+          // args[1]: access_type, unchanged.
+          new_args.push_back(VisitExpr(op->args[1]));
+          // version-dim extent.
+          new_args.push_back(num_versions);
+          for (size_t i = 2; i < op->args.size(); i++) {
+            new_args.push_back(VisitExpr(op->args[i]));
+          }
+          return Call(op->dtype, op->op, new_args, op->annotations, op->span);
+        }
+      }
+    }
+    return StmtExprMutator::VisitExpr_(op);
+  }
+
+  std::unordered_map<Buffer, Buffer, ObjectPtrHash, ObjectPtrEqual>
+      multi_buffer_;
 };
 
 // Recursive function to rewrite BufferLoad/BufferStore in TaskNode stmts
@@ -396,181 +441,6 @@ static TaskNode *GetInnerTask(ScheduleUnit *unit) {
   } else {
     return nullptr;
   }
-}
-
-// Enumerate (region_group_id, is_write, wg_id) accesses by every TaskNode
-// under the given `unit`, derived from the partition's entry table.
-// Broadcast tasks are expanded across [0, num_wgs).
-static std::set<std::tuple<int, bool, int>>
-GetUnitRegionGroupAccesses(IRStructure *unit, const RegionPartition &partition,
-                           int num_wgs) {
-  std::set<std::tuple<int, bool, int>> result;
-  const auto &entries = partition.GetEntries();
-  const auto &gids = partition.GetEntryGroupIds();
-  for (size_t i = 0; i < entries.size(); ++i) {
-    if (entries[i].unit != unit)
-      continue;
-    int rg = gids[i];
-    int task_wg = entries[i].task->GetWarpgroupId();
-    if (IsWarpgroupBroadcast(task_wg)) {
-      for (int w = 0; w < num_wgs; ++w)
-        result.emplace(rg, entries[i].is_write, w);
-    } else {
-      result.emplace(rg, entries[i].is_write, task_wg);
-    }
-  }
-  return result;
-}
-
-static auto
-GetSyncInfos(const std::vector<ScheduleUnit *> &units, int num_wgs,
-             const RegionPartition &partition,
-             const std::map<Buffer, int64_t> &buffer_num_versions = {},
-             bool is_loop = false) {
-  // Collect the region groups we need to track. Skip groups whose
-  // representative buffer is register/local — sync between those is handled
-  // by the warpgroup-broadcast mechanism, not by this pass.
-  std::set<int> rg_set;
-  for (auto *unit : units) {
-    const auto &entries = partition.GetEntries();
-    const auto &gids = partition.GetEntryGroupIds();
-    for (size_t i = 0; i < entries.size(); ++i) {
-      if (entries[i].unit != unit)
-        continue;
-      int rg = gids[i];
-      if (IsLocalBuffer(partition.GetRepresentativeBuffer(rg), true))
-        continue;
-      rg_set.insert(rg);
-    }
-  }
-  std::map<std::pair<ScheduleUnit *, int>,
-           std::map<std::pair<ScheduleUnit *, int>, std::set<SyncInfo>>>
-      sync_infos;
-  for (int rg : rg_set) {
-    Buffer buffer = partition.GetRepresentativeBuffer(rg);
-    int num_versions = 1;
-    auto it = buffer_num_versions.find(buffer);
-    if (it != buffer_num_versions.end()) {
-      num_versions = it->second;
-    }
-    std::vector<ScheduleUnit *> last_read_unit(num_wgs, nullptr);
-    std::vector<std::set<BufferAccessPoint>> last_read_unit_tasks(num_wgs);
-    ScheduleUnit *last_write_unit = nullptr;
-    std::vector<std::pair<int, std::set<BufferAccessPoint>>>
-        last_write_unit_wg_tasks;
-    std::vector<bool> waited_write_wgs(num_wgs, false);
-    for (int iter = 0; iter < (is_loop ? 2 : 1); ++iter) {
-      for (ScheduleUnit *unit : units) {
-        // Region-group accesses of this unit (rg, is_write, wg_id).
-        auto unit_accesses =
-            GetUnitRegionGroupAccesses(unit, partition, num_wgs);
-        for (int wg_id = 0; wg_id < num_wgs; ++wg_id) {
-          int distance = iter ? num_versions : 0;
-          // RAW: unit reads rg, wait for last writer
-          auto first_reads = unit->GetFirstAccessPoints(
-              rg, partition, /*is_write=*/false, wg_id);
-          if (!first_reads.empty() && last_write_unit != nullptr &&
-              !waited_write_wgs[wg_id]) {
-            if (last_write_unit == unit)
-              continue;
-            for (const auto &consumer_pt : first_reads) {
-              for (const auto &[last_write_wg_id, last_write_unit_tasks] :
-                   last_write_unit_wg_tasks) {
-                for (const auto &producer_pt : last_write_unit_tasks) {
-                  sync_infos[{last_write_unit, last_write_wg_id}][{unit, wg_id}]
-                      .emplace(distance, buffer, producer_pt, consumer_pt,
-                               num_versions);
-                }
-              }
-            }
-          }
-          // WAR/WAW: unit writes rg, wait for all last readers
-          // if there are no last readers, wait for last writer
-          auto first_writes = unit->GetFirstAccessPoints(
-              rg, partition, /*is_write=*/true, wg_id);
-          if (!first_writes.empty()) {
-            bool has_last_read = false;
-            for (int last_wg = 0; last_wg < num_wgs; ++last_wg) {
-              if (last_read_unit[last_wg] == nullptr)
-                continue;
-              has_last_read = true;
-              if (last_read_unit[last_wg] == unit)
-                continue;
-              for (const auto &consumer_pt : first_writes) {
-                for (const auto &producer_pt : last_read_unit_tasks[last_wg]) {
-                  sync_infos[{last_read_unit[last_wg], last_wg}][{unit, wg_id}]
-                      .emplace(distance, buffer, producer_pt, consumer_pt,
-                               num_versions);
-                }
-              }
-            }
-            if (!has_last_read && last_write_unit != nullptr &&
-                !waited_write_wgs[wg_id] && last_write_unit != unit) {
-              for (const auto &consumer_pt : first_writes) {
-                for (const auto &[last_write_wg_id, last_write_unit_tasks] :
-                     last_write_unit_wg_tasks) {
-                  for (const auto &producer_pt : last_write_unit_tasks) {
-                    sync_infos[{last_write_unit, last_write_wg_id}]
-                              [{unit, wg_id}]
-                                  .emplace(distance, buffer, producer_pt,
-                                           consumer_pt, num_versions);
-                  }
-                }
-              }
-            }
-          }
-        }
-        // Update state machine from this unit's accesses to `rg`.
-        for (const auto &[a_rg, a_is_write, a_wg] : unit_accesses) {
-          if (a_rg != rg)
-            continue;
-          if (!a_is_write) {
-            waited_write_wgs[a_wg] = true;
-            last_read_unit[a_wg] = nullptr;
-          } else {
-            for (int w = 0; w < num_wgs; ++w) {
-              last_read_unit[w] = nullptr;
-            }
-            last_write_unit = nullptr;
-          }
-        }
-        if (iter == 0) {
-          for (int wg = 0; wg < num_wgs; ++wg) {
-            auto last_reads = unit->GetLastAccessPoints(rg, partition,
-                                                        /*is_write=*/false, wg);
-            if (!last_reads.empty()) {
-              last_read_unit[wg] = unit;
-              last_read_unit_tasks[wg] = std::move(last_reads);
-            }
-          }
-          {
-            std::vector<int> write_wg_ids;
-            for (const auto &[a_rg, a_is_write, a_wg] : unit_accesses) {
-              if (a_rg == rg && a_is_write) {
-                if (std::find(write_wg_ids.begin(), write_wg_ids.end(), a_wg) ==
-                    write_wg_ids.end())
-                  write_wg_ids.push_back(a_wg);
-              }
-            }
-            if (!write_wg_ids.empty()) {
-              last_write_unit = unit;
-              last_write_unit_wg_tasks.clear();
-              for (int wg : write_wg_ids) {
-                auto last_writes = unit->GetLastAccessPoints(
-                    rg, partition, /*is_write=*/true, wg);
-                if (!last_writes.empty())
-                  last_write_unit_wg_tasks.emplace_back(wg,
-                                                        std::move(last_writes));
-              }
-              for (int wg = 0; wg < num_wgs; ++wg)
-                waited_write_wgs[wg] = false;
-            }
-          }
-        }
-      }
-    }
-  }
-  return sync_infos;
 }
 
 // --- Ascend set_flag / wait_flag helpers ---
@@ -714,17 +584,71 @@ CommonInsertionSite(const std::vector<std::vector<InsertionSite>> &chains) {
   return chains[0][common - 1];
 }
 
-static std::vector<SyncPoint> CollectSyncPoints(
-    const std::vector<ScheduleUnit *> &units,
-    const std::map<std::pair<ScheduleUnit *, int>,
-                   std::map<std::pair<ScheduleUnit *, int>, std::set<SyncInfo>>>
-        &sync_infos) {
-  // Build unit→index map for order comparison
-  std::unordered_map<ScheduleUnit *, int> unit_index;
-  for (size_t i = 0; i < units.size(); ++i)
-    unit_index[units[i]] = static_cast<int>(i);
+static std::vector<SyncPoint>
+CollectSyncPoints(const std::vector<ScheduleUnit *> &units, int num_wgs,
+                  std::optional<For> current_loop,
+                  const std::map<Buffer, int64_t> &buffer_num_versions,
+                  bool is_loop) {
+  auto deps = AnalyzeDependencies(units, is_loop ? current_loop : std::nullopt);
+
+  std::map<std::pair<ScheduleUnit *, int>,
+           std::map<std::pair<ScheduleUnit *, int>, std::vector<DepInfo>>>
+      sync_infos;
+
+  // Expand a task's warpgroup id into the concrete wg ids it participates in.
+  auto expand_wgs = [&](int task_wg) {
+    std::vector<int> out;
+    if (IsWarpgroupBroadcast(task_wg)) {
+      for (int w = 0; w < num_wgs; ++w) {
+        out.push_back(w);
+      }
+    } else if (task_wg >= 0 && task_wg < num_wgs) {
+      out.push_back(task_wg);
+    }
+    return out;
+  };
+
+  for (const auto &dep : deps) {
+    if (IsLocalBuffer(dep.buffer, true))
+      continue;
+
+    // Bucket producer / consumer access points by warpgroup.
+    std::map<int, std::vector<BufferAccessPoint>> prod_by_wg, cons_by_wg;
+    for (const auto &pt : dep.producer_pts) {
+      for (int wg : expand_wgs(pt.task()->GetWarpgroupId()))
+        prod_by_wg[wg].push_back(pt);
+    }
+    for (const auto &pt : dep.consumer_pts) {
+      for (int wg : expand_wgs(pt.task()->GetWarpgroupId()))
+        cons_by_wg[wg].push_back(pt);
+    }
+
+    for (auto &[pwg, ppts] : prod_by_wg) {
+      for (auto &[cwg, cpts] : cons_by_wg) {
+        DepInfo d;
+        d.prod_unit = dep.prod_unit;
+        d.cons_unit = dep.cons_unit;
+        d.buffer = dep.buffer;
+        d.producer_pts = ppts;
+        d.consumer_pts = cpts;
+        d.cross_iter = dep.cross_iter;
+        d.latency = dep.latency;
+        sync_infos[{dep.prod_unit, pwg}][{dep.cons_unit, cwg}].push_back(
+            std::move(d));
+      }
+    }
+  }
 
   std::vector<SyncPoint> sync_points;
+
+  auto get_versions = [&](const Buffer &b) -> int {
+    auto it = buffer_num_versions.find(b);
+    return it != buffer_num_versions.end() ? static_cast<int>(it->second) : 1;
+  };
+
+  auto get_distance = [&](const DepInfo &d) -> int {
+    return d.cross_iter ? get_versions(d.buffer) : 0;
+  };
 
   for (auto prod_unit : units) {
     for (int prod_wg = 0; prod_wg < 2; ++prod_wg) {
@@ -732,76 +656,81 @@ static std::vector<SyncPoint> CollectSyncPoints(
       if (sync_it == sync_infos.end())
         continue;
       const auto &wait_map = sync_it->second;
-      for (const auto &[cons_unit_info, sync_info_set] : wait_map) {
+      for (const auto &[cons_unit_info, dep_list] : wait_map) {
         auto [cons_unit, cons_wg] = cons_unit_info;
-
-        if (sync_info_set.empty())
+        if (dep_list.empty())
+          continue;
+        if (prod_unit == cons_unit)
           continue;
 
-        int min_distance = std::numeric_limits<int>::max();
-        for (const auto &si : sync_info_set) {
-          min_distance = std::min(min_distance, si.distance);
+        // Keep only the dependencies at the minimum distance (same-iter wins
+        // over the loop back-edge when both are present).
+        int distance = std::numeric_limits<int>::max();
+        for (const auto &d : dep_list) {
+          distance = std::min(distance, get_distance(d));
         }
-        std::set<SyncInfo> kept;
-        for (const auto &si : sync_info_set) {
-          if (si.distance == min_distance) {
-            kept.insert(si);
-          }
+        std::vector<DepInfo> kept_deps;
+        for (const auto &d : dep_list) {
+          if (get_distance(d) == distance)
+            kept_deps.push_back(d);
         }
 
         int num_versions = 1;
         std::set<std::string> all_event;
         std::vector<std::vector<InsertionSite>> prod_chains;
         std::vector<std::vector<InsertionSite>> cons_chains;
-        for (const auto &si : kept) {
-          const TaskNode *producer = si.producer_pt.task();
-          const TaskNode *consumer = si.consumer_pt.task();
-          num_versions = std::max(num_versions, si.num_versions);
-          all_event.insert(GetHardEvent(producer, consumer));
-          prod_chains.push_back(CollectInsertCandidates(si.producer_pt, false));
-          cons_chains.push_back(CollectInsertCandidates(si.consumer_pt, true));
+        for (const auto &d : kept_deps) {
+          num_versions = std::max(num_versions, get_versions(d.buffer));
+          for (const auto &ppt : d.producer_pts) {
+            for (const auto &cpt : d.consumer_pts) {
+              all_event.insert(GetHardEvent(ppt.task(), cpt.task()));
+            }
+          }
+          for (const auto &ppt : d.producer_pts) {
+            prod_chains.push_back(CollectInsertCandidates(ppt, false));
+          }
+          for (const auto &cpt : d.consumer_pts) {
+            cons_chains.push_back(CollectInsertCandidates(cpt, true));
+          }
         }
-
         InsertionSite prod_site = CommonInsertionSite(prod_chains);
         InsertionSite cons_site = CommonInsertionSite(cons_chains);
         ICHECK(prod_site.first != nullptr);
         ICHECK(cons_site.first != nullptr);
 
-        int prod_idx = unit_index[prod_unit];
-        int cons_idx = unit_index[cons_unit];
-        int distance = min_distance;
-
         if (all_event.size() > 1) {
           ICHECK(prod_wg == cons_wg);
           sync_points.push_back({SyncType::PipeBarrier, prod_unit, prod_wg,
-                                 prod_unit, PrimExpr(), prod_idx, cons_unit,
-                                 cons_wg, cons_unit, PrimExpr(), cons_idx,
-                                 distance, num_versions, kept});
+                                 prod_unit, PrimExpr(), cons_unit, cons_wg,
+                                 cons_unit, PrimExpr(), distance, num_versions,
+                                 kept_deps});
           continue;
         }
 
         std::string hard_event = *all_event.begin();
+        size_t pos = hard_event.find('_');
+        std::string prod_pipe = "PIPE_" + hard_event.substr(0, pos);
+        std::string cons_pipe = "PIPE_" + hard_event.substr(pos + 1);
 
         if (prod_wg != cons_wg) {
-          size_t pos = hard_event.find('_');
-          std::string prod_pipe = "PIPE_" + hard_event.substr(0, pos);
-          std::string cons_pipe = "PIPE_" + hard_event.substr(pos + 1);
           int mode_id = 4;
 
-          sync_points.push_back(
-              {SyncType::CrossCore, prod_unit, prod_wg, prod_site.first,
-               prod_site.second, prod_idx, cons_unit, cons_wg, cons_site.first,
-               cons_site.second, cons_idx, distance, num_versions, kept,
-               hard_event, prod_pipe, cons_pipe, mode_id});
+          sync_points.push_back({SyncType::CrossCore, prod_unit, prod_wg,
+                                 prod_site.first, prod_site.second, cons_unit,
+                                 cons_wg, cons_site.first, cons_site.second,
+                                 distance, num_versions, kept_deps, hard_event,
+                                 prod_pipe, cons_pipe, mode_id});
           continue;
         }
 
-        // Intra-core sync: use ascend_set_flag / wait_flag
+        // Intra-core sync: use ascend_set_flag / wait_flag. prod_pipe/cons_pipe
+        // are filled (same PIPE_ encoding as cross-core) so grouping and the
+        // transitive reduction can treat both sync types uniformly.
         sync_points.push_back({SyncType::IntraCore, prod_unit, prod_wg,
-                               prod_site.first, prod_site.second, prod_idx,
-                               cons_unit, cons_wg, cons_site.first,
-                               cons_site.second, cons_idx, distance,
-                               num_versions, kept, hard_event});
+                               prod_site.first, prod_site.second, cons_unit,
+                               cons_wg, cons_site.first, cons_site.second,
+                               distance, num_versions, kept_deps, hard_event,
+                               prod_pipe, cons_pipe});
       }
     }
   }
@@ -866,76 +795,95 @@ static int CompareChainPos(const UnitChain &a, const UnitChain &b,
   }
 }
 
+static UnitChain ChainForSync(const SyncPoint &sp, const ScheduleUnit *unit,
+                              bool is_producer) {
+  if (sp.deps.empty() || unit == nullptr)
+    return {};
+  const DepInfo &rep = sp.deps.front();
+  const auto &pts = is_producer ? rep.producer_pts : rep.consumer_pts;
+  if (pts.empty())
+    return {};
+  return BuildChainFromPath(pts.front().path, unit);
+}
+
+static bool SyncDominates(const SyncPoint &x, const SyncPoint &y) {
+  if (x.type != y.type)
+    return false;
+  if (x.type != SyncType::CrossCore && x.type != SyncType::IntraCore)
+    return false;
+  if (x.prod_pipe != y.prod_pipe || x.cons_pipe != y.cons_pipe ||
+      x.prod_wg != y.prod_wg || x.cons_wg != y.cons_wg)
+    return false;
+  UnitChain xp = ChainForSync(x, x.prod_insertion_unit, true);
+  UnitChain xc = ChainForSync(x, x.cons_insertion_unit, false);
+  UnitChain yp = ChainForSync(y, y.prod_insertion_unit, true);
+  UnitChain yc = ChainForSync(y, y.cons_insertion_unit, false);
+  if (xp.empty() || xc.empty() || yp.empty() || yc.empty())
+    return false;
+  int D = y.distance - x.distance;
+  if (D < 0)
+    return false;
+  if (D >= 2)
+    return true;
+  bool c0 = CompareChainPos(xp, yp, false) >= 0;
+  bool cD = CompareChainPos(xc, yc, true) <= 0;
+  if (D == 1)
+    return c0 || cD;
+  return c0 && cD;
+}
+
 static std::vector<SyncPoint>
 OptimizeSyncPoints(const std::vector<SyncPoint> &sync_points) {
-  // Derive insertion chains from the SyncPoint's own sync_info_set — any
-  // representative SyncInfo works because the insertion_unit is on the LCA
-  // common prefix of every SyncInfo's path in the group.
-  auto chain_for = [](const SyncPoint &sp, const ScheduleUnit *unit,
-                      bool is_producer) -> UnitChain {
-    if (sp.sync_info_set.empty() || unit == nullptr)
-      return {};
-    const SyncInfo &rep = *sp.sync_info_set.begin();
-    const auto &path =
-        is_producer ? rep.producer_pt.path : rep.consumer_pt.path;
-    return BuildChainFromPath(path, unit);
-  };
-
   std::vector<bool> keep(sync_points.size(), true);
 
+  // Pairwise domination within a group
   for (size_t i = 0; i < sync_points.size(); ++i) {
     if (!keep[i])
       continue;
     for (size_t j = i + 1; j < sync_points.size(); ++j) {
       if (!keep[j])
         continue;
-      const auto &a = sync_points[i];
-      const auto &b = sync_points[j];
-
-      if (a.type != b.type)
-        continue;
-
-      bool same_group = false;
-      if (a.type == SyncType::CrossCore) {
-        same_group =
-            (a.prod_pipe == b.prod_pipe && a.cons_pipe == b.cons_pipe &&
-             a.num_versions == b.num_versions &&
-             (a.cons_idx < a.prod_idx) == (b.cons_idx < b.prod_idx));
-      } else if (a.type == SyncType::IntraCore) {
-        same_group =
-            (a.hard_event == b.hard_event && a.num_versions == b.num_versions &&
-             (a.cons_idx < a.prod_idx) == (b.cons_idx < b.prod_idx));
-      } else {
-        continue;
-      }
-
-      if (!same_group)
-        continue;
-
-      UnitChain a_prod = chain_for(a, a.prod_insertion_unit, true);
-      UnitChain a_cons = chain_for(a, a.cons_insertion_unit, false);
-      UnitChain b_prod = chain_for(b, b.prod_insertion_unit, true);
-      UnitChain b_cons = chain_for(b, b.cons_insertion_unit, false);
-      if (a_prod.empty() || a_cons.empty() || b_prod.empty() || b_cons.empty())
-        continue;
-
-      auto dominates = [&](const SyncPoint &x, const SyncPoint &y,
-                           const UnitChain &xp, const UnitChain &yp,
-                           const UnitChain &xc, const UnitChain &yc) {
-        if (x.distance < y.distance)
-          return false;
-        if (CompareChainPos(xp, yp, false) < 0)
-          return false;
-        if (CompareChainPos(xc, yc, true) > 0)
-          return false;
-        return true;
-      };
-
-      if (dominates(a, b, a_prod, b_prod, a_cons, b_cons)) {
+      if (SyncDominates(sync_points[i], sync_points[j])) {
         keep[j] = false;
-      } else if (dominates(b, a, b_prod, a_prod, b_cons, a_cons)) {
+      } else if (SyncDominates(sync_points[j], sync_points[i])) {
         keep[i] = false;
         break;
+      }
+    }
+  }
+
+  // Cross-pipe transitive reduction
+  for (size_t i = 0; i < sync_points.size(); ++i) {
+    const auto &ab = sync_points[i];
+    if (ab.type != SyncType::IntraCore && ab.type != SyncType::CrossCore)
+      continue;
+    for (size_t j = 0; j < sync_points.size(); ++j) {
+      const auto &bc = sync_points[j];
+      if (bc.type != SyncType::IntraCore && bc.type != SyncType::CrossCore)
+        continue;
+      // ab and bc must compose at the intermediate unit: same unit, same
+      // in-order pipe + warpgroup.
+      if (ab.cons_unit != bc.prod_unit || ab.cons_pipe != bc.prod_pipe ||
+          ab.cons_wg != bc.prod_wg)
+        continue;
+      // Synthetic edge: producer side from ab, consumer side from bc, distances
+      // summed.
+      SyncPoint chain = ab;
+      chain.cons_unit = bc.cons_unit;
+      chain.cons_insertion_unit = bc.cons_insertion_unit;
+      chain.cons_guard = bc.cons_guard;
+      chain.cons_wg = bc.cons_wg;
+      chain.cons_pipe = bc.cons_pipe;
+      chain.distance = ab.distance + bc.distance;
+      chain.type = (chain.prod_wg != chain.cons_wg) ? SyncType::CrossCore
+                                                    : SyncType::IntraCore;
+      if (!chain.deps.empty() && !bc.deps.empty())
+        chain.deps.front().consumer_pts = bc.deps.front().consumer_pts;
+      for (size_t k = 0; k < sync_points.size(); ++k) {
+        if (!keep[k] || k == i || k == j)
+          continue;
+        if (SyncDominates(chain, sync_points[k]))
+          keep[k] = false;
       }
     }
   }
@@ -965,7 +913,7 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
       int cc_base_id = cc_id->second;
       cc_id->second += sp.num_versions;
 
-      if (sp.cons_idx < sp.prod_idx) {
+      if (sp.distance > 0) {
         if (!sp.prod_wg) {
           for (int base = 0; base < sp.num_versions; ++base) {
             flag_infos.push_back(
@@ -1026,16 +974,11 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
     } else if (sp.type == SyncType::IntraCore) {
       // When producer and consumer share the same pipe, insert a pipe_barrier
       // before the consumer to ensure pipeline ordering.
-      size_t pos = sp.hard_event.find('_');
-      if (pos != std::string::npos) {
-        std::string prod_pipe = sp.hard_event.substr(0, pos);
-        std::string cons_pipe = sp.hard_event.substr(pos + 1);
-        if (prod_pipe == cons_pipe) {
-          Stmt barrier = makeAscendPipeBarrier("PIPE_" + prod_pipe);
-          InsertStatementIntoScheduleUnit(sp.cons_insertion_unit, barrier, true,
-                                          sp.cons_wg, sp.cons_guard);
-          continue;
-        }
+      if (sp.prod_pipe == sp.cons_pipe) {
+        Stmt barrier = makeAscendPipeBarrier(sp.prod_pipe);
+        InsertStatementIntoScheduleUnit(sp.cons_insertion_unit, barrier, true,
+                                        sp.cons_wg, sp.cons_guard);
+        continue;
       }
       auto base_id = event_id_map.find(sp.hard_event);
       if (base_id == event_id_map.end()) {
@@ -1050,7 +993,7 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
       PrimExpr event_id =
           indexmod(iteration, Integer(sp.num_versions)) + base_id_val;
 
-      if (sp.cons_idx < sp.prod_idx) {
+      if (sp.distance > 0) {
         for (int base = 0; base < sp.num_versions; ++base) {
           flag_infos.push_back(FlagInfo{sp.prod_wg, Integer(base_id_val + base),
                                         sp.hard_event, 0});
@@ -1095,15 +1038,9 @@ AnalyzeSequenceNodeBarriers(SequenceNode *seq, EventIdMap &event_id_map,
     }
   }
 
-  // Reuse the RegionPartition built during scheduling. Z3SchedulePython is
-  // guaranteed to have stashed it on the SequenceNode.
-  ICHECK(seq->region_partition)
-      << "SequenceNode missing region_partition cached by schedule_builder";
-  const RegionPartition &partition = *seq->region_partition;
-
-  // Analyze dependencies and insert synchronization
-  auto sync_infos = GetSyncInfos(units, 2, partition);
-  auto sync_points = CollectSyncPoints(units, sync_infos);
+  // Analyze dependencies with the shared AnalyzeDependencies, no enclosing
+  // loop at the straight-line level (hence no multi-buffering).
+  auto sync_points = CollectSyncPoints(units, 2, /*current_loop=*/std::nullopt);
   sync_points = OptimizeSyncPoints(sync_points);
   InsertSyncPoints(sync_points, flag_infos, event_id_map, loop_info);
 }
@@ -1176,16 +1113,10 @@ AnalyzeControlNodeBarriers(ControlNode *ctrl, EventIdMap &event_id_map,
   // Recursively rewrite all TaskNode stmts
   RewriteTaskNodeBuffers(ctrl, multi_buffer, iteration);
 
-  // Reuse the RegionPartition built during scheduling. Z3SchedulePythonLoop
-  // is guaranteed to have stashed it on the body SequenceNode.
-  ICHECK(seq->region_partition)
-      << "SequenceNode missing region_partition cached by schedule_builder";
-  const RegionPartition &partition = *seq->region_partition;
-
-  // Analyze dependencies and insert synchronization
-  auto sync_infos =
-      GetSyncInfos(units, 2, partition, ctrl->buffer_num_versions, true);
-  auto sync_points = CollectSyncPoints(units, sync_infos);
+  // Analyze dependencies with the shared AnalyzeDependencies, passing the
+  // enclosing loop so cross-iteration (loop back-edge) deps are detected.
+  auto sync_points = CollectSyncPoints(units, 2, ctrl->control,
+                                       ctrl->buffer_num_versions, true);
   sync_points = OptimizeSyncPoints(sync_points);
   InsertSyncPoints(sync_points, flag_infos, event_id_map, loop_info);
 

@@ -246,7 +246,7 @@ private:
 // bindings, AttrStmt thread_extent/virtual_thread/tilelang_assume,
 // IfThenElse branch guards) is maintained automatically. Whenever a fresh
 // TaskNode is constructed, `StampCtx` snapshots `GetConstrSet()` onto it
-// for later use by RegionPartition::MayOverlap.
+// for later use by RegionsMayConflict.
 //
 // Caveat: each VisitStmt_ override below replaces ConstrVisitor's default —
 // for nodes that introduce a scope (For, LetStmt, AttrStmt, IfThenElse),
@@ -272,7 +272,7 @@ public:
 
 protected:
   // Stamp the current ConstrVisitor stack snapshot onto a freshly-built
-  // TaskNode, so RegionPartition::MayOverlap later sees the symbol
+  // TaskNode, so RegionsMayConflict later sees the symbol
   // environment (ancestor For ranges, Let bindings, thread_extents,
   // tilelang_assume, branch guards) the region was written under.
   void StampCtx(TaskNode *task) { task->outer_ctx = GetConstrSet(); }
@@ -1223,6 +1223,11 @@ tvm::transform::Pass AutoSchedule() {
       Stmt final_body = replacer(func->body);
       if (!kr.buffer_infos.empty()) {
         final_body = RewriteAllocBuffers(final_body, kr.buffer_infos);
+        // Rewrite multi-buffered accesses that live outside the annotated loop
+        // (e.g. prologue fill): broadcast them to version 0 over the full
+        // version dimension. In-loop accesses were already versioned.
+        BroadcastMultiBufferRewriter broadcast(kr.buffer_infos);
+        final_body = broadcast(final_body);
       }
       final_body = ReNestLetStmts(final_body);
 
@@ -1259,6 +1264,13 @@ tvm::transform::Pass AutoSchedule() {
 
       TilelangRootBodyReplacer replacer(scheduled_body);
       Stmt scheduled_subtree = replacer(kernel_subtree);
+
+      if (!result.buffer_infos.empty()) {
+        scheduled_subtree =
+            RewriteAllocBuffers(scheduled_subtree, result.buffer_infos);
+        BroadcastMultiBufferRewriter broadcast(result.buffer_infos);
+        scheduled_subtree = broadcast(scheduled_subtree);
+      }
 
       if (!combined_stmts.empty()) {
         combined_stmts.push_back(
