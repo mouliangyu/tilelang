@@ -5,11 +5,10 @@ from typing import Tuple
 from tilelang.utils.tensor import torch_assert_close
 
 from tilelang.profiler import do_bench
+from tilelang.transform import PassConfigKey
 
 
-@tilelang.jit(
-    out_idx=[1, 2],
-)
+@tilelang.jit(out_idx=[1, 2], pass_configs={PassConfigKey.TL_ENABLE_FAST_MATH: True})
 def per_token_cast_to_fp8(M, N):
     dtype = T.float
     group_size = 128

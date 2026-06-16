@@ -162,9 +162,10 @@ def copy(
         l2_cache_ctrl (Optional[int | str], keyword-only): Ascend L2 cache control
             policy for GM↔UB, GM↔L1, and UB↔GM DMA paths. Accepts an integer (hardware
             L2Ctrl value) or a case-insensitive string name.
-            Common values: ``0`` / ``"normal_fv"`` (default), ``4`` / ``"notalloc_keep"``
+            Common values: ``0`` / ``"normal_fv"``, ``4`` / ``"notalloc_keep"``
             (bypass L2 to stream past), ``5`` / ``"notalloc_clean"`` (bypass L2 to
-            avoid pollution). Defaults to None (hardware default 0).
+            avoid pollution). Defaults to None; Ascend UB→GM store paths use
+            default 4, while load paths use default 0.
             Ascend only; ignored on other backends.
         scale_factor (bool, keyword-only): Whether the copied data is an Ascend
             scale-factor tile. The marker changes GM→L1 NZ stride setup for

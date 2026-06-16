@@ -174,15 +174,18 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
                      plan.src_stride_bytes, plan.dst_stride_bytes});
       }
     } else {
+      constexpr int kStoreDefaultL2CacheCtrl = 4;
+      PrimExpr store_l2_cache_ctrl =
+          I(op.GetL2CacheCtrl(kStoreDefaultL2CacheCtrl));
       if (plan_single_row) {
         call = Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
                     {plan_dst_ptr, plan_src_ptr, sid, I(1), plan_total_bytes,
-                     l2_cache_ctrl, plan_total_bytes, plan_total_bytes});
+                     store_l2_cache_ctrl, plan_total_bytes, plan_total_bytes});
       } else {
-        call =
-            Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
-                 {plan_dst_ptr, plan_src_ptr, sid, plan.n_rows, plan.row_bytes,
-                  l2_cache_ctrl, plan.dst_stride_bytes, plan.src_stride_bytes});
+        call = Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
+                    {plan_dst_ptr, plan_src_ptr, sid, plan.n_rows,
+                     plan.row_bytes, store_l2_cache_ctrl, plan.dst_stride_bytes,
+                     plan.src_stride_bytes});
       }
     }
   } else if (dma_path == 2) {
