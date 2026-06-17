@@ -505,7 +505,7 @@ def _bench_with_msprof(
 
         kernel_profiles = _parse_ffts_profile(Path(prof.prof_if.prof_path))
 
-    kernel_profiles = {name: profile for name, profile in kernel_profiles.items() if name != "_tilelang_profiler_cache_flush_kernel"}
+    kernel_profiles = {name: profile for name, profile in kernel_profiles.items() if "_tilelang_profiler_cache_flush_kernel" not in name}
     if not kernel_profiles:
         raise RuntimeError("No profiled kernels remain after excluding the msprof flush kernel.")
 

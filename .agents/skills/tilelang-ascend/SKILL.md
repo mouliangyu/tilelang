@@ -1,11 +1,11 @@
 ---
 name: tilelang-ascend
 description: >
-Guide for writing TileLang programs targeting the Huawei Ascend NPU.
-Covers Ascend-specific concepts (AIC/AIV dual-core, Cube/Vector engines,
-memory hierarchy, thread model, synchronization) and how they differ
-from CUDA/GPU programming. Use this skill whenever the user asks about
-Ascend, NPU, Huawei, or writes TileLang code for the Ascend backend.
+  Guide for writing TileLang programs targeting the Huawei Ascend NPU.
+  Covers Ascend-specific concepts (AIC/AIV dual-core, Cube/Vector engines,
+  memory hierarchy, thread model, synchronization) and how they differ
+  from CUDA/GPU programming. Use this skill whenever the user asks about
+  Ascend, NPU, Huawei, or writes TileLang code for the Ascend backend.
 ---
 
 # TileLang Ascend NPU Programming
