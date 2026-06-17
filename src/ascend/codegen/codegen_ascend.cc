@@ -1319,6 +1319,30 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     os << ", " << Downcast<StringImm>(op->args[3])->value; // mode
     os << ")";
   }
+  // --- SimdVF predicate ops ---
+  else if (op->op.same_as(tl::simd_pand()) || op->op.same_as(tl::simd_por()) ||
+           op->op.same_as(tl::simd_pxor()) || op->op.same_as(tl::simd_pnot()) ||
+           op->op.same_as(tl::simd_psel())) {
+    const char *name = nullptr;
+    if (op->op.same_as(tl::simd_pand()))
+      name = "pand";
+    else if (op->op.same_as(tl::simd_por()))
+      name = "por";
+    else if (op->op.same_as(tl::simd_pxor()))
+      name = "pxor";
+    else if (op->op.same_as(tl::simd_pnot()))
+      name = "pnot";
+    else
+      name = "psel";
+    ICHECK(op->args.size() == (op->op.same_as(tl::simd_pnot()) ? 2 : 3));
+    os << "simd_inst::" << name << "(";
+    PrintExpr(op->args[0], os);
+    for (int i = 1; i < static_cast<int>(op->args.size()); ++i) {
+      os << ", ";
+      PrintExpr(op->args[i], os);
+    }
+    os << ")";
+  }
   // --- SimdVF bitwise: (src0, src1, mask, mode) ---
   else if (op->op.same_as(tl::simd_vand()) || op->op.same_as(tl::simd_vor())) {
     ICHECK_EQ(op->args.size(), 4);
@@ -1332,10 +1356,22 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     os << ", " << Downcast<StringImm>(op->args[3])->value; // mode
     os << ")";
   }
+  // --- SimdVF vector shift: (src0, src1, mask, mode) ---
+  else if (op->op.same_as(tl::simd_vshl()) || op->op.same_as(tl::simd_vshr())) {
+    ICHECK_EQ(op->args.size(), 4);
+    const char *name = op->op.same_as(tl::simd_vshl()) ? "vshl" : "vshr";
+    os << "simd_inst::" << name << "(";
+    PrintExpr(op->args[0], os); // src0
+    os << ", ";
+    PrintExpr(op->args[1], os); // src1
+    os << ", ";
+    PrintExpr(op->args[2], os);                            // mask
+    os << ", " << Downcast<StringImm>(op->args[3])->value; // mode
+    os << ")";
+  }
   // --- SimdVF unary ops: (src, mask, mode) ---
   else if (op->op.same_as(tl::simd_vexp()) || op->op.same_as(tl::simd_vln()) ||
            op->op.same_as(tl::simd_vsqrt()) ||
-           op->op.same_as(tl::simd_vrsqrt()) ||
            op->op.same_as(tl::simd_vabs()) || op->op.same_as(tl::simd_vneg()) ||
            op->op.same_as(tl::simd_vrelu())) {
     ICHECK_EQ(op->args.size(), 3);
@@ -1346,8 +1382,6 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       name = "vln";
     else if (op->op.same_as(tl::simd_vsqrt()))
       name = "vsqrt";
-    else if (op->op.same_as(tl::simd_vrsqrt()))
-      name = "vrsqrt";
     else if (op->op.same_as(tl::simd_vabs()))
       name = "vabs";
     else if (op->op.same_as(tl::simd_vrelu()))
@@ -1361,15 +1395,19 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     os << ", " << Downcast<StringImm>(op->args[2])->value; // mode
     os << ")";
   }
-  // --- SimdVF cross-lane reduce with vcgadd addition ---
+  // --- SimdVF cross-lane reduce/permutation ---
   else if (op->op.same_as(tl::simd_vcmax()) ||
            op->op.same_as(tl::simd_vcmin()) ||
            op->op.same_as(tl::simd_vcadd()) ||
-           op->op.same_as(tl::simd_vcgadd())) {
+           op->op.same_as(tl::simd_vcgadd()) ||
+           op->op.same_as(tl::simd_vcgmax()) ||
+           op->op.same_as(tl::simd_vsqz())) {
     ICHECK_EQ(op->args.size(), 3);
     const char *name = op->op.same_as(tl::simd_vcmax())    ? "vcmax"
                        : op->op.same_as(tl::simd_vcmin())  ? "vcmin"
                        : op->op.same_as(tl::simd_vcgadd()) ? "vcgadd"
+                       : op->op.same_as(tl::simd_vcgmax()) ? "vcgmax"
+                       : op->op.same_as(tl::simd_vsqz())   ? "vsqz"
                                                            : "vcadd";
     os << "simd_inst::" << name << "(";
     PrintExpr(op->args[0], os); // src
@@ -1466,6 +1504,40 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     os << ")";
   }
+  // --- SimdVF gather elements: (base, index, mask) ---
+  else if (op->op.same_as(tl::simd_vgather2())) {
+    ICHECK_EQ(op->args.size(), 3);
+    auto get_vgather2_base_elem = [](const PrimExpr &ptr,
+                                     DataType fallback) -> DataType {
+      const auto *call = ptr.as<CallNode>();
+      if (!call) {
+        return fallback;
+      }
+      if (call->op.same_as(tl::access_ptr())) {
+        ICHECK_EQ(call->args.size(), 3U)
+            << "tl.access_ptr expects 3 args: (BufferLoad, extent, rw_mask)";
+        const auto *load = call->args[0].as<BufferLoadNode>();
+        ICHECK(load) << "tl.access_ptr arg0 must be BufferLoad";
+        return load->buffer->dtype;
+      }
+      if (call->op.same_as(tirx::builtin::tvm_access_ptr())) {
+        ICHECK_GE(call->args.size(), 1U)
+            << "tvm_access_ptr expects a type annotation arg";
+        DataType dtype = call->args[0].dtype();
+        return dtype.lanes() == 1 ? dtype : dtype.element_of();
+      }
+      return fallback;
+    };
+    DataType elem = get_vgather2_base_elem(op->args[0], op->dtype.element_of());
+    os << "simd_inst::vgather2<" << CCEUBufType(elem) << ">((" << "__ubuf__ "
+       << CCEUBufType(elem) << "*)";
+    PrintExpr(op->args[0], os); // base
+    os << ", ";
+    PrintExpr(op->args[1], os); // index
+    os << ", ";
+    PrintExpr(op->args[2], os); // mask
+    os << ")";
+  }
   // --- SimdVF load: (addr, dist [, offset]) ---
   else if (op->op.same_as(tl::simd_vld())) {
     ICHECK(op->args.size() >= 2 && op->args.size() <= 3);
@@ -1534,9 +1606,18 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   }
   // --- SimdVF scalar-vector ops: (src, scalar, mask, mode) ---
   else if (op->op.same_as(tl::simd_vadds()) ||
-           op->op.same_as(tl::simd_vmuls())) {
+           op->op.same_as(tl::simd_vmuls()) ||
+           op->op.same_as(tl::simd_vmaxs()) ||
+           op->op.same_as(tl::simd_vmins()) ||
+           op->op.same_as(tl::simd_vshls()) ||
+           op->op.same_as(tl::simd_vshrs())) {
     ICHECK_EQ(op->args.size(), 4);
-    const char *name = op->op.same_as(tl::simd_vadds()) ? "vadds" : "vmuls";
+    const char *name = op->op.same_as(tl::simd_vadds())   ? "vadds"
+                       : op->op.same_as(tl::simd_vmaxs()) ? "vmaxs"
+                       : op->op.same_as(tl::simd_vmins()) ? "vmins"
+                       : op->op.same_as(tl::simd_vshls()) ? "vshls"
+                       : op->op.same_as(tl::simd_vshrs()) ? "vshrs"
+                                                          : "vmuls";
     os << "simd_inst::" << name << "(";
     PrintExpr(op->args[0], os); // src
     os << ", ";
@@ -1593,6 +1674,15 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     PrintExpr(op->args[1], os); // src1
     os << ", ";
     PrintExpr(op->args[2], os); // mask
+    os << ")";
+  }
+  // --- SimdVF select by lane index: (src, index) ---
+  else if (op->op.same_as(tl::simd_vselr())) {
+    ICHECK_EQ(op->args.size(), 2);
+    os << "simd_inst::vselr(";
+    PrintExpr(op->args[0], os); // src
+    os << ", ";
+    PrintExpr(op->args[1], os); // index
     os << ")";
   } else if (op->op.same_as(tl::simd_mem_bar())) {
     std::string mem_type_str = Downcast<StringImm>(op->args[0])->value;
@@ -2023,16 +2113,18 @@ void CodeGenTileLangAscend::VisitStmt_(const BindNode *op) {
       }
     }
     if (const auto *call = op->value.as<CallNode>()) {
-      // simd_pset(elem_width_bits, dist) → vector_bool vid = pset_bXX(dist);
-      if (call->op.same_as(tl::simd_pset())) {
+      // simd_pset/pge(elem_width_bits, dist) -> vector_bool vid = p*_bXX(dist);
+      if (call->op.same_as(tl::simd_pset()) ||
+          call->op.same_as(tl::simd_pge())) {
+        const char *name = call->op.same_as(tl::simd_pset()) ? "pset" : "pge";
         int elem_bits = (int)Downcast<IntImm>(call->args[0])->value;
         std::string dist =
             (call->args.size() >= 2 && call->args[1].as<StringImmNode>())
                 ? Downcast<StringImm>(call->args[1])->value
                 : "PAT_ALL";
         PrintIndent();
-        stream << "vector_bool " << vid << " = pset_b" << elem_bits << "("
-               << dist << ");\n";
+        stream << "vector_bool " << vid << " = " << name << "_b" << elem_bits
+               << "(" << dist << ");\n";
         return;
       }
       // pair_get(pair, idx) → inline as pair.vN, no auto decl

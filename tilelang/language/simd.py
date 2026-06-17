@@ -71,6 +71,31 @@ def pset(elem_width: int, dist: str = "PAT_ALL"):
     return tirx.call_intrin("boolx256", _Op("tl.simd.pset"), elem_width, dist)
 
 
+def pge(elem_width: int, dist: str = "PAT_ALL"):
+    """Create a predicate mask from pge_bXX(dist)."""
+    return tirx.call_intrin("boolx256", _Op("tl.simd.pge"), elem_width, dist)
+
+
+def pand(src0, src1, mask):
+    return tirx.call_intrin("boolx256", _Op("tl.simd.pand"), src0, src1, mask)
+
+
+def por(src0, src1, mask):  # codespell:ignore
+    return tirx.call_intrin("boolx256", _Op("tl.simd.por"), src0, src1, mask)  # codespell:ignore
+
+
+def pxor(src0, src1, mask):
+    return tirx.call_intrin("boolx256", _Op("tl.simd.pxor"), src0, src1, mask)
+
+
+def pnot(src, mask):
+    return tirx.call_intrin("boolx256", _Op("tl.simd.pnot"), src, mask)
+
+
+def psel(src0, src1, mask):
+    return tirx.call_intrin("boolx256", _Op("tl.simd.psel"), src0, src1, mask)
+
+
 def alloc_var(dtype: str):
     """Allocate a mutable SIMD variable for return-value style SIMD code."""
     return _alloc_buffer([1], _vec_dtype(dtype), scope="local.var")
@@ -172,6 +197,14 @@ def vor(src0, src1, mask, mode="MODE_ZEROING"):  # codespell:ignore
     return tirx.call_intrin(str(src0.dtype), _Op("tl.simd.vor"), src0, src1, mask, mode)  # codespell:ignore
 
 
+def vshl(src0, src1, mask, mode="MODE_ZEROING"):
+    return tirx.call_intrin(str(src0.dtype), _Op("tl.simd.vshl"), src0, src1, mask, mode)
+
+
+def vshr(src0, src1, mask, mode="MODE_ZEROING"):
+    return tirx.call_intrin(str(src0.dtype), _Op("tl.simd.vshr"), src0, src1, mask, mode)
+
+
 # -- Unary ------------------------------------------------------------------------
 
 
@@ -185,10 +218,6 @@ def vln(src, mask, mode="MODE_ZEROING"):
 
 def vsqrt(src, mask, mode="MODE_ZEROING"):
     return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vsqrt"), src, mask, mode)
-
-
-def vrsqrt(src, mask, mode="MODE_ZEROING"):
-    return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vrsqrt"), src, mask, mode)
 
 
 def vabs(src, mask, mode="MODE_ZEROING"):  # noqa: A001
@@ -228,7 +257,12 @@ def vdupv(src, mask, pos="POS_LOWEST", mode="MODE_ZEROING"):
 
 def vcadd(src, mask, mode="MODE_ZEROING"):
     """Pairwise add reduction: dst = vcadd(src, mask)."""
-    return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vcadd"), src, mask, mode)
+    src_elem = str(src.dtype).split("x", 1)[0]
+    out_dtype = {
+        "int16": _vec_dtype("int32"),
+        "uint16": _vec_dtype("uint32"),
+    }.get(src_elem, str(src.dtype))
+    return tirx.call_intrin(out_dtype, _Op("tl.simd.vcadd"), src, mask, mode)
 
 
 def vcmax(src, mask, mode="MODE_ZEROING"):
@@ -244,6 +278,16 @@ def vcmin(src, mask, mode="MODE_ZEROING"):
 def vcgadd(src, mask, mode="MODE_ZEROING"):
     """Grouped add reduction: dst = vcgadd(src, mask)."""
     return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vcgadd"), src, mask, mode)
+
+
+def vcgmax(src, mask, mode="MODE_ZEROING"):
+    """Grouped max reduction: dst = vcgmax(src, mask)."""
+    return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vcgmax"), src, mask, mode)
+
+
+def vsqz(src, mask, mode="MODE_STORED"):
+    """Squeeze selected lanes toward the low lanes: dst = vsqz(src, mask)."""
+    return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vsqz"), src, mask, mode)
 
 
 # -- Index ramp / compare ---------------------------------------------------------
@@ -332,6 +376,27 @@ def vgatherb(base, index, mask=None):
     return tirx.call_intrin(vec_dtype, _Op("tl.simd.vgatherb"), *args)
 
 
+def vgather2(base, index, mask):
+    """Gather elements from base using per-lane offsets."""
+    if isinstance(base, BufferLoad):
+        elem_dtype = str(base.buffer.dtype)
+        base = access_ptr(base, "r", extent=_vreg_lanes(_elem_bits(elem_dtype)))
+    else:
+        inner_load = base.args[0]
+        elem_dtype = str(inner_load.buffer.dtype)
+    out_elem = {
+        "int8": "int16",
+        "uint8": "uint16",
+    }.get(elem_dtype, elem_dtype)
+    return tirx.call_intrin(
+        _vec_dtype(out_elem),
+        _Op("tl.simd.vgather2"),
+        base,
+        index,
+        mask,
+    )
+
+
 # -- Type conversion --------------------------------------------------------------
 
 
@@ -413,12 +478,33 @@ def vsel(src0, src1, mask):
     return tirx.call_intrin(str(src0.dtype), _Op("tl.simd.vsel"), src0, src1, mask)
 
 
+def vselr(src, index):
+    """Select lanes from src using per-lane indices."""
+    return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vselr"), src, index)
+
+
+def vmaxs(src, scalar, mask, mode="MODE_ZEROING"):
+    return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vmaxs"), src, scalar, mask, mode)
+
+
+def vmins(src, scalar, mask, mode="MODE_ZEROING"):
+    return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vmins"), src, scalar, mask, mode)
+
+
 def vmuls(src, scalar, mask, mode="MODE_ZEROING"):
     return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vmuls"), src, scalar, mask, mode)
 
 
 def vadds(src, scalar, mask, mode="MODE_ZEROING"):
     return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vadds"), src, scalar, mask, mode)
+
+
+def vshls(src, scalar, mask, mode="MODE_ZEROING"):
+    return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vshls"), src, scalar, mask, mode)
+
+
+def vshrs(src, scalar, mask, mode="MODE_ZEROING"):
+    return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vshrs"), src, scalar, mask, mode)
 
 
 def mem_bar(mem_type):

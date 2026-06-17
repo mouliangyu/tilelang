@@ -794,6 +794,12 @@ TVM_DLL const Op &ascend_reduce_min();
 
 // -- Mask
 TVM_DLL const Op &simd_pset();
+TVM_DLL const Op &simd_pge();
+TVM_DLL const Op &simd_pand();
+TVM_DLL const Op &simd_por();
+TVM_DLL const Op &simd_pxor();
+TVM_DLL const Op &simd_pnot();
+TVM_DLL const Op &simd_psel();
 
 // -- Load / Store
 TVM_DLL const Op &simd_vld();
@@ -809,12 +815,13 @@ TVM_DLL const Op &simd_vmax();
 TVM_DLL const Op &simd_vmin();
 TVM_DLL const Op &simd_vand();
 TVM_DLL const Op &simd_vor();
+TVM_DLL const Op &simd_vshl();
+TVM_DLL const Op &simd_vshr();
 
 // -- Unary
 TVM_DLL const Op &simd_vexp();
 TVM_DLL const Op &simd_vln();
 TVM_DLL const Op &simd_vsqrt();
-TVM_DLL const Op &simd_vrsqrt();
 TVM_DLL const Op &simd_vabs();
 TVM_DLL const Op &simd_vneg();
 TVM_DLL const Op &simd_vrelu();
@@ -828,6 +835,8 @@ TVM_DLL const Op &simd_vcadd();
 TVM_DLL const Op &simd_vcmax();
 TVM_DLL const Op &simd_vcmin();
 TVM_DLL const Op &simd_vcgadd();
+TVM_DLL const Op &simd_vcgmax();
+TVM_DLL const Op &simd_vsqz();
 
 // -- Index ramp / compare
 TVM_DLL const Op &simd_vci();
@@ -837,6 +846,7 @@ TVM_DLL const Op &simd_vcmps();
 // -- Register permutation
 TVM_DLL const Op &simd_vintlv();
 TVM_DLL const Op &simd_vgatherb();
+TVM_DLL const Op &simd_vgather2();
 TVM_DLL const Op &simd_vdintlv();
 TVM_DLL const Op &simd_pair_get();
 TVM_DLL const Op &simd_vpack();
@@ -846,8 +856,13 @@ TVM_DLL const Op &simd_vcvt();
 
 // -- Special
 TVM_DLL const Op &simd_vsel();
+TVM_DLL const Op &simd_vselr();
+TVM_DLL const Op &simd_vmaxs();
+TVM_DLL const Op &simd_vmins();
 TVM_DLL const Op &simd_vmuls();
 TVM_DLL const Op &simd_vadds();
+TVM_DLL const Op &simd_vshls();
+TVM_DLL const Op &simd_vshrs();
 TVM_DLL const Op &simd_mem_bar();
 TVM_DLL const Op &simd_vexpdif();
 

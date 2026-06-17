@@ -272,9 +272,6 @@ private:
         if (n == "tir.sqrt" && call->args.size() == 1) {
           return EmitUnary(call->args[0], dtype, simd_vsqrt(), stmts);
         }
-        if (n == "tir.rsqrt" && call->args.size() == 1) {
-          return EmitUnary(call->args[0], dtype, simd_vrsqrt(), stmts);
-        }
         if (n == "tir.fabs" && call->args.size() == 1) {
           return EmitUnary(call->args[0], dtype, simd_vabs(), stmts);
         }

@@ -47,6 +47,10 @@ template <> struct vec<uint16_t> {
   using type = vector_u16;
 };
 
+template <> struct vec<uint8_t> {
+  using type = vector_u8;
+};
+
 template <> struct vec<int32_t> {
   using type = vector_s32;
 };
@@ -55,12 +59,38 @@ template <> struct vec<int16_t> {
   using type = vector_s16;
 };
 
+template <> struct vec<int8_t> {
+  using type = vector_s8;
+};
+
 template <typename SrcVec> struct vec_pair {
   SrcVec v0;
   SrcVec v1;
 };
 
 template <typename T> using vec_t = typename vec<T>::type;
+
+template <typename SrcVec> struct widen_vec {
+  using type = SrcVec;
+};
+
+template <> struct widen_vec<vector_s8> {
+  using type = vector_s16;
+};
+
+template <> struct widen_vec<vector_u8> {
+  using type = vector_u16;
+};
+
+template <> struct widen_vec<vector_s16> {
+  using type = vector_s32;
+};
+
+template <> struct widen_vec<vector_u16> {
+  using type = vector_u32;
+};
+
+template <typename SrcVec> using widen_vec_t = typename widen_vec<SrcVec>::type;
 
 template <typename T, typename Dist>
 __simd_callee__ inline vec_t<T> vld(__ubuf__ T *src, Dist dist) {
@@ -92,9 +122,67 @@ __simd_callee__ inline vec_t<T> vgatherb(__ubuf__ T *base, vector_u32 idx,
 }
 
 template <typename T, typename IdxVec>
+__simd_callee__ inline vec_t<T> vgather2(__ubuf__ T *base, IdxVec idx,
+                                         vector_bool mask) {
+  vec_t<T> dst;
+  ::vgather2(dst, base, idx, mask);
+  return dst;
+}
+
+template <typename IdxVec>
+__simd_callee__ inline widen_vec_t<vec_t<int8_t>>
+vgather2(__ubuf__ int8_t *base, IdxVec idx, vector_bool mask) {
+  widen_vec_t<vec_t<int8_t>> dst;
+  ::vgather2(dst, base, idx, mask);
+  return dst;
+}
+
+template <typename IdxVec>
+__simd_callee__ inline widen_vec_t<vec_t<uint8_t>>
+vgather2(__ubuf__ uint8_t *base, IdxVec idx, vector_bool mask) {
+  widen_vec_t<vec_t<uint8_t>> dst;
+  ::vgather2(dst, base, idx, mask);
+  return dst;
+}
+
+template <typename T, typename IdxVec>
 __simd_callee__ inline void vscatter(vec_t<T> data, __ubuf__ T *base,
                                      IdxVec idx, vector_bool mask) {
   ::vscatter(data, base, idx, mask);
+}
+
+__simd_callee__ inline vector_bool pand(vector_bool src_0, vector_bool src_1,
+                                        vector_bool mask) {
+  vector_bool dst;
+  ::pand(dst, src_0, src_1, mask);
+  return dst;
+}
+
+__simd_callee__ inline vector_bool por(vector_bool src_0, vector_bool src_1,
+                                       vector_bool mask) {
+  vector_bool dst;
+  ::por(dst, src_0, src_1, mask);
+  return dst;
+}
+
+__simd_callee__ inline vector_bool pxor(vector_bool src_0, vector_bool src_1,
+                                        vector_bool mask) {
+  vector_bool dst;
+  ::pxor(dst, src_0, src_1, mask);
+  return dst;
+}
+
+__simd_callee__ inline vector_bool pnot(vector_bool src, vector_bool mask) {
+  vector_bool dst;
+  ::pnot(dst, src, mask);
+  return dst;
+}
+
+__simd_callee__ inline vector_bool psel(vector_bool src_0, vector_bool src_1,
+                                        vector_bool mask) {
+  vector_bool dst;
+  ::psel(dst, src_0, src_1, mask);
+  return dst;
 }
 
 // f16→f32, f8→f32, i32→f32: ::vcvt(dst, src, mask, part/round, mode)
@@ -270,6 +358,22 @@ __simd_callee__ inline SrcVec vor(SrcVec src_0, SrcVec src_1, vector_bool mask,
   return dst;
 }
 
+template <typename SrcVec, typename ShiftVec, typename Mode>
+__simd_callee__ inline SrcVec vshl(SrcVec src_0, ShiftVec src_1,
+                                   vector_bool mask, Mode mode) {
+  SrcVec dst;
+  ::vshl(dst, src_0, src_1, mask, mode);
+  return dst;
+}
+
+template <typename SrcVec, typename ShiftVec, typename Mode>
+__simd_callee__ inline SrcVec vshr(SrcVec src_0, ShiftVec src_1,
+                                   vector_bool mask, Mode mode) {
+  SrcVec dst;
+  ::vshr(dst, src_0, src_1, mask, mode);
+  return dst;
+}
+
 // -- Unary
 // ----------------------------------------------------------------------
 
@@ -284,13 +388,6 @@ template <typename SrcVec, typename Mode>
 __simd_callee__ inline SrcVec vsqrt(SrcVec src, vector_bool mask, Mode mode) {
   SrcVec dst;
   ::vsqrt(dst, src, mask, mode);
-  return dst;
-}
-
-template <typename SrcVec, typename Mode>
-__simd_callee__ inline SrcVec vrsqrt(SrcVec src, vector_bool mask, Mode mode) {
-  SrcVec dst;
-  vrsqrt(dst, src, mask, mode);
   return dst;
 }
 
@@ -324,10 +421,10 @@ __simd_callee__ inline SrcVec vexp(SrcVec src, vector_bool mask, Mode mode) {
 
 // -- Cross-lane reductions
 // ------------------------------------------------------
-
 template <typename SrcVec, typename Mode>
-__simd_callee__ inline SrcVec vcadd(SrcVec src, vector_bool mask, Mode mode) {
-  SrcVec dst;
+__simd_callee__ inline widen_vec_t<SrcVec> vcadd(SrcVec src, vector_bool mask,
+                                                 Mode mode) {
+  widen_vec_t<SrcVec> dst;
   ::vcadd(dst, src, mask, mode);
   return dst;
 }
@@ -343,6 +440,27 @@ template <typename SrcVec, typename Mode>
 __simd_callee__ inline SrcVec vcmin(SrcVec src, vector_bool mask, Mode mode) {
   SrcVec dst;
   ::vcmin(dst, src, mask, mode);
+  return dst;
+}
+
+template <typename SrcVec, typename Mode>
+__simd_callee__ inline SrcVec vcgadd(SrcVec src, vector_bool mask, Mode mode) {
+  SrcVec dst;
+  ::vcgadd(dst, src, mask, mode);
+  return dst;
+}
+
+template <typename SrcVec, typename Mode>
+__simd_callee__ inline SrcVec vcgmax(SrcVec src, vector_bool mask, Mode mode) {
+  SrcVec dst;
+  ::vcgmax(dst, src, mask, mode);
+  return dst;
+}
+
+template <typename SrcVec, typename Mode>
+__simd_callee__ inline SrcVec vsqz(SrcVec src, vector_bool mask, Mode mode) {
+  SrcVec dst;
+  ::vsqz(dst, src, mask, mode);
   return dst;
 }
 
@@ -410,6 +528,13 @@ __simd_callee__ inline SrcVec vsel(SrcVec src_0, SrcVec src_1,
   return dst;
 }
 
+template <typename SrcVec, typename IdxVec>
+__simd_callee__ inline SrcVec vselr(SrcVec src, IdxVec idx) {
+  SrcVec dst;
+  ::vselr(dst, src, idx);
+  return dst;
+}
+
 // -- Scalar-vector ops
 // ----------------------------------------------------------
 
@@ -422,10 +547,42 @@ __simd_callee__ inline SrcVec vadds(SrcVec src, ScalarT scalar,
 }
 
 template <typename SrcVec, typename ScalarT, typename Mode>
+__simd_callee__ inline SrcVec vmaxs(SrcVec src, ScalarT scalar,
+                                    vector_bool mask, Mode mode) {
+  SrcVec dst;
+  ::vmaxs(dst, src, scalar, mask, mode);
+  return dst;
+}
+
+template <typename SrcVec, typename ScalarT, typename Mode>
+__simd_callee__ inline SrcVec vmins(SrcVec src, ScalarT scalar,
+                                    vector_bool mask, Mode mode) {
+  SrcVec dst;
+  ::vmins(dst, src, scalar, mask, mode);
+  return dst;
+}
+
+template <typename SrcVec, typename ScalarT, typename Mode>
 __simd_callee__ inline SrcVec vmuls(SrcVec src, ScalarT scalar,
                                     vector_bool mask, Mode mode) {
   SrcVec dst;
   ::vmuls(dst, src, scalar, mask, mode);
+  return dst;
+}
+
+template <typename SrcVec, typename ScalarT, typename Mode>
+__simd_callee__ inline SrcVec vshls(SrcVec src, ScalarT scalar,
+                                    vector_bool mask, Mode mode) {
+  SrcVec dst;
+  ::vshls(dst, src, scalar, mask, mode);
+  return dst;
+}
+
+template <typename SrcVec, typename ScalarT, typename Mode>
+__simd_callee__ inline SrcVec vshrs(SrcVec src, ScalarT scalar,
+                                    vector_bool mask, Mode mode) {
+  SrcVec dst;
+  ::vshrs(dst, src, scalar, mask, mode);
   return dst;
 }
 

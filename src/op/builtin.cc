@@ -496,6 +496,24 @@ TIR_DEFINE_TL_BUILTIN(ascend_reduce_min)
 TIR_DEFINE_TL_SIMD_BUILTIN(pset).set_num_inputs(-1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_SIMD_BUILTIN(pge).set_num_inputs(-1).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_SIMD_BUILTIN(pand).set_num_inputs(-1).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_SIMD_BUILTIN(por).set_num_inputs(-1).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_SIMD_BUILTIN(pxor).set_num_inputs(-1).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_SIMD_BUILTIN(pnot).set_num_inputs(-1).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_SIMD_BUILTIN(psel).set_num_inputs(-1).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_SIMD_BUILTIN(vld).set_num_inputs(-1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
@@ -526,6 +544,12 @@ TIR_DEFINE_TL_SIMD_BUILTIN(vand).set_num_inputs(-1).set_attr<TCallEffectKind>(
 TIR_DEFINE_TL_SIMD_BUILTIN(vor).set_num_inputs(-1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_SIMD_BUILTIN(vshl).set_num_inputs(-1).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_SIMD_BUILTIN(vshr).set_num_inputs(-1).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_SIMD_BUILTIN(vexp).set_num_inputs(-1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
@@ -533,9 +557,6 @@ TIR_DEFINE_TL_SIMD_BUILTIN(vln).set_num_inputs(-1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TL_SIMD_BUILTIN(vsqrt).set_num_inputs(-1).set_attr<TCallEffectKind>(
-    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
-
-TIR_DEFINE_TL_SIMD_BUILTIN(vrsqrt).set_num_inputs(-1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TL_SIMD_BUILTIN(vabs).set_num_inputs(-1).set_attr<TCallEffectKind>(
@@ -574,11 +595,22 @@ TIR_DEFINE_TL_SIMD_BUILTIN(vcmps).set_num_inputs(-1).set_attr<TCallEffectKind>(
 TIR_DEFINE_TL_SIMD_BUILTIN(vcgadd).set_num_inputs(-1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_SIMD_BUILTIN(vcgmax).set_num_inputs(-1).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_SIMD_BUILTIN(vsqz).set_num_inputs(-1).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_SIMD_BUILTIN(vsstb).set_num_inputs(-1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TL_SIMD_BUILTIN(vgatherb)
     .set_num_inputs(-1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_SIMD_BUILTIN(vgather2)
+    .set_num_inputs(3)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
@@ -605,10 +637,25 @@ TIR_DEFINE_TL_SIMD_BUILTIN(vexpdif).set_num_inputs(4).set_attr<TCallEffectKind>(
 TIR_DEFINE_TL_SIMD_BUILTIN(vsel).set_num_inputs(-1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_SIMD_BUILTIN(vselr).set_num_inputs(2).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_SIMD_BUILTIN(vmaxs).set_num_inputs(-1).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_SIMD_BUILTIN(vmins).set_num_inputs(-1).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_SIMD_BUILTIN(vmuls).set_num_inputs(-1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TL_SIMD_BUILTIN(vadds).set_num_inputs(-1).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_SIMD_BUILTIN(vshls).set_num_inputs(-1).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_SIMD_BUILTIN(vshrs).set_num_inputs(-1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TL_SIMD_BUILTIN(mem_bar).set_num_inputs(1).set_attr<TCallEffectKind>(
