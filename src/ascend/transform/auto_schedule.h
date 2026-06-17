@@ -98,6 +98,27 @@ inline int64_t GetSharedMemoryLimit(Target target) {
   }
 }
 
+// Check whether a kernel body contains any SIMT_VF blocks. SIMT_VF
+// (asc_vf_call) reserves 32 KB of the physical 248 KB Unified Buffer for
+// thread context, so the usable shared memory depends on its presence.
+class SimtVFDetector : public tirx::StmtVisitor {
+public:
+  bool found = false;
+
+  void VisitStmt_(const tirx::SBlockNode *op) override {
+    if (op->name_hint == "SIMT_VF") {
+      found = true;
+    }
+    tirx::StmtVisitor::VisitStmt_(op);
+  }
+};
+
+inline bool HasSimtVF(const tirx::Stmt &stmt) {
+  SimtVFDetector detector;
+  detector(stmt);
+  return detector.found;
+}
+
 inline int64_t GetL1MemoryLimit(Target target) {
   if (TargetIsAscend(target)) {
     return 512 * 1024; // 512 KB L1 cache on Ascend

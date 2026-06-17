@@ -171,6 +171,7 @@ from .annotations import (  # noqa: F401
     annotate_restrict_buffers,
     annotate_min_blocks_per_sm,
     annotate_buffer_versions,
+    annotate_unlimit_memory,
 )
 
 from .random import (

@@ -8,6 +8,8 @@ from tvm.tirx.script.parser import attr
 from tvm.tirx.script.builder.ir import sblock_attr
 from tvm.tirx import FloatImm, tvm_tuple
 
+_VALID_MEMORY_SCOPES = ("shared", "shared.l1", "shared.l0c", "shared.l0a", "shared.l0b")
+
 __all__ = [
     "use_swizzle",
     "annotate_layout",
@@ -16,6 +18,7 @@ __all__ = [
     "annotate_restrict_buffers",
     "annotate_min_blocks_per_sm",
     "annotate_buffer_versions",
+    "annotate_unlimit_memory",
 ]
 
 
@@ -138,3 +141,29 @@ def annotate_buffer_versions(buffer_versions_map: dict):
             raise ValueError(f"num_versions must be a positive integer, got {num_versions} for buffer {buffer}")
         _buffer_versions_map[buffer.data] = num_versions
     return sblock_attr({"tl.buffer_versions_map": _buffer_versions_map})
+
+
+def annotate_unlimit_memory(*scopes: str):
+    """Remove the memory capacity limit for the given scopes during auto-scheduling.
+
+    When unlimit'd, a scope's capacity is effectively unbounded so Z3 will not
+    constrain multi-buffer versions based on that memory pool. Use this when you
+    know a particular scope has spare headroom.
+
+    Valid scopes: ``"shared"``, ``"shared.l1"``, ``"shared.l0c"``, ``"shared.l0a"``, ``"shared.l0b"``.
+
+    Example
+    -------
+    >>> @T.prim_func
+    ... def my_kernel(x: T.Tensor((M, K), T.float16),
+    ...               w: T.Tensor((N, K), T.float16),
+    ...               y: T.Tensor((M, N), T.float16)):
+    ...     with T.Kernel(T.ceildiv(N, block_N), threads=128) as bx:
+    ...         T.annotate_unlimit_memory("shared")
+    ...         ...
+    """
+    valid = _VALID_MEMORY_SCOPES
+    for scope in scopes:
+        if scope not in valid:
+            raise ValueError(f"Invalid memory scope {scope!r}, must be one of {valid}")
+    return sblock_attr({"tl.unlimit_memory_scopes": list(scopes)})

@@ -79,6 +79,7 @@ class TilelangRootBodyExtractor : public StmtVisitor {
 public:
   Stmt body;
   std::map<std::string, int64_t> buffer_versions_overrides;
+  std::set<std::string> unlimit_memory_scopes;
   Optional<Var> sid;
 
   void VisitStmt_(const SBlockNode *op) override {
@@ -93,6 +94,16 @@ public:
               if (auto imm = it.second.as<int>()) {
                 buffer_versions_overrides[var->name_hint] = imm.value();
               }
+            }
+          }
+        }
+      }
+      auto mem_ann = op->annotations.Get("tl.unlimit_memory_scopes");
+      if (mem_ann.has_value()) {
+        if (auto *arr = mem_ann.value().as<ffi::ArrayObj>()) {
+          for (const auto &it : *arr) {
+            if (auto str_opt = it.as<ffi::String>()) {
+              unlimit_memory_scopes.insert(str_opt.value());
             }
           }
         }
@@ -1113,6 +1124,7 @@ static void PropagateReadRegions(IRStructure *root) {
 static ScheduledKernelResult ScheduleSingleKernel(
     const Stmt &kernel_body, Target target,
     const std::map<std::string, int64_t> &buffer_versions_overrides = {},
+    const std::set<std::string> &unlimit_memory_scopes = {},
     Optional<Var> external_sid = {}) {
   // Build IRStructure from the body to schedule
   ScheduledKernelResult result;
@@ -1128,11 +1140,19 @@ static ScheduledKernelResult ScheduleSingleKernel(
 
   // Build ScheduleUnits from IRStructure (Z3 scheduling + Ascend sync)
   ScheduleUnitBuilder unit_builder;
-  unit_builder.SetMemoryLimit("shared", GetSharedMemoryLimit(target));
+  int64_t shared_mem_limit = GetSharedMemoryLimit(target);
+  if (TargetIsAscend(target) && !HasSimtVF(kernel_body)) {
+    shared_mem_limit = 248 * 1024;
+  }
+  unit_builder.SetMemoryLimit("shared", shared_mem_limit);
   unit_builder.SetMemoryLimit("shared.l1", GetL1MemoryLimit(target));
   unit_builder.SetMemoryLimit("shared.l0c", GetL0CMemoryLimit(target));
   unit_builder.SetMemoryLimit("shared.l0a", GetL0AMemoryLimit(target));
   unit_builder.SetMemoryLimit("shared.l0b", GetL0BMemoryLimit(target));
+  constexpr int64_t kUnlimitedMemory = 1LL << 40;
+  for (const auto &scope : unlimit_memory_scopes) {
+    unit_builder.SetMemoryLimit(scope, kUnlimitedMemory);
+  }
   unit_builder.SetBufferVersionsOverride(buffer_versions_overrides);
   unit_builder.ScheduleRecursive(ir_structure);
 
@@ -1287,8 +1307,9 @@ tvm::transform::Pass AutoSchedule() {
       }
 
       auto overrides = extractor.buffer_versions_overrides;
-      auto kr = ScheduleSingleKernel(body_to_schedule, target, overrides,
-                                     extractor.sid);
+      auto kr =
+          ScheduleSingleKernel(body_to_schedule, target, overrides,
+                               extractor.unlimit_memory_scopes, extractor.sid);
 
       TilelangRootBodyReplacer replacer(kr.scheduled_body);
       Stmt final_body = replacer(func->body);
@@ -1329,8 +1350,9 @@ tvm::transform::Pass AutoSchedule() {
       Stmt body_to_schedule = extractor.body;
 
       auto overrides = extractor.buffer_versions_overrides;
-      auto result = ScheduleSingleKernel(body_to_schedule, target, overrides,
-                                         extractor.sid);
+      auto result =
+          ScheduleSingleKernel(body_to_schedule, target, overrides,
+                               extractor.unlimit_memory_scopes, extractor.sid);
       Stmt scheduled_body = result.scheduled_body;
 
       TilelangRootBodyReplacer replacer(scheduled_body);

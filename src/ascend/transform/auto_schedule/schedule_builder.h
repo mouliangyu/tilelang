@@ -337,11 +337,13 @@ public:
     // std::map iteration is ordered by key: "shared" then "shared.l1".
     std::map<std::string, int> scope_to_group;
     std::vector<int64_t> group_capacities;
+    std::vector<std::string> group_scopes;
     std::vector<std::vector<int64_t>> group_indices;
     for (const auto &entry : memory_limits_) {
       if (entry.second > 0) {
         scope_to_group[entry.first] = (int)group_capacities.size();
         group_capacities.push_back(entry.second);
+        group_scopes.push_back(entry.first);
         group_indices.push_back({});
       }
     }
@@ -395,6 +397,35 @@ public:
         }
       }
     });
+
+    // Validate buffer capacities upfront: if the minimum requirement (one
+    // version of each eligible buffer) already exceeds the remaining capacity,
+    // Z3 will never find a feasible solution.
+    for (size_t g = 0; g < group_capacities.size(); ++g) {
+      int64_t capacity = group_capacities[g];
+      const auto &idxs = group_indices[g];
+      if (!idxs.empty()) {
+        if (capacity < 0) {
+          LOG(FATAL)
+              << "Z3 loop scheduling failed: scope \"" << group_scopes[g]
+              << "\" capacity is negative (" << capacity
+              << "). Non-eligible and fixed-version buffers already exceed"
+              << " the memory limit. Try using T.annotate_unlimit_memory(\""
+              << group_scopes[g] << "\") or reduce buffer sizes.";
+        }
+        int64_t min_usage = 0;
+        for (int64_t idx : idxs) {
+          min_usage += buffer_sizes[idx];
+        }
+        if (min_usage > capacity) {
+          LOG(FATAL) << "Z3 loop scheduling failed: scope \"" << group_scopes[g]
+                     << "\" capacity " << capacity
+                     << " is insufficient for minimum buffer usage "
+                     << min_usage << ". Try using T.annotate_unlimit_memory(\""
+                     << group_scopes[g] << "\") or reduce buffer sizes.";
+        }
+      }
+    }
 
     // Variable (Let-var write -> read) data dependencies
     for (size_t i = 0; i < n; ++i) {
