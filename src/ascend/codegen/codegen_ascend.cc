@@ -452,6 +452,10 @@ CodeGenTileLangAscend::CollectVFCaptures(const SBlockNode *op) const {
     if (seen.count(var.get())) {
       continue;
     }
+    auto it = var_idmap_.find(var.get());
+    if (it != var_idmap_.end() && it->second == "blockIdx.x") {
+      continue;
+    }
     seen.insert(var.get());
 
     const DataType dtype = var->dtype;
@@ -1880,34 +1884,26 @@ void CodeGenTileLangAscend::VisitStmt_(const AttrStmtNode *op) {
     if (const auto *iv = op->node.as<IterVarNode>()) {
       // Materialize a placeholder symbol so later uses (e.g. simtvf_tx) are
       // printable in expression codegen.
-      std::string var_name = AllocVarID(iv->var.get());
       if ((iv->thread_tag == "threadIdx.x" || iv->thread_tag == "threadIdx.y" ||
            iv->thread_tag == "threadIdx.z") &&
           !inside_simtvf_body_ && !inside_simdvf_body_) {
         this->VisitStmt(op->body);
         return;
       }
-      PrintIndent();
-      PrintType(iv->var.dtype(), stream);
-      stream << " " << var_name << " = ";
-      if (iv->thread_tag == "threadIdx.x") {
-        stream << "threadIdx.x";
-      } else if (iv->thread_tag == "threadIdx.y") {
-        stream << "threadIdx.y";
-      } else if (iv->thread_tag == "threadIdx.z") {
-        stream << "threadIdx.z";
-      } else if (iv->thread_tag == "blockIdx.x") {
-        stream << "blockIdx.x";
-      } else if (iv->thread_tag == "blockIdx.y") {
-        stream << "blockIdx.y";
-      } else if (iv->thread_tag == "blockIdx.z") {
-        stream << "blockIdx.z";
-      } else if (iv->thread_tag == "cthread") {
-        stream << "get_subblockid()";
+      if (std::string::npos == iv->thread_tag.find("threadIdx.") &&
+          std::string::npos == iv->thread_tag.find("blockIdx.")) {
+        PrintIndent();
+        PrintType(iv->var.dtype(), stream);
+        stream << " " << AllocVarID(iv->var.get()) << " = ";
+        if (iv->thread_tag == "cthread") {
+          stream << "get_subblockid()";
+        } else {
+          stream << "0";
+        }
+        stream << ";\n";
       } else {
-        stream << "0";
+        var_idmap_[iv->var.get()] = iv->thread_tag;
       }
-      stream << ";\n";
     }
     this->VisitStmt(op->body);
     return;
