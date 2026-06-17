@@ -624,12 +624,30 @@ private:
       }
     };
 
+    // Specialized issue queues (DMA / Cube / Vector / Fixpipe). On Ascend these
+    // are the only pipes a statement can occupy *other than* the scalar (S)
+    // unit, which is the default issue queue for everything else.
+    constexpr uint16_t kSpecializedPipes =
+        static_cast<uint16_t>(ResourcePipe::kMTE1) |
+        static_cast<uint16_t>(ResourcePipe::kMTE2) |
+        static_cast<uint16_t>(ResourcePipe::kMTE3) |
+        static_cast<uint16_t>(ResourcePipe::kCube) |
+        static_cast<uint16_t>(ResourcePipe::kVector) |
+        static_cast<uint16_t>(ResourcePipe::kFixpipe);
+
+    auto resolve_pipe = [&](uint16_t mask) -> uint16_t {
+      if ((mask & kSpecializedPipes) == 0) {
+        return mask | static_cast<uint16_t>(ResourcePipe::kScalar);
+      }
+      return mask;
+    };
+
     ResourceAnalyzer analyzer(task_node, target_);
     analyzer(stmt);
 
     if (!only_variables) {
-      // Set task node pipe mask
-      task_node->SetPipeMask(analyzer.pipe_mask);
+      // Set task node pipe mask.
+      task_node->SetPipeMask(resolve_pipe(analyzer.pipe_mask));
       task_node->SetHbmMask(analyzer.hbm_mask);
       // Set Tensor Core shape information if available
       for (const auto &shape : analyzer.tensor_core_shapes) {
@@ -941,6 +959,59 @@ static void PropagateBroadcastWarpgroupId(IRStructure *root) {
   }
 }
 
+// Resolve scalar tasks to a concrete warpgroup just before barrier insertion.
+static void ResolveScalarWarpgroupId(IRStructure *root) {
+  std::vector<TaskNodeWithContext> all_tasks;
+  CollectAllTaskNodesWithContext(root, all_tasks);
+
+  // Collect buffers touched by each side's non-broadcast tasks.
+  std::unordered_set<const BufferNode *> cube_bufs, vec_bufs;
+  for (auto &task_ctx : all_tasks) {
+    TaskNode *t = task_ctx.task;
+    int wg = t->GetWarpgroupId();
+    if (IsWarpgroupBroadcast(wg) || wg == kWarpgroupUnassigned)
+      continue;
+    auto &dst = (wg == 1) ? cube_bufs : vec_bufs;
+    for (auto &r : t->GetReadRegions())
+      dst.insert(r->buffer.get());
+    for (auto &r : t->GetWriteRegions())
+      dst.insert(r->buffer.get());
+  }
+
+  for (auto &task_ctx : all_tasks) {
+    TaskNode *t = task_ctx.task;
+    if (!IsWarpgroupBroadcast(t->GetWarpgroupId()))
+      continue;
+    if (!t->UsesPipe(ResourcePipe::kScalar))
+      continue;
+
+    bool serves_cube = false, serves_aiv = false;
+    auto check = [&](const std::vector<BufferRegion> &regions) {
+      for (auto &r : regions) {
+        if (cube_bufs.count(r->buffer.get()))
+          serves_cube = true;
+        if (vec_bufs.count(r->buffer.get()))
+          serves_aiv = true;
+        if (IsL1Buffer(r->buffer) || IsL0ABuffer(r->buffer) ||
+            IsL0BBuffer(r->buffer) || IsL0CBuffer(r->buffer))
+          serves_cube = true;
+        if (IsSharedBuffer(r->buffer))
+          serves_aiv = true;
+      }
+    };
+    check(t->GetReadRegions());
+    check(t->GetWriteRegions());
+
+    if (serves_cube && serves_aiv) {
+      // Cross-core scalar: leave as broadcast (both sides need a copy).
+    } else if (serves_cube) {
+      t->SetWarpgroupId(1);
+    } else {
+      t->SetWarpgroupId(0);
+    }
+  }
+}
+
 // Local enumerator for PropagateReadRegions: in addition to leaf TaskNodes,
 // also include TaskNodes that live as WrapperNode::task (i.e. LetDecl /
 // AttrDecl tasks built by IRStructureBuilder::VisitStmt_(BindNode*) and
@@ -1090,8 +1161,7 @@ static ScheduledKernelResult ScheduleSingleKernel(
           }
         }
         t->SetWarpgroupId(to_l1 ? 1 : 0);
-      } else if (m == 0) {
-        // Scalar-only tasks (e.g. swizzle arithmetic): broadcast to all wgs.
+      } else if (t->UsesPipe(ResourcePipe::kScalar) || m == 0) {
         t->SetWarpgroupId(kWarpgroupBroadcast);
       }
     }
@@ -1100,6 +1170,7 @@ static ScheduledKernelResult ScheduleSingleKernel(
   // Propagate broadcast warpgroup IDs for register buffers accessed
   // across warp groups.
   PropagateBroadcastWarpgroupId(ir_structure.get());
+  ResolveScalarWarpgroupId(ir_structure.get());
 
   EventIdMap event_id_map;
   FlagInfoList flag_infos;

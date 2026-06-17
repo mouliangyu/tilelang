@@ -1014,6 +1014,10 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
       // When producer and consumer share the same pipe, insert a pipe_barrier
       // before the consumer to ensure pipeline ordering.
       if (sp.prod_pipe == sp.cons_pipe) {
+        // The scalar pipe (PIPE_S) issues instructions in program order
+        if (sp.prod_pipe == "PIPE_S") {
+          continue;
+        }
         Stmt barrier = makeAscendPipeBarrier(sp.prod_pipe);
         InsertStatementIntoScheduleUnit(sp.cons_insertion_unit, barrier, true,
                                         sp.cons_wg, sp.cons_guard);
