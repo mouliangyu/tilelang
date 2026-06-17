@@ -140,7 +140,7 @@ class KernelCache:
             "backend/pass_pipeline/pipeline.py",
             "backend/pass_pipeline/pipeline_utils.py",
             "ascend/analysis/vf_local_var_checker.py",
-            "ascend/analysis/vf_parallel_checker.py",
+            "ascend/analysis/vf_checker.py",
             "ascend/pipeline.py",
             "ascend/target.py",
             "ascend/transform/hoist_simd_pairs.py",

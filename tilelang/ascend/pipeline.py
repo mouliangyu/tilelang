@@ -53,7 +53,7 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.VerifyParallelLoop()(mod)
     mod = tilelang.transform.InjectAssumes()(mod)
     mod = tilelang.transform.Simplify()(mod)
-    tilelang.ascend.analysis.VFParallelChecker()(mod)
+    tilelang.ascend.analysis.VFChecker()(mod)
 
     if allow_autoschedule(pass_ctx=pass_ctx):
         mod = ascend_transform.AnnotateMultiBufferEligible()(mod)
@@ -80,7 +80,7 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.HoistGlobalBufferAllocations()(mod)
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     mod = tilelang.transform.Simplify()(mod)
-    mod = tilelang.ascend.analysis.VFParallelChecker()(mod)
+    mod = tilelang.ascend.analysis.VFLocalVarChecker()(mod)
     mod = tirx.transform.NarrowDataType(32)(mod)
     mod = tilelang.transform.FlattenBuffer()(mod)
     mod = tilelang.transform.ConfigIndexBitwidth()(mod)
