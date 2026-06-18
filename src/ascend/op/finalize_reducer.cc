@@ -87,7 +87,7 @@ Stmt LowerFinalizeReducer(const FinalizeReducerOpNode &op, const LowerArgs &T,
   }
   if (need_workspace) {
     PrimExpr workspace =
-        T.AddWorkspace(*as_const_int(T.thread_bounds->extent), buffer->dtype);
+        T.add_workspace(*as_const_int(T.thread_bounds->extent), buffer->dtype);
     thread_reduce_args.push_back(workspace);
   }
   auto call = Call(buffer->dtype, builtin::call_extern(), thread_reduce_args);

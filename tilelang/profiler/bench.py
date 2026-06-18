@@ -96,6 +96,7 @@ def do_bench(
     fast_flush: bool = True,
     backend: Literal["event", "cupti", "cudagraph", "msprof", "msprof_detail"] = "event",
     return_mode: Literal["min", "max", "mean", "median"] = "mean",
+    device: int | torch.device | None = None,
 ) -> float | list[float]:
     """Benchmark the runtime of a PyTorch function with L2 cache management.
 

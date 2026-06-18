@@ -45,11 +45,6 @@ struct Gemm {
     (void)gemm_inst;
     return false;
   }
-
-  static String InstructionKind(String gemm_inst) {
-    (void)gemm_inst;
-    return "mad";
-  }
 };
 
 } // namespace ascend
@@ -65,7 +60,6 @@ bool RegisterAscendGemm() {
       ascend::Gemm::SelectInst,
       ascend::Gemm::ComputeWarpPartition,
       ascend::Gemm::ReuseExistingSharedLayout,
-      ascend::Gemm::InstructionKind,
   });
   return true;
 }

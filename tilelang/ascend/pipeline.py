@@ -42,6 +42,12 @@ def _has_vf_region(mod: IRModule, names: set[str] | None = None) -> bool:
 
 def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tirx.transform.BindTarget(target)(mod)
+    # Materialize the target-neutral kernel-launch nest (thread_binding For
+    # loops emitted by T.Kernel) into thread_extent AttrStmts. Ascend's NPU
+    # launch is a 1-D blockIdx.x grid with no threadIdx, so SIMT-style
+    # materialization (lower_thread_binding=True) reproduces the previous
+    # LaunchThread(blockIdx.x) behavior.
+    mod = tilelang.transform.MaterializeKernelLaunch()(mod)
     mod = ascend_transform.HoistSimdPairs()(mod)
     pass_ctx = tilelang.transform.get_pass_context()
 
