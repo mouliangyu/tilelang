@@ -285,7 +285,7 @@ def z3_schedule_loop_python(
     # Binary search for minimal II
     # Lower bound: 1 cycle
     # Upper bound: sum of all latencies (conservative)
-    ii_lower = 1
+    ii_lower = max(iis)
     ii_upper = sum(latencies) + 1
     best_ii = ii_upper
     best_model = None
