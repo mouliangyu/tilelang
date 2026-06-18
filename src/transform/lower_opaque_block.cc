@@ -163,7 +163,10 @@ private:
     // Step 1. Update unit loop info.
     PrimExpr min = this->VisitExpr(op->min);
     PrimExpr extent = this->VisitExpr(op->extent);
-    if (is_one(extent) && IsEffectivelyEmptyAnnotation(op->annotations)) {
+    bool is_unit_loop = is_one(extent) &&
+                        IsEffectivelyEmptyAnnotation(op->annotations) &&
+                        !ContainsLoopBreak(op->body);
+    if (is_unit_loop) {
       // handling unit loop
       unit_loop_vars_[op->loop_var] = min;
     }
@@ -179,8 +182,7 @@ private:
       ICHECK(op->thread_binding.defined());
       String thread_tag = op->thread_binding.value()->thread_tag;
       body = MakeLaunchThread(min, extent, op->loop_var, thread_tag, body);
-    } else if (is_one(extent) &&
-               IsEffectivelyEmptyAnnotation(op->annotations)) {
+    } else if (is_unit_loop) {
       // Case 2. Unit loop
       return body;
     } else {
@@ -209,6 +211,22 @@ private:
       }
     }
     return false;
+  }
+
+  // Whether `stmt` contains a `tl.loop_break` call. Used to prevent unit-loop
+  // flattening from orphaning a `break;`.
+  static bool ContainsLoopBreak(const Stmt &stmt) {
+    bool found = false;
+    PostOrderVisit(stmt, [&found](const ObjectRef &node) {
+      if (found)
+        return;
+      if (const auto *call = node.as<CallNode>()) {
+        if (call->op.same_as(tl::loop_break())) {
+          found = true;
+        }
+      }
+    });
+    return found;
   }
 
   PrimExpr VisitExpr_(const VarNode *op) final {
