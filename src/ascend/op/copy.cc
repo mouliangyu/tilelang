@@ -200,11 +200,9 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
     PrimExpr n_value = op.GetTranspose() ? inner_elems : n_rows;
     PrimExpr d_value = op.GetTranspose() ? n_rows : inner_elems;
     PrimExpr dst_n_value = dst_n_rows;
-    PrimExpr scale_factor = I(op.GetScaleFactor() ? 1 : 0);
     call = Call(DataType::Void(), ascend_copy_gm_to_cbuf(),
                 {dst_ptr, src_ptr, sid, src_row_stride_bytes, l2_cache_ctrl,
-                 n_value, d_value, zero, zero, transpose_flag, dst_n_value,
-                 scale_factor});
+                 n_value, d_value, zero, zero, transpose_flag, dst_n_value});
   } else if (dma_path == 3 || dma_path == 4) {
     PrimExpr src_base_offset = make_const(DataType::Int(64), 0);
     for (size_t i = 0; i + 1 < op.src_range.size(); ++i) {

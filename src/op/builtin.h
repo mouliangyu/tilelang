@@ -929,14 +929,11 @@ TVM_DLL const Op &ascend_copy_ubuf_to_gm();
  * \brief Ascend DMA copy from GM to CBuf (L1).
  *
  * ascend_copy_gm_to_cbuf(dst, src, sid, loop1_src_stride, l2_cache_ctrl,
- * n_value, d_value, loop4_src_stride, smallc0_en, transpose, dst_n_value,
- * scale_factor)
+ * n_value, d_value, loop4_src_stride, smallc0_en, transpose, dst_n_value)
  *
  * When transpose=0 emits copy_gm_to_cbuf_multi_nd2nz (row-major → NZ).
  * When transpose!=0 emits copy_gm_to_cbuf_multi_dn2nz (col-major → NZ),
  * which transposes the N/D mapping — useful for NN matmul on Ascend.
- * When scale_factor!=0, nz_c0_stride = n_rows_val without ceil-to-16
- * grouping, for scale factor data in flat layout.
  */
 TVM_DLL const Op &ascend_copy_gm_to_cbuf();
 

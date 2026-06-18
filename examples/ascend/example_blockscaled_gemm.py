@@ -74,12 +74,8 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", MIXED=None, hf32=
                     T.copy(W[n_tile * TILE_N : (n_tile + 1) * TILE_N, kt * TILE_K : (kt + 1) * TILE_K], w_l1)
 
                     if kt % sf_int == 0:
-                        T.copy(
-                            SFX[kt * TILE_SF_K : (kt + sf_int) * TILE_SF_K, m_tile * TILE_M : (m_tile + 1) * TILE_M], xsf_l1, scale_factor=1
-                        )
-                        T.copy(
-                            SFW[kt * TILE_SF_K : (kt + sf_int) * TILE_SF_K, n_tile * TILE_N : (n_tile + 1) * TILE_N], wsf_l1, scale_factor=1
-                        )
+                        T.copy(SFX[kt * TILE_SF_K : (kt + sf_int) * TILE_SF_K, m_tile * TILE_M : (m_tile + 1) * TILE_M], xsf_l1)
+                        T.copy(SFW[kt * TILE_SF_K : (kt + sf_int) * TILE_SF_K, n_tile * TILE_N : (n_tile + 1) * TILE_N], wsf_l1)
 
                     T.blockscaled_gemm(
                         x_l1,

@@ -969,8 +969,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->stream << ", " << Downcast<StringImm>(op->args[3])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_gm_to_cbuf())) {
-    ICHECK_EQ(op->args.size(), 12)
-        << "tl.ascend_copy_gm_to_cbuf expects exactly 12 arguments";
+    ICHECK_EQ(op->args.size(), 11)
+        << "tl.ascend_copy_gm_to_cbuf expects exactly 11 arguments";
     // arg[9] is the transpose flag: 0 → nd2nz, nonzero → dn2nz
     const IntImmNode *transpose_node = op->args[9].as<IntImmNode>();
     bool use_dn2nz = transpose_node && transpose_node->value != 0;
@@ -978,30 +978,12 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     // mte2NzPara encoding: [15:0]=ndNum, [31:16]=dstNzNStride,
     // [47:32]=dstNzC0Stride SDK convention (from data_copy_wrapper_nd.h):
     //   dstNzNStride = 1 (always)
-    //   dstNzC0Stride = ceil(height/16)*16  where height = n_rows for nd2nz,
-    //   inner_elems for dn2nz
+    //   dstNzC0Stride = ceil(height/16)*16
     {
       const IntImmNode *rows_node = op->args[10].as<IntImmNode>();
       const IntImmNode *inner_node = op->args[6].as<IntImmNode>();
-      int n_rows_val = rows_node ? rows_node->value : 16;
+      int nz_c0_stride = rows_node ? rows_node->value : 16;
       int inner_val = inner_node ? inner_node->value : 16;
-      // For nd2nz: height=n_rows, width=inner_elems; dstNzC0Stride =
-      // ceil(height/16)*16 For dn2nz: height=inner_elems(K), width=n_rows(N);
-      // dstNzC0Stride = ceil(width/16)*16 nd2nz [n_rows, d]: dstNzC0Stride =
-      // ceil(n_rows/16)*16  (C0 tiles the row dimension) dn2nz [n_rows, d]:
-      // dstNzC0Stride = ceil(d/16)*16      (C0 tiles the col=N dimension
-      // after transpose)
-      //   SDK: dn2nz dValue=height(=n_rows/K), dstNzC0Stride=Ceil(width=d/N,
-      //   16)*16
-      // dstNzC0Stride = Ceil(nValue, 16) * 16
-      // After copy.cc swaps n_value/d_value for dn2nz, args[5] is always
-      // nValue (= height for nd2nz, = width for dn2nz). Both cases:
-      // dstNzC0Stride = Ceil(nValue, 16) * 16.
-      const IntImmNode *scale_node = op->args[11].as<IntImmNode>();
-      bool is_scale_factor = scale_node && scale_node->value != 0;
-      const IntImmNode *nval_node = op->args[5].as<IntImmNode>();
-      int nval = nval_node ? nval_node->value : n_rows_val;
-      int nz_c0_stride = is_scale_factor ? nval : ((n_rows_val + 15) / 16) * 16;
       this->PrintIndent();
       this->stream << "set_mte2_nz_para("
                    << "uint64_t(1) | (uint64_t(1) << 16) | (uint64_t("

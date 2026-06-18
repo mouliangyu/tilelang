@@ -136,7 +136,6 @@ def copy(
     transpose: bool = False,
     nd2nz: bool = False,
     l2_cache_ctrl: int | str | None = None,
-    scale_factor: bool = False,
     unit_flag_ctrl: int = 0,
 ) -> tirx.PrimExpr | tirx.Stmt:
     """Copy data between memory regions.
@@ -167,10 +166,7 @@ def copy(
             (bypass L2 to stream past), ``5`` / ``"notalloc_clean"`` (bypass L2 to
             avoid pollution). Defaults to None; Ascend UB→GM store paths use
             default 4, while load paths use default 0.
-            Ascend only; ignored on other backends.
-        scale_factor (bool, keyword-only): Whether the copied data is an Ascend
-            scale-factor tile. The marker changes GM→L1 NZ stride setup for
-            scale-factor data. Defaults to False.
+             Ascend only; ignored on other backends.
 
     Raises:
         TypeError: If copy extents cannot be deduced from arguments
@@ -232,8 +228,6 @@ def copy(
     # Ascend DMA: L2 cache control for GM↔L1 and UB↔GM paths.
     if l2_cache_ctrl is not None and "l2_cache_ctrl" not in ann:
         ann["l2_cache_ctrl"] = l2_cache_ctrl
-    if scale_factor and "scale_factor" not in ann:
-        ann["scale_factor"] = tirx.IntImm("int32", 1)
     if unit_flag_ctrl and "unit_flag_ctrl" not in ann:
         ann["unit_flag_ctrl"] = unit_flag_ctrl
     if "l2_cache_ctrl" in ann:
