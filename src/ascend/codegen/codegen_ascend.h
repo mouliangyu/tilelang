@@ -63,11 +63,17 @@ private:
   bool has_nd2nz_copy_included_{false};
   bool has_simd_ops_{false};
   bool has_simd_inst_included_{false};
+  bool has_gm_bypass_dcache_{false};
+  bool has_gm_bypass_dcache_included_{false};
 
   ffi::Array<Var> CollectVFCaptures(const SBlockNode *op) const;
   void EmitVFFunction(const SBlockNode *op, const ffi::Array<Var> &captures,
                       const std::string &helper_name,
                       const std::string &func_attrs, bool &inside_vf_body);
+  bool IsGlobalGmBuffer(const BufferNode *buffer) const;
+  bool IsGlobalScalarGmAccess(const BufferNode *buffer, DataType dtype) const;
+  std::string GetGmBypassPtr(DataType dtype, const BufferNode *buffer,
+                             PrimExpr index);
 
   enum class AscendKernelMode { kVector, kCube, kMix };
   AscendKernelMode kernel_mode_{AscendKernelMode::kVector};

@@ -347,6 +347,20 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
         has_nd2nz_copy_ = true;
       }
     }
+    if (const auto *load = n.as<BufferLoadNode>()) {
+      if (load->indices.size() == 1 && !load->predicate.defined() &&
+          load->dtype == load->buffer->dtype &&
+          IsGlobalScalarGmAccess(load->buffer.get(), load->dtype)) {
+        has_gm_bypass_dcache_ = true;
+      }
+    }
+    if (const auto *store = n.as<BufferStoreNode>()) {
+      if (store->indices.size() == 1 && !store->predicate.defined() &&
+          store->buffer->dtype.is_scalar() &&
+          IsGlobalScalarGmAccess(store->buffer.get(), store->buffer->dtype)) {
+        has_gm_bypass_dcache_ = true;
+      }
+    }
   });
 
   // Conditionally include gemm.h when ascend_gemm_l1 is used
@@ -359,6 +373,13 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   if (has_nd2nz_copy_ && !has_nd2nz_copy_included_) {
     decl_stream << "#include <tl_templates/ascend/nd2nz_copy.h>\n";
     has_nd2nz_copy_included_ = true;
+  }
+
+  // Conditionally include dcache_bypass.h when scalar global GM access emits
+  // tl::read/write_gm_bypass_dcache
+  if (has_gm_bypass_dcache_ && !has_gm_bypass_dcache_included_) {
+    decl_stream << "#include <tl_templates/ascend/dcache_bypass.h>\n";
+    has_gm_bypass_dcache_included_ = true;
   }
 
   if (has_cube && has_vector) {
@@ -1738,10 +1759,50 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   }
 }
 
+bool CodeGenTileLangAscend::IsGlobalGmBuffer(const BufferNode *buffer) const {
+  const VarNode *buf_var = buffer->data.get();
+  auto it = alloc_storage_scope_.find(buf_var);
+  std::string scope = (it != alloc_storage_scope_.end())
+                          ? it->second
+                          : std::string(GetPtrStorageScope(buffer->data));
+  return scope == "global";
+}
+
+bool CodeGenTileLangAscend::IsGlobalScalarGmAccess(const BufferNode *buffer,
+                                                   DataType dtype) const {
+  if (!dtype.is_scalar()) {
+    return false;
+  }
+  return IsGlobalGmBuffer(buffer);
+}
+
+std::string CodeGenTileLangAscend::GetGmBypassPtr(DataType dtype,
+                                                  const BufferNode *buffer,
+                                                  PrimExpr index) {
+  const VarNode *buf_var = buffer->data.get();
+  std::ostringstream os;
+  os << "((";
+  PrintStorageScope("global", os);
+  PrintType(dtype, os);
+  os << "*)" << GetVarID(buf_var) << " + ";
+  PrintExpr(index, os);
+  os << ")";
+  return os.str();
+}
+
 void CodeGenTileLangAscend::VisitExpr_(const BufferLoadNode *op,
                                        std::ostream &os) {
   DataType value_dtype = op->dtype;
   const VarNode *buf_var = op->buffer->data.get();
+
+  if (op->indices.size() == 1 && !op->predicate.defined() &&
+      value_dtype == op->buffer->dtype && !inside_simtvf_body_ &&
+      !inside_simdvf_body_ &&
+      IsGlobalScalarGmAccess(op->buffer.get(), value_dtype)) {
+    os << "tl::read_gm_bypass_dcache("
+       << GetGmBypassPtr(value_dtype, op->buffer.get(), op->indices[0]) << ")";
+    return;
+  }
 
   // For Ascend: scalar FP8 loads from shared/UBUF memory need conversion
   // through raw bytes, because the scalar FP8 type (tl::float_e4m3_t) is a
@@ -1803,6 +1864,19 @@ void CodeGenTileLangAscend::EmitScalarizedLoad(const BufferLoadNode *op,
   int lanes = value_dtype.lanes();
   PrimExpr index = op->indices[0];
 
+  // A vectorized GM access on the scalar core (outside any VF body) has no
+  // valid lowering: the only scalar-pipe GM path is the per-element
+  // read_gm_bypass_dcache emitted in VisitExpr_. Vector GM traffic must go
+  // through an MTE copy (T.copy) or a SimtVF/SimdVF region.
+  if (!inside_simtvf_body_ && !inside_simdvf_body_ &&
+      IsGlobalGmBuffer(op->buffer.get())) {
+    LOG(FATAL) << "Ascend: cannot vectorize GM access of " << op->buffer->name
+               << " (lanes=" << lanes
+               << ") on the scalar core. Scalar-core GM reads must be a single "
+                  "scalar element (lowered to read_gm_bypass_dcache); use "
+                  "T.copy or a T.SimtVF/T.SimdVF region for vector GM traffic.";
+  }
+
   // Provably aligned: a single reinterpret-cast vector load (fast path).
   if (VectorAccessIsAligned(index, lanes)) {
     arith::PVar<PrimExpr> base;
@@ -1839,6 +1913,26 @@ void CodeGenTileLangAscend::VisitStmt_(const BufferStoreNode *op) {
   DataType element_dtype = op->buffer->dtype;
   const VarNode *buf_var = op->buffer->data.get();
   PrimExpr index_expr = op->indices[0];
+
+  if (op->indices.size() == 1 && !op->predicate.defined() &&
+      value_dtype.is_scalar() && element_dtype.is_scalar() &&
+      !inside_simtvf_body_ && !inside_simdvf_body_ &&
+      IsGlobalScalarGmAccess(op->buffer.get(), element_dtype)) {
+    std::string value = PrintExpr(op->value);
+    PrintIndent();
+    stream << "tl::write_gm_bypass_dcache("
+           << GetGmBypassPtr(element_dtype, op->buffer.get(), index_expr)
+           << ", ";
+    if (value_dtype != element_dtype) {
+      stream << "(";
+      PrintType(element_dtype, stream);
+      stream << ")(" << value << ")";
+    } else {
+      stream << value;
+    }
+    stream << ");\n";
+    return;
+  }
 
   if (value_dtype.lanes() > 1 && op->indices.size() == 1) {
     const auto *broadcast_index = index_expr.as<BroadcastNode>();
@@ -1905,6 +1999,20 @@ bool CodeGenTileLangAscend::EmitScalarizedStore(const BufferStoreNode *op) {
   DataType value_dtype = op->value.dtype();
   int lanes = value_dtype.lanes();
   PrimExpr index = op->indices[0];
+
+  // A vectorized GM access on the scalar core (outside any VF body) has no
+  // valid lowering: the only scalar-pipe GM path is the per-element
+  // write_gm_bypass_dcache emitted in VisitStmt_. Vector GM traffic must go
+  // through an MTE copy (T.copy) or a SimtVF/SimdVF region.
+  if (!inside_simtvf_body_ && !inside_simdvf_body_ &&
+      IsGlobalGmBuffer(op->buffer.get())) {
+    LOG(FATAL)
+        << "Ascend: cannot vectorize GM access of " << op->buffer->name
+        << " (lanes=" << lanes
+        << ") on the scalar core. Scalar-core GM writes must be a single "
+           "scalar element (lowered to write_gm_bypass_dcache); use "
+           "T.copy or a T.SimtVF/T.SimdVF region for vector GM traffic.";
+  }
 
   // Provably aligned: let the base class emit a single reinterpret vector
   // store.
