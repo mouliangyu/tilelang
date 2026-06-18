@@ -291,7 +291,7 @@ def ref_program(a, b):
     return a.float() @ b.float().T
 
 
-def run(m: int, n: int, k: int) -> None:
+def run(m: int, n: int, k: int) -> float:
     a = torch.randn(m, k, dtype=torch.bfloat16, device="npu")
     b = torch.randn(n, k, dtype=torch.bfloat16, device="npu")
 
@@ -311,6 +311,12 @@ def run(m: int, n: int, k: int) -> None:
     prof = do_bench(lambda: kernel(a, b), backend="msprof_detail")
 
     print(f"m={m:5}, n={n:5}, k={k:5}:  PASS  max_diff={max_diff:.2e}  |  {prof.dur_us:6.1f} us  |  {prof.tflops(flops):5.1f} TFLOPS")
+    return prof.dur_ns / 1e6
+
+
+def run_regression_perf(m=8192, n=8192, k=8192) -> float:
+    """Benchmark one representative (largest square) shape from enumerate_shapes()."""
+    return run(m, n, k)
 
 
 def main() -> None:

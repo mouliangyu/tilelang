@@ -47,6 +47,24 @@ def ref_program(x, w):
     return x.float() @ w.float().T
 
 
+def run_regression_perf(M=256, N=7168, K=2048):
+    import torch
+
+    device = torch.device("npu")
+    program = gemm(M, N, K)
+    kernel = tilelang.compile(program, out_idx=-1)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    kernel(x, w)
+    torch.npu.synchronize()
+    latency_ms = do_bench(lambda: kernel(x, w), backend="msprof", _n_warmup=30, _n_repeat=100)
+    us = latency_ms * 1e3
+    flops = 2.0 * M * N * K
+    tf = flops / (us / 1e6) / 1e12
+    print(f"  {us:.1f} us  |  {tf:.1f} TFLOPS")
+    return latency_ms
+
+
 if __name__ == "__main__":
     import torch
 

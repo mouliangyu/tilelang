@@ -162,6 +162,27 @@ def ref_program(Q, K, V):
     )
 
 
+def run_regression_perf(D=128, SEQ_LEN=4096):
+    """Compile + benchmark the Mix FlashAttention kernel, returning latency in ms (msprof)."""
+    import torch
+
+    device = torch.device("npu")
+    program = flash_attention(D, SEQ_LEN)
+    kernel = tilelang.compile(program, out_idx=-1)
+
+    torch.manual_seed(42)
+    Q = torch.randn(SEQ_LEN, D, dtype=torch.bfloat16, device=device)
+    K = torch.randn(SEQ_LEN, D, dtype=torch.bfloat16, device=device)
+    V = torch.randn(SEQ_LEN, D, dtype=torch.bfloat16, device=device)
+    kernel(Q, K, V)
+    torch.npu.synchronize()
+
+    prof = do_bench(lambda: kernel(Q, K, V), backend="msprof_detail", _n_warmup=30, _n_repeat=500)
+    flops = 4.0 * SEQ_LEN * SEQ_LEN * D
+    print(f"    [D={D} SEQ_LEN={SEQ_LEN}] {prof.dur_us:.2f} us/iter  |  {prof.tflops(flops):.1f} TFLOPS")
+    return prof.dur_ns / 1e6
+
+
 if __name__ == "__main__":
     import torch
 

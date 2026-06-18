@@ -122,6 +122,23 @@ M_DIM = 8192
 K_DIM = 8192
 N_DIM = 8192
 
+
+def run_regression_perf(M_DIM=8192, K_DIM=8192, N_DIM=8192):
+    import torch
+
+    device = torch.device("npu")
+    program = gemm(M_DIM, K_DIM, N_DIM)
+    kernel = tilelang.compile(program, out_idx=-1, pass_configs={tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False})
+    x = torch.randn(M_DIM, K_DIM, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N_DIM, K_DIM, dtype=torch.bfloat16, device=device)
+    kernel(x, w)
+    torch.npu.synchronize()
+    latency_ms = do_bench(lambda: kernel(x, w), backend="msprof", _n_warmup=30, _n_repeat=NUM_REPEATS)
+    flops = 2.0 * M_DIM * N_DIM * K_DIM
+    print(f"{latency_ms:.3f} ms/iter  |  {flops / (latency_ms / 1e3) / 1e12:.1f} TFLOPS")
+    return latency_ms
+
+
 if __name__ == "__main__":
     import torch
 

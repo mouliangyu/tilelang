@@ -48,6 +48,23 @@ def ref_program(a, b):
 
 NUM_REPEATS = 10
 
+
+def run_regression_perf(N=2**30):
+    import torch
+
+    device = torch.device("npu")
+    program = vector_add(N)
+    kernel = tilelang.compile(program, out_idx=-1)
+    a = torch.randn(N, dtype=torch.float32, device=device)
+    b = torch.randn(N, dtype=torch.float32, device=device)
+    kernel(a, b)
+    torch.npu.synchronize()
+    latency_ms = do_bench(lambda: kernel(a, b), backend="msprof", _n_warmup=30, _n_repeat=NUM_REPEATS)
+    gbps = (N * a.element_size() * 3) / (latency_ms / 1e3) / 1e9
+    print(f"    [N={N}] {latency_ms * 1e3:.2f} us  |  {gbps:.1f} GB/s")
+    return latency_ms
+
+
 if __name__ == "__main__":
     import torch
 

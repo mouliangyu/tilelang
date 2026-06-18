@@ -181,4 +181,13 @@ def regression_all(examples_root: str | os.PathLike[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    regression_all()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run all regression_*.py benchmark drivers under an examples root.")
+    parser.add_argument(
+        "--examples-root",
+        default=None,
+        help="Directory to scan for regression_*.py (default: repo's examples/). Use examples/ascend to run only the Ascend suite.",
+    )
+    args = parser.parse_args()
+    regression_all(args.examples_root)

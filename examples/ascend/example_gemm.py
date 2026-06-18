@@ -81,6 +81,29 @@ def ref_program(x, w):
     return x.float() @ w.float().T
 
 
+def run_regression_perf(M=8192, K=8192, N=8192, dtype="bfloat16", hf32=None):
+    """Compile + benchmark an auto-scheduled GEMM, returning latency in ms (msprof)."""
+    import torch
+
+    device = torch.device("npu")
+    program = gemm(M, K, N, dtype=dtype, hf32=hf32)
+    kernel = tilelang.compile(program, out_idx=-1)
+
+    x = torch.randn(M, K, device=device).to(dtype=getattr(torch, dtype))
+    w = torch.randn(N, K, device=device).to(dtype=getattr(torch, dtype))
+    kernel(x, w)
+    torch.npu.synchronize()
+
+    def run_kernel():
+        return kernel(x, w)
+
+    num_repeats = 100 if dtype == "bfloat16" else 50
+    prof = do_bench(run_kernel, backend="msprof_detail", _n_warmup=30, _n_repeat=num_repeats)
+    flops = 2.0 * M * N * K
+    print(f"    [{dtype}] {prof.dur_us:.2f} us/iter  |  {prof.tflops(flops):.1f} TFLOPS")
+    return prof.dur_ns / 1e6
+
+
 if __name__ == "__main__":
     import torch
 

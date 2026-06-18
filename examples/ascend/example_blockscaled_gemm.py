@@ -116,6 +116,37 @@ def ref_program(x, w, sfx, sfw):
     return (xf * sx) @ (wf * sw).T
 
 
+def run_regression_perf(M=8192, K=8192, N=8192, dtype="float8_e4m3fn"):
+    import torch
+
+    device = torch.device("npu")
+    program = gemm(M, K, N, dtype=dtype)
+    kernel = tilelang.compile(program, out_idx=-1)
+
+    x = (torch.randn(M, K, device=device) * 0.1).to(getattr(torch, dtype))
+    w = (torch.randn(N, K, device=device) * 0.1).to(getattr(torch, dtype))
+
+    sf_k_e8m0 = K // 32  # e8m0 values along K
+    sfx_e8m0 = torch.randint(120, 135, (M, sf_k_e8m0), dtype=torch.uint8, device=device)
+    sfw_e8m0 = torch.randint(120, 135, (N, sf_k_e8m0), dtype=torch.uint8, device=device)
+
+    sfx = sfx_e8m0.view(torch.uint16).T.contiguous()  # [K/64, M]
+    sfw = sfw_e8m0.view(torch.uint16).T.contiguous()  # [K/64, N]
+
+    kernel(x, w, sfx, sfw)
+    torch.npu.synchronize()
+
+    NUM_REPEATS = 100 if dtype == "bfloat16" else 50
+
+    def run_kernel(kernel=kernel, x=x, w=w, sfx=sfx, sfw=sfw):
+        return kernel(x, w, sfx, sfw)
+
+    latency_ms = do_bench(run_kernel, backend="msprof", _n_warmup=30, _n_repeat=NUM_REPEATS)
+    flops = 2.0 * M * N * K
+    print(f"  {latency_ms:.3f} ms/iter  |  {flops / (latency_ms / 1e3) / 1e12:.1f} TFLOPS")
+    return latency_ms
+
+
 if __name__ == "__main__":
     import torch
 

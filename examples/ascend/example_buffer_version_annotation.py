@@ -90,6 +90,34 @@ def ref_program(x, weight, eps=1e-6):
     return (x.float() * rstd.unsqueeze(-1) * weight.float().unsqueeze(0)).to(x.dtype)
 
 
+def run_regression_perf(batch=4096, d=5120, eps=1e-6):
+    dtype = torch.float32
+    device = torch.device("npu")
+
+    x = torch.randn(batch, d, dtype=dtype, device=device)
+    weight = torch.randn(d, dtype=dtype, device=device)
+
+    program = rms_norm_fwd(batch, d, str(dtype)[len("torch.") :])
+    kernel = tilelang.compile(program, out_idx=[1, 3])
+
+    x_flat = x.view(-1).contiguous()
+
+    kernel(x_flat, weight, eps)
+    torch.npu.synchronize()
+
+    N_ITERS = 20
+
+    def run_kernel(kernel=kernel, x_flat=x_flat, weight=weight, eps=eps):
+        return kernel(x_flat, weight, eps)
+
+    latency_ms = do_bench(run_kernel, backend="msprof", _n_warmup=30, _n_repeat=N_ITERS)
+    elapsed_us = latency_ms * 1e3
+    total_bytes = batch * d * 4 * 2 + d * 4 + batch * 4
+    bw_gbs = total_bytes / (elapsed_us * 1e-6) / 1e9
+    print(f"    [batch={batch}, d={d}] {elapsed_us:.1f} us  {bw_gbs:.0f} GB/s")
+    return latency_ms
+
+
 if __name__ == "__main__":
     dtype = torch.float32
     device = torch.device("npu")

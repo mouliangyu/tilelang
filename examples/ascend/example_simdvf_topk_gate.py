@@ -130,6 +130,28 @@ def ref_program(scores: torch.Tensor, num_topk: int) -> torch.Tensor:
 
 N_ITERS = 20
 
+
+def run_regression_perf(num_experts=256, num_topk=8, num_tokens=4096):
+    device = torch.device("npu")
+    program = topk_gate(num_experts, num_topk)
+    kernel = tilelang.compile(program, out_idx=-1)
+
+    scores = torch.randn(num_tokens, num_experts, dtype=torch.float32, device=device)
+
+    kernel(scores)
+    torch.npu.synchronize()
+
+    def run_kernel(kernel=kernel, scores=scores):
+        return kernel(scores)
+
+    latency_ms = do_bench(run_kernel, backend="msprof", _n_warmup=30, _n_repeat=N_ITERS)
+    elapsed_us = latency_ms * 1e3
+    total_bytes = num_tokens * (num_experts + num_topk) * 4
+    bw_gbs = total_bytes / (elapsed_us * 1e-6) / 1e9
+    print(f"  {elapsed_us:.1f} us  {bw_gbs:.0f} GB/s")
+    return latency_ms
+
+
 if __name__ == "__main__":
     device = torch.device("npu")
     num_tokens = 4096

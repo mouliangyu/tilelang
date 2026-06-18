@@ -44,6 +44,26 @@ def ref_program(a, b):
 
 NUM_REPEATS = 10
 
+
+def run_regression_perf(N=2**30):
+    """Compile + benchmark the SimdVF vector-add kernel, returning latency in ms (msprof)."""
+    import torch
+
+    device = torch.device("npu")
+    program = vector_add(N)
+    kernel = tilelang.compile(program, out_idx=-1)
+
+    a = torch.randn(N, dtype=torch.float32, device=device)
+    b = torch.randn(N, dtype=torch.float32, device=device)
+    kernel(a, b)
+    torch.npu.synchronize()
+
+    prof = do_bench(lambda: kernel(a, b), backend="msprof_detail", _n_warmup=30, _n_repeat=NUM_REPEATS)
+    nbytes = N * a.element_size() * 3
+    print(f"    [N={N}] {prof.dur_us:.2f} us/iter  |  {prof.gbps(nbytes):.1f} GB/s")
+    return prof.dur_ns / 1e6
+
+
 if __name__ == "__main__":
     import torch
 

@@ -21,6 +21,23 @@ def atomic_add_gm_float(N, num_blocks=8, threads=256):
     return main
 
 
+def run_regression_perf(num_blocks=64, threads=2048):
+    import torch
+
+    device = torch.device("npu")
+    bench_kernel = tilelang.compile(atomic_add_gm_float(1, num_blocks, threads))
+    counter = torch.zeros(1, dtype=torch.float32, device=device)
+
+    def run():
+        bench_kernel(counter)
+
+    run()
+    torch.npu.synchronize()
+    latency_ms = do_bench(run, backend="msprof", _n_warmup=10, _n_repeat=50)
+    print(f"  {latency_ms:.3f} ms/iter")
+    return latency_ms
+
+
 if __name__ == "__main__":
     import torch
 
