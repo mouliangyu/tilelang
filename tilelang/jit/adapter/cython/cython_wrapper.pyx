@@ -36,7 +36,10 @@ cdef class CythonKernelWrapper:
         self.param_dtypes = [param.torch_dtype() for param in params]
         # Convert TVM shape arrays to native Python lists
         self.param_shapes = []
-        self.get_current_device = torch.cuda.current_device
+        if hasattr(torch, 'npu') and torch.npu.is_available():
+            self.get_current_device = lambda: torch.device('npu', torch.npu.current_device())
+        else:
+            self.get_current_device = torch.cuda.current_device
         for param in params:
             native_shape = []
             for dim in param.shape:
@@ -164,6 +167,8 @@ cdef class CythonKernelWrapper:
         for tensor in inputs:
             if isinstance(tensor, torch.Tensor):
                 return tensor.device
+        if hasattr(torch, 'npu') and torch.npu.is_available():
+            return torch.device('npu', torch.npu.current_device())
         return torch.cuda.current_device()
 
     cpdef forward(self, list inputs, int64_t stream = -1, bint skip_tensor_validation = False):
