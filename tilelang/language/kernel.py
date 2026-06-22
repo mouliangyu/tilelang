@@ -316,7 +316,6 @@ def Kernel(
     threads: int | list[int] | tuple | None = None,
     cluster_dims: int | tuple[int, int, int] | list[int] | None = None,
     is_cpu: bool = False,
-    is_ascend: bool = False,
     prelude: str | None = None,
 ):
     """Tools to quickly construct a kernel launch frame.
@@ -380,6 +379,10 @@ def Kernel(
 
     if Builder.current() is None:
         raise JITNoBuilderError("T.Kernel() can only be used inside @tilelang.jit or @T.prim_func context. No Builder is available.")
+
+    from tilelang.ascend.target import check_ascend_availability
+
+    is_ascend = check_ascend_availability()
 
     attrs: dict = {}
     if is_ascend and is_cpu:

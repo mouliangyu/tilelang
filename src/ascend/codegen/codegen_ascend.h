@@ -28,6 +28,7 @@ public:
   void VisitExpr_(const BroadcastNode *op, std::ostream &os) final; // NOLINT(*)
   void VisitExpr_(const FloatImmNode *op, std::ostream &os) final;
   void VisitExpr_(const CastNode *op, std::ostream &os) final;
+  void VisitExpr_(const VarNode *op, std::ostream &os) final;
   void VisitExpr_(const BufferLoadNode *op, std::ostream &os) final;
   void VisitStmt_(const BufferStoreNode *op) final;
 

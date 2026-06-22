@@ -2525,6 +2525,28 @@ void CodeGenTileLangAscend::VisitExpr_(const CastNode *op,
   CodeGenC::VisitExpr_(op, os);
 }
 
+void CodeGenTileLangAscend::VisitExpr_(const VarNode *op,
+                                       std::ostream &os) { // NOLINT(*)
+  // blockIdx.* / threadIdx.* are mapped directly to the ASC thread builtins,
+  // which are unsigned (uint32). The IR binds them to a signed-int loop var
+  // (IterVar forbids a uint var, see materialize_kernel_launch.cc). Without a
+  // cast the generated C++ uses uint32 at the reference site, diverging from
+  // the IR's int32 dtype and breaking e.g. template argument deduction in
+  // tl::write_gm_bypass_dcache. Cast back to the var's IR dtype to keep types
+  // consistent. The sanitized VF-parameter form ("blockIdx_x", no dot) is a
+  // real int32 parameter and must not be touched.
+  auto it = var_idmap_.find(op);
+  if (it != var_idmap_.end() && op->dtype.is_int() &&
+      (it->second.rfind("blockIdx.", 0) == 0 ||
+       it->second.rfind("threadIdx.", 0) == 0)) {
+    os << "((";
+    PrintType(op->dtype, os);
+    os << ")" << it->second << ")";
+    return;
+  }
+  CodeGenC::VisitExpr_(op, os);
+}
+
 void CodeGenTileLangAscend::PrintStorageSync(const CallNode *op) {
   ICHECK_GE(op->args.size(), 1U);
   PrintIndent();
