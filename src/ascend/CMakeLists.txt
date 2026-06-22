@@ -8,6 +8,7 @@
 file(GLOB TILE_LANG_ASCEND_SRCS
   src/ascend/codegen/*.cc
   src/ascend/op/*.cc
+  src/ascend/runtime/*.cc
   src/ascend/transform/*.cc
   src/ascend/transform/auto_schedule/*.cc
 )

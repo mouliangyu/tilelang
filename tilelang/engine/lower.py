@@ -190,6 +190,34 @@ def tilelang_callback_ascend_compile(code, target):
     return obj
 
 
+@tvm_ffi.register_global_func("tilelang_callback_ascend_compile_so", override=True)
+def tilelang_callback_ascend_compile_so(code):
+    """Bisheng-compile AscendC source into a shared library and return its path.
+
+    Used by the tvm_ffi runtime module (AscendModuleNode) which dlopens the
+    returned .so and resolves the per-kernel ``__tl_launch_<name>`` launchers.
+    The library is written into TILELANG_TMP_DIR with a unique name so concurrent
+    compiles do not collide; it persists for the lifetime of the loaded module.
+    """
+    import os
+    import uuid
+
+    from tilelang import env
+
+    os.makedirs(env.TILELANG_TMP_DIR, exist_ok=True)
+    lib_path = os.path.join(env.TILELANG_TMP_DIR, f"ascend_{os.getpid()}_{uuid.uuid4().hex}.so")
+    bisheng.compile_ascend(
+        code,
+        target_format="so",
+        options=[
+            "-I" + TILELANG_TEMPLATE_PATH,
+        ],
+        path_target=lib_path,
+        verbose=False,
+    )
+    return lib_path
+
+
 def extrac_params(func: tirx.PrimFunc) -> list[KernelParam]:
     tensor_types = []
     for var in func.params:

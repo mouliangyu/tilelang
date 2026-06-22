@@ -4,6 +4,12 @@ from tvm.target import Target
 
 from tilelang.backend.target import TargetLike, register_target_detector, register_target_normalizer
 
+# torch_npu represents NPU tensors in DLPack as kDLExtDev (device type 12).
+# The Ascend target uses target kind "c" (whose default device type is kDLCPU),
+# so we explicitly tag it with kDLExtDev to match the runtime DLPack tensors;
+# this lets the tvm_ffi ABI binder's device_type check pass without relaxation.
+_kDLExtDev = 12
+
 
 def _target_ffi_api():
     from tilelang import _ffi_api
@@ -14,6 +20,7 @@ def _target_ffi_api():
 def _with_ascend_key(target: Target) -> Target:
     target_dict = dict(target.export())
     target_dict["keys"] = list(dict.fromkeys([*target_dict.get("keys", ()), "ascend"]))
+    target_dict.setdefault("target_device_type", _kDLExtDev)
     return Target(target_dict)
 
 
@@ -24,6 +31,7 @@ def _make_ascend_target(target_dict: dict | None = None) -> Target:
         keys = (keys,)
     target_dict["kind"] = "c"
     target_dict["keys"] = list(dict.fromkeys([*keys, "ascend"]))
+    target_dict.setdefault("target_device_type", _kDLExtDev)
     return Target(target_dict)
 
 

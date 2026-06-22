@@ -458,6 +458,90 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   this->EndScope(func_scope);
   this->PrintIndent();
   this->stream << "}\n\n";
+
+  // Emit the tvm_ffi launcher alongside the kernel so the bisheng-compiled .so
+  // exports a stable `extern "C"` entry the AscendModule can dlsym.
+  this->PrintKernelLauncher(f, static_cast<std::string>(global_symbol.value()));
+}
+
+void CodeGenTileLangAscend::PrintKernelLauncher(
+    const PrimFunc &f, const std::string &global_symbol) {
+  // The launcher receives kernel arguments by address (cuda-style void**, see
+  // PackFuncVoidAddr): void_args[i] points to argument i. Pointer params hold a
+  // `void*` at that address; scalar params hold the scalar value.
+  //
+  // grid (flattened blockIdx extent) and smem (dynamic shared-memory bytes) are
+  // baked here from the PrimFunc's static `thread_extent` /
+  // `dyn_shared_memory_buf` attrs, mirroring the cython host wrapper. We
+  // deliberately do NOT use the grid/smem passed by the runtime: the upstream
+  // LaunchParamConfig folds Ascend-specific launch tags such as
+  // `cthread`/`vthread` into the grid dims, which would corrupt the launch
+  // grid. The stream is taken from the caller.
+  int64_t grid = 1;
+  if (auto opt = f->GetAttr<ffi::Map<ffi::String, PrimExpr>>("thread_extent")) {
+    for (const auto &kv : opt.value()) {
+      const std::string tag = kv.first;
+      if (tag.compare(0, 9, "blockIdx.") == 0) {
+        if (const auto *imm = kv.second.as<IntImmNode>()) {
+          grid *= imm->value;
+        }
+      }
+    }
+  }
+  int64_t smem = 0;
+  if (auto opt = f->GetAttr<Integer>("dyn_shared_memory_buf")) {
+    smem = opt.value()->value;
+  }
+
+  std::ostringstream os;
+  os << "#ifdef __cplusplus\n";
+  os << "extern \"C\"\n";
+  os << "#endif\n";
+  os << "void __tl_launch_" << global_symbol
+     << "(void** void_args, uint32_t grid, uint32_t smem, void* stream) {\n";
+
+  // Build the unpacked argument list, casting each void_args[i] to the
+  // corresponding kernel parameter type.
+  std::vector<std::string> call_args;
+  for (size_t i = 0; i < f->params.size(); ++i) {
+    const tirx::Var &v = f->params[i];
+    std::ostringstream arg;
+    if (v.dtype().is_handle()) {
+      // Pointer parameter: emit the fully-qualified pointer type (storage
+      // scope + element type) and load the pointer value from void_args[i].
+      std::ostringstream ty;
+      auto it = alloc_storage_scope_.find(v.get());
+      if (it != alloc_storage_scope_.end()) {
+        PrintStorageScope(it->second, ty);
+      }
+      if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
+        CodeGenC::PrintType(ptr->element_type, ty);
+      } else {
+        ty << "void";
+      }
+      arg << "(*reinterpret_cast<" << ty.str() << "**>(void_args[" << i
+          << "]))";
+    } else {
+      std::ostringstream ty;
+      CodeGenC::PrintType(v.dtype(), ty);
+      arg << "(*reinterpret_cast<" << ty.str() << "*>(void_args[" << i << "]))";
+    }
+    call_args.push_back(arg.str());
+  }
+
+  std::string joined;
+  for (size_t i = 0; i < call_args.size(); ++i) {
+    if (i != 0)
+      joined += ", ";
+    joined += call_args[i];
+  }
+
+  // Suppress unused-parameter warnings for the runtime-supplied grid/smem.
+  os << "  (void)grid; (void)smem;\n";
+  os << "  " << global_symbol << "<<<" << grid << ", " << smem << ", stream>>>("
+     << joined << ");\n";
+  os << "}\n\n";
+  this->stream << os.str();
 }
 
 ffi::Array<Var>

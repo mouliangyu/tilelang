@@ -1,10 +1,19 @@
 #include "codegen_ascend.h"
 
+#include "runtime/metadata.h"
 #include "support/check.h"
 #include <tvm/ffi/extra/module.h>
 #include <tvm/ffi/reflection/registry.h>
 
 namespace tvm {
+
+// Defined in src/ascend/runtime/ascend_module.cc.
+namespace ascend {
+ffi::Module
+AscendModuleCreate(ffi::String source, ffi::String fmt,
+                   ffi::Map<ffi::String, runtime::FunctionInfo> fmap);
+} // namespace ascend
+
 namespace codegen {
 
 namespace {
@@ -34,6 +43,49 @@ std::string AscendCodeGen(IRModule mod) {
   return cg.Finish();
 }
 
+// Build the per-kernel FunctionInfo table the runtime module needs to recover
+// the launch grid (via LaunchParamConfig) and pack arguments. Mirrors the CUDA
+// ExtractFuncInfo (src/cuda/codegen/rt_mod_cuda.cc) but only carries what the
+// Ascend launch ABI uses: arg types + kernel launch params (thread extents).
+ffi::Map<ffi::String, runtime::FunctionInfo>
+ExtractFuncInfo(const IRModule &mod) {
+  ffi::Map<ffi::String, runtime::FunctionInfo> fmap;
+  for (auto kv : mod->functions) {
+    auto f = Downcast<tirx::PrimFunc>(kv.second);
+    // Only device kernels are launchable; skip call_extern globals.
+    auto calling_conv = f->GetAttr<Integer>(tvm::attr::kCallingConv);
+    if (!(calling_conv == CallingConv::kDeviceKernelLaunch)) {
+      continue;
+    }
+
+    ffi::Array<DLDataType> arg_types;
+    ffi::Array<ffi::String> launch_param_tags;
+
+    for (size_t i = 0; i < f->params.size(); ++i) {
+      DataType dtype = f->params[i].dtype();
+      if (dtype.is_bool())
+        dtype = DataType::Int(32);
+      arg_types.push_back(dtype);
+    }
+    if (auto opt = f->GetAttr<ffi::Array<ffi::String>>(
+            tirx::attr::kKernelLaunchParams)) {
+      for (const auto &tag : opt.value()) {
+        launch_param_tags.push_back(tag);
+      }
+    }
+
+    auto global_symbol = f->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol);
+    std::string sym = global_symbol.has_value()
+                          ? static_cast<std::string>(global_symbol.value())
+                          : static_cast<std::string>(
+                                Downcast<GlobalVar>(kv.first)->name_hint);
+    fmap.Set(ffi::String(sym),
+             runtime::FunctionInfo(ffi::String(sym), arg_types,
+                                   launch_param_tags, {}));
+  }
+  return fmap;
+}
+
 } // namespace
 
 ffi::Module BuildTileLangAscend(IRModule mod, Target target) {
@@ -44,15 +96,11 @@ ffi::Module BuildTileLangAscend(IRModule mod, Target target) {
     code = (*f)(code, target).cast<std::string>();
   }
 
-  if (const auto f =
-          ffi::Function::GetGlobal("tilelang_callback_ascend_compile")) {
-    (*f)(code, target);
-  }
-
-  // Return a CSourceModule so that inspect_source() still works.
-  // The actual binary compilation for execution is handled by the
-  // cython adapter (LibraryGenerator) or the callback above.
-  return CSourceModuleCreate(code, "asc", ffi::Array<ffi::String>());
+  // Return a runnable Ascend module. The kernel source is bisheng-compiled
+  // lazily (on first launch) inside the module; on the tvm_ffi path the host
+  // stub resolves the kernel through tvm_call_packed -> GetFunction.
+  return ascend::AscendModuleCreate(ffi::String(code), ffi::String("asc"),
+                                    ExtractFuncInfo(mod));
 }
 
 ffi::Module BuildTileLangAscendWithoutCompile(IRModule mod, Target target) {
@@ -61,6 +109,9 @@ ffi::Module BuildTileLangAscendWithoutCompile(IRModule mod, Target target) {
           ffi::Function::GetGlobal("tilelang_callback_ascend_postproc")) {
     code = (*f)(code, target).cast<std::string>();
   }
+  // Source-only module used by the cython adapter / inspect_source. The cython
+  // path compiles host+device together with bisheng, so no runnable module is
+  // needed here.
   return CSourceModuleCreate(code, "asc", ffi::Array<ffi::String>());
 }
 

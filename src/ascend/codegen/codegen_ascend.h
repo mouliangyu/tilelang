@@ -88,6 +88,12 @@ private:
 
   void EmitScalarizedLoad(const BufferLoadNode *op, std::ostream &os);
   bool EmitScalarizedStore(const BufferStoreNode *op);
+
+  // Emit an extern "C" launcher `__tl_launch_<name>(void** void_args,
+  // uint32_t grid, uint32_t smem, void* stream)` that performs the Ascend
+  // triple-chevron launch. Used by the tvm_ffi runtime module (AscendModule)
+  // to invoke the kernel from a bisheng-compiled .so via dlsym.
+  void PrintKernelLauncher(const PrimFunc &f, const std::string &global_symbol);
 };
 
 } // namespace codegen
