@@ -187,7 +187,16 @@ cdef class CythonKernelWrapper:
         # Use current device stream if none specified
         if stream == -1:
             if hasattr(torch, 'npu') and torch.npu.is_available():
-                stream = torch.npu.current_stream().npu_stream
+                # NOTE(chaofan): Use the low-level raw-stream getter (mirrors the CUDA branch
+                # below). torch.npu.current_stream() goes through a Python
+                # wrapper that internally probes torch.cuda.is_available(), which
+                # costs ~150us per call on a CUDA-less NPU host; the _C accessor
+                # avoids that and returns the raw stream in <1us.
+                try:
+                    import torch_npu
+                    stream = torch_npu._C._npu_getCurrentRawStream(torch.npu.current_device())
+                except (ImportError, AttributeError):
+                    stream = torch.npu.current_stream().npu_stream
             elif torch.cuda.is_available():
                 try:
                     stream = torch._C._cuda_getCurrentRawStream(torch.cuda.current_device())

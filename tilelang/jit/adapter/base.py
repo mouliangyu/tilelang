@@ -67,7 +67,17 @@ class BaseKernelAdapter(ABC):
         device runtime is available, it returns a lambda that yields 0.
         """
         if hasattr(torch, "npu") and torch.npu.is_available():
-            return lambda: int(torch.npu.current_stream().npu_stream)
+            # NOTE(chaofan): Mirror the CUDA branch: use the low-level raw-stream accessor.
+            # torch.npu.current_stream() internally probes
+            # torch.cuda.is_available(), which costs ~150us per call on a
+            # CUDA-less NPU host; the _C accessor avoids that.
+            try:
+                import torch_npu
+
+                get_npu_stream = torch_npu._C._npu_getCurrentRawStream
+                return lambda: int(get_npu_stream(torch.npu.current_device()))
+            except (ImportError, AttributeError):
+                return lambda: int(torch.npu.current_stream().npu_stream)
         elif torch.cuda.is_available():
             try:
                 torch.cuda._lazy_init()
