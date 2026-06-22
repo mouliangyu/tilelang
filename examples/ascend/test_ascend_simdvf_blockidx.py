@@ -1,0 +1,28 @@
+import tilelang
+import tilelang.language as T
+
+
+@tilelang.jit()
+def get_kernel():
+
+    @T.prim_func
+    def program():
+        with T.Kernel(2) as bx:
+            shared_buf = T.alloc_shared([64], T.float32)
+            with T.SimdVF():
+                mask_f32 = T.simd.pset(32)
+                for _ in T.serial(T.min(1, bx)):
+                    v = T.simd.vld(shared_buf[0])
+                    T.simd.vsts(shared_buf[0], v, mask_f32)
+
+    return program
+
+
+def test_simdvf_blockidx_capture():
+    source = get_kernel().get_kernel_source()
+    print(source)
+
+
+if __name__ == "__main__":
+    test_simdvf_blockidx_capture()
+    print("PASS")

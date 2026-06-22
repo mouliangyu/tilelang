@@ -1,5 +1,6 @@
 #include "codegen_ascend.h"
 
+#include <algorithm>
 #include <cmath>
 #include <sstream>
 #include <string>
@@ -473,8 +474,13 @@ CodeGenTileLangAscend::CollectVFCaptures(const SBlockNode *op) const {
     if (seen.count(var.get())) {
       continue;
     }
+    // SimtVF helpers are launched via asc_vf_call and retain kernel launch
+    // context, so blockIdx.x is directly accessible inside them and must not
+    // be captured. A plain __simd_vf__ helper has no such context, so the
+    // block index must be passed in as a parameter (handled below).
     auto it = var_idmap_.find(var.get());
-    if (it != var_idmap_.end() && it->second == "blockIdx.x") {
+    if (op->name_hint == "SIMT_VF" && it != var_idmap_.end() &&
+        it->second == "blockIdx.x") {
       continue;
     }
     seen.insert(var.get());
@@ -508,6 +514,23 @@ void CodeGenTileLangAscend::EmitVFFunction(const SBlockNode *op,
   name_supply_ = NameSupply();
   for (const auto &kv : saved_var_idmap) {
     var_idmap_[kv.first] = kv.second;
+  }
+  // Captures whose printed name is not a valid C identifier (e.g. the
+  // `blockIdx.x` thread builtin, which is only accessible at kernel scope and
+  // must be passed in as a parameter) get a sanitized parameter name. The
+  // sanitized name is written back into the body-local var_idmap_ so body
+  // references print the parameter, and recorded in vf_param_name for use in
+  // the function signature.
+  std::unordered_map<const VarNode *, std::string> vf_param_name;
+  for (const auto &v : captures) {
+    auto it = var_idmap_.find(v.get());
+    std::string name =
+        (it != var_idmap_.end()) ? it->second : std::string(v->name_hint);
+    if (name.find('.') != std::string::npos) {
+      std::replace(name.begin(), name.end(), '.', '_');
+      var_idmap_[v.get()] = name;
+    }
+    vf_param_name[v.get()] = name;
   }
   // Reserve all capture parameter names in the fresh NameSupply so that
   // newly generated variables inside the VF body do not shadow them.
@@ -546,7 +569,9 @@ void CodeGenTileLangAscend::EmitVFFunction(const SBlockNode *op,
       decl_stream << ", ";
     }
     const Var &v = captures[i];
-    std::string vname = resolve_var_name(v);
+    auto pit = vf_param_name.find(v.get());
+    std::string vname =
+        (pit != vf_param_name.end()) ? pit->second : resolve_var_name(v);
     if (!v->type_annotation.as<PointerTypeNode>()) {
       PrintType(v.dtype(), decl_stream);
       decl_stream << " " << vname;

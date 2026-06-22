@@ -34,7 +34,7 @@ jobs:
   permissions-check:
     name: Check bot permissions
     if: |
-      github.repository_owner == 'tile-ai' &&
+      github.repository_owner == 'deepseek-ai' &&
       github.event.issue.pull_request &&
       (contains(github.event.comment.body, '@ascend-perf-regression'))
     runs-on: [self-hosted, ascend]
