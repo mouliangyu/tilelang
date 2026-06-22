@@ -116,7 +116,7 @@ struct MultiVersionBufferInfo {
 };
 
 // Synchronization point types
-enum class SyncType { PipeBarrier, CrossCore, IntraCore };
+enum class SyncType { CrossCore, IntraCore };
 
 // Describes a synchronization point between two ScheduleUnits.
 // Collected during analysis and inserted in a separate pass so that
@@ -694,62 +694,83 @@ CollectSyncPoints(const std::vector<ScheduleUnit *> &units, int num_wgs,
             kept_deps.push_back(d);
         }
 
-        int num_versions = 1;
-        std::set<std::string> all_event;
-        std::vector<std::vector<InsertionSite>> prod_chains;
-        std::vector<std::vector<InsertionSite>> cons_chains;
+        // Bucket the producer/consumer access points by the hardware event
+        // (PRODPIPE_CONSPIPE) of each (producer, consumer) pair, so that each
+        // distinct event gets its own, properly scoped sync point instead of a
+        // single coarse PIPE_ALL barrier.
+        struct EventPts {
+          std::set<BufferAccessPoint> ppts;
+          std::set<BufferAccessPoint> cpts;
+          int num_versions = 1;
+        };
+        std::map<std::string, EventPts> by_event;
         for (const auto &d : kept_deps) {
-          num_versions = std::max(num_versions, get_versions(d.buffer));
+          int d_versions = get_versions(d.buffer);
           for (const auto &ppt : d.producer_pts) {
             for (const auto &cpt : d.consumer_pts) {
-              all_event.insert(GetHardEvent(ppt.task(), cpt.task()));
+              std::string event = GetHardEvent(ppt.task(), cpt.task());
+              auto &ev = by_event[event];
+              ev.ppts.insert(ppt);
+              ev.cpts.insert(cpt);
+              ev.num_versions = std::max(ev.num_versions, d_versions);
             }
           }
-          for (const auto &ppt : d.producer_pts) {
+        }
+
+        const DepInfo &rep_dep = kept_deps.front();
+        for (const auto &[hard_event, pts] : by_event) {
+          int num_versions = pts.num_versions;
+          std::vector<std::vector<InsertionSite>> prod_chains;
+          std::vector<std::vector<InsertionSite>> cons_chains;
+          for (const auto &ppt : pts.ppts) {
             prod_chains.push_back(CollectInsertCandidates(ppt, false));
           }
-          for (const auto &cpt : d.consumer_pts) {
+          for (const auto &cpt : pts.cpts) {
             cons_chains.push_back(CollectInsertCandidates(cpt, true));
           }
-        }
-        InsertionSite prod_site = CommonInsertionSite(prod_chains);
-        InsertionSite cons_site = CommonInsertionSite(cons_chains);
-        ICHECK(prod_site.first != nullptr);
-        ICHECK(cons_site.first != nullptr);
+          InsertionSite prod_site = CommonInsertionSite(prod_chains);
+          InsertionSite cons_site = CommonInsertionSite(cons_chains);
+          ICHECK(prod_site.first != nullptr);
+          ICHECK(cons_site.first != nullptr);
 
-        if (all_event.size() > 1) {
-          ICHECK(prod_wg == cons_wg);
-          sync_points.push_back({SyncType::PipeBarrier, prod_unit, prod_wg,
-                                 prod_unit, PrimExpr(), cons_unit, cons_wg,
-                                 cons_unit, PrimExpr(), distance, num_versions,
-                                 kept_deps});
-          continue;
-        }
+          size_t pos = hard_event.find('_');
+          std::string prod_pipe = "PIPE_" + hard_event.substr(0, pos);
+          std::string cons_pipe = "PIPE_" + hard_event.substr(pos + 1);
 
-        std::string hard_event = *all_event.begin();
-        size_t pos = hard_event.find('_');
-        std::string prod_pipe = "PIPE_" + hard_event.substr(0, pos);
-        std::string cons_pipe = "PIPE_" + hard_event.substr(pos + 1);
+          // Per-event deps so the downstream transitive reduction
+          // (OptimizeSyncPoints / SyncDominates / ChainForSync) reads access
+          // points consistent with this event's insertion units.
+          DepInfo ev_dep;
+          ev_dep.prod_unit = rep_dep.prod_unit;
+          ev_dep.cons_unit = rep_dep.cons_unit;
+          ev_dep.buffer = rep_dep.buffer;
+          ev_dep.producer_pts.assign(pts.ppts.begin(), pts.ppts.end());
+          ev_dep.consumer_pts.assign(pts.cpts.begin(), pts.cpts.end());
+          ev_dep.cross_iter = rep_dep.cross_iter;
+          ev_dep.latency = rep_dep.latency;
+          std::vector<DepInfo> ev_deps = {ev_dep};
 
-        if (prod_wg != cons_wg) {
-          int mode_id = 4;
+          if (prod_wg != cons_wg) {
+            int mode_id = 4;
 
-          sync_points.push_back({SyncType::CrossCore, prod_unit, prod_wg,
+            sync_points.push_back({SyncType::CrossCore, prod_unit, prod_wg,
+                                   prod_site.first, prod_site.second, cons_unit,
+                                   cons_wg, cons_site.first, cons_site.second,
+                                   distance, num_versions, ev_deps, hard_event,
+                                   prod_pipe, cons_pipe, mode_id});
+            continue;
+          }
+
+          // Intra-core sync: use ascend_set_flag / wait_flag.
+          // prod_pipe/cons_pipe are filled (same PIPE_ encoding as cross-core)
+          // so grouping and the transitive reduction can treat both sync types
+          // uniformly.
+          sync_points.push_back({SyncType::IntraCore, prod_unit, prod_wg,
                                  prod_site.first, prod_site.second, cons_unit,
                                  cons_wg, cons_site.first, cons_site.second,
-                                 distance, num_versions, kept_deps, hard_event,
-                                 prod_pipe, cons_pipe, mode_id});
-          continue;
+                                 distance, num_versions, ev_deps, hard_event,
+                                 prod_pipe, cons_pipe});
         }
-
-        // Intra-core sync: use ascend_set_flag / wait_flag. prod_pipe/cons_pipe
-        // are filled (same PIPE_ encoding as cross-core) so grouping and the
-        // transitive reduction can treat both sync types uniformly.
-        sync_points.push_back({SyncType::IntraCore, prod_unit, prod_wg,
-                               prod_site.first, prod_site.second, cons_unit,
-                               cons_wg, cons_site.first, cons_site.second,
-                               distance, num_versions, kept_deps, hard_event,
-                               prod_pipe, cons_pipe});
       }
     }
   }
@@ -939,11 +960,7 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
                              FlagInfoList &flag_infos, EventIdMap &event_id_map,
                              LoopNestingInfo &loop_info) {
   for (const auto &sp : sync_points) {
-    if (sp.type == SyncType::PipeBarrier) {
-      Stmt barrier = makeAscendPipeBarrier("PIPE_ALL");
-      InsertStatementIntoScheduleUnit(sp.cons_insertion_unit, barrier, true,
-                                      sp.cons_wg, sp.cons_guard);
-    } else if (sp.type == SyncType::CrossCore) {
+    if (sp.type == SyncType::CrossCore) {
       auto cc_id = event_id_map.find("Cube-Vector");
       if (cc_id == event_id_map.end()) {
         event_id_map["Cube-Vector"] = 0;
