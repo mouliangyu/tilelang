@@ -301,6 +301,7 @@ public:
     std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t>>
         data_deps; // (i, j, distance, latency)
     std::vector<std::pair<int64_t, int64_t>> resource_deps;
+    std::vector<std::pair<int64_t, int64_t>> stage_order_deps;
 
     latencies.reserve(n);
     iis.reserve(n);
@@ -490,6 +491,65 @@ public:
       }
     }
 
+    // Stage-order constraints for copied Let variables.
+    //
+    // A Let task `a = buf[...]` only READS buffers (it writes a scalar var).
+    // When `a` is consumed in a different pipeline stage, solve_conflict_var
+    // clones the Let into that consumer's stage and prepends it to the loop
+    // body. The clone re-reads `buf` at the consumer's iteration. If `buf` is
+    // also WRITTEN inside the loop, that re-read must observe the value from
+    // before the write — otherwise the clone reads a stale/overwritten buffer.
+    //
+    // AnalyzeDependencies already feeds the Let's own WAR edge to Z3, but only
+    // constrains the Let's original stage, not the stages of units that will
+    // receive a copy. Here we add: for every unit U that (transitively) reads a
+    // Let-defined var, and every WAR consumer W of that Let (a unit that writes
+    // the buffer the Let reads, same-iter or cross-iter), require k_U <= k_W in
+    // the Z3 (k, r) model. Equality is allowed because the clone is placed at
+    // the front of the loop body, so it reads before any write in that
+    // iteration.
+    auto bind_of = [&](size_t idx) -> const BindNode * {
+      IRStructure *node = units[idx]->child.get();
+      if (node && node->IsTask()) {
+        auto task = static_cast<TaskNode *>(node);
+        if (task->stmts.size() == 1) {
+          return task->stmts[0].as<BindNode>();
+        }
+      }
+      return nullptr;
+    };
+    std::unordered_map<const VarNode *, size_t> let_var_to_unit;
+    for (size_t i = 0; i < n; ++i) {
+      if (auto *bind = bind_of(i)) {
+        let_var_to_unit[bind->var.get()] = i;
+      }
+    }
+    std::vector<std::set<size_t>> unit_let_deps(n);
+    for (size_t i = 0; i < n; ++i) {
+      for (const auto &rv : units[i]->GetIndirectReadVars()) {
+        auto it = let_var_to_unit.find(rv.get());
+        if (it != let_var_to_unit.end())
+          unit_let_deps[i].insert(it->second);
+      }
+    }
+    // Collect WAR consumers per Let unit
+    std::vector<std::set<size_t>> let_war_consumers(n);
+    for (const auto &dep : deps) {
+      size_t p = unit_idx[dep.prod_unit];
+      if (bind_of(p) != nullptr) {
+        let_war_consumers[p].insert(unit_idx[dep.cons_unit]);
+      }
+    }
+    for (size_t u = 0; u < n; ++u) {
+      for (size_t l : unit_let_deps[u]) {
+        for (size_t w : let_war_consumers[l]) {
+          if (u == w)
+            continue;
+          stage_order_deps.emplace_back((int64_t)u, (int64_t)w);
+        }
+      }
+    }
+
     // Convert vectors to TVM containers
     ffi::Array<int64_t> tvm_latencies;
     ffi::Array<int64_t> tvm_iis;
@@ -522,6 +582,13 @@ public:
       pair.push_back(dep.second);
       tvm_resource_deps.push_back(pair);
     }
+    ffi::Array<ffi::Array<int64_t>> tvm_stage_order_deps;
+    for (const auto &dep : stage_order_deps) {
+      ffi::Array<int64_t> pair;
+      pair.push_back(dep.first);
+      pair.push_back(dep.second);
+      tvm_stage_order_deps.push_back(pair);
+    }
     for (auto val : buffer_sizes) {
       tvm_buffer_sizes.push_back(val);
     }
@@ -545,7 +612,7 @@ public:
         z3_schedule_loop_func
             .value()(num_stages, tvm_latencies, tvm_iis, tvm_resource_flags,
                      tvm_data_deps, tvm_resource_deps, tvm_buffer_sizes,
-                     tvm_memory_groups)
+                     tvm_memory_groups, tvm_stage_order_deps)
             .cast<ffi::Tuple<ffi::Array<int64_t>, ffi::Array<int64_t>,
                              int64_t>>();
 
@@ -645,7 +712,7 @@ public:
               }
             }
 
-            seq_body->children.insert(seq_body->children.begin() + j,
+            seq_body->children.insert(seq_body->children.begin(),
                                       std::move(cloned_unit));
             n += 1;
             return true; // Conflict resolved, restart the loop

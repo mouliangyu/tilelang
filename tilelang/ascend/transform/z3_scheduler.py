@@ -225,6 +225,7 @@ def z3_schedule_loop_python(
     resource_deps: list[tuple[int, int]],
     buffer_sizes: list[int],
     memory_groups: list[list[int]],  # [[capacity, idx0, idx1, ...], ...]
+    stage_order_deps: list[tuple[int, int]] | None = None,  # (u, w): k_u <= k_w
     recalculate_buffer_versions: bool = True,
     verbose: bool = False,
     seed: int | None = None,
@@ -257,6 +258,9 @@ def z3_schedule_loop_python(
         Buffer size for each buffer (for negative distance dependencies)
     memory_groups : list[list[int]]
         Memory groups with capacity and buffer indices, e.g. [[capacity, idx0, idx1, ...], ...]
+    stage_order_deps : list[tuple[int, int]] | None
+        Stage-order constraints (u, w) requiring k_u <= k_w (same or earlier
+        iteration-stage).
 
     Returns
     -------
@@ -271,6 +275,9 @@ def z3_schedule_loop_python(
     if n < 1:
         raise RuntimeError("Z3 loop scheduling failed: n too small")
 
+    if stage_order_deps is None:
+        stage_order_deps = []
+
     if verbose:
         print(f"[Python Z3 Loop] Starting scheduling for {n} tasks")
         print(f"[Python Z3 Loop] Latencies: {latencies}")
@@ -278,6 +285,7 @@ def z3_schedule_loop_python(
         print(f"[Python Z3 Loop] Resource flags: {resource_flags}")
         print(f"[Python Z3 Loop] Data dependencies with distances: {data_deps}")
         print(f"[Python Z3 Loop] Resource dependencies: {resource_deps}")
+        print(f"[Python Z3 Loop] Stage-order dependencies: {stage_order_deps}")
         print(f"[Python Z3 Loop] Buffer sizes: {buffer_sizes} within groups {memory_groups}")
 
     assert Z3_AVAILABLE, "z3-solver package is required but not installed"
@@ -357,6 +365,16 @@ def z3_schedule_loop_python(
 
                 if verbose:
                     print(f"[Python Z3 Loop] Resource dependency between {i} and {j}: ii_i={ii_i}, ii_j={ii_j}")
+
+        # Add stage-order constraints for copied Let variables.
+        # (u, w) requires k_u <= k_w: any unit u that reads a Let-defined var
+        # must not be scheduled into a later iteration-stage than w, a unit that
+        # writes the buffer the Let reads. This keeps the cloned Let (prepended
+        # to the loop body in u's stage) reading the pre-write buffer value.
+        for u, w in stage_order_deps:
+            solver.add(k_vars[u] <= k_vars[w])
+            if verbose:
+                print(f"[Python Z3 Loop] Stage-order constraint: k_{u} <= k_{w}")
 
         # Check feasibility
         if verbose:
@@ -610,12 +628,15 @@ def z3_schedule_loop_python(
 
 # FFI-exposed function for loop scheduling
 @tvm_ffi.register_global_func("tl.transform.z3_schedule_loop_python")
-def z3_schedule_loop_ffi(num_stages, latencies, iis, resource_flags, data_deps, resource_deps, buffer_sizes, memory_groups):
+def z3_schedule_loop_ffi(
+    num_stages, latencies, iis, resource_flags, data_deps, resource_deps, buffer_sizes, memory_groups, stage_order_deps=None
+):
     """FFI wrapper for z3_schedule_loop_python.
 
     This function accepts TVM containers and converts them to Python lists.
     Data dependencies are expected as 4-tuples (i, j, distance, latency).
     memory_groups is a list of lists: [[capacity, idx0, idx1, ...], ...]
+    stage_order_deps is a list of pairs (u, w) meaning k_u <= k_w.
     """
     # Convert TVM containers to Python lists
     latencies_list = list(latencies)
@@ -642,6 +663,13 @@ def z3_schedule_loop_ffi(num_stages, latencies, iis, resource_flags, data_deps, 
             if hasattr(resource_deps[i], "__len__") and len(resource_deps[i]) == 2:
                 resource_deps_list.append((int(resource_deps[i][0]), int(resource_deps[i][1])))
 
+    # Convert stage-order dependencies (pairs)
+    stage_order_deps_list = []
+    if stage_order_deps is not None:
+        for i in range(len(stage_order_deps)):
+            if hasattr(stage_order_deps[i], "__len__") and len(stage_order_deps[i]) == 2:
+                stage_order_deps_list.append((int(stage_order_deps[i][0]), int(stage_order_deps[i][1])))
+
     # Call the actual scheduler (Z3 is not thread-safe, serialize access)
     with _z3_lock:
         start_times, buffer_versions, best_ii = z3_schedule_loop_python(
@@ -653,6 +681,7 @@ def z3_schedule_loop_ffi(num_stages, latencies, iis, resource_flags, data_deps, 
             resource_deps_list,
             buffer_sizes_list,
             memory_groups_list,
+            stage_order_deps_list,
         )
 
     # Return start_times and buffer_versions as separate arrays for easier FFI handling

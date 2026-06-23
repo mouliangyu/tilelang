@@ -129,6 +129,43 @@ std::vector<Var> SequenceNode::GetReadVars() const {
   return all_vars;
 }
 
+std::vector<Var> SequenceNode::GetIndirectReadVars() const {
+  std::vector<Var> all_vars;
+  for (const auto &child : children) {
+    if (child) {
+      auto child_vars = child->GetIndirectReadVars();
+      all_vars.insert(all_vars.end(), child_vars.begin(), child_vars.end());
+    }
+  }
+  return all_vars;
+}
+
+std::vector<BufferRegion> SequenceNode::GetIndirectReadRegions() const {
+  std::vector<BufferRegion> all_regions;
+  for (const auto &child : children) {
+    if (child) {
+      auto child_regions = child->GetIndirectReadRegions();
+      all_regions.insert(all_regions.end(), child_regions.begin(),
+                         child_regions.end());
+    }
+  }
+  // Remove duplicates (by buffer and region equality)
+  std::vector<BufferRegion> deduplicated;
+  for (const auto &region : all_regions) {
+    bool found = false;
+    for (const auto &existing : deduplicated) {
+      if (existing->buffer.same_as(region->buffer) &&
+          RegionsEqual(existing->region, region->region)) {
+        found = true;
+        break;
+      }
+    }
+    if (!found)
+      deduplicated.push_back(region);
+  }
+  return deduplicated;
+}
+
 std::vector<BufferRegion> SequenceNode::GetWriteRegions() const {
   std::vector<BufferRegion> all_write_regions;
   for (const auto &child : children) {
@@ -222,6 +259,9 @@ std::shared_ptr<IRStructure> TaskNode::Clone() const {
   // Copy memory access regions
   new_task->SetReadRegions(GetReadRegions());
   new_task->SetWriteRegions(GetWriteRegions());
+  // Copy indirect read sets (propagated through scalar Let bindings)
+  new_task->SetIndirectReads(indirect_read_regions_, indirect_read_vars_,
+                             indirect_computed_);
   // Copy latency and II
   new_task->SetLatency(GetLatency());
   new_task->SetII(GetII());

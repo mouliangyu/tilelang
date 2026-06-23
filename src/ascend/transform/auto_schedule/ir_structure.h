@@ -170,6 +170,15 @@ public:
   virtual std::vector<Var> GetReadVars() const = 0;
   virtual std::vector<Var> GetWriteVars() const = 0;
 
+  // Indirect read access: read regions/vars plus anything reached transitively
+  // through scalar Let bindings (see PropagateReadRegions). Falls back to the
+  // direct sets for nodes that don't track an indirect set. Aggregate across
+  // children like GetReadRegions()/GetReadVars().
+  virtual std::vector<BufferRegion> GetIndirectReadRegions() const {
+    return GetReadRegions();
+  }
+  virtual std::vector<Var> GetIndirectReadVars() const { return GetReadVars(); }
+
   // Latency estimation
   virtual int64_t GetLatency() const = 0; // Estimated latency in cycles
   virtual int64_t GetII() const = 0;      // Initiation interval in cycles
@@ -262,6 +271,19 @@ public:
   }
   std::vector<Var> GetReadVars() const override { return read_vars_; }
   std::vector<Var> GetWriteVars() const override { return write_vars_; }
+
+  // Indirect read access: the direct read regions/vars plus anything reached
+  // transitively through scalar Let bindings (e.g. `a = buf[0]; copy(a)` makes
+  // the copy task indirectly read `buf`). Filled by PropagateReadRegions; the
+  // direct read_regions_/read_vars_ are never mutated. Falls back to the direct
+  // set when propagation has not run, so callers always get a valid answer.
+  std::vector<BufferRegion> GetIndirectReadRegions() const override {
+    return indirect_computed_ ? indirect_read_regions_ : read_regions_;
+  }
+  std::vector<Var> GetIndirectReadVars() const override {
+    return indirect_computed_ ? indirect_read_vars_ : read_vars_;
+  }
+
   // Latency estimation
   int64_t GetLatency() const override { return latency_; }
   int64_t GetII() const override { return ii_; }
@@ -277,6 +299,12 @@ public:
   }
   void SetReadVars(const std::vector<Var> &vars) { read_vars_ = vars; }
   void SetWriteVars(const std::vector<Var> &vars) { write_vars_ = vars; }
+  void SetIndirectReads(const std::vector<BufferRegion> &regions,
+                        const std::vector<Var> &vars, bool computed) {
+    indirect_read_regions_ = regions;
+    indirect_read_vars_ = vars;
+    indirect_computed_ = computed;
+  }
   void SubstituteVar(const Var &old_var, const Var &new_var) override {
     for (auto &var : read_vars_) {
       if (var.same_as(old_var)) {
@@ -410,6 +438,30 @@ public:
     write_vars_.push_back(var);
   }
 
+  // Indirect read accumulation (used by PropagateReadRegions). Seed once from
+  // the direct sets, then add transitively-reached regions/vars.
+  void SeedIndirectReads() {
+    indirect_read_regions_ = read_regions_;
+    indirect_read_vars_ = read_vars_;
+    indirect_computed_ = true;
+  }
+  void AddIndirectReadRegion(const BufferRegion &region) {
+    for (const auto &existing : indirect_read_regions_) {
+      if (existing->buffer.same_as(region->buffer) &&
+          RegionsEqual(existing->region, region->region)) {
+        return;
+      }
+    }
+    indirect_read_regions_.push_back(region);
+  }
+  void AddIndirectReadVar(const Var &var) {
+    for (const auto &existing : indirect_read_vars_) {
+      if (existing.same_as(var))
+        return;
+    }
+    indirect_read_vars_.push_back(var);
+  }
+
   bool CollectFirstAccessPoints(const TaskAccessPredicate &pred,
                                 std::set<BufferAccessPoint> &result,
                                 std::vector<const IRStructure *> &path,
@@ -438,6 +490,15 @@ private:
 
   std::vector<Var> read_vars_;
   std::vector<Var> write_vars_;
+
+  // Indirect read sets: direct reads plus reads reached transitively through
+  // scalar Let bindings. Populated by PropagateReadRegions;
+  // `indirect_computed_` gates whether the Get*Indirect* accessors return these
+  // or fall back to the direct sets. Never affects barrier/dependency analysis,
+  // which uses the direct read_regions_/read_vars_.
+  std::vector<BufferRegion> indirect_read_regions_;
+  std::vector<Var> indirect_read_vars_;
+  bool indirect_computed_{false};
 
   // Latency estimation
   int64_t latency_{0}; // Estimated latency in cycles
@@ -510,6 +571,27 @@ public:
     }
     return vars;
   }
+
+  // Indirect read access (aggregate from child & task)
+  std::vector<Var> GetIndirectReadVars() const override {
+    std::vector<Var> vars =
+        child ? child->GetIndirectReadVars() : std::vector<Var>{};
+    if (task) {
+      auto task_vars = task->GetIndirectReadVars();
+      vars.insert(vars.end(), task_vars.begin(), task_vars.end());
+    }
+    return vars;
+  }
+  std::vector<BufferRegion> GetIndirectReadRegions() const override {
+    std::vector<BufferRegion> regions =
+        child ? child->GetIndirectReadRegions() : std::vector<BufferRegion>{};
+    if (task) {
+      auto task_regions = task->GetIndirectReadRegions();
+      regions.insert(regions.end(), task_regions.begin(), task_regions.end());
+    }
+    return regions;
+  }
+
   void SubstituteVar(const Var &old_var, const Var &new_var) override {
     if (child) {
       child->SubstituteVar(old_var, new_var);
@@ -667,6 +749,26 @@ public:
     return vars;
   }
 
+  // Indirect read access (aggregate from child & task)
+  std::vector<Var> GetIndirectReadVars() const override {
+    std::vector<Var> vars =
+        child ? child->GetIndirectReadVars() : std::vector<Var>{};
+    if (task) {
+      auto task_vars = task->GetIndirectReadVars();
+      vars.insert(vars.end(), task_vars.begin(), task_vars.end());
+    }
+    return vars;
+  }
+  std::vector<BufferRegion> GetIndirectReadRegions() const override {
+    std::vector<BufferRegion> regions =
+        child ? child->GetIndirectReadRegions() : std::vector<BufferRegion>{};
+    if (task) {
+      auto task_regions = task->GetIndirectReadRegions();
+      regions.insert(regions.end(), task_regions.begin(), task_regions.end());
+    }
+    return regions;
+  }
+
   void SubstituteVar(const Var &old_var, const Var &new_var) override {
     if (wrapper.defined()) {
       wrapper = Substitute(wrapper, {{old_var, new_var}});
@@ -790,6 +892,7 @@ public:
     return regions;
   }
 
+  // Variable access (union of both branches + task)
   std::vector<Var> GetReadVars() const override {
     std::vector<Var> vars;
     if (task) {
@@ -821,6 +924,40 @@ public:
       vars.insert(vars.end(), v.begin(), v.end());
     }
     return vars;
+  }
+
+  // Indirect read access (union of both branches + task)
+  std::vector<Var> GetIndirectReadVars() const override {
+    std::vector<Var> vars;
+    if (task) {
+      auto v = task->GetIndirectReadVars();
+      vars.insert(vars.end(), v.begin(), v.end());
+    }
+    if (then_child) {
+      auto v = then_child->GetIndirectReadVars();
+      vars.insert(vars.end(), v.begin(), v.end());
+    }
+    if (else_child) {
+      auto v = else_child->GetIndirectReadVars();
+      vars.insert(vars.end(), v.begin(), v.end());
+    }
+    return vars;
+  }
+  std::vector<BufferRegion> GetIndirectReadRegions() const override {
+    std::vector<BufferRegion> regions;
+    if (task) {
+      auto r = task->GetIndirectReadRegions();
+      regions.insert(regions.end(), r.begin(), r.end());
+    }
+    if (then_child) {
+      auto r = then_child->GetIndirectReadRegions();
+      regions.insert(regions.end(), r.begin(), r.end());
+    }
+    if (else_child) {
+      auto r = else_child->GetIndirectReadRegions();
+      regions.insert(regions.end(), r.begin(), r.end());
+    }
+    return regions;
   }
 
   void SubstituteVar(const Var &old_var, const Var &new_var) override {
@@ -905,11 +1042,21 @@ public:
     return child ? child->GetWriteRegions() : std::vector<BufferRegion>{};
   }
 
+  // Variable access (aggregate from child)
   std::vector<Var> GetReadVars() const override {
     return child ? child->GetReadVars() : std::vector<Var>{};
   }
   std::vector<Var> GetWriteVars() const override {
     return child ? child->GetWriteVars() : std::vector<Var>{};
+  }
+
+  // Indirect read access (aggregate from child)
+  std::vector<Var> GetIndirectReadVars() const override {
+    return child ? child->GetIndirectReadVars() : std::vector<Var>{};
+  }
+  std::vector<BufferRegion> GetIndirectReadRegions() const override {
+    return child ? child->GetIndirectReadRegions()
+                 : std::vector<BufferRegion>{};
   }
 
   void SubstituteVar(const Var &old_var, const Var &new_var) override {
@@ -1003,8 +1150,13 @@ public:
   std::vector<BufferRegion> GetReadRegions() const override;
   std::vector<BufferRegion> GetWriteRegions() const override;
 
+  // Variable access (aggregate from all children)
   std::vector<Var> GetReadVars() const override;
   std::vector<Var> GetWriteVars() const override;
+
+  // Indirect read access (aggregate from all children)
+  std::vector<Var> GetIndirectReadVars() const override;
+  std::vector<BufferRegion> GetIndirectReadRegions() const override;
 
   void SubstituteVar(const Var &old_var, const Var &new_var) override {
     for (auto &child : children) {

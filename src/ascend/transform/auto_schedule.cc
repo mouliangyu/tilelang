@@ -983,7 +983,7 @@ static void ResolveScalarWarpgroupId(IRStructure *root) {
     if (IsWarpgroupBroadcast(wg) || wg == kWarpgroupUnassigned)
       continue;
     auto &dst = (wg == 1) ? cube_bufs : vec_bufs;
-    for (auto &r : t->GetReadRegions())
+    for (auto &r : t->GetIndirectReadRegions())
       dst.insert(r->buffer.get());
     for (auto &r : t->GetWriteRegions())
       dst.insert(r->buffer.get());
@@ -1010,7 +1010,7 @@ static void ResolveScalarWarpgroupId(IRStructure *root) {
           serves_aiv = true;
       }
     };
-    check(t->GetReadRegions());
+    check(t->GetIndirectReadRegions());
     check(t->GetWriteRegions());
 
     if (serves_cube && serves_aiv) {
@@ -1061,13 +1061,15 @@ static void CollectTaskNodesForPropagation(IRStructure *node,
   }
 }
 
-// Propagate read regions from LetDecl tasks to their consumers via scalar vars.
-// When a task reads a scalar var that was defined by a LetDecl (e.g.
-// m_tile_3 = buf[0]), the LetDecl's read_regions are added to the task so that
-// register buffer dependencies become visible to barrier analysis.
+// Compute indirect read regions/vars for every task: the direct reads plus
+// anything reached transitively through scalar Let bindings.
 static void PropagateReadRegions(IRStructure *root) {
   std::vector<TaskNode *> all_tasks;
   CollectTaskNodesForPropagation(root, all_tasks);
+
+  // Seed every task's indirect set from its direct reads.
+  for (TaskNode *task : all_tasks)
+    task->SeedIndirectReads();
 
   // Build mapping: var → the LetDecl TaskNode that defines it
   std::unordered_map<const VarNode *, TaskNode *> var_to_let_decl;
@@ -1085,35 +1087,34 @@ static void PropagateReadRegions(IRStructure *root) {
   bool changed = true;
   while (changed) {
     changed = false;
-    // Count total regions before this round
     size_t count_before = 0;
     for (TaskNode *task : all_tasks)
-      count_before += task->GetReadRegions().size();
+      count_before += task->GetIndirectReadRegions().size() +
+                      task->GetIndirectReadVars().size();
 
     for (TaskNode *task : all_tasks) {
-      if (IsLetDeclTask(task))
-        continue;
-
-      // Snapshot current read vars (may grow during propagation)
-      std::vector<Var> read_vars = task->GetReadVars();
+      // Snapshot current indirect read vars (may grow during propagation)
+      std::vector<Var> read_vars = task->GetIndirectReadVars();
       for (const auto &var : read_vars) {
         auto it = var_to_let_decl.find(var.get());
         if (it == var_to_let_decl.end())
           continue;
         TaskNode *def = it->second;
-        // Propagate the defining LetDecl's read_regions
-        for (const auto &region : def->GetReadRegions())
-          task->AddReadRegion(region);
-        // Also propagate the LetDecl's own read_vars (transitive)
-        for (const auto &v : def->GetReadVars())
-          task->AddReadVar(v);
+        if (def == task)
+          continue;
+        // Fold the defining Let's already-accumulated indirect closure into
+        // this task's indirect set.
+        for (const auto &region : def->GetIndirectReadRegions())
+          task->AddIndirectReadRegion(region);
+        for (const auto &v : def->GetIndirectReadVars())
+          task->AddIndirectReadVar(v);
       }
     }
 
-    // Check if any new regions appeared
     size_t count_after = 0;
     for (TaskNode *task : all_tasks)
-      count_after += task->GetReadRegions().size();
+      count_after += task->GetIndirectReadRegions().size() +
+                     task->GetIndirectReadVars().size();
     if (count_after > count_before)
       changed = true;
   }
@@ -1133,9 +1134,10 @@ static ScheduledKernelResult ScheduleSingleKernel(
 
   ICHECK(ir_structure) << "IRStructure is null (empty body?)";
 
-  // Propagate read regions through scalar var dependencies so that register
-  // buffers accessed indirectly (e.g. m_tile → m_tile_3 → MTE copy) are visible
-  // to barrier analysis.
+  // Compute indirect read sets (direct reads + reads reached through scalar
+  // Let bindings, e.g. m_tile → m_tile_3 → MTE copy) so warpgroup resolution
+  // can see register buffers accessed indirectly. Direct read regions/vars are
+  // left untouched for barrier/dependency analysis.
   PropagateReadRegions(ir_structure.get());
 
   // Build ScheduleUnits from IRStructure (Z3 scheduling + Ascend sync)
