@@ -188,14 +188,20 @@ private:
                     outer_repl)(index);
   }
 
+  static PrimExpr MakeAccessPtr(const Buffer &buffer,
+                                const Array<PrimExpr> &idx, int rw_mask) {
+    return Call(DataType::Handle(), tl::access_ptr(),
+                {BufferLoad(buffer, idx), IntImm(DataType::Int(32), 1),
+                 IntImm(DataType::Int(32), rw_mask)});
+  }
+
   PrimExpr MakeAddressOf(const Buffer &buffer,
-                         const Array<PrimExpr> &orig_indices) {
+                         const Array<PrimExpr> &orig_indices, int rw_mask) {
     Array<PrimExpr> idx;
     for (const auto &i : orig_indices) {
       idx.push_back(SubstituteIndex(i));
     }
-    return Call(DataType::Handle(), builtin::address_of(),
-                {BufferLoad(buffer, idx)});
+    return MakeAccessPtr(buffer, idx, rw_mask);
   }
 
   Var EmitUnary(const PrimExpr &value, DataType dtype, const Op &op,
@@ -232,7 +238,7 @@ private:
         }
       }
 
-      PrimExpr addr = MakeAddressOf(load->buffer, load->indices);
+      PrimExpr addr = MakeAddressOf(load->buffer, load->indices, /*rw_mask=*/1);
       PrimExpr vld_call =
           Call(reg->dtype, simd_vld(),
                {addr, StringImm(depends_on_vreg ? "NORM" : "BRC_B32")});
@@ -293,9 +299,10 @@ private:
   Stmt LowerBufferStore(const BufferStoreNode *store, DataType dtype) {
     Array<Stmt> stmts;
     Var result = DecomposeExpr(store->value, dtype, &stmts);
-    Stmt vsts_stmt = Evaluate(Call(
-        DataType::Void(), simd_vsts(),
-        {MakeAddressOf(store->buffer, store->indices), result, mask_var_}));
+    Stmt vsts_stmt = Evaluate(
+        Call(DataType::Void(), simd_vsts(),
+             {MakeAddressOf(store->buffer, store->indices, /*rw_mask=*/2),
+              result, mask_var_}));
     return AppendStmt(stmts, vsts_stmt);
   }
 
@@ -493,8 +500,7 @@ private:
       idxs.insert(idxs.begin(), remaining);
     }
 
-    PrimExpr addr = Call(DataType::Handle(), builtin::address_of(),
-                         {BufferLoad(buf, idxs)});
+    PrimExpr addr = MakeAccessPtr(buf, idxs, /*rw_mask=*/2);
     Stmt store =
         Evaluate(Call(DataType::Void(), simd_vsts(), {addr, frag, mask}));
     Stmt loop =
@@ -572,7 +578,7 @@ private:
         Call(DataType::Bool(256), simd_pset(),
              {IntImm(DataType::Int(32), mask_elem_bits), StringImm("PAT_ALL")});
 
-    auto flat_addr = [&](const Buffer &buf, int ndim) -> PrimExpr {
+    auto flat_addr = [&](const Buffer &buf, int ndim, int rw_mask) -> PrimExpr {
       PrimExpr flat_idx = chunk * IntImm(DataType::Int(32), vreg_size_);
       Array<PrimExpr> idxs;
       if (ndim == 1) {
@@ -585,12 +591,11 @@ private:
         }
         idxs.insert(idxs.begin(), r);
       }
-      return Call(DataType::Handle(), builtin::address_of(),
-                  {BufferLoad(buf, idxs)});
+      return MakeAccessPtr(buf, idxs, rw_mask);
     };
 
-    PrimExpr src_addr = flat_addr(src_buf, src_ranges.size());
-    PrimExpr dst_addr = flat_addr(dst_buf, dst_ranges.size());
+    PrimExpr src_addr = flat_addr(src_buf, src_ranges.size(), /*rw_mask=*/1);
+    PrimExpr dst_addr = flat_addr(dst_buf, dst_ranges.size(), /*rw_mask=*/2);
     PrimExpr vld_call =
         Call(load_frag->dtype, simd_vld(), {src_addr, StringImm("NORM")});
 
@@ -672,14 +677,12 @@ private:
                               : PrimExpr(FloatImm(dtype, -3.402823e+38));
 
     auto i32 = [](int64_t v) { return IntImm(DataType::Int(32), v); };
-    auto addr1d = [&](const Buffer &buf, const PrimExpr &i0) {
-      return Call(DataType::Handle(), builtin::address_of(),
-                  {BufferLoad(buf, {i0})});
+    auto addr1d = [&](const Buffer &buf, const PrimExpr &i0, int rw_mask) {
+      return MakeAccessPtr(buf, {i0}, rw_mask);
     };
-    auto addr2d = [&](const Buffer &buf, const PrimExpr &i0,
-                      const PrimExpr &i1) {
-      return Call(DataType::Handle(), builtin::address_of(),
-                  {BufferLoad(buf, {i0, i1})});
+    auto addr2d = [&](const Buffer &buf, const PrimExpr &i0, const PrimExpr &i1,
+                      int rw_mask) {
+      return MakeAccessPtr(buf, {i0, i1}, rw_mask);
     };
 
     mask_var_ = Var("mask", DataType::Bool(256));
@@ -701,8 +704,9 @@ private:
         Var reduced = MakeReg(dtype);
         Var next_acc = MakeReg(dtype);
         row.push_back(tirx::Bind(
-            loaded, Call(loaded->dtype, simd_vld(),
-                         {addr2d(src, rep, col), StringImm("NORM")})));
+            loaded,
+            Call(loaded->dtype, simd_vld(),
+                 {addr2d(src, rep, col, /*rw_mask=*/1), StringImm("NORM")})));
         row.push_back(tirx::Bind(
             reduced, Call(reduced->dtype, reduce_op,
                           {loaded, mask_var_, StringImm("MODE_ZEROING")})));
@@ -716,16 +720,17 @@ private:
       if (!clear) {
         Var old = MakeReg(dtype);
         Var merged = MakeReg(dtype);
-        row.push_back(tirx::Bind(
-            old, Call(old->dtype, simd_vld(),
-                      {addr1d(dst, dst_off), StringImm("BRC_B32")})));
+        row.push_back(tirx::Bind(old, Call(old->dtype, simd_vld(),
+                                           {addr1d(dst, dst_off, /*rw_mask=*/1),
+                                            StringImm("BRC_B32")})));
         row.push_back(tirx::Bind(
             merged, Call(merged->dtype, element_op,
                          {acc, old, mask_var_, StringImm("MODE_ZEROING")})));
         acc = merged;
       }
-      row.push_back(Evaluate(Call(DataType::Void(), simd_vsts(),
-                                  {addr1d(dst, dst_off), acc, mask_var_})));
+      row.push_back(Evaluate(
+          Call(DataType::Void(), simd_vsts(),
+               {addr1d(dst, dst_off, /*rw_mask=*/2), acc, mask_var_})));
 
       Stmt row_body =
           MakeSeq({tirx::Bind(mask_var_, mask_value), MakeSeq(row)});
@@ -739,16 +744,18 @@ private:
     PrimExpr col = chunk * i32(vreg_size_);
     Array<Stmt> chunk_body;
     Var acc = MakeReg(dtype);
-    chunk_body.push_back(
-        tirx::Bind(acc, Call(acc->dtype, simd_vld(),
-                             {addr2d(src, i32(0), col), StringImm("NORM")})));
+    chunk_body.push_back(tirx::Bind(
+        acc,
+        Call(acc->dtype, simd_vld(),
+             {addr2d(src, i32(0), col, /*rw_mask=*/1), StringImm("NORM")})));
 
     for (int64_t row_idx = 1; row_idx < outer_extent; ++row_idx) {
       Var loaded = MakeReg(dtype);
       Var next_acc = MakeReg(dtype);
       chunk_body.push_back(tirx::Bind(
           loaded, Call(loaded->dtype, simd_vld(),
-                       {addr2d(src, i32(row_idx), col), StringImm("NORM")})));
+                       {addr2d(src, i32(row_idx), col, /*rw_mask=*/1),
+                        StringImm("NORM")})));
       chunk_body.push_back(tirx::Bind(
           next_acc, Call(next_acc->dtype, element_op,
                          {acc, loaded, mask_var_, StringImm("MODE_ZEROING")})));
@@ -758,16 +765,17 @@ private:
     if (!clear) {
       Var old = MakeReg(dtype);
       Var merged = MakeReg(dtype);
-      chunk_body.push_back(
-          tirx::Bind(old, Call(old->dtype, simd_vld(),
-                               {addr1d(dst, col), StringImm("BRC_B32")})));
+      chunk_body.push_back(tirx::Bind(
+          old, Call(old->dtype, simd_vld(),
+                    {addr1d(dst, col, /*rw_mask=*/1), StringImm("BRC_B32")})));
       chunk_body.push_back(tirx::Bind(
           merged, Call(merged->dtype, element_op,
                        {acc, old, mask_var_, StringImm("MODE_ZEROING")})));
       acc = merged;
     }
-    chunk_body.push_back(Evaluate(Call(DataType::Void(), simd_vsts(),
-                                       {addr1d(dst, col), acc, mask_var_})));
+    chunk_body.push_back(
+        Evaluate(Call(DataType::Void(), simd_vsts(),
+                      {addr1d(dst, col, /*rw_mask=*/2), acc, mask_var_})));
 
     Stmt loop =
         For(chunk, i32(0), i32(nchunks), ForKind::kSerial, MakeSeq(chunk_body));

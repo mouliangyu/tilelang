@@ -1300,7 +1300,7 @@ public:
   static PrimFunc Substitute(PrimFunc f, bool skip_thread_partition = false) {
     arith::Analyzer analyzer;
     PrimFuncNode *fptr = f.CopyOnWrite();
-    fptr->body = ParallelLoopFuser::Fuse(f->body);
+    fptr->body = ParallelLoopFuserSkipSimdVF::Fuse(f->body);
     BufferUseDefCollector collector(skip_thread_partition);
     collector.Collect(f);
     auto result = collector.Run();

@@ -61,6 +61,10 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.Simplify()(mod)
     tilelang.ascend.analysis.VFChecker()(mod)
 
+    mod = tilelang.transform.LayoutReducer()(mod)
+    mod = tilelang.transform.LayoutInference()(mod)
+    LayoutVisual(mod)
+
     if allow_autoschedule(pass_ctx=pass_ctx):
         mod = ascend_transform.AnnotateMultiBufferEligible()(mod)
         mod = ascend_transform.IfConditionExtract()(mod)
@@ -69,10 +73,6 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.Simplify()(mod)
 
     mod = ascend_transform.AscendSimdVFLowerParallel()(mod)
-
-    mod = tilelang.transform.LayoutReducer()(mod)
-    mod = tilelang.transform.LayoutInference()(mod)
-    LayoutVisual(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
 
     mod = tilelang.transform.DecoupleTypeCast()(mod)

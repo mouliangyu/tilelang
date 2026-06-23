@@ -99,7 +99,7 @@ public:
     return substituter.VisitStmt(stmt);
   }
 
-private:
+protected:
   ParallelLoopFuser(arith::Analyzer *analyzer)
       : IRMutatorWithAnalyzer(analyzer) {};
 
@@ -243,6 +243,26 @@ private:
       }
     }
     return fused_for;
+  }
+};
+
+class ParallelLoopFuserSkipSimdVF : public ParallelLoopFuser {
+public:
+  static Stmt Fuse(const Stmt &stmt) {
+    arith::Analyzer analyzer;
+    ParallelLoopFuserSkipSimdVF substituter(&analyzer);
+    return substituter.VisitStmt(stmt);
+  }
+
+private:
+  ParallelLoopFuserSkipSimdVF(arith::Analyzer *analyzer)
+      : ParallelLoopFuser(analyzer) {}
+
+  Stmt VisitStmt_(const SBlockNode *op) final {
+    if (op->name_hint == "SIMD_VF") {
+      return GetRef<Stmt>(op);
+    }
+    return IRMutatorWithAnalyzer::VisitStmt_(op);
   }
 };
 
