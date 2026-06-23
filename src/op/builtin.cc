@@ -706,13 +706,15 @@ TIR_DEFINE_TL_BUILTIN(ascend_copy_gm_to_cbuf)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+// 9 args for a plain L1→L0 data load; optionally 13 args when an MX
+// scale-factor companion load is attached (see src/ascend/op/copy.cc).
 TIR_DEFINE_TL_BUILTIN(ascend_load_cbuf_to_ca)
-    .set_num_inputs(9)
+    .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TL_BUILTIN(ascend_load_cbuf_to_cb)
-    .set_num_inputs(9)
+    .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
@@ -742,6 +744,13 @@ TIR_DEFINE_TL_BUILTIN(ascend_copy_matrix_cc_to_gm)
                                Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TL_BUILTIN(ascend_mad)
+    .set_num_inputs(10)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+// L0 block-scaled MAD (MXFP8). Same args as ascend_mad; reads the per-block
+// scale factors from the L0A/L0B MX registers loaded beforehand.
+TIR_DEFINE_TL_BUILTIN(ascend_mad_mx)
     .set_num_inputs(10)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));

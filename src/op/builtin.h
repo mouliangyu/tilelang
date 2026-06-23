@@ -959,6 +959,13 @@ TVM_DLL const Op &ascend_copy_gm_to_cbuf();
  * ascend_load_cbuf_to_ca(dst, src, mStartPosition, kStartPosition,
  * mStep, kStep, srcStride, dstStride, transpose)
  *
+ * Optionally 16 args when an MX scale-factor companion load is attached; the
+ * extra args drive a following load_cbuf_to_ca_mx:
+ *   [9]  sf_ptr, [10] sf_x_start,
+ *   [11] sf_y_start (y is contiguous fractal direction),
+ *   [12] sf_x_step,
+ *   [13] sf_y_step,
+ *   [14] sf_src_stride, [15] sf_dst_stride.
  */
 TVM_DLL const Op &ascend_load_cbuf_to_ca();
 
@@ -968,6 +975,13 @@ TVM_DLL const Op &ascend_load_cbuf_to_ca();
  * ascend_load_cbuf_to_cb(dst, src, mStartPosition, kStartPosition,
  * mStep, kStep, srcStride, dstStride, transpose)
  *
+ * Optionally 16 args when an MX scale-factor companion load is attached; the
+ * extra args drive a following load_cbuf_to_ca_mx:
+ *   [9]  sf_ptr, [10] sf_x_start,
+ *   [11] sf_y_start (y is contiguous fractal direction),
+ *   [12] sf_x_step,
+ *   [13] sf_y_step,
+ *   [14] sf_src_stride, [15] sf_dst_stride.
  */
 TVM_DLL const Op &ascend_load_cbuf_to_cb();
 
@@ -1019,6 +1033,18 @@ TVM_DLL const Op &ascend_copy_matrix_cc_to_gm();
  *
  */
 TVM_DLL const Op &ascend_mad();
+
+/*!
+ * \brief Ascend Cube block-scaled MAD (MXFP8) instruction.
+ *
+ * ascend_mad_mx(dst, src_a, src_b, M, K, N, unit_flag_ctrl, gemv_ctrl,
+ * BTbuf_ctrl, zero_Cmatrix)
+ *
+ * Same arguments as ascend_mad. The per-block scale factors are read from the
+ * L0A/L0B MX scale registers that must be loaded beforehand (e.g. via
+ * T.copy(l1_data, l0, sf=l1_sf) which emits load_cbuf_to_ca_mx/cb_mx).
+ */
+TVM_DLL const Op &ascend_mad_mx();
 
 /*!
  * \brief Ascend GEMM with L1-scoped inputs (auto sub-K pipeline).

@@ -32,6 +32,11 @@ public:
   Buffer src, dst;                   // Source and destination buffers
   Array<Range> src_range, dst_range; // Ranges for each dimension in src and dst
   Optional<PrimExpr> dst_block;      // Destination block index for cluster copy
+  // Ascend MX scale-factor companion source (L1/cbuf) for an L1→L0 data copy.
+  // When set, the L1→L0A/L0B lowering also loads the per-block scale factors
+  // into the L0 MX scale registers (load_cbuf_to_ca_mx / load_cbuf_to_cb_mx).
+  Optional<Buffer> sf;
+  Array<Range> sf_range;              // Ranges for each dimension of `sf`.
   Map<String, ObjectRef> annotations; // Backend/pass-specific annotations.
   // Common SIMT annotation keys:
   //   - "coalesced_width": IntImm, width for coalesced memory access.
@@ -52,6 +57,8 @@ public:
         .def_ro("src_range", &CopyNode::src_range)
         .def_ro("dst_range", &CopyNode::dst_range)
         .def_ro("dst_block", &CopyNode::dst_block)
+        .def_ro("sf", &CopyNode::sf)
+        .def_ro("sf_range", &CopyNode::sf_range)
         .def_ro("annotations", &CopyNode::annotations);
   }
 

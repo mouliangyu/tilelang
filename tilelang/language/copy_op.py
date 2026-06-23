@@ -137,6 +137,7 @@ def copy(
     nd2nz: bool = False,
     l2_cache_ctrl: int | str | None = None,
     unit_flag_ctrl: int = 0,
+    scale: BufferLikeType | None = None,
 ) -> tirx.PrimExpr | tirx.Stmt:
     """Copy data between memory regions.
 
@@ -166,7 +167,15 @@ def copy(
             (bypass L2 to stream past), ``5`` / ``"notalloc_clean"`` (bypass L2 to
             avoid pollution). Defaults to None; Ascend UB→GM store paths use
             default 4, while load paths use default 0.
-             Ascend only; ignored on other backends.
+            Ascend only; ignored on other backends.
+        scale (Optional[BufferLikeType], keyword-only): Ascend MX scale-factor source
+            buffer (in L1/cbuf) for an L1→L0A/L0B copy. When provided, the copy
+            additionally loads the per-block scale factors into the L0 MX scale
+            registers via ``load_cbuf_to_ca_mx`` / ``load_cbuf_to_cb_mx`` so that a
+            subsequent ``mad_mx`` applies the scaling. K-offset / K-step are
+            auto-derived from the data slice (1 SF pair = 64 K-elements); the
+            NZ stride is taken from the scale buffer's second-to-last dimension.
+            Ascend L1→L0 only; ignored on other paths/backends. Defaults to None.
 
     Raises:
         TypeError: If copy extents cannot be deduced from arguments
@@ -240,6 +249,21 @@ def copy(
     if nd2nz_active:
         assert src_extent is not None and dst_extent is not None
         return _emit_nd2nz_seq(src, dst, src_orig, dst_orig, src_extent, dst_extent, ann)
+
+    # Ascend MX scale-factor companion load (L1→L0A/L0B). Pass the scale source
+    # as a third positional region so the backend can derive the scale L1 pointer
+    # and emit load_cbuf_to_ca_mx / load_cbuf_to_cb_mx alongside the data load.
+    if scale is not None:
+        scale_extent = get_extent(scale)
+        scale_region = to_buffer_region(scale, access_type="r", extents=scale_extent)
+        return tirx.call_intrin(
+            "handle",
+            tirx.op.Op.get("tl.tileop.copy"),
+            src,
+            dst,
+            scale_region,
+            annotations=ann if ann else None,
+        )
 
     return tirx.call_intrin("handle", tirx.op.Op.get("tl.tileop.copy"), src, dst, annotations=ann if ann else None)
 

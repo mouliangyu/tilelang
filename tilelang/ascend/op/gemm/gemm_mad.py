@@ -85,6 +85,8 @@ class GemmMAD(GemmBase):
             if self.is_blockscaled:
                 return self._lower_l1_blockscaled()
             return self._lower_l1()
+        if self.is_blockscaled:
+            return self._lower_l0_blockscaled()
         return self._lower_l0()
 
     def _is_l1_input(self):
@@ -134,6 +136,36 @@ class GemmMAD(GemmBase):
             T.evaluate(call)
 
         return _Simplify(_gemm_mad, inline_let=True)
+
+    def _lower_l0_blockscaled(self):
+        # L0 block-scaled MAD. The per-block scale factors must already have been
+        # loaded into the L0A/L0B MX scale registers (e.g. via
+        # T.copy(l1_data, l0, sf=l1_sf)); mad_mx then applies them. The call
+        # signature matches tl.ascend_mad — the scaling is implicit in the
+        # hardware MX registers, so no SF pointer is passed here.
+        c_ptr = _make_access_ptr(self.CRegion.buffer, self.CRegion, 2)
+        a_ptr = _make_access_ptr(self.ARegion.buffer, self.ARegion, 1)
+        b_ptr = _make_access_ptr(self.BRegion.buffer, self.BRegion, 1)
+        call = tirx.call_intrin(
+            "void",
+            tirx.op.Op.get("tl.ascend_mad_mx"),
+            c_ptr,
+            a_ptr,
+            b_ptr,
+            _to_int32(self.M),
+            _to_int32(self.K),
+            _to_int32(self.N),
+            _to_int32(self.unit_flag_ctrl),
+            _to_int32(0),  # gemv_ctrl
+            _to_int32(0),  # BTbuf_ctrl
+            self.clear_accum,
+        )
+
+        @T.prim_func
+        def _gemm_mad_mx() -> None:
+            T.evaluate(call)
+
+        return _Simplify(_gemm_mad_mx, inline_let=True)
 
     def _lower_l1(self):
         tile_k_sub = self._compute_tile_k_sub()

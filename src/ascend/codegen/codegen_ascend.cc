@@ -340,7 +340,8 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
           call->op.same_as(tl::ascend_blockscaled_gemm_l1())) {
         has_gemm_l1_ = true;
       }
-      if (call->op.same_as(tl::ascend_mad())) {
+      if (call->op.same_as(tl::ascend_mad()) ||
+          call->op.same_as(tl::ascend_mad_mx())) {
         has_gemm_l0_ = true;
       }
       if (call->op.same_as(tl::ascend_nd2nz_scatter()) ||
@@ -1134,11 +1135,16 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     if (op->args.size() >= 4 && op->args[3].as<StringImmNode>())
       this->stream << ", " << Downcast<StringImm>(op->args[3])->value;
     this->stream << ");\n";
-  } else if (op->op.same_as(tl::ascend_load_cbuf_to_ca())) {
-    ICHECK_EQ(op->args.size(), 9)
-        << "tl.ascend_load_cbuf_to_ca expects exactly 9 arguments";
+  } else if (op->op.same_as(tl::ascend_load_cbuf_to_ca()) ||
+             op->op.same_as(tl::ascend_load_cbuf_to_cb())) {
+    const bool is_ca = op->op.same_as(tl::ascend_load_cbuf_to_ca());
+    const char *fn = is_ca ? "load_cbuf_to_ca" : "load_cbuf_to_cb";
+    const char *fn_mx = is_ca ? "load_cbuf_to_ca_mx" : "load_cbuf_to_cb_mx";
+    // 9 args: plain data load. 16 args: data load + MX scale-factor companion.
+    ICHECK(op->args.size() == 9 || op->args.size() == 16)
+        << "tl." << fn << " expects 9 or 16 arguments, got " << op->args.size();
     this->PrintIndent();
-    this->stream << "load_cbuf_to_ca(";
+    this->stream << fn << "(";
     this->PrintExpr(op->args[0], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[1], this->stream);
@@ -1148,26 +1154,33 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
-    if (op->args.size() >= 4 && op->args[3].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[3])->value;
     this->stream << ");\n";
-  } else if (op->op.same_as(tl::ascend_load_cbuf_to_cb())) {
-    ICHECK_EQ(op->args.size(), 9)
-        << "tl.ascend_load_cbuf_to_cb expects exactly 9 arguments";
-    this->PrintIndent();
-    this->stream << "load_cbuf_to_cb(";
-    this->PrintExpr(op->args[0], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[1], this->stream);
-    this->stream << ", ";
-    for (int i = 2; i < 9; ++i) {
-      if (i > 2)
-        this->stream << ", ";
-      this->PrintExpr(op->args[i], this->stream);
+
+    if (op->args.size() == 16) {
+      // MX scale-factor companion load. The L0 destination address must be
+      // divided by kSFAddrDiv (16) per hardware requirement;
+      // SF args: [9] sf_ptr, [10] sf_k_start,
+      // [11] sf_x_start, [12] sf_x_step, [13] sf_y_step,
+      // [14] sf_src_stride, [15] sf_dst_stride.
+      this->PrintIndent();
+      this->stream << fn_mx << "((uint64_t)(uintptr_t)(";
+      this->PrintExpr(op->args[0], this->stream);
+      this->stream << ") / 16, ";
+      this->PrintExpr(op->args[9], this->stream);
+      this->stream << ", ";
+      this->PrintExpr(op->args[10], this->stream); // sf_x_start
+      this->stream << ", ";
+      this->PrintExpr(op->args[11], this->stream); // sf_y_start
+      this->stream << ", ";
+      this->PrintExpr(op->args[12], this->stream); // sf_x_step
+      this->stream << ", ";
+      this->PrintExpr(op->args[13], this->stream); // sf_y_step
+      this->stream << ", ";
+      this->PrintExpr(op->args[14], this->stream); // sf_src_stride
+      this->stream << ", ";
+      this->PrintExpr(op->args[15], this->stream); // sf_dst_stride
+      this->stream << ");\n";
     }
-    if (op->args.size() >= 4 && op->args[3].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[3])->value;
-    this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_matrix_cc_to_ub())) {
     ICHECK_EQ(op->args.size(), 26)
         << "tl.ascend_copy_matrix_cc_to_ub expects exactly 26 arguments";
@@ -1286,11 +1299,14 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[1], this->stream);
     this->stream << "), 0, " << burst_num << ", " << burst_len << ", "
                  << src_gap << ", " << dst_gap << ");\n";
-  } else if (op->op.same_as(tl::ascend_mad())) {
+  } else if (op->op.same_as(tl::ascend_mad()) ||
+             op->op.same_as(tl::ascend_mad_mx())) {
+    const bool is_mx = op->op.same_as(tl::ascend_mad_mx());
+    const char *fn = is_mx ? "mad_mx" : "mad";
     ICHECK_EQ(op->args.size(), 10)
-        << "tl.ascend_mad expects exactly 10 arguments";
+        << "tl." << fn << " expects exactly 10 arguments";
     this->PrintIndent();
-    this->stream << "mad(";
+    this->stream << fn << "(";
     this->PrintExpr(op->args[0], this->stream);
     this->stream << ", ";
     this->PrintExpr(op->args[1], this->stream);
@@ -1302,7 +1318,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         this->stream << ", ";
       this->PrintExpr(op->args[i], this->stream);
     }
-    if (op->args.size() >= 4 && op->args[3].as<StringImmNode>())
+    if (op->args[3].as<StringImmNode>())
       this->stream << ", " << Downcast<StringImm>(op->args[3])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_gemm_l1())) {

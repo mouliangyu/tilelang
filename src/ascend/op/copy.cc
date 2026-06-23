@@ -204,29 +204,75 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
                 {dst_ptr, src_ptr, sid, src_row_stride_bytes, l2_cache_ctrl,
                  n_value, d_value, zero, zero, transpose_flag, dst_n_value});
   } else if (dma_path == 3 || dma_path == 4) {
-    PrimExpr src_base_offset = make_const(DataType::Int(64), 0);
-    for (size_t i = 0; i + 1 < op.src_range.size(); ++i) {
-      PrimExpr stride = make_const(DataType::Int(64), 1);
-      for (size_t j = i + 1; j < op.src->shape.size(); ++j) {
-        stride = stride * op.src->shape[j];
-      }
-      src_base_offset = src_base_offset + op.src_range[i]->min * stride;
-    }
+    // M/K positions go through intrinsic args; leading dims (e.g. version)
+    // through the pointer offset.  MakeAccessPtrFromRegion splits offset/extent
+    // the same way: leading dims → offset, last two (M×K) → extent.
     PrimExpr src_base_ptr =
-        make_access_ptr(op.src, src_base_offset, total_elems, 1);
+        MakeAccessPtrFromRegion(BufferRegion(op.src, op.src_range), 1, false);
 
+    // M-direction fractal is always 16 rows; K-direction fractal C0 depends on
+    // the element size: C0 = 32 / elem_bytes (16 for bf16/fp16, 32 for fp8,
+    // 8 for fp32).
     PrimExpr c0 = I(16);
-    size_t dst_ndim = op.dst_range.size();
-    PrimExpr m_dim = dst_ndim >= 2 ? op.dst_range[dst_ndim - 2]->extent : I(1);
-    PrimExpr k_dim = op.dst_range[dst_ndim - 1]->extent;
-    PrimExpr k_start = op.src_range[op.src_range.size() - 1]->min;
+    PrimExpr c0_k = I(32 / elem_bytes);
+    size_t src_range_ndim = op.src_range.size();
+    size_t src_shape_ndim = op.src->shape.size();
+    PrimExpr m_dim =
+        src_range_ndim >= 2 ? op.src_range[src_range_ndim - 2]->extent : I(1);
+    PrimExpr k_dim =
+        src_range_ndim >= 2 ? op.src_range[src_range_ndim - 1]->extent : I(1);
+    PrimExpr m_start =
+        src_range_ndim >= 2 ? op.src_range[src_range_ndim - 2]->min / c0 : I(0);
+    PrimExpr k_start = src_range_ndim >= 2
+                           ? op.src_range[src_range_ndim - 1]->min / c0_k
+                           : I(0);
+    PrimExpr src_m_dim =
+        src_shape_ndim >= 2 ? op.src->shape[src_shape_ndim - 2] : I(1);
     PrimExpr m_step = m_dim / c0;
-    PrimExpr k_step = k_dim / c0;
+    PrimExpr k_step = k_dim / c0_k;
+    PrimExpr src_stride = src_m_dim / c0;
+    PrimExpr dst_stride = m_dim / c0;
+
     auto intrinsic =
         dma_path == 3 ? ascend_load_cbuf_to_ca() : ascend_load_cbuf_to_cb();
-    call = Call(DataType::Void(), intrinsic,
-                {dst_ptr, src_base_ptr, zero, k_start / c0, m_step, k_step,
-                 m_step, m_step, zero});
+    Array<PrimExpr> ld_args = {dst_ptr,    src_base_ptr, m_start,
+                               k_start,    m_step,       k_step,
+                               src_stride, dst_stride,   zero};
+
+    if (op.sf.defined()) {
+      const Buffer &sf_buf = op.sf.value();
+      const int sf_range_ndim = static_cast<int>(op.sf_range.size());
+      const int sf_shape_ndim = static_cast<int>(sf_buf->shape.size());
+      // SF buffer layout is (..., K-pairs, M): K-pairs is the second-to-last
+      // dim, M is the last. All positions are derived from the SF region itself
+      // (independent of the data copy), and the M/K start positions flow
+      // through the load_cbuf_to_ca_mx intrinsic parameters rather than the
+      // pointer.
+      const int sf_k_dim = sf_range_ndim >= 2 ? sf_range_ndim - 2 : -1;
+      const int sf_m_dim = sf_range_ndim - 1;
+
+      // SF pointer: M/K positions go through intrinsic args; leading dims
+      // (e.g. pipeline version) go through the pointer offset.
+      PrimExpr sf_ptr =
+          MakeAccessPtrFromRegion(BufferRegion(sf_buf, op.sf_range), 1, false);
+      PrimExpr sf_m_start = op.sf_range[sf_m_dim]->min / c0;
+      PrimExpr sf_m_step = op.sf_range[sf_m_dim]->extent / c0;
+      PrimExpr sf_k_start = sf_k_dim >= 0 ? op.sf_range[sf_k_dim]->min : I(0);
+      PrimExpr sf_k_step = sf_k_dim >= 0 ? op.sf_range[sf_k_dim]->extent : I(1);
+      PrimExpr sf_src_stride =
+          sf_shape_ndim >= 2 ? sf_buf->shape[sf_shape_ndim - 2] : I(1);
+      PrimExpr sf_dst_stride =
+          sf_k_dim >= 0 ? op.sf_range[sf_k_dim]->extent : I(1);
+
+      ld_args.push_back(sf_ptr);        // [9]  sf_ptr
+      ld_args.push_back(sf_m_start);    // [10] sf_x_start
+      ld_args.push_back(sf_k_start);    // [11] sf_y_start
+      ld_args.push_back(sf_m_step);     // [12] sf_x_step
+      ld_args.push_back(sf_k_step);     // [13] sf_y_step
+      ld_args.push_back(sf_src_stride); // [14] sf_src_stride
+      ld_args.push_back(sf_dst_stride); // [15] sf_dst_stride
+    }
+    call = Call(DataType::Void(), intrinsic, ld_args);
   } else if (dma_path == 5) {
     PrimExpr dual_dst_ctl_val = I(op.GetDualDstCtl());
     PrimExpr unit_flag_ctl_val = I(op.GetUnitFlagCtl());
