@@ -103,6 +103,7 @@ private:
   void Update(std::vector<Buffer> *buffers,
               std::vector<std::vector<arith::IntSet>> *regions, Buffer buffer,
               std::vector<arith::IntSet> region) {
+    UpdateReadVar(buffer->data);
     // Check if buffer already exists
     for (size_t i = 0; i < buffers->size(); ++i) {
       if ((*buffers)[i].same_as(buffer)) {

@@ -57,10 +57,8 @@ restore_harness() {
 
 # ---- Save current state ----
 if [[ -n "$(git status --porcelain)" ]]; then
-    echo "WARNING: uncommitted changes detected; they will be stashed."
-    read -p "Continue? [y/N] " -n 1 -r
-    echo
-    [[ $REPLY =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
+    echo "Uncommitted changes detected; stashing them:"
+    git status --porcelain
     STASHED=1
     git stash push -u -m "perf_regression_ascend_temp_stash"
 else

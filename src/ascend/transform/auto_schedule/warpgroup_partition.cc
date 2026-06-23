@@ -124,6 +124,46 @@ static Stmt RenameLetStmtVars(Stmt stmt, const std::string &suffix) {
   return LetStmtVarRenamer(suffix).Rename(std::move(stmt));
 }
 
+// Like tirx::Substitute, but also remaps a buffer's backing `data` var at
+// *use* sites. The generic IRSubstitute only rewrites buffer->data at
+// definition sites (VisitBufferDef); a buffer produced by T.make_tensor is
+// backed by a LetStmt-bound var and only appears as a use inside the scheduled
+// region (e.g. the regions of a T.copy), so renaming that let var via the
+// generic Substitute leaves the buffer pointing at the old, now-undefined var.
+class LetVarSubstituter : public StmtExprMutator {
+public:
+  explicit LetVarSubstituter(const Map<Var, PrimExpr> &vmap) : vmap_(vmap) {}
+
+  PrimExpr VisitExpr_(const VarNode *op) final {
+    auto it = vmap_.find(GetRef<Var>(op));
+    return it != vmap_.end() ? (*it).second : StmtExprMutator::VisitExpr_(op);
+  }
+
+  Buffer VisitBufferUse(const Buffer &buffer) final {
+    auto it = buffer_remap_.find(buffer);
+    if (it != buffer_remap_.end())
+      return (*it).second;
+    auto vit = vmap_.find(buffer->data);
+    if (vit == vmap_.end())
+      return buffer;
+    Buffer new_buf = buffer;
+    new_buf.CopyOnWrite()->data = Downcast<Var>((*vit).second);
+    buffer_remap_[buffer] = new_buf;
+    return new_buf;
+  }
+
+private:
+  const Map<Var, PrimExpr> &vmap_;
+  std::unordered_map<Buffer, Buffer, ObjectPtrHash, ObjectPtrEqual>
+      buffer_remap_;
+};
+
+static Stmt SubstituteLetVars(Stmt stmt, const Map<Var, PrimExpr> &vmap) {
+  if (vmap.empty())
+    return stmt;
+  return LetVarSubstituter(vmap)(std::move(stmt));
+}
+
 bool IsLetDeclTask(const TaskNode *task) {
   return task->stmts.size() == 1 && task->stmts[0].as<BindNode>() != nullptr;
 }
@@ -207,7 +247,7 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
     if (!var_remap.empty()) {
       auto ct = static_cast<TaskNode *>(cloned.get());
       for (size_t i = 0; i < ct->stmts.size(); ++i) {
-        ct->stmts[i] = Substitute(ct->stmts[i], var_remap);
+        ct->stmts[i] = SubstituteLetVars(ct->stmts[i], var_remap);
       }
     }
     return cloned;
@@ -254,7 +294,8 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
           std::static_pointer_cast<TaskNode>(ctrl->task->Clone());
       if (!var_remap.empty()) {
         for (size_t i = 0; i < cloned_task->stmts.size(); ++i) {
-          cloned_task->stmts[i] = Substitute(cloned_task->stmts[i], var_remap);
+          cloned_task->stmts[i] =
+              SubstituteLetVars(cloned_task->stmts[i], var_remap);
         }
       }
       new_ctrl->task = std::move(cloned_task);
@@ -296,10 +337,10 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
       // Substitute renamed LetDecl variables in before/after stmts
       if (!var_remap.empty()) {
         for (auto &s : new_unit->before[warpgroup_id]) {
-          s = Substitute(s, var_remap);
+          s = SubstituteLetVars(s, var_remap);
         }
         for (auto &s : new_unit->after[warpgroup_id]) {
-          s = Substitute(s, var_remap);
+          s = SubstituteLetVars(s, var_remap);
         }
       }
     }
@@ -317,7 +358,8 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
           std::static_pointer_cast<TaskNode>(if_node->task->Clone());
       if (!var_remap.empty()) {
         for (size_t i = 0; i < cloned_task->stmts.size(); ++i) {
-          cloned_task->stmts[i] = Substitute(cloned_task->stmts[i], var_remap);
+          cloned_task->stmts[i] =
+              SubstituteLetVars(cloned_task->stmts[i], var_remap);
         }
       }
       new_if->task = std::move(cloned_task);

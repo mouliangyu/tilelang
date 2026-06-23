@@ -2358,6 +2358,54 @@ void CodeGenTileLangAscend::VisitStmt_(const BindNode *op) {
     stream << ";\n";
     return;
   }
+
+  // A handle var bound by a LetStmt (e.g. the pointer materialized by
+  // T.make_tensor: `src = reinterpret(handle, src_ptrs[0])`) carries its
+  // element type and storage scope in `type_annotation`, but the base
+  // CodeGenC::VisitStmt_ only inspects the scalar DataType (always "handle")
+  // and emits a scope-less `void*`. That loses the `__gm__`/`__ubuf__`
+  // qualifier and the element type, so later casts to `__gm__ T*` are rejected
+  // by bisheng. Read the PointerType directly and emit the qualified pointer.
+  if (op->var.dtype().is_handle()) {
+    if (const auto *ptr = op->var->type_annotation.as<PointerTypeNode>()) {
+      if (const auto *prim = ptr->element_type.as<PrimTypeNode>()) {
+        std::string scope = GetPtrStorageScope(op->var);
+        // Scoped pointer type, e.g. "__gm__ float *".
+        std::ostringstream type_os;
+        PrintStorageScope(scope, type_os);
+        PrintType(prim->dtype, type_os);
+        type_os << " *";
+        std::string ptr_type = type_os.str();
+
+        // A reinterpret from an integer address (the make_tensor case) is
+        // emitted by the base codegen as a `void*` bit-cast, which bisheng
+        // refuses to convert to a scoped pointer. Emit the bit-cast directly
+        // against the scoped pointer type so no `void*` intermediate appears.
+        const auto *call = op->value.as<CallNode>();
+        if (call && call->op.same_as(builtin::reinterpret()) &&
+            !call->args[0]->dtype.is_handle()) {
+          std::string rhs =
+              SSAGetID(PrintExpr(call->args[0]), call->args[0]->dtype);
+          std::string vid = AllocVarID(op->var.get());
+          PrintIndent();
+          stream << ptr_type << vid << " = (*(" << ptr_type << " *)(&(" << rhs
+                 << ")));\n";
+        } else {
+          // Emit the value first: PrintExpr may spill helper temporaries into
+          // the stream, which must land before the declaration rather than
+          // inside its initializer.
+          std::string value = PrintExpr(op->value);
+          std::string vid = AllocVarID(op->var.get());
+          PrintIndent();
+          stream << ptr_type << vid << " = (" << ptr_type << ")" << value
+                 << ";\n";
+        }
+        alloc_storage_scope_[op->var.get()] = scope;
+        RegisterHandleType(op->var.get(), prim->dtype);
+        return;
+      }
+    }
+  }
   CodeGenC::VisitStmt_(op);
 }
 
