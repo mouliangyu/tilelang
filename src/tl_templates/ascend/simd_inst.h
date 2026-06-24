@@ -63,6 +63,14 @@ template <> struct vec<int8_t> {
   using type = vector_s8;
 };
 
+template <> struct vec<int64_t> {
+  using type = vector_s64;
+};
+
+template <> struct vec<uint64_t> {
+  using type = vector_u64;
+};
+
 template <typename SrcVec> struct vec_pair {
   SrcVec v0;
   SrcVec v1;
