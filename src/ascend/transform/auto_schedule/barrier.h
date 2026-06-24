@@ -443,6 +443,20 @@ static TaskNode *GetInnerTask(ScheduleUnit *unit) {
   }
 }
 
+// Whether a same-unit (prod_unit == cons_unit) self-dependency can be skipped.
+// A self-dependency can be skipped only in two provably-safe shapes:
+//   (a) the unit uses ONLY the Cube (M) pipe, including the L1-gemm.
+//   (b) the unit's child is directly a For loop without a loop break.
+// Any other shape may carry a real dependency.
+static bool CanSkipSelfDependency(ScheduleUnit *unit) {
+  if (unit->UsesOnlyPipe(ResourcePipe::kCube))
+    return true;
+  if (unit->child && unit->child->IsControl() &&
+      !unit->child->ContainsLoopBreak())
+    return true;
+  return false;
+}
+
 // Check if a TaskNode's operation has unit_flag_ctl/ctrl != 0.
 static bool HasUnitFlagCtrl(const TaskNode *task) {
   if (!task || task->stmts.size() != 1)
@@ -628,7 +642,7 @@ CollectSyncPoints(const std::vector<ScheduleUnit *> &units, int num_wgs,
   };
 
   for (const auto &dep : deps) {
-    if (IsLocalBuffer(dep.buffer, true))
+    if (IsLocalBuffer(dep.buffer, true) || IsFragmentBuffer(dep.buffer))
       continue;
 
     // Bucket producer / consumer access points by warpgroup.
@@ -679,7 +693,7 @@ CollectSyncPoints(const std::vector<ScheduleUnit *> &units, int num_wgs,
         auto [cons_unit, cons_wg] = cons_unit_info;
         if (dep_list.empty())
           continue;
-        if (prod_unit == cons_unit)
+        if (prod_unit == cons_unit && CanSkipSelfDependency(prod_unit))
           continue;
 
         // Keep only the dependencies at the minimum distance (same-iter wins
@@ -926,6 +940,22 @@ OptimizeSyncPoints(const std::vector<SyncPoint> &raw_sync_points) {
       if (ab.cons_unit != bc.prod_unit || ab.cons_pipe != bc.prod_pipe ||
           ab.cons_wg != bc.prod_wg)
         continue;
+      // ...and B's consume-of-A must be at-or-before B's produce-for-C on that
+      // shared in-order pipe.
+      // TODO: this is conservative — it only handles the same-pipe-in-B case.
+      // When ab.cons and bc.prod are on *different* pipes in B but B internally
+      // synchronizes them, the chain is still valid; detecting that needs
+      // looking inside B and is deferred.
+      {
+        UnitChain ab_cons =
+            ChainForSync(ab, ab.cons_insertion_unit, /*is_producer=*/false);
+        UnitChain bc_prod =
+            ChainForSync(bc, bc.prod_insertion_unit, /*is_producer=*/true);
+        if (ab_cons.empty() || bc_prod.empty())
+          continue;
+        if (CompareChainPos(ab_cons, bc_prod, /*at_beginning=*/false) > 0)
+          continue;
+      }
       // Synthetic edge: producer side from ab, consumer side from bc, distances
       // summed.
       SyncPoint chain = ab;
@@ -1084,18 +1114,8 @@ AnalyzeSequenceNodeBarriers(SequenceNode *seq, EventIdMap &event_id_map,
   for (auto &child : seq->children) {
     auto unit = static_cast<ScheduleUnit *>(child.get());
     units.push_back(unit);
-    if (GetInnerTask(unit) != nullptr) {
-      // We will handle these units specially in
-      // CollectSyncPoints/InsertSyncPoints, so we skip it here.
-      continue;
-    }
-    if (unit->child->IsSequence() || unit->child->IsControl() ||
-        unit->child->IsIf()) {
-      // If child is SequenceNode, ControlNode, or IfNode, recursively analyze
-      // it
-      AnalyzeAndInsertBarriers(unit->child.get(), event_id_map, flag_infos, sid,
-                               loop_info, buffer_infos);
-    }
+    AnalyzeAndInsertBarriers(unit->child.get(), event_id_map, flag_infos, sid,
+                             loop_info, buffer_infos);
   }
 
   // Analyze dependencies with the shared AnalyzeDependencies, no enclosing
@@ -1128,18 +1148,8 @@ AnalyzeControlNodeBarriers(ControlNode *ctrl, EventIdMap &event_id_map,
   for (auto &child : seq->children) {
     auto unit = static_cast<ScheduleUnit *>(child.get());
     units.push_back(unit);
-    if (GetInnerTask(unit) != nullptr) {
-      // We will handle these units specially in
-      // CollectSyncPoints/InsertSyncPoints, so we skip it here.
-      continue;
-    }
-    if (unit->child->IsSequence() || unit->child->IsControl() ||
-        unit->child->IsIf()) {
-      // If child is SequenceNode, ControlNode, or IfNode, recursively analyze
-      // it
-      AnalyzeAndInsertBarriers(unit->child.get(), event_id_map, flag_infos, sid,
-                               loop_info, buffer_infos);
-    }
+    AnalyzeAndInsertBarriers(unit->child.get(), event_id_map, flag_infos, sid,
+                             loop_info, buffer_infos);
   }
 
   // Sort units by stage (largest first) to match SW-pipelining order — the

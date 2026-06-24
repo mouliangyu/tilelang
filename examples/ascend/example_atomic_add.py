@@ -46,7 +46,7 @@ if __name__ == "__main__":
     print("=== float32 GM atomic_add ===")
     num_blocks, threads = 8, 256
     program = atomic_add_gm_float(1, num_blocks, threads)
-    kernel = tilelang.compile(program, out_idx=-1)
+    kernel = tilelang.compile(program)
     print(kernel.get_kernel_source())
 
     counter = torch.zeros(1, dtype=torch.float32, device=device)
@@ -60,7 +60,7 @@ if __name__ == "__main__":
 
     # Benchmark
     print("\n=== Benchmark ===")
-    bench_kernel = tilelang.compile(atomic_add_gm_float(1, 64, 2048), out_idx=-1)
+    bench_kernel = tilelang.compile(atomic_add_gm_float(1, 64, 2048))
     counter = torch.zeros(1, dtype=torch.float32, device=device)
 
     def run():
