@@ -118,6 +118,14 @@ struct MultiVersionBufferInfo {
 // Synchronization point types
 enum class SyncType { CrossCore, IntraCore };
 
+// Synchronization insertion site information
+struct SyncInsertionSite {
+  ScheduleUnit *unit;
+  PrimExpr guard;
+  bool at_beginning;
+  std::vector<std::pair<const SequenceNode *, const ScheduleUnit *>> chain;
+};
+
 // Describes a synchronization point between two ScheduleUnits.
 // Collected during analysis and inserted in a separate pass so that
 // future optimizations can inspect, deduplicate, or eliminate sync points.
@@ -125,18 +133,15 @@ struct SyncPoint {
   SyncType type;
   ScheduleUnit *prod_unit;
   int prod_wg;
-  ScheduleUnit *prod_insertion_unit;
-  PrimExpr prod_guard;
+  SyncInsertionSite prod_site;
+  std::string prod_pipe;
   ScheduleUnit *cons_unit;
   int cons_wg;
-  ScheduleUnit *cons_insertion_unit;
-  PrimExpr cons_guard;
+  SyncInsertionSite cons_site;
+  std::string cons_pipe;
   int distance;
   int num_versions;
-  std::vector<DepInfo> deps;
   std::string hard_event;
-  std::string prod_pipe;
-  std::string cons_pipe;
   // CrossCore-specific
   int mode_id;
 };
@@ -544,14 +549,14 @@ static std::string GetHardEvent(const TaskNode *producer,
   return event;
 }
 
-using InsertionSite = std::pair<ScheduleUnit *, PrimExpr>;
-
-static std::vector<InsertionSite>
-CollectInsertCandidates(const BufferAccessPoint &pt, bool at_beginning) {
-  const auto &path = pt.path;
-  std::vector<InsertionSite> candidates;
+static SyncInsertionSite
+GetInsertionSite(const std::set<BufferAccessPoint> &pts, bool at_beginning) {
+  SyncInsertionSite site = {nullptr, PrimExpr(), at_beginning, {}};
+  if (pts.empty()) {
+    LOG(FATAL) << "No access points provided for insertion site.";
+    return site;
+  }
   PrimExpr accumulated_guard;
-
   auto append_guard = [&](PrimExpr term) {
     if (!accumulated_guard.defined()) {
       accumulated_guard = term;
@@ -559,19 +564,33 @@ CollectInsertCandidates(const BufferAccessPoint &pt, bool at_beginning) {
       accumulated_guard = accumulated_guard && term;
     }
   };
-
-  for (auto node : path) {
+  const SequenceNode *parent = nullptr;
+  for (size_t idx = 0; idx < pts.begin()->path.size(); ++idx) {
+    const auto &node = pts.begin()->path[idx];
+    bool all_match = true;
+    for (const auto &pt : pts) {
+      if (idx >= pt.path.size() || pt.path[idx] != node) {
+        all_match = false;
+        break;
+      }
+    }
+    if (!all_match) {
+      break;
+    }
     if (node->IsScheduleUnit()) {
-      candidates.emplace_back(
-          const_cast<ScheduleUnit *>(static_cast<const ScheduleUnit *>(node)),
-          accumulated_guard);
+      site.unit =
+          const_cast<ScheduleUnit *>(static_cast<const ScheduleUnit *>(node));
+      site.guard = accumulated_guard;
+      site.chain.emplace_back(parent, site.unit);
     } else if (node->IsIf()) {
-      return candidates;
+      break;
+    } else if (node->IsSequence()) {
+      parent = static_cast<const SequenceNode *>(node);
     } else if (node->IsControl()) {
       const ControlNode *ctrl = static_cast<const ControlNode *>(node);
       const ForNode *for_node = ctrl->control.get();
       if (ctrl->child->ContainsLoopBreak()) {
-        return candidates;
+        break;
       }
       PrimExpr loop_var = for_node->loop_var;
       PrimExpr min = for_node->min;
@@ -587,34 +606,10 @@ CollectInsertCandidates(const BufferAccessPoint &pt, bool at_beginning) {
       append_guard(term);
     }
   }
-  return candidates;
-}
-
-static InsertionSite
-CommonInsertionSite(const std::vector<std::vector<InsertionSite>> &chains) {
-  if (chains.empty()) {
-    return {nullptr, PrimExpr()};
+  if (!site.unit) {
+    LOG(FATAL) << "Failed to find insertion ScheduleUnit for access points.";
   }
-  size_t max_common = chains[0].size();
-  for (const auto &c : chains) {
-    max_common = std::min(max_common, c.size());
-  }
-  size_t common = 0;
-  for (size_t i = 0; i < max_common; ++i) {
-    ScheduleUnit *u = chains[0][i].first;
-    bool all_match = true;
-    for (const auto &c : chains) {
-      if (c[i].first != u) {
-        all_match = false;
-        break;
-      }
-    }
-    if (!all_match)
-      break;
-    common = i + 1;
-  }
-  ICHECK_GT(common, 0u);
-  return chains[0][common - 1];
+  return site;
 }
 
 static std::vector<SyncPoint>
@@ -679,10 +674,6 @@ CollectSyncPoints(const std::vector<ScheduleUnit *> &units, int num_wgs,
     return it != buffer_num_versions.end() ? static_cast<int>(it->second) : 1;
   };
 
-  auto get_distance = [&](const DepInfo &d) -> int {
-    return d.cross_iter ? get_versions(d.buffer) : 0;
-  };
-
   for (auto prod_unit : units) {
     for (int prod_wg = 0; prod_wg < 2; ++prod_wg) {
       auto sync_it = sync_infos.find({prod_unit, prod_wg});
@@ -696,94 +687,43 @@ CollectSyncPoints(const std::vector<ScheduleUnit *> &units, int num_wgs,
         if (prod_unit == cons_unit && CanSkipSelfDependency(prod_unit))
           continue;
 
-        // Keep only the dependencies at the minimum distance (same-iter wins
-        // over the loop back-edge when both are present).
-        int distance = std::numeric_limits<int>::max();
-        for (const auto &d : dep_list) {
-          distance = std::min(distance, get_distance(d));
-        }
-        std::vector<DepInfo> kept_deps;
-        for (const auto &d : dep_list) {
-          if (get_distance(d) == distance)
-            kept_deps.push_back(d);
-        }
-
-        // Bucket the producer/consumer access points by the hardware event
-        // (PRODPIPE_CONSPIPE) of each (producer, consumer) pair, so that each
-        // distinct event gets its own, properly scoped sync point instead of a
-        // single coarse PIPE_ALL barrier.
+        // Bucket the producer/consumer access points by distance and the
+        // hardware event (PRODPIPE_CONSPIPE) of each (producer, consumer) pair.
         struct EventPts {
           std::set<BufferAccessPoint> ppts;
           std::set<BufferAccessPoint> cpts;
           int num_versions = 1;
         };
-        std::map<std::string, EventPts> by_event;
-        for (const auto &d : kept_deps) {
-          int d_versions = get_versions(d.buffer);
+        std::map<std::pair<int, std::string>, EventPts> by_distance_event;
+        for (const auto &d : dep_list) {
+          int num_versions = get_versions(d.buffer);
+          int distance = d.cross_iter ? num_versions : 0;
           for (const auto &ppt : d.producer_pts) {
             for (const auto &cpt : d.consumer_pts) {
               std::string event = GetHardEvent(ppt.task(), cpt.task());
-              auto &ev = by_event[event];
+              auto &ev = by_distance_event[{distance, event}];
               ev.ppts.insert(ppt);
               ev.cpts.insert(cpt);
-              ev.num_versions = std::max(ev.num_versions, d_versions);
+              ev.num_versions = std::max(ev.num_versions, num_versions);
             }
           }
         }
 
-        const DepInfo &rep_dep = kept_deps.front();
-        for (const auto &[hard_event, pts] : by_event) {
+        for (const auto &[distance_event, pts] : by_distance_event) {
+          const auto &[distance, hard_event] = distance_event;
           int num_versions = pts.num_versions;
-          std::vector<std::vector<InsertionSite>> prod_chains;
-          std::vector<std::vector<InsertionSite>> cons_chains;
-          for (const auto &ppt : pts.ppts) {
-            prod_chains.push_back(CollectInsertCandidates(ppt, false));
-          }
-          for (const auto &cpt : pts.cpts) {
-            cons_chains.push_back(CollectInsertCandidates(cpt, true));
-          }
-          InsertionSite prod_site = CommonInsertionSite(prod_chains);
-          InsertionSite cons_site = CommonInsertionSite(cons_chains);
-          ICHECK(prod_site.first != nullptr);
-          ICHECK(cons_site.first != nullptr);
-
+          auto prod_site = GetInsertionSite(pts.ppts, false);
+          auto cons_site = GetInsertionSite(pts.cpts, true);
           size_t pos = hard_event.find('_');
           std::string prod_pipe = "PIPE_" + hard_event.substr(0, pos);
           std::string cons_pipe = "PIPE_" + hard_event.substr(pos + 1);
-
-          // Per-event deps so the downstream transitive reduction
-          // (OptimizeSyncPoints / SyncDominates / ChainForSync) reads access
-          // points consistent with this event's insertion units.
-          DepInfo ev_dep;
-          ev_dep.prod_unit = rep_dep.prod_unit;
-          ev_dep.cons_unit = rep_dep.cons_unit;
-          ev_dep.buffer = rep_dep.buffer;
-          ev_dep.producer_pts.assign(pts.ppts.begin(), pts.ppts.end());
-          ev_dep.consumer_pts.assign(pts.cpts.begin(), pts.cpts.end());
-          ev_dep.cross_iter = rep_dep.cross_iter;
-          ev_dep.latency = rep_dep.latency;
-          std::vector<DepInfo> ev_deps = {ev_dep};
-
-          if (prod_wg != cons_wg) {
-            int mode_id = 4;
-
-            sync_points.push_back({SyncType::CrossCore, prod_unit, prod_wg,
-                                   prod_site.first, prod_site.second, cons_unit,
-                                   cons_wg, cons_site.first, cons_site.second,
-                                   distance, num_versions, ev_deps, hard_event,
-                                   prod_pipe, cons_pipe, mode_id});
-            continue;
-          }
-
-          // Intra-core sync: use ascend_set_flag / wait_flag.
-          // prod_pipe/cons_pipe are filled (same PIPE_ encoding as cross-core)
-          // so grouping and the transitive reduction can treat both sync types
-          // uniformly.
-          sync_points.push_back({SyncType::IntraCore, prod_unit, prod_wg,
-                                 prod_site.first, prod_site.second, cons_unit,
-                                 cons_wg, cons_site.first, cons_site.second,
-                                 distance, num_versions, ev_deps, hard_event,
-                                 prod_pipe, cons_pipe});
+          SyncType sync_type =
+              (prod_wg == cons_wg) ? SyncType::IntraCore : SyncType::CrossCore;
+          int mode_id = 4; // Default mode for cross-core syncs
+          sync_points.push_back({sync_type, prod_unit, prod_wg, prod_site,
+                                 prod_pipe, cons_unit, cons_wg, cons_site,
+                                 cons_pipe, distance, num_versions, hard_event,
+                                 mode_id});
         }
       }
     }
@@ -791,31 +731,8 @@ CollectSyncPoints(const std::vector<ScheduleUnit *> &units, int num_wgs,
   return sync_points;
 }
 
-using UnitChain =
-    std::vector<std::pair<const SequenceNode *, const ScheduleUnit *>>;
-
-static UnitChain
-BuildChainFromPath(const std::vector<const IRStructure *> &path,
-                   const ScheduleUnit *target_unit) {
-  UnitChain out;
-  const SequenceNode *cur_parent = nullptr;
-  for (const IRStructure *node : path) {
-    if (!node)
-      continue;
-    if (node->IsSequence()) {
-      cur_parent = static_cast<const SequenceNode *>(node);
-    } else if (node->IsScheduleUnit()) {
-      const ScheduleUnit *u = static_cast<const ScheduleUnit *>(node);
-      out.emplace_back(cur_parent, u);
-      if (u == target_unit)
-        break;
-    }
-  }
-  return out;
-}
-
-static int CompareChainPos(const UnitChain &a, const UnitChain &b,
-                           bool at_beginning) {
+static int CompareInsertionSites(const SyncInsertionSite &a_site,
+                                 const SyncInsertionSite &b_site) {
   auto get_idx =
       [](std::pair<const SequenceNode *, const ScheduleUnit *> p) -> size_t {
     const SequenceNode *parent = p.first;
@@ -827,6 +744,8 @@ static int CompareChainPos(const UnitChain &a, const UnitChain &b,
     LOG(FATAL) << "Child not found in parent";
     return 0;
   };
+  const auto &a = a_site.chain;
+  const auto &b = b_site.chain;
   size_t n = std::min(a.size(), b.size());
   for (size_t i = 0; i < n; ++i) {
     if (a[i].first != b[i].first) {
@@ -842,45 +761,26 @@ static int CompareChainPos(const UnitChain &a, const UnitChain &b,
   }
   if (a.size() == b.size())
     return 0;
-  if (at_beginning) {
-    return a.size() < b.size() ? -1 : +1;
+  if (a.size() < b.size()) {
+    return a_site.at_beginning ? -1 : +1;
   } else {
-    return a.size() < b.size() ? +1 : -1;
+    return b_site.at_beginning ? +1 : -1;
   }
-}
-
-static UnitChain ChainForSync(const SyncPoint &sp, const ScheduleUnit *unit,
-                              bool is_producer) {
-  if (sp.deps.empty() || unit == nullptr)
-    return {};
-  const DepInfo &rep = sp.deps.front();
-  const auto &pts = is_producer ? rep.producer_pts : rep.consumer_pts;
-  if (pts.empty())
-    return {};
-  return BuildChainFromPath(pts.front().path, unit);
 }
 
 static bool SyncDominates(const SyncPoint &x, const SyncPoint &y) {
   if (x.type != y.type)
     return false;
-  if (x.type != SyncType::CrossCore && x.type != SyncType::IntraCore)
-    return false;
   if (x.prod_pipe != y.prod_pipe || x.cons_pipe != y.cons_pipe ||
       x.prod_wg != y.prod_wg || x.cons_wg != y.cons_wg)
-    return false;
-  UnitChain xp = ChainForSync(x, x.prod_insertion_unit, true);
-  UnitChain xc = ChainForSync(x, x.cons_insertion_unit, false);
-  UnitChain yp = ChainForSync(y, y.prod_insertion_unit, true);
-  UnitChain yc = ChainForSync(y, y.cons_insertion_unit, false);
-  if (xp.empty() || xc.empty() || yp.empty() || yc.empty())
     return false;
   int D = y.distance - x.distance;
   if (D < 0)
     return false;
   if (D >= 2)
     return true;
-  bool c0 = CompareChainPos(xp, yp, false) >= 0;
-  bool cD = CompareChainPos(xc, yc, true) <= 0;
+  bool c0 = CompareInsertionSites(x.prod_site, y.prod_site) >= 0;
+  bool cD = CompareInsertionSites(x.cons_site, y.cons_site) <= 0;
   if (D == 1)
     return c0 || cD;
   return c0 && cD;
@@ -929,46 +829,31 @@ OptimizeSyncPoints(const std::vector<SyncPoint> &raw_sync_points) {
   // Cross-pipe transitive reduction
   for (size_t i = 0; i < sync_points.size(); ++i) {
     const auto &ab = sync_points[i];
-    if (ab.type != SyncType::IntraCore && ab.type != SyncType::CrossCore)
-      continue;
     for (size_t j = 0; j < sync_points.size(); ++j) {
       const auto &bc = sync_points[j];
-      if (bc.type != SyncType::IntraCore && bc.type != SyncType::CrossCore)
-        continue;
       // ab and bc must compose at the intermediate unit: same unit, same
-      // in-order pipe + warpgroup.
-      if (ab.cons_unit != bc.prod_unit || ab.cons_pipe != bc.prod_pipe ||
-          ab.cons_wg != bc.prod_wg)
-        continue;
-      // ...and B's consume-of-A must be at-or-before B's produce-for-C on that
-      // shared in-order pipe.
+      // in-order pipe + warpgroup, and B's consume-of-A must be at-or-before
+      // B's produce-for-C on that shared in-order pipe.
       // TODO: this is conservative — it only handles the same-pipe-in-B case.
       // When ab.cons and bc.prod are on *different* pipes in B but B internally
       // synchronizes them, the chain is still valid; detecting that needs
       // looking inside B and is deferred.
-      {
-        UnitChain ab_cons =
-            ChainForSync(ab, ab.cons_insertion_unit, /*is_producer=*/false);
-        UnitChain bc_prod =
-            ChainForSync(bc, bc.prod_insertion_unit, /*is_producer=*/true);
-        if (ab_cons.empty() || bc_prod.empty())
-          continue;
-        if (CompareChainPos(ab_cons, bc_prod, /*at_beginning=*/false) > 0)
-          continue;
-      }
+      if (ab.cons_unit != bc.prod_unit || ab.cons_pipe != bc.prod_pipe ||
+          ab.cons_wg != bc.prod_wg ||
+          CompareInsertionSites(ab.cons_site, bc.prod_site) > 0)
+        continue;
       // Synthetic edge: producer side from ab, consumer side from bc, distances
       // summed.
       SyncPoint chain = ab;
       chain.cons_unit = bc.cons_unit;
-      chain.cons_insertion_unit = bc.cons_insertion_unit;
-      chain.cons_guard = bc.cons_guard;
       chain.cons_wg = bc.cons_wg;
       chain.cons_pipe = bc.cons_pipe;
+      chain.cons_site = bc.cons_site;
       chain.distance = ab.distance + bc.distance;
       chain.type = (chain.prod_wg != chain.cons_wg) ? SyncType::CrossCore
                                                     : SyncType::IntraCore;
-      if (!chain.deps.empty() && !bc.deps.empty())
-        chain.deps.front().consumer_pts = bc.deps.front().consumer_pts;
+      chain.hard_event =
+          chain.prod_pipe.substr(5) + "_" + chain.cons_pipe.substr(5);
       for (size_t k = 0; k < sync_points.size(); ++k) {
         if (!keep[k] || k == i || k == j)
           continue;
@@ -1025,23 +910,22 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
         }
       }
 
-      PrimExpr iteration =
-          loop_info.CalculateIterationCount() - Integer(sp.distance);
+      PrimExpr iteration = loop_info.CalculateIterationCount();
       PrimExpr cc_event_id =
           indexmod(iteration, Integer(sp.num_versions)) + cc_base_id;
 
       if (!sp.prod_wg) {
         Stmt set_stmt =
             makeAscendCrossCoreSetFlag(sp.mode_id, sp.prod_pipe, cc_event_id);
-        InsertStatementIntoScheduleUnit(sp.prod_insertion_unit, set_stmt, false,
-                                        sp.prod_wg, sp.prod_guard);
+        InsertStatementIntoScheduleUnit(sp.prod_site.unit, set_stmt, false,
+                                        sp.prod_wg, sp.prod_site.guard);
         for (unsigned s = 0; s != 2; ++s) {
           Stmt wait_stmt = makeAscendCrossCoreWaitFlag(
               sp.mode_id, sp.cons_pipe,
               indexmod(iteration, Integer(sp.num_versions)) +
                   Integer(cc_base_id + 16 * s));
-          InsertStatementIntoScheduleUnit(sp.cons_insertion_unit, wait_stmt,
-                                          true, sp.cons_wg, sp.cons_guard);
+          InsertStatementIntoScheduleUnit(sp.cons_site.unit, wait_stmt, true,
+                                          sp.cons_wg, sp.cons_site.guard);
         }
       } else {
         for (unsigned s = 0; s != 2; ++s) {
@@ -1049,13 +933,13 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
               sp.mode_id, sp.prod_pipe,
               indexmod(iteration, Integer(sp.num_versions)) +
                   Integer(cc_base_id + 16 * s));
-          InsertStatementIntoScheduleUnit(sp.prod_insertion_unit, set_stmt,
-                                          false, sp.prod_wg, sp.prod_guard);
+          InsertStatementIntoScheduleUnit(sp.prod_site.unit, set_stmt, false,
+                                          sp.prod_wg, sp.prod_site.guard);
         }
         Stmt wait_stmt =
             makeAscendCrossCoreWaitFlag(sp.mode_id, sp.cons_pipe, cc_event_id);
-        InsertStatementIntoScheduleUnit(sp.cons_insertion_unit, wait_stmt, true,
-                                        sp.cons_wg, sp.cons_guard);
+        InsertStatementIntoScheduleUnit(sp.cons_site.unit, wait_stmt, true,
+                                        sp.cons_wg, sp.cons_site.guard);
       }
     } else if (sp.type == SyncType::IntraCore) {
       // When producer and consumer share the same pipe, insert a pipe_barrier
@@ -1066,8 +950,8 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
           continue;
         }
         Stmt barrier = makeAscendPipeBarrier(sp.prod_pipe);
-        InsertStatementIntoScheduleUnit(sp.cons_insertion_unit, barrier, true,
-                                        sp.cons_wg, sp.cons_guard);
+        InsertStatementIntoScheduleUnit(sp.cons_site.unit, barrier, true,
+                                        sp.cons_wg, sp.cons_site.guard);
         continue;
       }
       auto base_id = event_id_map.find(sp.hard_event);
@@ -1078,8 +962,7 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
       int base_id_val = base_id->second;
       base_id->second += sp.num_versions;
 
-      PrimExpr iteration =
-          loop_info.CalculateIterationCount() - Integer(sp.distance);
+      PrimExpr iteration = loop_info.CalculateIterationCount();
       PrimExpr event_id =
           indexmod(iteration, Integer(sp.num_versions)) + base_id_val;
 
@@ -1091,12 +974,12 @@ static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
       }
 
       Stmt set_stmt = makeAscendSetFlag(sp.hard_event, event_id);
-      InsertStatementIntoScheduleUnit(sp.prod_insertion_unit, set_stmt, false,
-                                      sp.prod_wg, sp.prod_guard);
+      InsertStatementIntoScheduleUnit(sp.prod_site.unit, set_stmt, false,
+                                      sp.prod_wg, sp.prod_site.guard);
 
       Stmt wait_stmt = makeAscendWaitFlag(sp.hard_event, event_id);
-      InsertStatementIntoScheduleUnit(sp.cons_insertion_unit, wait_stmt, true,
-                                      sp.cons_wg, sp.cons_guard);
+      InsertStatementIntoScheduleUnit(sp.cons_site.unit, wait_stmt, true,
+                                      sp.cons_wg, sp.cons_site.guard);
     }
   }
 }

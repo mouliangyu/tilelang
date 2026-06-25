@@ -697,7 +697,7 @@ public:
             auto cloned_unit = std::make_shared<ScheduleUnit>();
             cloned_unit->child = cloned_task;
             cloned_unit->stage = unit_j->stage;
-            cloned_unit->SetStartTime(unit_j->GetStartTime());
+            cloned_unit->SetStartTime(unit_j->GetStartTime() / ii * ii);
             cloned_unit->SetLatency(cloned_task->GetLatency());
             cloned_unit->SetII(cloned_task->GetII());
 
