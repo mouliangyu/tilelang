@@ -9,6 +9,7 @@ from .utils import (
     is_ascend_target,
     is_metal_target,
     is_cutedsl_target,
+    is_pto_target,
     match_declare_kernel,
     match_declare_kernel_cpu,
     is_cuda_target,
@@ -19,6 +20,7 @@ from .utils import (
     parse_function_call_args,
     parse_tma_descriptor_args,
 )
+import ast
 import re
 import logging
 import textwrap
@@ -1036,6 +1038,220 @@ class TLAscendSourceWrapper(TLCUDASourceWrapper):
         return {"name": "stream=nullptr", "type": "void*"}
 
 
+class TLPTOSourceWrapper:
+    """Wrapper for PTO JIT source.
+
+    PTO codegen emits PTODSL source. This wrapper generates the host launch
+    stub directly from PTODSL/TIR metadata and keeps the PTODSL source for
+    device compilation in libgen.
+    """
+
+    _TYPE_MAP = {
+        "float32": "float",
+        "float16": "half",
+        "bfloat16": "bfloat16_t",
+        "float8_e4m3": "float8_e4m3_t",
+        "float8_e4m3fn": "float8_e4m3_t",
+        "float8_e5m2": "float8_e5m2_t",
+        "float8_e8m0fnu": "float8_e8m0_t",
+        "float64": "double",
+        "int64": "int64_t",
+        "int32": "int",
+        "uint32": "unsigned int",
+        "bool": "int8_t",
+        "int8": "int8_t",
+        "uint8": "uint8_t",
+        "int16": "int16_t",
+        "uint16": "uint16_t",
+    }
+
+    def __init__(
+        self,
+        scheduled_ir_module: IRModule,
+        source: str,
+        target: Target,
+        device_mod: IRModule | None = None,
+        host_mod: IRModule | None = None,
+        pass_configs: dict[str, Any] | None = None,
+    ):
+        self.mod = scheduled_ir_module
+        self.source = source
+        self.target = target
+        self.device_mod = device_mod
+        self.host_mod = host_mod
+        self.pass_configs = pass_configs
+        self.pto_kernel_source = source.strip()
+        self.pto_kernel_name = self._primary_kernel_name()
+        self.grid_dim = self._extract_grid_dim(self._primary_device_func())
+        self.lib_code = self._generate_host_source(self.prim_func, self.pto_kernel_name, self.grid_dim)
+
+    def _primary_kernel_name(self) -> str:
+        if self.device_mod is None:
+            raise RuntimeError("PTO wrapper requires device module to determine kernel name.")
+        functions = list(self.device_mod.functions.items())
+        if len(functions) != 1:
+            names = [g_var.name_hint for g_var, _ in functions]
+            raise RuntimeError(f"PTO JIT currently supports exactly one kernel, got {len(names)}: {names}")
+        g_var, _ = functions[0]
+        return g_var.name_hint
+
+    def _primary_device_func(self):
+        if self.device_mod is None:
+            raise RuntimeError("PTO wrapper requires device module to determine launch metadata.")
+        functions = list(self.device_mod.functions.items())
+        if len(functions) != 1:
+            names = [g_var.name_hint for g_var, _ in functions]
+            raise RuntimeError(f"PTO JIT currently supports exactly one kernel, got {len(names)}: {names}")
+        _, func = functions[0]
+        return func
+
+    @property
+    def prim_func(self):
+        if len(self.mod.get_global_vars()) == 1:
+            return self.mod[self.mod.get_global_vars()[0]]
+        if "main" in self.mod:
+            return self.mod["main"]
+        for _, function in self.mod.functions.items():
+            attr = function.attrs
+            if "tir.is_global_func" in attr and attr["tir.is_global_func"]:
+                return function
+        raise ValueError("Cannot find primary function in the module.")
+
+    def _pythonic_expr(self, expr: tvm.tirx.PrimExpr) -> str:
+        return pythonic_expr(expr, self._TYPE_MAP, floor_div_op="/")
+
+    def _extract_grid_dim(self, func: tvm.tirx.PrimFunc) -> str:
+        grid_extents = [1, 1, 1]
+        attrs = func.attrs
+        if "thread_extent" in attrs:
+            thread_extent = attrs["thread_extent"]
+            for tag, extent in thread_extent.items():
+                if "blockIdx" in tag:
+                    idx = "xyz".index(tag[-1])
+                    grid_extents[idx] = extent
+        else:
+            extents = {}
+
+            def visitor(node):
+                if isinstance(node, tvm.tirx.AttrStmt) and node.attr_key == "thread_extent":
+                    var_name = str(node.node)
+                    if "blockIdx" in var_name:
+                        extents[var_name] = node.value
+
+            post_order_visit(func.body, visitor)
+            for var_name, extent in extents.items():
+                if "blockIdx.x" in var_name:
+                    grid_extents[0] = extent
+                elif "blockIdx.y" in var_name:
+                    grid_extents[1] = extent
+                elif "blockIdx.z" in var_name:
+                    grid_extents[2] = extent
+        return f"({self._pythonic_expr(grid_extents[0])} * {self._pythonic_expr(grid_extents[1])} * {self._pythonic_expr(grid_extents[2])})"
+
+    def _lookup_type(self, dtype: str | Any) -> str:
+        key = dtype if isinstance(dtype, str) else str(dtype)
+        result = self._TYPE_MAP.get(key)
+        if result is None:
+            raise RuntimeError(f"Unsupported PTO argument dtype: {dtype}")
+        return result
+
+    def _gm_cast_type(self, dtype: str | Any) -> str:
+        return f"__gm__ {self._lookup_type(dtype)} *"
+
+    def _parse_ptodsl_kernel_args(self, kernel_name: str) -> list[str]:
+        try:
+            module = ast.parse(self.pto_kernel_source)
+        except SyntaxError as err:
+            raise RuntimeError(f"Failed to parse PTODSL source for PTO kernel `{kernel_name}`.") from err
+
+        for node in module.body:
+            if isinstance(node, ast.FunctionDef) and node.name == kernel_name:
+                if node.args.posonlyargs or node.args.vararg or node.args.kwonlyargs or node.args.kwarg:
+                    raise RuntimeError(f"PTO kernel `{kernel_name}` must use positional arguments only.")
+                arg_names = [arg.arg for arg in node.args.args]
+                if len(arg_names) != len(set(arg_names)):
+                    raise RuntimeError(f"PTO kernel `{kernel_name}` has duplicate argument names: {arg_names}")
+                return arg_names
+
+        raise RuntimeError(f"Cannot find PTODSL function definition for PTO kernel `{kernel_name}`.")
+
+    def _host_argument_infos(self, func) -> tuple[list[dict[str, str]], dict[str, dict[str, str]]]:
+        host_args = []
+        arg_by_name = {}
+
+        def add_alias(alias: str, info: dict[str, str]):
+            if alias in arg_by_name and arg_by_name[alias]["name"] != info["name"]:
+                raise RuntimeError(f"Duplicate PTO host argument name or alias: {alias}")
+            arg_by_name[alias] = info
+
+        for param in func.params:
+            if param in func.buffer_map:
+                buffer = func.buffer_map[param]
+                name = buffer.data.name
+                info = {
+                    "name": name,
+                    "host_type": "void *",
+                    "prototype_type": "__gm__ void *",
+                    "call_arg": f"({self._gm_cast_type(buffer.dtype)}){name}",
+                }
+                host_args.append(info)
+                add_alias(name, info)
+                add_alias(param.name, info)
+            elif isinstance(param, tvm.tirx.Var):
+                name = param.name
+                c_type = self._lookup_type(param.dtype)
+                info = {
+                    "name": name,
+                    "host_type": c_type,
+                    "prototype_type": c_type,
+                    "call_arg": f"({c_type}){name}",
+                }
+                host_args.append(info)
+                add_alias(name, info)
+            else:
+                raise RuntimeError(f"Unsupported PTO kernel parameter: {param}")
+
+        if len({arg["name"] for arg in host_args}) != len(host_args):
+            names = [arg["name"] for arg in host_args]
+            raise RuntimeError(f"Duplicate PTO host argument names: {names}")
+
+        return host_args, arg_by_name
+
+    def _generate_host_source(self, func, kernel_name: str, grid_dim: str) -> str:
+        host_args, host_arg_by_name = self._host_argument_infos(func)
+        device_arg_names = self._parse_ptodsl_kernel_args(kernel_name)
+        if len(device_arg_names) != len(host_args):
+            raise RuntimeError(f"PTO kernel `{kernel_name}` argument count mismatch: device={len(device_arg_names)}, host={len(host_args)}")
+
+        prototype_args = []
+        call_args = []
+        for arg_name in device_arg_names:
+            arg_info = host_arg_by_name.get(arg_name)
+            if arg_info is None:
+                host_names = [arg["name"] for arg in host_args]
+                raise RuntimeError(f"PTO kernel `{kernel_name}` argument `{arg_name}` does not match host arguments {host_names}")
+            prototype_args.append(arg_info["prototype_type"])
+            call_args.append(arg_info["call_arg"])
+
+        launch_params = [f"{arg['host_type']} {arg['name']}" for arg in host_args]
+
+        prototype = (
+            "#ifndef AICORE\n"
+            "#define AICORE [aicore]\n"
+            "#endif\n"
+            f'extern "C" __global__ AICORE void {kernel_name}({", ".join(prototype_args)});'
+        )
+        launch_params.append("void *stream")
+        call_arg_list = ", ".join(call_args)
+        launch_stub = (
+            f'extern "C" TL_EXPORT int call({", ".join(launch_params)}) {{\n'
+            f"  {kernel_name}<<<{grid_dim}, nullptr, stream>>>({call_arg_list});\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        return "\n\n".join([PREDEF_INIT_FUNC.format(""), prototype, launch_stub])
+
+
 class TLMetalSourceWrapper:
     def __init__(
         self,
@@ -1072,6 +1288,8 @@ class TLWrapper(BaseWrapper):
     pass_configs: dict[str, Any] | None = None
     target: Target | None = None
     lib: object | None = None
+    pto_kernel_source: str | None = None
+    pto_kernel_name: str | None = None
 
     def __init__(self, target: Target):
         super().__init__()
@@ -1079,6 +1297,8 @@ class TLWrapper(BaseWrapper):
         self.pass_configs = None
         self.target = target
         self.lib = None
+        self.pto_kernel_source = None
+        self.pto_kernel_name = None
 
     def assign_optimized_module(self, scheduled_ir_module: IRModule):
         self.scheduled_ir_module = scheduled_ir_module
@@ -1099,6 +1319,8 @@ class TLWrapper(BaseWrapper):
             wrapper_class = TLCUDASourceWrapper
         elif is_hip_target(self.target):
             wrapper_class = TLHIPSourceWrapper
+        elif is_pto_target(self.target):
+            wrapper_class = TLPTOSourceWrapper
         elif is_ascend_target(self.target):
             wrapper_class = TLAscendSourceWrapper
         elif is_cpu_target(self.target):
@@ -1115,6 +1337,8 @@ class TLWrapper(BaseWrapper):
             host_mod=self.host_mod,
             pass_configs=self.pass_configs,
         )
+        self.pto_kernel_source = getattr(wrapper, "pto_kernel_source", None)
+        self.pto_kernel_name = getattr(wrapper, "pto_kernel_name", None)
         return wrapper.lib_code
 
 

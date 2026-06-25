@@ -116,11 +116,18 @@ jobs:
 
           # PTO toolchain
           export PTO_SOURCE_DIR=/nfs-hg/prod/deepseek/permanent/xuruifan/PTOAS
-          export PTO_INSTALL_DIR=${PTO_SOURCE_DIR}/install
+          export PTO_BUILD_DIR=${PTO_SOURCE_DIR}/build
+          export PTO_PYTHON_ROOT=${PTO_BUILD_DIR}/python
+          export PTO_PTODSL_ROOT=${PTO_SOURCE_DIR}/ptodsl
+          export LLVM_BUILD_DIR=/nfs-hg/prod/deepseek/permanent/xuruifan/llvm-project/build
+          export MLIR_PYTHON_ROOT=${LLVM_BUILD_DIR}/tools/mlir/python_packages/mlir_core
           echo "PTO_SOURCE_DIR=${PTO_SOURCE_DIR}" | tee -a "${GITHUB_ENV}"
-          echo "PTO_INSTALL_DIR=${PTO_INSTALL_DIR}" | tee -a "${GITHUB_ENV}"
-          echo "MLIR_PYTHON_ROOT=/nfs-hg/prod/deepseek/permanent/xuruifan/llvm-project/tools/mlir/python_packages/mlir_core" | tee -a "${GITHUB_ENV}"
-          echo "PTO_PYTHON_ROOT=${PTO_INSTALL_DIR}/" | tee -a "${GITHUB_ENV}"
+          echo "PTO_BUILD_DIR=${PTO_BUILD_DIR}" | tee -a "${GITHUB_ENV}"
+          echo "PTO_PYTHON_ROOT=${PTO_PYTHON_ROOT}" | tee -a "${GITHUB_ENV}"
+          echo "LLVM_BUILD_DIR=${LLVM_BUILD_DIR}" | tee -a "${GITHUB_ENV}"
+          echo "MLIR_PYTHON_ROOT=${MLIR_PYTHON_ROOT}" | tee -a "${GITHUB_ENV}"
+          echo "PTO_PTODSL_ROOT=${PTO_PTODSL_ROOT}" | tee -a "${GITHUB_ENV}"
+          echo "PYTHONPATH=${MLIR_PYTHON_ROOT}:${PTO_PTODSL_ROOT}:${PTO_PYTHON_ROOT}" | tee -a "${GITHUB_ENV}"
           echo "${PTO_SOURCE_DIR}/build/tools/ptoas:${PTO_SOURCE_DIR}/build/tools/ptobc" | tee -a "${GITHUB_PATH}"
 
           # CANN runtime env for torch_npu autoload (libascendcl.so, liburma.so.0, ...).
@@ -134,8 +141,8 @@ jobs:
           # driver / urma library paths injected by the container but absent from set_env.sh
           export LD_LIBRARY_PATH="/usr/local/Ascend/lib64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver_libs:${LD_LIBRARY_PATH}"
 
-          # Propagate the assembled CANN + PTO/llvm environment to subsequent steps
-          export LD_LIBRARY_PATH="/nfs-hg/prod/deepseek/permanent/xuruifan/llvm-project/lib:${PTO_INSTALL_DIR}/lib:${LD_LIBRARY_PATH}"
+          # Propagate the assembled CANN + PTO/LLVM environment to subsequent steps.
+          export LD_LIBRARY_PATH="${LLVM_BUILD_DIR}/lib:${PTO_BUILD_DIR}/lib:${LD_LIBRARY_PATH}"
           {
             echo "ASCEND_TOOLKIT_HOME=${ASCEND_TOOLKIT_HOME}"
             echo "ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
@@ -175,6 +182,7 @@ jobs:
           uv pip install --upgrade pip setuptools wheel
           uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu130
           uv pip install -v -r requirements-test.txt
+          uv pip install pybind11==2.12.0
           echo "import torch; print(f'torch: {torch.__version__}')" | uv run --no-project --script -
           echo "::group::torch.utils.collect_env"
           uv run --no-project -m -- torch.utils.collect_env

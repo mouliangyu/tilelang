@@ -288,6 +288,8 @@ def device_codegen(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
         device_mod = tvm.ffi.get_global_func(global_func)(device_mod, target)
     elif target.kind.name == "hip":
         device_mod = tvm.ffi.get_global_func("target.build.tilelang_hip")(device_mod, target)
+    elif "pto" in target.keys:
+        device_mod = tvm.ffi.get_global_func("target.build.tilelang_pto")(device_mod, target)
     elif target.kind.name == "ascend" or "ascend" in target.keys:
         device_mod = tvm.ffi.get_global_func("target.build.tilelang_ascend")(device_mod, target)
     elif target.kind.name == "metal":
@@ -317,6 +319,8 @@ def device_codegen_without_compile(device_mod: tvm.IRModule, target: Target) -> 
         device_mod = tvm.ffi.get_global_func(global_func)(device_mod, target)
     elif target.kind.name == "hip":
         device_mod = tvm.ffi.get_global_func("target.build.tilelang_hip_without_compile")(device_mod, target)
+    elif "pto" in target.keys:
+        device_mod = tvm.ffi.get_global_func("target.build.tilelang_pto_without_compile")(device_mod, target)
     elif target.kind.name == "ascend" or "ascend" in target.keys:
         device_mod = tvm.ffi.get_global_func("target.build.tilelang_ascend_without_compile")(device_mod, target)
     elif target.kind.name == "c":
