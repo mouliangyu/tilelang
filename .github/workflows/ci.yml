@@ -122,7 +122,28 @@ jobs:
           echo "MLIR_PYTHON_ROOT=/nfs-hg/prod/deepseek/permanent/xuruifan/llvm-project/tools/mlir/python_packages/mlir_core" | tee -a "${GITHUB_ENV}"
           echo "PTO_PYTHON_ROOT=${PTO_INSTALL_DIR}/" | tee -a "${GITHUB_ENV}"
           echo "${PTO_SOURCE_DIR}/build/tools/ptoas:${PTO_SOURCE_DIR}/build/tools/ptobc" | tee -a "${GITHUB_PATH}"
-          echo "LD_LIBRARY_PATH=/nfs-hg/prod/deepseek/permanent/xuruifan/llvm-project/lib:${PTO_INSTALL_DIR}/lib:${LD_LIBRARY_PATH}" | tee -a "${GITHUB_ENV}"
+
+          # CANN runtime env for torch_npu autoload (libascendcl.so, liburma.so.0, ...).
+          # The runner daemon does not inherit the container-injected CANN environment,
+          # so torch_npu fails to load at `import torch` without this.
+          CANN_SET_ENV="$(ls -d /usr/local/Ascend/cann-*/set_env.sh 2>/dev/null | sort | tail -1)"
+          if [[ -n "${CANN_SET_ENV}" ]]; then
+            # shellcheck disable=SC1090
+            source "${CANN_SET_ENV}"
+          fi
+          # driver / urma library paths injected by the container but absent from set_env.sh
+          export LD_LIBRARY_PATH="/usr/local/Ascend/lib64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver_libs:${LD_LIBRARY_PATH}"
+
+          # Propagate the assembled CANN + PTO/llvm environment to subsequent steps
+          export LD_LIBRARY_PATH="/nfs-hg/prod/deepseek/permanent/xuruifan/llvm-project/lib:${PTO_INSTALL_DIR}/lib:${LD_LIBRARY_PATH}"
+          {
+            echo "ASCEND_TOOLKIT_HOME=${ASCEND_TOOLKIT_HOME}"
+            echo "ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+            echo "ASCEND_OPP_PATH=${ASCEND_OPP_PATH}"
+            echo "ASCEND_AICPU_PATH=${ASCEND_AICPU_PATH}"
+            echo "TOOLCHAIN_HOME=${TOOLCHAIN_HOME}"
+            echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
+          } | tee -a "${GITHUB_ENV}"
 
       - name: Setup Python and uv with caching
         id: setup-uv
