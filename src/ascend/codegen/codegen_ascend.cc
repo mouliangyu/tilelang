@@ -2332,10 +2332,14 @@ void CodeGenTileLangAscend::VisitStmt_(const BindNode *op) {
         return;
       }
     }
+    // Materialize the RHS into a string first: a reinterpret (and other exprs)
+    // emit SSA helper statements via SSAGetID directly into `stream`. Printing
+    // straight after "auto vid = " would inject those declarations mid-line and
+    // produce illegal C++. Building the string first flushes the helper decls
+    // onto their own lines before the assignment is written.
+    std::string rhs = PrintExpr(op->value);
     PrintIndent();
-    stream << "auto " << vid << " = ";
-    PrintExpr(op->value, stream);
-    stream << ";\n";
+    stream << "auto " << vid << " = " << rhs << ";\n";
     return;
   }
 
