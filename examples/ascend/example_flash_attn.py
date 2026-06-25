@@ -53,7 +53,7 @@ def flash_attention(D=128, SEQ_LEN=4096):
                 T.fill(l_ub, 0.0)
                 T.fill(m_ub, -T.infinity(accum_dtype))
 
-            for k in T.Pipelined(NUM_KV_BLOCKS, num_stages=2):
+            for k in T.Pipelined(NUM_KV_BLOCKS, num_stages=2, annotations={"enable_offset": True}):
                 T.copy(K[k * BC : (k + 1) * BC, 0:D], K_shared)
                 T.copy(
                     V[k * BC : (k + 1) * BC, 0:D],

@@ -287,6 +287,16 @@ public:
       num_stages = num_stages_val.value().cast<IntImm>()->value;
     }
 
+    // When false, the Z3 loop scheduler keeps each resource's tasks within a
+    // single II window (max(start) - min(start) < II). Sourced from the loop's
+    // "enable_offset" annotation; defaults to false (constraint applied).
+    bool enable_offset = false;
+    auto enable_offset_val =
+        ctrl->control.get()->annotations.Get("enable_offset");
+    if (enable_offset_val.has_value()) {
+      enable_offset = enable_offset_val.value().cast<bool>();
+    }
+
     static std::optional<ffi::Function> z3_schedule_loop_func =
         ffi::Function::GetGlobal("tl.transform.z3_schedule_loop_python");
     if (!z3_schedule_loop_func.has_value()) {
@@ -508,44 +518,47 @@ public:
     // the Z3 (k, r) model. Equality is allowed because the clone is placed at
     // the front of the loop body, so it reads before any write in that
     // iteration.
-    auto bind_of = [&](size_t idx) -> const BindNode * {
-      IRStructure *node = units[idx]->child.get();
-      if (node && node->IsTask()) {
-        auto task = static_cast<TaskNode *>(node);
-        if (task->stmts.size() == 1) {
-          return task->stmts[0].as<BindNode>();
+    if (enable_offset) {
+
+      auto bind_of = [&](size_t idx) -> const BindNode * {
+        IRStructure *node = units[idx]->child.get();
+        if (node && node->IsTask()) {
+          auto task = static_cast<TaskNode *>(node);
+          if (task->stmts.size() == 1) {
+            return task->stmts[0].as<BindNode>();
+          }
+        }
+        return nullptr;
+      };
+      std::unordered_map<const VarNode *, size_t> let_var_to_unit;
+      for (size_t i = 0; i < n; ++i) {
+        if (auto *bind = bind_of(i)) {
+          let_var_to_unit[bind->var.get()] = i;
         }
       }
-      return nullptr;
-    };
-    std::unordered_map<const VarNode *, size_t> let_var_to_unit;
-    for (size_t i = 0; i < n; ++i) {
-      if (auto *bind = bind_of(i)) {
-        let_var_to_unit[bind->var.get()] = i;
+      std::vector<std::set<size_t>> unit_let_deps(n);
+      for (size_t i = 0; i < n; ++i) {
+        for (const auto &rv : units[i]->GetIndirectReadVars()) {
+          auto it = let_var_to_unit.find(rv.get());
+          if (it != let_var_to_unit.end())
+            unit_let_deps[i].insert(it->second);
+        }
       }
-    }
-    std::vector<std::set<size_t>> unit_let_deps(n);
-    for (size_t i = 0; i < n; ++i) {
-      for (const auto &rv : units[i]->GetIndirectReadVars()) {
-        auto it = let_var_to_unit.find(rv.get());
-        if (it != let_var_to_unit.end())
-          unit_let_deps[i].insert(it->second);
+      // Collect WAR consumers per Let unit
+      std::vector<std::set<size_t>> let_war_consumers(n);
+      for (const auto &dep : deps) {
+        size_t p = unit_idx[dep.prod_unit];
+        if (bind_of(p) != nullptr) {
+          let_war_consumers[p].insert(unit_idx[dep.cons_unit]);
+        }
       }
-    }
-    // Collect WAR consumers per Let unit
-    std::vector<std::set<size_t>> let_war_consumers(n);
-    for (const auto &dep : deps) {
-      size_t p = unit_idx[dep.prod_unit];
-      if (bind_of(p) != nullptr) {
-        let_war_consumers[p].insert(unit_idx[dep.cons_unit]);
-      }
-    }
-    for (size_t u = 0; u < n; ++u) {
-      for (size_t l : unit_let_deps[u]) {
-        for (size_t w : let_war_consumers[l]) {
-          if (u == w)
-            continue;
-          stage_order_deps.emplace_back((int64_t)u, (int64_t)w);
+      for (size_t u = 0; u < n; ++u) {
+        for (size_t l : unit_let_deps[u]) {
+          for (size_t w : let_war_consumers[l]) {
+            if (u == w)
+              continue;
+            stage_order_deps.emplace_back((int64_t)u, (int64_t)w);
+          }
         }
       }
     }
@@ -612,7 +625,7 @@ public:
         z3_schedule_loop_func
             .value()(num_stages, tvm_latencies, tvm_iis, tvm_resource_flags,
                      tvm_data_deps, tvm_resource_deps, tvm_buffer_sizes,
-                     tvm_memory_groups, tvm_stage_order_deps)
+                     tvm_memory_groups, tvm_stage_order_deps, enable_offset)
             .cast<ffi::Tuple<ffi::Array<int64_t>, ffi::Array<int64_t>,
                              int64_t>>();
 
@@ -633,7 +646,9 @@ public:
       min_k_raw = std::min(min_k_raw, k);
     }
     for (size_t i = 0; i < n; ++i) {
-      units[i]->stage = min_k_raw - raw_k[i];
+      // When offset is disabled, collapse every task into a single pipeline
+      // stage so warpgroup_partition emits a flat (non-pipelined) loop body.
+      units[i]->stage = enable_offset ? (min_k_raw - raw_k[i]) : 0;
     }
     auto phys_time = [&](const std::shared_ptr<IRStructure> &c) -> int64_t {
       auto *u = static_cast<ScheduleUnit *>(c.get());

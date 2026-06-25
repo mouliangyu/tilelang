@@ -227,6 +227,7 @@ def z3_schedule_loop_python(
     memory_groups: list[list[int]],  # [[capacity, idx0, idx1, ...], ...]
     stage_order_deps: list[tuple[int, int]] | None = None,  # (u, w): k_u <= k_w
     recalculate_buffer_versions: bool = True,
+    enable_offset: bool = False,
     verbose: bool = False,
     seed: int | None = None,
 ) -> tuple[list[int], list[int], int]:
@@ -261,6 +262,12 @@ def z3_schedule_loop_python(
     stage_order_deps : list[tuple[int, int]] | None
         Stage-order constraints (u, w) requiring k_u <= k_w (same or earlier
         iteration-stage).
+    enable_offset : bool
+        When False, constrain each resource so that, among the tasks using that
+        resource (pipe bit in resource_flags), max(start_time) - min(start_time) < II.
+        This keeps all tasks on a resource within a single II window (no offsetting
+        a resource's tasks across pipeline stages). When True, no such
+        constraint is added. Defaults to False (constraint applied).
 
     Returns
     -------
@@ -375,6 +382,22 @@ def z3_schedule_loop_python(
             solver.add(k_vars[u] <= k_vars[w])
             if verbose:
                 print(f"[Python Z3 Loop] Stage-order constraint: k_{u} <= k_{w}")
+
+        # Optional offset constraint: when disabled, every task using a given
+        # resource (pipe bit) must fit within a single II window, i.e.
+        # max(start) - min(start) < II among that resource's tasks. For a set,
+        # max - min < II is equivalent to |start_a - start_b| < II for all pairs.
+        if not enable_offset:
+            pipe_bits = [1, 2, 4, 8, 16, 32, 64]  # MTE1, MTE2, MTE3, Cube, Vector, Fixpipe, Scalar
+            for bit in pipe_bits:
+                group = [i for i in range(n) if resource_flags[i] & bit]
+                for a in range(len(group)):
+                    for b in range(a + 1, len(group)):
+                        ia, ib = group[a], group[b]
+                        solver.add(start_vars[ia] - start_vars[ib] < ii_mid)
+                        solver.add(start_vars[ib] - start_vars[ia] < ii_mid)
+                if verbose and len(group) > 1:
+                    print(f"[Python Z3 Loop] Offset disabled: resource bit {bit} tasks {group} span < {ii_mid}")
 
         # Check feasibility
         if verbose:
@@ -629,7 +652,16 @@ def z3_schedule_loop_python(
 # FFI-exposed function for loop scheduling
 @tvm_ffi.register_global_func("tl.transform.z3_schedule_loop_python")
 def z3_schedule_loop_ffi(
-    num_stages, latencies, iis, resource_flags, data_deps, resource_deps, buffer_sizes, memory_groups, stage_order_deps=None
+    num_stages,
+    latencies,
+    iis,
+    resource_flags,
+    data_deps,
+    resource_deps,
+    buffer_sizes,
+    memory_groups,
+    stage_order_deps=None,
+    enable_offset=False,
 ):
     """FFI wrapper for z3_schedule_loop_python.
 
@@ -637,6 +669,7 @@ def z3_schedule_loop_ffi(
     Data dependencies are expected as 4-tuples (i, j, distance, latency).
     memory_groups is a list of lists: [[capacity, idx0, idx1, ...], ...]
     stage_order_deps is a list of pairs (u, w) meaning k_u <= k_w.
+    enable_offset is a bool sourced from the loop's "enable_offset" annotation.
     """
     # Convert TVM containers to Python lists
     latencies_list = list(latencies)
@@ -682,6 +715,7 @@ def z3_schedule_loop_ffi(
             buffer_sizes_list,
             memory_groups_list,
             stage_order_deps_list,
+            enable_offset=bool(enable_offset),
         )
 
     # Return start_times and buffer_versions as separate arrays for easier FFI handling

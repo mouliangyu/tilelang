@@ -342,6 +342,37 @@ T.annotate_buffer_versions({buf1: 2, buf2: 2})
 Without this hint, the compiler may misjudge buffer lifetimes, leading
 to suboptimal pipelining or correctness issues.
 
+**Pipeline offset control (`enable_offset`)**: Ascend hardware already
+overlaps work on **different** resource pipes (MTE1/MTE2/MTE3/Cube/Vector/
+Fixpipe/Scalar) asynchronously — that cross-pipe pipelining happens
+automatically and is *not* affected by this flag. `enable_offset` only
+changes how the scheduler treats tasks that share the **same** pipe, for
+example the two `T.gemm` calls in flash attention (both on the Cube pipe).
+
+By default (`enable_offset=False`) the Z3 loop scheduler keeps all tasks
+on a given pipe within a single II window (`max(start) - min(start) < II`)
+and at the same pipeline stage, so same-pipe ops are **not** offset across
+loop iterations. To let the scheduler offset same-pipe tasks across
+iterations/stages, opt in with the `enable_offset` annotation on the loop:
+
+```python
+for k in T.Pipelined(NUM_KV_BLOCKS, num_stages=2,
+                     annotations={"enable_offset": True}):
+    ...
+```
+
+- `enable_offset=False` (default): same-pipe tasks stay in one II window /
+  one stage. Simpler, more predictable; use when the offset schedule is
+  incorrect or unnecessary.
+- `enable_offset=True`: the scheduler may stagger same-pipe tasks across
+  iterations (e.g. issue iteration `i+1`'s GEMM before iteration `i`'s
+  consumer finishes), at the cost of a larger II / more buffering.
+
+Buffer multi-versioning (`T.annotate_buffer_versions`) is independent of
+this flag and still applies in both modes.
+
+Reference: `examples/ascend/example_flash_attn.py`
+
 ### 7.2 Legacy: Manual Flag Pipelining (Deprecated)
 
 Manual `T.ascend_set_flag`/`T.ascend_wait_flag` pipelining and
