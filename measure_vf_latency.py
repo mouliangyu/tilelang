@@ -147,13 +147,108 @@ def _compile_kernel(kernel_path: str, call_expr: str | None, out_idx: int) -> tu
     if func is None:
         sys.exit("Could not find a PrimFunc. Use --call to specify.")
 
+    return _compile_func(func, out_idx), scope_func
+
+
+def _compile_func(func, out_idx: int) -> str:
+    """Compile a PrimFunc and return its generated .asc source.
+
+    Tries with auto-schedule first; falls back to disabling it (e.g. for kernels
+    with manual flag sync where Z3 scheduling fails).
+    """
     import tilelang
 
     try:
         kernel = tilelang.compile(func, out_idx=out_idx)
     except Exception:
         kernel = tilelang.compile(func, out_idx=out_idx, pass_configs={"tl.enable_auto_schedule": False})
-    return kernel.get_kernel_source(), scope_func
+    return kernel.get_kernel_source()
+
+
+def _capture_main_compiles(kernel_path: str) -> list[dict]:
+    """Run the file's ``__main__`` block and capture every ``tilelang.compile``.
+
+    Instead of guessing kernel factory args, we execute the module *as*
+    ``__main__`` with ``tilelang.compile`` replaced by a spy that records the
+    PrimFunc (and kwargs) it was handed and returns a stub so the rest of
+    ``__main__`` keeps running. This captures the **actual** PrimFunc objects
+    with the user's real hyperparameters already substituted.
+
+    Returns a list of dicts ``{"func", "out_idx", "scope_func"}`` in compile
+    order, one per ``tilelang.compile(...)`` call whose first argument was a
+    PrimFunc. ``scope_func`` is the outermost factory name from the compile
+    call's first argument (``compile(factory(...), ...)``), recovered from the
+    ``__main__`` AST; it is ``None`` when the name cannot be determined.
+    """
+    import unittest.mock
+
+    import tilelang
+    import tvm.tirx
+
+    module_path = Path(kernel_path).resolve()
+    spec = importlib.util.spec_from_file_location("__main__", str(module_path))
+    mod = importlib.util.module_from_spec(spec)
+
+    captured: list[dict] = []
+
+    class _StubKernel:
+        def __call__(self, *a, **k):
+            return None
+
+        def __getattr__(self, _name):
+            return lambda *a, **k: None
+
+    def _spy(func, *a, **k):
+        captured.append({"func": func, "kwargs": k})
+        return _StubKernel()
+
+    # Recover factory names for each compile call from the __main__ AST, in
+    # source order, so they zip against the (sequentially executed) captures.
+    scope_names = _main_compile_scope_names(module_path.read_text())
+
+    with unittest.mock.patch.object(tilelang, "compile", _spy), contextlib.suppress(Exception, SystemExit):
+        spec.loader.exec_module(mod)
+
+    results: list[dict] = []
+    for i, c in enumerate(captured):
+        if not isinstance(c["func"], tvm.tirx.PrimFunc):
+            continue
+        results.append(
+            {
+                "func": c["func"],
+                "out_idx": c["kwargs"].get("out_idx", -1),
+                "scope_func": scope_names[i] if i < len(scope_names) else None,
+            }
+        )
+    return results
+
+
+def _main_compile_scope_names(source: str) -> list[str | None]:
+    """Outermost factory name of each ``compile(...)`` call in ``__main__``.
+
+    Walks the ``if __name__ == "__main__"`` block for ``*.compile(arg0, ...)``
+    calls (in source order) and returns the outermost call name of ``arg0`` when
+    it is itself a call (``compile(factory(...), ...)``), else ``None``. The
+    order matches ``_capture_main_compiles``'s sequential capture order.
+    """
+    tree = ast.parse(source)
+    names: list[str | None] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not (isinstance(test, ast.Compare) and isinstance(test.left, ast.Name) and test.left.id == "__name__"):
+            continue
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Call):
+                continue
+            fname = _ast_attr_name(sub.func)
+            if not (fname and "compile" in fname and sub.args):
+                continue
+            arg0 = sub.args[0]
+            names.append(_ast_attr_name(arg0.func) if isinstance(arg0, ast.Call) else None)
+        break
+    return names
 
 
 def _outermost_call_name(call_expr: str) -> str | None:
@@ -220,12 +315,12 @@ def _auto_detect_func(mod, kernel_path: str, main_locals: dict = None):
     2. Look for functions that return PrimFunc when called with typical args
     3. Parse if __name__ == "__main__" block to find the call expression
     """
-    import tvm.tir
+    import tvm.tirx
 
     # Strategy 1: module-level PrimFunc objects
     for name in dir(mod):
         obj = getattr(mod, name)
-        if isinstance(obj, tvm.tir.PrimFunc):
+        if isinstance(obj, tvm.tirx.PrimFunc):
             print(f"  auto-detected: {name} (PrimFunc object)")
             return obj, name
 
@@ -236,7 +331,7 @@ def _auto_detect_func(mod, kernel_path: str, main_locals: dict = None):
         try:
             ns = {**vars(mod), **(main_locals or {})}
             func = eval(call_expr, ns)
-            if isinstance(func, tvm.tir.PrimFunc):
+            if isinstance(func, tvm.tirx.PrimFunc):
                 print(f"  auto-detected from __main__: {call_expr}")
                 return func, _outermost_call_name(call_expr)
         except Exception:
@@ -252,7 +347,7 @@ def _auto_detect_func(mod, kernel_path: str, main_locals: dict = None):
         for args in common_args:
             try:
                 result = fn(*args)
-                if isinstance(result, tvm.tir.PrimFunc):
+                if isinstance(result, tvm.tirx.PrimFunc):
                     args_str = ", ".join(str(a) for a in args)
                     print(f"  auto-detected: {name}({args_str})")
                     return result, name
@@ -663,7 +758,7 @@ def _run_cannsim(launcher_path: Path, output_dir: Path, soc: str) -> Path | None
     env["LD_LIBRARY_PATH"] = ld_path
 
     # Step 1: cannsim record
-    cmd = [_CANNSIM, "record", "-o", str(output_dir), "-s", soc, "-n", "0", str(wrapper)]
+    cmd = [_CANNSIM, "record", "-o", str(output_dir), "-s", soc, str(wrapper)]
     print(f"  [CMD] {' '.join(cmd)}")
     subprocess.run(cmd, env=env, capture_output=True, text=True)
     dirs = sorted(output_dir.glob("cannsim_*"), key=lambda p: p.stat().st_mtime)
@@ -671,23 +766,16 @@ def _run_cannsim(launcher_path: Path, output_dir: Path, soc: str) -> Path | None
         return None
     cannsim_dir = dirs[-1]
 
-    # Step 2: generate tracing JSON via trace_tools (bypasses cannprof which
-    # hangs on ARM). trace_tools needs the full per-instruction log restored
-    # from instr.bin (the raw log_ca/ only has a summary line).
+    # Step 2: generate tracing JSON via cannsim.report (bypasses cannprof which
+    # hangs on ARM). generate_report consumes the record output dir directly and
+    # emits report/trace_core0.json; it tolerates the missing log_ca/ subdir.
     if _CANN_PYTHON_SITE not in sys.path:
         sys.path.insert(0, _CANN_PYTHON_SITE)
-    from cannsim.core.report.report_path import _prepare_log_ca
-    from cannsim.trace_tools.rts_sequence import _gen_model_trace
+    from cannsim.report import generate_report
 
-    _prepare_log_ca(cannsim_dir)  # restores instr.bin -> tmp_log_ca/
     report_dir = output_dir / "report"
     report_dir.mkdir(exist_ok=True)
-    _gen_model_trace(
-        case_name="trace",
-        run_mode=str(report_dir) + "/",
-        log_ca_path=str(cannsim_dir),
-        target_block_dim=(0,),
-    )
+    generate_report(export=str(cannsim_dir), output=str(report_dir), core_id="0", verbose=False)
 
     return cannsim_dir
 
@@ -910,25 +998,26 @@ def _inject_latency(source_text: str, vf_blocks: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def measure_kernel(
-    kernel_path: str,
-    *,
-    call_expr: str | None = None,
-    out_idx: int = -1,
-    soc: str = "Ascend950",
-    dry_run: bool = False,
-    work_dir: str | None = None,
-) -> None:
-    print(f"Compiling kernel from {kernel_path} ...")
-    asc_source, scope_func = _compile_kernel(kernel_path, call_expr, out_idx)
-    print(f"  got .asc ({len(asc_source)} chars)")
+def _measure_one_kernel(
+    asc_source: str,
+    scope_func: str | None,
+    py_source: str,
+    work_base: Path,
+    soc: str,
+) -> list[dict]:
+    """Measure every VF block in one compiled kernel's .asc.
 
+    Returns the scoped Python VF blocks (from ``_find_python_vf_blocks``) with
+    ``measured_latency`` set on the ones that were measured successfully. The
+    func→block mapping is local to this kernel, so the ``simt_vf_0`` name reused
+    across kernels never collides.
+    """
     includes = _extract_includes(asc_source)
     vf_funcs = _extract_vf_functions(asc_source)
 
     if not vf_funcs:
-        print("No VF functions found in generated .asc")
-        return
+        print("  No VF functions found in generated .asc")
+        return []
 
     print(f"  found {len(vf_funcs)} VF function(s):")
     for vf in vf_funcs:
@@ -938,14 +1027,11 @@ def measure_kernel(
 
     # Find Python VF blocks for mapping, scoped to the compiled kernel so
     # blocks from other kernel factories in the same file are ignored.
-    py_source = Path(kernel_path).read_text()
     py_blocks = _find_python_vf_blocks(py_source, scope_func)
 
-    # Map vf_func → python block. tl.vf_source_index is module-monotonic, not a
-    # per-file block position, so we can't index py_blocks with it directly.
-    # Instead, within each kind, order the generated funcs by source_index (the
-    # emission order in the .asc can differ from source order under pipelining)
-    # and zip against the source-order python blocks of that kind.
+    # Map vf_func → python block. tl.vf_source_index is per-kernel (reset on each
+    # T.Kernel() scope), so within each kind we order the generated funcs by
+    # source_index and zip against the source-order python blocks of that kind.
     simt_blocks = [b for b in py_blocks if b["kind"] == "simt"]
     simd_blocks = [b for b in py_blocks if b["kind"] == "simd"]
 
@@ -963,17 +1049,9 @@ def measure_kernel(
         for func, block in zip(funcs, blocks):
             func_to_block[func["name"]] = block
 
-    # Measure each VF function
-    work_base = Path(work_dir) if work_dir else (_REPO_ROOT / ".cannsim_work")
-    if work_base.exists():
-        subprocess.run(["pkill", "-9", "-f", "cannprof"], capture_output=True)
-        subprocess.run(["rm", "-rf", str(work_base)], capture_output=True)
-    work_base.mkdir(exist_ok=True)
-
-    print()
     for i, vf in enumerate(vf_funcs):
         label = "SimtVF" if vf["kind"] == "simt" else "SimdVF"
-        print(f"Measuring [{i + 1}/{len(vf_funcs)}] {vf['name']} ({label}) ...", flush=True)
+        print(f"  Measuring [{i + 1}/{len(vf_funcs)}] {vf['name']} ({label}) ...", flush=True)
 
         wdir = Path(tempfile.mkdtemp(prefix=f"{vf['name']}_", dir=str(work_base)))
         wdir.chmod(0o755)
@@ -1054,19 +1132,80 @@ def measure_kernel(
                 for line in exc.stderr.strip().splitlines()[:5]:
                     print(f"    {line}")
 
-    # Inject latencies
-    measured = [b for b in py_blocks if b.get("measured_latency")]
+    return py_blocks
+
+
+def measure_kernel(
+    kernel_path: str,
+    *,
+    call_expr: str | None = None,
+    out_idx: int = -1,
+    soc: str = "Ascend950",
+    dry_run: bool = False,
+    work_dir: str | None = None,
+) -> None:
+    py_source = Path(kernel_path).read_text()
+
+    # Build the work list of (func, out_idx, scope_func) entries to measure.
+    work: list[dict] = []
+    if call_expr:
+        print(f"Compiling kernel from {kernel_path} (--call {call_expr}) ...")
+        asc_source, scope_func = _compile_kernel(kernel_path, call_expr, out_idx)
+        work.append({"asc": asc_source, "scope_func": scope_func})
+    else:
+        # Capture every tilelang.compile() the file's __main__ actually runs,
+        # with the user's real hyperparameters already substituted.
+        captured = _capture_main_compiles(kernel_path)
+        # Dedupe by scope_func (a factory compiled twice is measured once).
+        seen: set = set()
+        for c in captured:
+            key = c["scope_func"]
+            if key is not None and key in seen:
+                continue
+            seen.add(key)
+            print(f"Compiling kernel {c['scope_func']} (out_idx={c['out_idx']}) ...")
+            try:
+                asc_source = _compile_func(c["func"], c["out_idx"])
+            except Exception as exc:  # noqa: BLE001
+                print(f"  FAIL to compile: {exc}")
+                continue
+            work.append({"asc": asc_source, "scope_func": c["scope_func"]})
+
+        # Fallback: nothing captured (no usable __main__) — single auto-detect.
+        if not work:
+            print(f"Compiling kernel from {kernel_path} (auto-detect) ...")
+            asc_source, scope_func = _compile_kernel(kernel_path, None, out_idx)
+            work.append({"asc": asc_source, "scope_func": scope_func})
+
+    # Work base setup/cleanup once for all kernels.
+    work_base = Path(work_dir) if work_dir else (_REPO_ROOT / ".cannsim_work")
+    if work_base.exists():
+        subprocess.run(["pkill", "-9", "-f", "cannprof"], capture_output=True)
+        subprocess.run(["rm", "-rf", str(work_base)], capture_output=True)
+    work_base.mkdir(exist_ok=True)
+
+    # Measure each kernel; accumulate all scoped blocks. Linenos are unique
+    # across factories (each block lives in exactly one def), so no collision.
+    all_blocks: list[dict] = []
+    for w in work:
+        label = w["scope_func"] or "<auto>"
+        print(f"\n=== kernel {label} ===")
+        print(f"  got .asc ({len(w['asc'])} chars)")
+        all_blocks.extend(_measure_one_kernel(w["asc"], w["scope_func"], py_source, work_base, soc))
+
+    # Inject latencies once.
+    measured = [b for b in all_blocks if b.get("measured_latency")]
     if not measured:
         print("\nNo latencies measured.")
         return
 
     print()
-    new_source = _inject_latency(py_source, py_blocks)
+    new_source = _inject_latency(py_source, all_blocks)
+    old_lines = py_source.splitlines()
+    new_lines = new_source.splitlines()
 
     if dry_run:
         print("=== Results (--dry-run, file not modified) ===")
-        old_lines = py_source.splitlines()
-        new_lines = new_source.splitlines()
         for b in measured:
             li = b["lineno"] - 1
             if li < len(old_lines) and li < len(new_lines) and old_lines[li] != new_lines[li]:
@@ -1074,8 +1213,6 @@ def measure_kernel(
                 print(f"    - {old_lines[li].strip()}")
                 print(f"    + {new_lines[li].strip()}")
     else:
-        old_lines = py_source.splitlines()
-        new_lines = new_source.splitlines()
         changed = 0
         for b in measured:
             li = b["lineno"] - 1

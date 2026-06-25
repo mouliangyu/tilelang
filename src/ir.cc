@@ -287,6 +287,8 @@ public:
 
 public:
   TVM_DLL void EnterWithScope() final {
+    simtvf_source_counter_ = 0;
+    simdvf_source_counter_ = 0;
     for (auto frame = frames.begin(); frame != frames.end(); ++frame)
       (*frame)->EnterWithScope();
   }
