@@ -69,7 +69,7 @@ def ref_program(logits, num_topk):
     """Reference: torch.topk (largest=True, sorted=True, stable tie-break)."""
     import torch
 
-    return torch.topk(logits, num_topk, dim=-1, largest=True, sorted=True).indices.to(torch.int32)
+    return torch.topk(logits + 1, num_topk, dim=-1, largest=True, sorted=True).indices.to(torch.int32)
 
 
 if __name__ == "__main__":
