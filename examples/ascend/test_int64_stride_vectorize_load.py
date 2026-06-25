@@ -6,7 +6,6 @@ from example_int64_stride_vectorize_load import DIM, repro_kernel
 
 
 def test_int64_stride_vectorize_load():
-    torch.set_default_device("npu")
     device = torch.device("npu")
 
     num_slots, cache_size, total_c = 2, 32, 4

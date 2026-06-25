@@ -166,7 +166,7 @@ def make_input(n: int, torch_dtype: torch.dtype, value_kind: str) -> torch.Tenso
     elif value_kind == "e2m1":
         if torch_dtype == torch.float4_e2m1fn_x2:
             return fp4_e2m1_codes(n).view(torch_dtype)
-        idx = torch.arange(n, dtype=torch.long) % FP4_E2M1_VALUES.numel()
+        idx = torch.arange(n, dtype=torch.long, device=FP4_E2M1_VALUES.device) % FP4_E2M1_VALUES.numel()
         x = FP4_E2M1_VALUES[idx].to(device="npu")
     elif value_kind == "uint":
         x = torch.arange(n, device="npu", dtype=torch.int32)
@@ -206,7 +206,7 @@ def test_simdvf_cast(case):
         y = y.view(torch.uint8)
         ref = fp4_e2m1_codes(y.numel(), device=y.device)
     elif in_tl_dtype == FP4_E2M1 and out_tl_dtype == BF16:
-        idx = torch.arange(y.numel(), dtype=torch.long) % FP4_E2M1_VALUES.numel()
+        idx = torch.arange(y.numel(), dtype=torch.long, device=FP4_E2M1_VALUES.device) % FP4_E2M1_VALUES.numel()
         ref = FP4_E2M1_VALUES[idx].to(device=y.device, dtype=y.dtype)
     else:
         ref = x.to(out_torch_dtype)

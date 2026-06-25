@@ -74,12 +74,12 @@ def repro_kernel() -> object:
 if __name__ == "__main__":
     import torch
 
-    torch.set_default_device("npu")
+    device = torch.device("npu")
 
     num_slots, cache_size, total_c = 2, 32, 4
-    state_cache = torch.randn(num_slots, cache_size, DIM, dtype=torch.float32)
-    slot_idx = torch.zeros(1, dtype=torch.int32)
-    out = torch.zeros(total_c, DIM, dtype=torch.float32)
+    state_cache = torch.randn(num_slots, cache_size, DIM, dtype=torch.float32, device=device)
+    slot_idx = torch.zeros(1, dtype=torch.int32, device=device)
+    out = torch.zeros(total_c, DIM, dtype=torch.float32, device=device)
 
     kernel = repro_kernel()
     kernel(state_cache, slot_idx, out)
