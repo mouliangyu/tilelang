@@ -3,17 +3,18 @@ import tilelang.language as T
 from tilelang.profiler import do_bench
 
 
-def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", MIXED=None, hf32=None, enable_unit_flag=True):
+def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", out_dtype="float32", MIXED=None, hf32=None, enable_unit_flag=True):
     """Auto-scheduled GEMM.
 
     dtype: 'bfloat16' or 'float32'.
+    out_dtype: 'bfloat16' or 'float32'.
     MIXED: True/False/None (auto: bf16→mixed, fp32→cube-only).
     hf32: None (off) / 'nearest_zero' / 'nearest_even' (fp32 only).
     """
     NUM_BLOCKS = 32
     is_fp32 = dtype == "float32"
     if MIXED is None:
-        MIXED = not is_fp32  # default: bf16→mixed, fp32→cube-only
+        MIXED = not is_fp32 and out_dtype != "bfloat16"  # default: bf16→mixed, fp32/bf16_out→cube-only
     TILE_M = 256
     TILE_N = 256
     TILE_K = 128 if is_fp32 else 256  # fp32: L1 512KB, 2*(256+256)*128*4=512KB fits
@@ -52,7 +53,7 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", MIXED=None, hf32=
     def main(
         X: T.Buffer((M_DIM, K_DIM), dtype),
         W: T.Buffer((N_DIM, K_DIM), dtype),
-        C: T.Buffer((M_DIM, N_DIM), "float32"),
+        C: T.Buffer((M_DIM, N_DIM), out_dtype),
     ):
         with T.Kernel(NUM_BLOCKS) as bx:
             if is_fp32:
@@ -60,7 +61,7 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", MIXED=None, hf32=
             res = T.alloc_l0c((TILE_M, TILE_N), "float32")
             x_l1 = T.alloc_l1((TILE_M, TILE_K), dtype)
             w_l1 = T.alloc_l1((TILE_N, TILE_K), dtype)
-            temp = T.alloc_shared((TILE_M // 2, TILE_N), "float32")
+            temp = T.alloc_shared((TILE_M // 2, TILE_N), out_dtype)
 
             for tile_idx in T.Persistent([OUT_TILES], NUM_BLOCKS, bx):
                 m_tile, n_tile = aswt_swizzle(tile_idx)
@@ -77,7 +78,12 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", MIXED=None, hf32=
     return main
 
 
-def ref_program(x, w):
+import torch
+
+
+def ref_program(x, w, out_dtype="float32"):
+    if out_dtype == "bfloat16":
+        return (x @ w.T).to(torch.bfloat16)
     return x.float() @ w.float().T
 
 
@@ -105,14 +111,19 @@ def run_regression_perf(M=8192, K=8192, N=8192, dtype="bfloat16", hf32=None):
 
 
 if __name__ == "__main__":
-    import torch
-
     device = torch.device("npu")
     M, K, N = 8192, 8192, 8192
 
-    for dt, thresh in [("float8_e4m3fn", 1e-1), ("bfloat16", 1e-2), ("float32", 5e-3)]:
+    test_pairs = [
+        ("float8_e4m3fn", 1e-1, "float32"),
+        ("bfloat16", 1e-2, "float32"),
+        ("float32", 5e-3, "float32"),
+        ("bfloat16", 1e-2, "bfloat16"),
+    ]
+
+    for dt, thresh, out_dt in test_pairs:
         print(f"\n=== {dt} GEMM ===")
-        program = gemm(M, K, N, dtype=dt)
+        program = gemm(M, K, N, dtype=dt, out_dtype=out_dt)
         kernel = tilelang.compile(program, out_idx=-1)
         print("Compilation succeeded!")
 
@@ -122,7 +133,7 @@ if __name__ == "__main__":
         c = kernel(x, w)
         torch.npu.synchronize()
 
-        expected = ref_program(x, w)
+        expected = ref_program(x, w, out_dtype=out_dt)
         max_diff = torch.max(torch.abs(c - expected)).item()
         print(f"  {'PASS' if max_diff < thresh else 'FAIL'}  max_diff={max_diff:.2e}")
 

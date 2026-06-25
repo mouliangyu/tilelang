@@ -91,6 +91,25 @@ PrimExpr ComputeFlatOffset(const Buffer &buf, const Array<Range> &range) {
   return offset;
 }
 
+// Map float32 source (L0C) + destination dtype → quant_pre hardware mode.
+static int GetCCQuantPre(DataType src_dtype, DataType dst_dtype) {
+  if (src_dtype.is_float() && src_dtype.bits() == 32) {
+    if (dst_dtype.is_bfloat16())
+      return 16; // F322BF16
+    if (dst_dtype.is_float16())
+      return 1; // F322F16
+    if (dst_dtype.is_float() && dst_dtype.bits() == 8)
+      return 13; // QF322FP8_PRE
+    if (dst_dtype.is_int() && dst_dtype.bits() == 8)
+      return 9; // REQ8
+    if (dst_dtype.is_int() && dst_dtype.bits() == 4)
+      return 22; // REQ4
+    if (dst_dtype.is_int() && dst_dtype.bits() == 16)
+      return 28; // DEQS16
+  }
+  return 0; // NoQuant
+}
+
 Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
                   arith::Analyzer *analyzer, int dma_path) {
   (void)T;
@@ -285,24 +304,24 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
                  inner_elems,
                  n_rows,
                  dual_dst_ctl_val,
-                 zero,              // sub_blockid
-                 zero,              // clip_relu_pre
-                 unit_flag_ctl_val, // unit_flag_ctl
-                 zero,              // quant_pre
-                 zero,              // relu_pre
-                 zero,              // split_en
-                 I(1),              // NZ2ND_en
-                 zero,              // quant_post
-                 zero,              // relu_post
-                 zero,              // clip_relu_post
-                 zero,              // loop_enhance_en
-                 zero,              // eltwise_op
-                 zero,              // eltwise_antq_en
-                 zero,              // loop_enhance_merge_en
-                 zero,              // C0_pad_en
-                 zero,              // wino_post_en
-                 zero,              // broadcast_en
-                 zero});            // NZ2DN_en
+                 I(op.GetSubBlockId()), // sub_blockid
+                 zero,                  // clip_relu_pre
+                 unit_flag_ctl_val,     // unit_flag_ctl
+                 I(GetCCQuantPre(op.src->dtype, op.dst->dtype)), // quant_pre
+                 zero,                                           // relu_pre
+                 zero,                                           // split_en
+                 I(1),                                           // NZ2ND_en
+                 zero,                                           // quant_post
+                 zero,                                           // relu_post
+                 zero,   // clip_relu_post
+                 zero,   // loop_enhance_en
+                 zero,   // eltwise_op
+                 zero,   // eltwise_antq_en
+                 zero,   // loop_enhance_merge_en
+                 zero,   // C0_pad_en
+                 zero,   // wino_post_en
+                 zero,   // broadcast_en
+                 zero}); // NZ2DN_en
   } else if (dma_path == 6) {
     ICHECK(!op.GetNd2Nz())
         << "Ascend nd2nz UB->L1 copy must be emitted directly from the Python "
@@ -314,32 +333,33 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
                 {dst_ptr, src_ptr, zero, n_burst_val, I(1), zero, zero});
   } else if (dma_path == 7) {
     PrimExpr dst_last_dim = op.dst->shape[op.dst->shape.size() - 1];
-    call = Call(DataType::Void(), ascend_copy_matrix_cc_to_gm(),
-                {dst_ptr,
-                 src_ptr,
-                 sid,
-                 inner_elems,
-                 n_rows,
-                 dst_last_dim,
-                 n_rows,
-                 I(op.GetL2CacheCtrl()), // [7] l2_cache_ctl
-                 zero,                   // [8] clip_relu_pre
-                 I(op.GetUnitFlagCtl()), // [9] unit_flag_ctl
-                 zero,                   // [10] quant_pre
-                 zero,                   // [11] relu_pre
-                 zero,                   // [12] split_en
-                 I(1),                   // [13] NZ2ND_en
-                 zero,                   // [14] quant_post
-                 zero,                   // [15] relu_post
-                 zero,                   // [16] clip_relu_post
-                 zero,                   // [17] loop_enhance_en
-                 zero,                   // [18] eltwise_op
-                 zero,                   // [19] eltwise_antq_en
-                 zero,                   // [20] loop_enhance_merge_en
-                 zero,                   // [21] C0_pad_en
-                 zero,                   // [22] wino_post_en
-                 zero,                   // [23] broadcast_en
-                 zero});                 // [24] NZ2DN_en
+    call =
+        Call(DataType::Void(), ascend_copy_matrix_cc_to_gm(),
+             {dst_ptr,
+              src_ptr,
+              sid,
+              inner_elems,
+              n_rows,
+              dst_last_dim,
+              n_rows,
+              I(op.GetL2CacheCtrl()), // [7] l2_cache_ctl
+              zero,                   // [8] clip_relu_pre
+              I(op.GetUnitFlagCtl()), // [9] unit_flag_ctl
+              I(GetCCQuantPre(op.src->dtype, op.dst->dtype)), // [10] quant_pre
+              zero,                                           // [11] relu_pre
+              zero,                                           // [12] split_en
+              I(1),                                           // [13] NZ2ND_en
+              zero,                                           // [14] quant_post
+              zero,                                           // [15] relu_post
+              zero,   // [16] clip_relu_post
+              zero,   // [17] loop_enhance_en
+              zero,   // [18] eltwise_op
+              zero,   // [19] eltwise_antq_en
+              zero,   // [20] loop_enhance_merge_en
+              zero,   // [21] C0_pad_en
+              zero,   // [22] wino_post_en
+              zero,   // [23] broadcast_en
+              zero}); // [24] NZ2DN_en
   } else {
     LOG(FATAL) << "Unknown Ascend DMA path: " << dma_path;
   }

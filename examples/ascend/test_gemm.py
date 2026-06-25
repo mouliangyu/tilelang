@@ -5,15 +5,15 @@ import tilelang
 from example_gemm import gemm, ref_program
 
 
-def _test(dtype, thresh):
+def _test(dtype, thresh, out_dtype="float32"):
     M, K, N = 8192, 8192, 8192
-    kernel = tilelang.compile(gemm(M, K, N, dtype=dtype), out_idx=-1)
+    kernel = tilelang.compile(gemm(M, K, N, dtype=dtype, out_dtype=out_dtype), out_idx=-1)
     device = torch.device("npu")
     x = torch.randn(M, K, device=device).to(dtype=getattr(torch, dtype))
     w = torch.randn(N, K, device=device).to(dtype=getattr(torch, dtype))
     c = kernel(x, w)
     torch.npu.synchronize()
-    expected = ref_program(x, w)
+    expected = ref_program(x, w, out_dtype=out_dtype)
     max_diff = (c - expected).abs().max().item()
     assert max_diff < thresh, f"{dtype} max_diff={max_diff:.2e}"
 
@@ -24,6 +24,7 @@ def test_gemm_auto_fp8():
 
 def test_gemm_auto_bf16():
     _test("bfloat16", 1e-2)
+    _test("bfloat16", 1e-2, "bfloat16")
 
 
 def test_gemm_auto_fp32():

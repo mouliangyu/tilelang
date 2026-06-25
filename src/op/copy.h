@@ -80,6 +80,15 @@ public:
     return 0;
   }
 
+  int GetSubBlockId() const {
+    if (auto val = annotations.Get("sub_blockid")) {
+      if (auto int_val = val->as<IntImmNode>()) {
+        return int_val->value;
+      }
+    }
+    return 0;
+  }
+
   int GetTranspose() const {
     if (auto val = annotations.Get("transpose")) {
       if (auto int_val = val->as<IntImmNode>()) {

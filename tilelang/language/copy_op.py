@@ -137,6 +137,7 @@ def copy(
     nd2nz: bool = False,
     l2_cache_ctrl: int | str | None = None,
     unit_flag_ctrl: int = 0,
+    sub_blockid: int = 0,
     scale: BufferLikeType | None = None,
 ) -> tirx.PrimExpr | tirx.Stmt:
     """Copy data between memory regions.
@@ -239,6 +240,8 @@ def copy(
         ann["l2_cache_ctrl"] = l2_cache_ctrl
     if unit_flag_ctrl and "unit_flag_ctrl" not in ann:
         ann["unit_flag_ctrl"] = unit_flag_ctrl
+    if sub_blockid and "sub_blockid" not in ann:
+        ann["sub_blockid"] = sub_blockid
     if "l2_cache_ctrl" in ann:
         ann["l2_cache_ctrl"] = _normalize_l2_cache_ctrl(ann["l2_cache_ctrl"])
 
@@ -871,6 +874,19 @@ def dual_copy(
     # This allows src[M,N] to be copied to dst[M/2,N] or dst[M,N/2]
     src_region = to_buffer_region(src)
     dst_region = to_buffer_region(dst)
+
+    # WARNING: dav-950 does NOT support quant_pre (type conversion) with
+    # fixpipe (cc->ub) dual-destination copies. If src and dst dtypes differ, the hardware may
+    # silently produce incorrect results.
+    src_dtype = src_region.buffer.dtype
+    dst_dtype = dst_region.buffer.dtype
+    if src_dtype != dst_dtype and src_region.buffer.scope() == "shared.l0c":
+        raise ValueError(
+            f"dual_copy: src dtype ({src_dtype}) != dst dtype ({dst_dtype}). "
+            "Type conversion during cc->ub dual-destination copy is NOT supported on dav-950. "
+            "Use a separate copy or cast inside a VF block instead."
+        )
+
     annotations = {
         "dual_dst_ctl": dual_dst_ctl,
         "unit_flag_ctrl": unit_flag_ctrl,

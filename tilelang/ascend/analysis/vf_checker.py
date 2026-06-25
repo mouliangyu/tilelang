@@ -44,7 +44,7 @@ class _VFCheckVisitor(PyStmtExprVisitor):
         src_buf = src_region.args[0].buffer
         dst_buf = dst_region.args[0].buffer
 
-        if not self.inside_vf and src_buf.dtype != dst_buf.dtype:
+        if not self.inside_vf and src_buf.dtype != dst_buf.dtype and src_buf.scope() != "shared.l0c":
             raise ValueError(
                 "[TileLang Semantic Check] "
                 f"T.copy() from dtype '{src_buf.dtype}' to dtype '{dst_buf.dtype}' "
