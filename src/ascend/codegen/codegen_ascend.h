@@ -72,7 +72,6 @@ private:
                       const std::string &helper_name,
                       const std::string &func_attrs, bool &inside_vf_body);
   bool IsGlobalGmBuffer(const BufferNode *buffer) const;
-  bool IsGlobalScalarGmAccess(const BufferNode *buffer, DataType dtype) const;
   std::string GetGmBypassPtr(DataType dtype, const BufferNode *buffer,
                              PrimExpr index);
 

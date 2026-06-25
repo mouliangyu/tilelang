@@ -765,6 +765,16 @@ TIR_DEFINE_TL_BUILTIN(ascend_blockscaled_gemm_l1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(ascend_read_gm_bypass_dcache)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kPure));
+
+TIR_DEFINE_TL_BUILTIN(ascend_write_gm_bypass_dcache)
+    .set_num_inputs(2)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(ascend_get_buf)
     .set_num_inputs(3)
     .set_attr<TCallEffectKind>("TCallEffectKind",

@@ -130,6 +130,7 @@ void CodeGenTileLangAscend::Init(bool output_ssa) {
   enable_fast_math_ =
       pass_ctx->GetConfig<Bool>(tl::kEnableFastMath, Bool(false)).value();
   decl_stream << "#include <tl_templates/ascend/common.h>\n";
+  decl_stream << "#include <tl_templates/ascend/debug.h>\n";
 }
 
 void CodeGenTileLangAscend::PrintCCEVectorSuffix(DataType t, std::ostream &os) {
@@ -348,18 +349,8 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
           call->op.same_as(tl::ascend_nd2nz_post_copy())) {
         has_nd2nz_copy_ = true;
       }
-    }
-    if (const auto *load = n.as<BufferLoadNode>()) {
-      if (load->indices.size() == 1 && !load->predicate.defined() &&
-          load->dtype == load->buffer->dtype &&
-          IsGlobalScalarGmAccess(load->buffer.get(), load->dtype)) {
-        has_gm_bypass_dcache_ = true;
-      }
-    }
-    if (const auto *store = n.as<BufferStoreNode>()) {
-      if (store->indices.size() == 1 && !store->predicate.defined() &&
-          store->buffer->dtype.is_scalar() &&
-          IsGlobalScalarGmAccess(store->buffer.get(), store->buffer->dtype)) {
+      if (call->op.same_as(tl::ascend_read_gm_bypass_dcache()) ||
+          call->op.same_as(tl::ascend_write_gm_bypass_dcache())) {
         has_gm_bypass_dcache_ = true;
       }
     }
@@ -1417,6 +1408,32 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       CodeGenC::VisitExpr_(op, os);
     }
   }
+  // --- Scalar GM dcache bypass intrinsics ---
+  else if (op->op.same_as(tl::ascend_read_gm_bypass_dcache())) {
+    // ascend_read_gm_bypass_dcache(address_of(BufferLoad))
+    ICHECK_EQ(op->args.size(), 1);
+    const auto *addr = op->args[0].as<CallNode>();
+    ICHECK(addr && addr->op.same_as(tirx::builtin::address_of()));
+    const auto *load = addr->args[0].as<BufferLoadNode>();
+    ICHECK(load && load->indices.size() == 1);
+    os << "tl::read_gm_bypass_dcache("
+       << GetGmBypassPtr(load->dtype, load->buffer.get(), load->indices[0])
+       << ")";
+  } else if (op->op.same_as(tl::ascend_write_gm_bypass_dcache())) {
+    // ascend_write_gm_bypass_dcache(address_of(BufferLoad), value)
+    ICHECK_EQ(op->args.size(), 2);
+    const auto *addr = op->args[0].as<CallNode>();
+    ICHECK(addr && addr->op.same_as(tirx::builtin::address_of()));
+    const auto *load = addr->args[0].as<BufferLoadNode>();
+    ICHECK(load && load->indices.size() == 1);
+    this->PrintIndent();
+    this->stream << "tl::write_gm_bypass_dcache("
+                 << GetGmBypassPtr(load->dtype, load->buffer.get(),
+                                   load->indices[0])
+                 << ", ";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << ");\n";
+  }
   // --- SimdVF binary ops: (src0, src1, mask, mode) ---
   else if (op->op.same_as(tl::simd_vadd()) || op->op.same_as(tl::simd_vsub()) ||
            op->op.same_as(tl::simd_vmul()) || op->op.same_as(tl::simd_vdiv()) ||
@@ -1893,14 +1910,6 @@ bool CodeGenTileLangAscend::IsGlobalGmBuffer(const BufferNode *buffer) const {
   return scope == "global";
 }
 
-bool CodeGenTileLangAscend::IsGlobalScalarGmAccess(const BufferNode *buffer,
-                                                   DataType dtype) const {
-  if (!dtype.is_scalar()) {
-    return false;
-  }
-  return IsGlobalGmBuffer(buffer);
-}
-
 std::string CodeGenTileLangAscend::GetGmBypassPtr(DataType dtype,
                                                   const BufferNode *buffer,
                                                   PrimExpr index) {
@@ -1919,15 +1928,6 @@ void CodeGenTileLangAscend::VisitExpr_(const BufferLoadNode *op,
                                        std::ostream &os) {
   DataType value_dtype = op->dtype;
   const VarNode *buf_var = op->buffer->data.get();
-
-  if (op->indices.size() == 1 && !op->predicate.defined() &&
-      value_dtype == op->buffer->dtype && !inside_simtvf_body_ &&
-      !inside_simdvf_body_ &&
-      IsGlobalScalarGmAccess(op->buffer.get(), value_dtype)) {
-    os << "tl::read_gm_bypass_dcache("
-       << GetGmBypassPtr(value_dtype, op->buffer.get(), op->indices[0]) << ")";
-    return;
-  }
 
   // For Ascend: scalar FP8 loads from shared/UBUF memory need conversion
   // through raw bytes, because the scalar FP8 type (tl::float_e4m3_t) is a
@@ -2038,26 +2038,6 @@ void CodeGenTileLangAscend::VisitStmt_(const BufferStoreNode *op) {
   DataType element_dtype = op->buffer->dtype;
   const VarNode *buf_var = op->buffer->data.get();
   PrimExpr index_expr = op->indices[0];
-
-  if (op->indices.size() == 1 && !op->predicate.defined() &&
-      value_dtype.is_scalar() && element_dtype.is_scalar() &&
-      !inside_simtvf_body_ && !inside_simdvf_body_ &&
-      IsGlobalScalarGmAccess(op->buffer.get(), element_dtype)) {
-    std::string value = PrintExpr(op->value);
-    PrintIndent();
-    stream << "tl::write_gm_bypass_dcache("
-           << GetGmBypassPtr(element_dtype, op->buffer.get(), index_expr)
-           << ", ";
-    if (value_dtype != element_dtype) {
-      stream << "(";
-      PrintType(element_dtype, stream);
-      stream << ")(" << value << ")";
-    } else {
-      stream << value;
-    }
-    stream << ");\n";
-    return;
-  }
 
   if (value_dtype.lanes() > 1 && op->indices.size() == 1) {
     const auto *broadcast_index = index_expr.as<BroadcastNode>();
@@ -2851,127 +2831,6 @@ void CodeGenTileLangAscend::PrintCallExtern(Type ret_type,
     os << sret;
     return;
   }
-
-  // Intercept debug_print_* call_extern functions for Ascend.
-  // blockIdx is an ASC builtin available only inside kernel functions, so we
-  // emit AscendC::printf inline instead of calling through template helpers
-  // (which live at file scope and can't see the builtins).
-  {
-    size_t arg_start = static_cast<size_t>(skip_first_arg);
-
-    auto emit_val = [&](size_t idx) {
-      DataType dtype = args[idx].dtype();
-      if (dtype.is_bool()) {
-        PrintExpr(args[idx], os);
-        os << " ? \"true\" : \"false\"";
-      } else if ((dtype.is_float() || dtype.is_bfloat16()) &&
-                 dtype.bits() < 32) {
-        os << "(float)(";
-        PrintExpr(args[idx], os);
-        os << ")";
-      } else if (!dtype.is_float() && !dtype.is_bfloat16()) {
-        if (dtype.bits() < 32) {
-          os << "(int)(";
-          PrintExpr(args[idx], os);
-          os << ")";
-        } else {
-          PrintExpr(args[idx], os);
-        }
-      } else {
-        PrintExpr(args[idx], os);
-      }
-    };
-
-    auto get_fmt = [](DataType dtype) -> std::string {
-      if (dtype.is_bool())
-        return "%s";
-      if (dtype.is_float() || dtype.is_bfloat16())
-        return "%f";
-      return "%d";
-    };
-
-    const char *pfx = inside_simtvf_body_ ? "printf" : "AscendC::printf";
-    const char *ctx_var = inside_simtvf_body_ ? "threadIdx.x" : "blockIdx.x";
-    const char *ctx_fmt = inside_simtvf_body_ ? "threadIdx=%d" : "blockIdx=%d";
-
-    if (global_symbol == "debug_print_msg") {
-      // args: [msg_string]
-      std::string msg = Downcast<StringImm>(args[arg_start])->value;
-      os << pfx << "(\"[" << ctx_fmt << "] " << msg << "\\n\", " << ctx_var
-         << ")";
-      return;
-    }
-
-    if (global_symbol == "debug_print_var") {
-      // args: [msg_string, val]
-      std::string msg = Downcast<StringImm>(args[arg_start])->value;
-      std::string fmt = get_fmt(args[arg_start + 1].dtype());
-      os << pfx << "(\"[" << ctx_fmt << "] " << msg << " = " << fmt << "\\n\", "
-         << ctx_var << ", ";
-      emit_val(arg_start + 1);
-      os << ")";
-      return;
-    }
-
-    if (global_symbol == "debug_print_buffer_value") {
-      // args: [msg_string, buf_name, index, val]
-      std::string msg = Downcast<StringImm>(args[arg_start])->value;
-      std::string buf_name = Downcast<StringImm>(args[arg_start + 1])->value;
-      std::string fmt = get_fmt(args[arg_start + 3].dtype());
-      os << pfx << "(\"[" << ctx_fmt << "] " << msg << " " << buf_name
-         << "[%d] = " << fmt << "\\n\", " << ctx_var << ", ";
-      PrintExpr(args[arg_start + 2], os);
-      os << ", ";
-      emit_val(arg_start + 3);
-      os << ")";
-      return;
-    }
-
-    if (global_symbol == "debug_print_buffer_dump") {
-      // args: [msg, buf_name, ptr, size, type_str]
-      uint64_t size_val = Downcast<IntImm>(args[arg_start + 3])->value;
-      std::string dtype_str = Downcast<StringImm>(args[arg_start + 4])->value;
-      std::string position = "VECIN";
-      auto scope = args[arg_start + 2]
-                       .as<CallNode>()
-                       ->args[0]
-                       .as<BufferLoadNode>()
-                       ->buffer.scope();
-      if (scope == "shared.l0c") {
-        position = "CO1";
-      }
-
-      os << "AscendC::DumpTensor(AscendC::LocalTensor<" << dtype_str
-         << ">(AscendC::TPosition::" << position << ", (uint32_t)(uintptr_t)";
-      PrintExpr(args[arg_start + 2], os);
-      os << ", " << size_val << "), 0, " << size_val << ")";
-      return;
-    }
-    if (global_symbol == "debug_print_global_buffer_dump") {
-      // args: [msg, buf_name, ptr, size, type_str]
-      uint64_t size_val = Downcast<IntImm>(args[arg_start + 3])->value;
-      std::string dtype_str = Downcast<StringImm>(args[arg_start + 4])->value;
-      this->PrintIndent();
-      this->stream << "{ AscendC::GlobalTensor<" << dtype_str
-                   << "> __dump_gt; __dump_gt.SetGlobalBuffer(";
-      // args[arg_start+2] via access_ptr -> resolve to the raw buffer Var
-      if (const auto *call = args[arg_start + 2].as<CallNode>()) {
-        // tvm_access_ptr(base, ...) -> extract base Var
-        if (call->args.size() >= 2) {
-          PrintExpr(call->args[1], this->stream);
-        } else {
-          PrintExpr(args[arg_start + 2], this->stream);
-        }
-      } else {
-        PrintExpr(args[arg_start + 2], this->stream);
-      }
-      this->stream << ", " << size_val
-                   << "); AscendC::DumpTensor(__dump_gt, 0, " << size_val
-                   << "); }\n";
-      return;
-    }
-  }
-  // debug_print_global_buffer_dump handled in VisitStmt_(EvaluateNode)
 
   CodeGenC::PrintCallExtern(ret_type, global_symbol, args, skip_first_arg, os);
 }

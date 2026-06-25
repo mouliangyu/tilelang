@@ -110,6 +110,7 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     if allow_global_thread_synchronization(pass_ctx=pass_ctx):
         mod = tilelang.transform.ThreadSync("global")(mod)
     mod = tilelang.transform.AnnotateDeviceRegions()(mod)
+    mod = ascend_transform.MarkScalarDcacheBypass()(mod)
     mod = tilelang.transform.SplitHostDevice()(mod)
     mod = tilelang.transform.AnnotateReadOnlyParams()(mod)
 

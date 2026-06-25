@@ -1067,6 +1067,26 @@ TVM_DLL const Op &ascend_gemm_l1();
 TVM_DLL const Op &ascend_blockscaled_gemm_l1();
 
 /*!
+ * \brief Ascend scalar GM read bypassing dcache.
+ *
+ * ascend_read_gm_bypass_dcache(address_of(BufferLoad))
+ *
+ * Replaces a scalar BufferLoad from a global buffer that has writes
+ * elsewhere.  The codegen emits tl::read_gm_bypass_dcache(ptr).
+ */
+TVM_DLL const Op &ascend_read_gm_bypass_dcache();
+
+/*!
+ * \brief Ascend scalar GM write bypassing dcache.
+ *
+ * ascend_write_gm_bypass_dcache(address_of(BufferLoad), value)
+ *
+ * Replaces a scalar BufferStore to a global buffer that has writes
+ * elsewhere.  The codegen emits tl::write_gm_bypass_dcache(ptr, val).
+ */
+TVM_DLL const Op &ascend_write_gm_bypass_dcache();
+
+/*!
  * \brief Ascend get_buf for pipe buffer acquisition.
  *
  * ascend_get_buf(pipe_string, buf_id, mode)

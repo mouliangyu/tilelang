@@ -42,12 +42,21 @@ def MergeUBAllocations(enable_aggressive_merge: bool = False, align_bytes: int =
     return _ffi_api.MergeUBAllocations(enable_aggressive_merge, align_bytes, disable_reuse)  # type: ignore
 
 
+def MarkScalarDcacheBypass():
+    """Rewrite scalar global buffer accesses to use dcache bypass intrinsics
+    for buffers that have writes (scalar BufferStore or MTE copy). Pure-read
+    buffers keep normal BufferLoad (dcache path).
+    """
+    return _ffi_api.MarkScalarDcacheBypass()  # type: ignore
+
+
 __all__ = [
     "AnnotateMultiBufferEligible",
     "AscendSimdVFLowerParallel",
     "AutoSchedule",
     "HoistSimdPairs",
     "IfConditionExtract",
+    "MarkScalarDcacheBypass",
     "MergeUBAllocations",
     "NormalizeMixedKernelSid",
 ]

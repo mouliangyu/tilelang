@@ -7,7 +7,6 @@ from tvm import tirx
 from typing import Any
 from tilelang.language.kernel import get_thread_bindings
 from tilelang.language import copy, macro, serial, alloc_shared
-from tilelang.language.tir.ir import address_of
 from tilelang.language.utils import index_to_coordinates
 
 
@@ -21,27 +20,6 @@ def _check_ascend_availability() -> bool:
 
 
 _IS_ASCEND_AVAILABLE = _check_ascend_availability()
-
-
-def _dtype_to_ascend_type_str(dtype) -> str:
-    """Convert a TVM dtype to the AscendC C++ type string."""
-    mapping = {
-        "float32": "float",
-        "float16": "half",
-        "bfloat16": "bfloat16_t",
-        "int32": "int32_t",
-        "int16": "int16_t",
-        "int8": "int8_t",
-        "uint32": "uint32_t",
-        "uint16": "uint16_t",
-        "uint8": "uint8_t",
-        "int64": "int64_t",
-        "uint64": "uint64_t",
-        "float64": "double",
-        "bool": "bool",
-    }
-    s = str(dtype)
-    return mapping.get(s, s)
 
 
 @macro
@@ -139,41 +117,6 @@ def print_msg(msg: str) -> None:
 
 
 @macro
-def print_buffer_dump_ascend(buffer: tirx.Buffer, msg: str, elems: int) -> None:
-    """Emit a single AscendC::DumpTensor call for the entire buffer.
-
-    Used on Ascend NPU where DumpTensor is more efficient than
-    per-element AscendC::printf and can be called from kernel level
-    (outside SimtVF).
-    """
-    type_str = _dtype_to_ascend_type_str(buffer.dtype)
-    tirx.call_extern(
-        "handle",
-        "debug_print_buffer_dump",
-        msg,
-        buffer.name,
-        address_of(buffer[[0] * len(buffer.shape)]),
-        elems,
-        type_str,
-    )
-
-
-@macro
-def print_global_buffer_dump_ascend(buffer: tirx.Buffer, msg: str, elems: int) -> None:
-    """Emit a single AscendC::DumpTensor(GlobalTensor) call for a global buffer."""
-    type_str = _dtype_to_ascend_type_str(buffer.dtype)
-    tirx.call_extern(
-        "handle",
-        "debug_print_global_buffer_dump",
-        msg,
-        buffer.name,
-        address_of(buffer[[0] * len(buffer.shape)]),
-        elems,
-        type_str,
-    )
-
-
-@macro
 def print_local_buffer_with_condition(condition: tirx.PrimExpr, buffer: tirx.Buffer, elems: int, msg: str = "") -> None:
     """
     Conditionally prints the values of a flattened TIR buffer if the condition is True.
@@ -225,14 +168,7 @@ def print(obj: Any = None, msg: str = "", warp_group_id: int = 0, warp_id: int =
         if not msg:
             msg = f"buffer<{buffer.name}, {buffer.dtype}>"
 
-        # On Ascend, emit a single DumpTensor call instead of iterating
-        # elements in a for loop. Local/shared -> LocalTensor, global -> GlobalTensor.
-        if _IS_ASCEND_AVAILABLE:
-            if buffer.scope() == "global":
-                print_global_buffer_dump_ascend(buffer, msg, elems)
-            else:
-                print_buffer_dump_ascend(buffer, msg, elems)
-        elif buffer.scope() == "local":
+        if buffer.scope() == "local":
             print_local_buffer_with_condition(True, buffer, elems, msg)
         elif buffer.scope() == "local.fragment":
             tx, ty, tz = get_thread_bindings()
@@ -242,11 +178,14 @@ def print(obj: Any = None, msg: str = "", warp_group_id: int = 0, warp_id: int =
             condition = tx == main_lane and ty == 0 and tz == 0
             print_fragment_buffer_with_condition(condition, buffer, elems, msg)
         elif buffer.scope() in {"shared", "shared.dyn"}:
-            tx, ty, tz = get_thread_bindings()
-            warp_group_size = 128
-            warp_size = 32
-            main_lane = warp_group_id * warp_group_size + warp_id * warp_size
-            condition = tx == main_lane and ty == 0 and tz == 0
+            if _IS_ASCEND_AVAILABLE:
+                condition = True
+            else:
+                tx, ty, tz = get_thread_bindings()
+                warp_group_size = 128
+                warp_size = 32
+                main_lane = warp_group_id * warp_group_size + warp_id * warp_size
+                condition = tx == main_lane and ty == 0 and tz == 0
             print_shared_buffer_with_condition(condition, buffer, elems, msg)
         elif buffer.scope() == "global":
             print_global_buffer_with_condition(True, buffer, elems, msg)
