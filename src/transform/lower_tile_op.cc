@@ -26,7 +26,7 @@
 #include "../op/simt_vf.h"
 #include "../op/utils.h"
 #include "backend/common/target_utils.h"
-#include "ptx_async_copy_injector.h"
+#include "cuda/transform/ptx_async_copy_injector.h"
 
 #include "arith/ir_mutator_with_analyzer.h"
 #include "common/attr.h"
@@ -1104,9 +1104,9 @@ private:
       is_ptx_ = true;
       auto call = Downcast<Call>(IRMutatorWithAnalyzer::VisitExpr_(op));
       is_ptx_ = false;
-      // form: T.ptx_stmatrix(trans, num, smem_ptr, value0, value1, ...)
-      // smem_ptr: T.tvm_access_ptr(ptype, data, offset, extent, rw_mask)
-      // or T.address_of(buffer, offset)
+      // form: T.ptx_stmatrix(trans, num, smem_ptr, value0, value1, ...,
+      // [shape]) smem_ptr: T.tvm_access_ptr(ptype, data, offset, extent,
+      // rw_mask) or T.address_of(buffer, offset)
       PrimExpr access_ptr = call->args[2];
       Call access_ptr_call = Downcast<Call>(access_ptr);
 
@@ -1392,9 +1392,6 @@ private:
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == kPipelineContextNumStages) {
-      return VisitStmt(op->body);
-    }
     if (op->attr_key == tirx::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
       ICHECK_NE(iv->thread_tag.length(), 0U);
@@ -1689,15 +1686,16 @@ private:
     // `tir.ptx_cp_async`.
     if (TargetIsCuda(target_) && TargetHasAsyncCopy(target_)) {
       tvm::transform::PassContext ctx = tvm::transform::PassContext::Current();
-      bool enable_auto_async_copy =
+      bool auto_async_copy_enabled =
           ctx->GetConfig<Bool>(kEnableAsyncCopy, Bool(true)).value();
-      bool should_enable_async_copy =
+      bool should_inject_async_copy =
           parallel_prefer_async ||
-          (enable_auto_async_copy && parallel_async_without_async_commit_wait);
-      auto inject_result =
-          InjectPTXAsyncCopy(lowered, should_enable_async_copy,
-                             parallel_async_without_async_commit_wait);
-      lowered = inject_result.stmt;
+          (auto_async_copy_enabled && parallel_async_without_async_commit_wait);
+      if (should_inject_async_copy) {
+        auto inject_result = InjectPTXAsyncCopy(
+            lowered, parallel_async_without_async_commit_wait);
+        lowered = inject_result.stmt;
+      }
     }
     return lowered;
   }

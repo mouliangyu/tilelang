@@ -369,30 +369,14 @@ file(GLOB TILE_LANG_SRCS
   src/transform/common/*.cc
   src/transform/pipeline/*.cc
   src/op/*.cc
-  src/cpu/op/*.cc
-  src/cuda/op/copy_analysis.cc
-  src/metal/op/*.cc
-  src/webgpu/op/*.cc
   src/backend/common/target_utils.cc
   src/backend/common/codegen/codegen_utils.cc
   src/backend/common/codegen/codegen_c_host.cc
-  src/backend/common/codegen/codegen_c.cc
-  src/backend/common/codegen/rt_mod_c.cc
-  # intrin_rule doesn't have system dependency; always compiled regardless of backend
-  src/cuda/codegen/intrin_rule_cuda.cc
-  src/rocm/codegen/intrin_rule_hip.cc
 )
 
 # Always include CPU-safe runtime helpers
 list(APPEND TILE_LANG_SRCS
   src/runtime/error_helpers.cc
-)
-
-# Metal codegen is pure C++ (no Apple frameworks) and can generate Metal shader
-# source on any platform.  Always compile it so that "target.build.tilelang_metal"
-# is available for cross-compilation on Linux/Windows.
-list(APPEND TILE_LANG_SRCS
-  src/backend/common/codegen/codegen_metal.cc
 )
 # Track if the user explicitly selected a backend via cache options.
 set(TILELANG_BACKEND_USER_SELECTED OFF)
@@ -462,9 +446,11 @@ endif()
 
 # Backend-local CMake files own native source lists, stubs, include paths, and
 # compile definitions. Top-level CMake only selects and delegates.
+include("${CMAKE_CURRENT_SOURCE_DIR}/src/cpu/CMakeLists.txt")
 include("${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/CMakeLists.txt")
 include("${CMAKE_CURRENT_SOURCE_DIR}/src/rocm/CMakeLists.txt")
 include("${CMAKE_CURRENT_SOURCE_DIR}/src/metal/CMakeLists.txt")
+include("${CMAKE_CURRENT_SOURCE_DIR}/src/webgpu/CMakeLists.txt")
 include("${CMAKE_CURRENT_SOURCE_DIR}/src/ascend/CMakeLists.txt")
 list(REMOVE_DUPLICATES TILE_LANG_SRCS)
 

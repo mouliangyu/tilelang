@@ -1,11 +1,9 @@
 /*!
- * \brief Lower eligible global->shared copies into PTX cp.async
- * \file lower_ptx_async_copy.cc
+ * \brief Inject eligible global->shared copies into ROCm async-copy intrinsics.
+ * \file rocm/transform/async_copy_injector.cc
  */
 #include "support/check.h"
 #include <tvm/runtime/logging.h>
-#include <tvm/s_tir/stmt.h>
-#include <tvm/target/target.h>
 #include <tvm/tirx/analysis.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/expr.h>
@@ -19,12 +17,10 @@
 #include <optional>
 #include <vector>
 
-#include "../op/builtin.h"
-#include "../op/utils.h"
-#include "backend/common/target_utils.h"
-#include "ptx_async_copy_injector.h"
+#include "op/builtin.h"
+#include "op/utils.h"
+#include "rocm/transform/async_copy_injector.h"
 #include "tir/ir/buffer_common.h"
-#include <tvm/tirx/stmt.h>
 
 namespace tvm {
 namespace tl {
@@ -32,14 +28,12 @@ namespace tl {
 using namespace tirx;
 using namespace ffi;
 
-class PTXAsyncCopyInjector : public StmtMutator {
+class ROCmAsyncCopyInjector : public StmtMutator {
 public:
-  explicit PTXAsyncCopyInjector(bool enable_auto_async_copy,
-                                bool async_without_async_commit_wait)
-      : enable_auto_async_copy_(enable_auto_async_copy),
-        async_without_async_commit_wait_(async_without_async_commit_wait) {}
+  explicit ROCmAsyncCopyInjector(bool async_without_async_commit_wait)
+      : async_without_async_commit_wait_(async_without_async_commit_wait) {}
 
-  bool InjectedPTXAsyncCopy() const { return injected_ptx_async_copy_; }
+  bool InjectedROCmAsyncCopy() const { return injected_rocm_async_copy_; }
 
   Stmt Finalize(Stmt body) {
     if (!pending_sync_copies_ || UseExplicitAsyncSemantics()) {
@@ -57,17 +51,6 @@ public:
     return SeqStmt(seq);
   }
 
-  Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == s_tir::attr::async_scope) {
-      ++explicit_async_scope_depth_;
-      Stmt body = this->VisitStmt(op->body);
-      --explicit_async_scope_depth_;
-      // `async_scope` is a lowering-only marker for cp.async semantics.
-      return body;
-    }
-    return StmtMutator::VisitStmt_(op);
-  }
-
   Stmt VisitStmt_(const ForNode *op) final {
     // Track nested vectorized loop extents so we can decide whether an
     // element-wise copy has a legal final cp.async width after later loop
@@ -75,9 +58,10 @@ public:
     //   for v in T.vectorized(k): tl.ptx_cp_async(dst, src, elem_count)
     // => tl.ptx_cp_async(dst_base, src_base, elem_count * k)
     //
-    // TileLang records logical element counts in tl.ptx_cp_async. The final
-    // PTX byte width is derived later from the access_ptr dtype, so subbyte
-    // dtypes such as int4/fp4/int2/int1 remain representable here.
+    // TileLang currently uses tl.ptx_cp_async as the async-copy IR marker.
+    // HIP codegen maps it to ROCm async-copy intrinsics. The final byte width
+    // is derived later from the access_ptr dtype, so subbyte dtypes such as
+    // int4/fp4/int2/int1 remain representable here.
     int previous_vectorized_lanes = current_vectorized_lanes_;
     bool pushed_vectorized_loop = false;
     if (op->kind == ForKind::kVectorized) {
@@ -101,14 +85,14 @@ public:
     return stmt;
   }
 
-  Optional<Stmt> TryInjectPTX(const BufferLoadNode *load,
-                              const BufferStoreNode *store,
-                              bool predicated = false,
-                              const PrimExpr &predicate_value = PrimExpr()) {
+  Optional<Stmt>
+  TryInjectROCmAsyncCopy(const BufferLoadNode *load,
+                         const BufferStoreNode *store, bool predicated = false,
+                         const PrimExpr &predicate_value = PrimExpr()) {
     // Pipeline:
     // 1) Analyze source/destination indices and transfer width eligibility.
-    // 2) Build tl.ptx_cp_async with scalar/vectorized base offsets when the
-    //    eventual PTX byte width is representable.
+    // 2) Build the async-copy IR marker with scalar/vectorized base offsets
+    //    when the eventual transfer byte width is representable.
     std::optional<CopyIndexInfo> index_info = PrepareCopyIndexInfo(load, store);
     if (!index_info.has_value()) {
       return Optional<Stmt>();
@@ -265,20 +249,16 @@ public:
     if (!IsSharedBuffer(store->buffer)) {
       return StmtMutator::VisitStmt_(store);
     }
-    // Only lower copies in regions where async-copy rewrite is enabled.
-    if (!enable_auto_async_copy_) {
-      return StmtMutator::VisitStmt_(store);
-    }
 
     Optional<PrimExpr> predicate = std::nullopt;
     const BufferLoadNode *load =
         MatchZeroFillBufferLoad(store->value, &predicate);
     if (load) {
-      Optional<Stmt> injected =
-          TryInjectPTX(load, store, predicate.defined(),
-                       predicate.defined() ? predicate.value() : PrimExpr());
+      Optional<Stmt> injected = TryInjectROCmAsyncCopy(
+          load, store, predicate.defined(),
+          predicate.defined() ? predicate.value() : PrimExpr());
       if (injected.defined()) {
-        injected_ptx_async_copy_ = true;
+        injected_rocm_async_copy_ = true;
         if (!UseExplicitAsyncSemantics()) {
           pending_sync_copies_ = true;
           uncommitted_sync_copies_ = true;
@@ -292,7 +272,7 @@ public:
 
 private:
   bool UseExplicitAsyncSemantics() const {
-    return async_without_async_commit_wait_ || explicit_async_scope_depth_ > 0;
+    return async_without_async_commit_wait_;
   }
 
   // A copy candidate represented after flattening source/destination indexing.
@@ -404,9 +384,10 @@ private:
     const int per_access_bits = effective_lanes * load->dtype.bits();
     const int total_bits = static_cast<int>(per_access_bits) *
                            static_cast<int>(current_vectorized_lanes_);
-    // PTX cp.async is byte-granular. `tl.ptx_cp_async` stores logical element
-    // counts, but we still need to know that the eventual vectorized transfer
-    // can map to a legal byte width without over-copying packed subbyte data.
+    // The async-copy marker is byte-granular. `tl.ptx_cp_async` stores logical
+    // element counts, but we still need to know that the eventual vectorized
+    // transfer can map to a legal byte width without over-copying packed
+    // subbyte data.
     if (total_bits % 8 != 0) {
       return std::nullopt;
     }
@@ -689,60 +670,20 @@ private:
   // Note: AnalyzeCopyRegion replaces both the old `IsPureCopyRegion` and
   // `SummarizeAsyncIntrinsics` helpers to avoid redundant traversals.
 
-  bool enable_auto_async_copy_{true};
   bool async_without_async_commit_wait_{false};
-  int explicit_async_scope_depth_{0};
   int current_vectorized_lanes_{1};
   std::vector<ActiveVectorizedLoop> active_vectorized_loops_;
   arith::Analyzer analyzer_;
-  bool injected_ptx_async_copy_{false};
+  bool injected_rocm_async_copy_{false};
   bool pending_sync_copies_{false};
   bool uncommitted_sync_copies_{false};
 };
 
-using namespace tirx::transform;
-
-PTXAsyncCopyInjectResult
-InjectPTXAsyncCopy(const Stmt &body, bool enable_auto_async_copy,
-                   bool async_without_async_commit_wait) {
-  PTXAsyncCopyInjector injector(enable_auto_async_copy,
-                                async_without_async_commit_wait);
+ROCmAsyncCopyInjectResult
+InjectROCmAsyncCopy(const Stmt &body, bool async_without_async_commit_wait) {
+  ROCmAsyncCopyInjector injector(async_without_async_commit_wait);
   Stmt injected = injector(body);
-  return {injector.Finalize(injected), injector.InjectedPTXAsyncCopy()};
-}
-
-tvm::transform::Pass LowerPTXAsyncCopy() {
-  auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
-    auto target_opt = f->GetAttr<Target>(tvm::attr::kTarget);
-    if (!target_opt.defined()) {
-      return f;
-    }
-    Target target = target_opt.value();
-    if (!TargetIsCuda(target)) {
-      return f;
-    }
-
-    if (!TargetHasAsyncCopy(target)) {
-      // Graceful fallback on older architectures.
-      return f;
-    }
-
-    bool enable_auto_async_copy =
-        ctx->GetConfig<Bool>(kEnableAsyncCopy, Bool(true)).value();
-
-    auto *n = f.CopyOnWrite();
-    auto inject_result =
-        InjectPTXAsyncCopy(n->body, enable_auto_async_copy,
-                           /*async_without_async_commit_wait=*/false);
-    n->body = inject_result.stmt;
-    return f;
-  };
-  return CreatePrimFuncPass(pass_func, 0, "tl.LowerPTXAsyncCopy", {});
-}
-
-TVM_FFI_STATIC_INIT_BLOCK() {
-  namespace refl = reflection;
-  refl::GlobalDef().def("tl.transform.LowerPTXAsyncCopy", LowerPTXAsyncCopy);
+  return {injector.Finalize(injected), injector.InjectedROCmAsyncCopy()};
 }
 
 } // namespace tl
