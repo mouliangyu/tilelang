@@ -878,10 +878,18 @@ bool ControlNode::CollectFirstAccessPoints(
   bool body_must = false;
   if (child && child->IsSequence()) {
     auto *seq = static_cast<const SequenceNode *>(child.get());
+    auto ordered = seq->children;
+    std::stable_sort(ordered.begin(), ordered.end(),
+                     [](const auto &a, const auto &b) {
+                       auto *ua = dynamic_cast<const ScheduleUnit *>(a.get());
+                       auto *ub = dynamic_cast<const ScheduleUnit *>(b.get());
+                       if (ua && ub)
+                         return ua->stage > ub->stage;
+                       return false;
+                     });
     path.push_back(seq);
     body_must = SequenceCollectFirstAccessPoints(
-        MakeSequenceEntriesFromUnits(seq->children), pred, result, path,
-        time_offset);
+        MakeSequenceEntriesFromUnits(ordered), pred, result, path, time_offset);
     path.pop_back();
   } else if (child) {
     body_must =
@@ -905,10 +913,18 @@ bool ControlNode::CollectLastAccessPoints(
   bool body_must = false;
   if (child && child->IsSequence()) {
     auto *seq = static_cast<const SequenceNode *>(child.get());
+    auto ordered = seq->children;
+    std::stable_sort(ordered.begin(), ordered.end(),
+                     [](const auto &a, const auto &b) {
+                       auto *ua = dynamic_cast<const ScheduleUnit *>(a.get());
+                       auto *ub = dynamic_cast<const ScheduleUnit *>(b.get());
+                       if (ua && ub)
+                         return ua->stage > ub->stage;
+                       return false;
+                     });
     path.push_back(seq);
     body_must = SequenceCollectLastAccessPoints(
-        MakeSequenceEntriesFromUnits(seq->children), pred, result, path,
-        body_offset);
+        MakeSequenceEntriesFromUnits(ordered), pred, result, path, body_offset);
     path.pop_back();
   } else if (child) {
     body_must = child->CollectLastAccessPoints(pred, result, path, body_offset);

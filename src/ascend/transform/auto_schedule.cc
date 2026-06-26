@@ -1203,8 +1203,9 @@ static ScheduledKernelResult ScheduleSingleKernel(
   } else {
     sid = Var("sid", DataType::Int(32));
   }
+  MultiVersionBufferMap buffer_info_map;
   AnalyzeAndInsertBarriers(ir_structure.get(), event_id_map, flag_infos, sid,
-                           loop_info, result.buffer_infos);
+                           loop_info, result.buffer_infos, buffer_info_map);
 
   Stmt wg0_body = Evaluate(0);
   Stmt wg1_body = Evaluate(0);
@@ -1226,10 +1227,10 @@ static ScheduledKernelResult ScheduleSingleKernel(
     for (const auto &info : flag_infos) {
       if (info.mode == 0) {
         stmts[info.warpgroup_id].push_back(
-            makeAscendSetFlag(info.hardevent, info.flag_var));
+            MakeAscendSetFlag(info.hardevent, info.flag_var));
       } else if (info.mode == 1) {
         stmts[info.warpgroup_id].push_back(
-            makeAscendCrossCoreSetFlag(4, info.hardevent, info.flag_var));
+            MakeAscendCrossCoreSetFlag(4, info.hardevent, info.flag_var));
       }
     }
     stmts[0].push_back(wg0_body);
@@ -1237,10 +1238,10 @@ static ScheduledKernelResult ScheduleSingleKernel(
     for (const auto &info : flag_infos) {
       if (info.mode == 0) {
         stmts[info.warpgroup_id].push_back(
-            makeAscendWaitFlag(info.hardevent, info.flag_var));
+            MakeAscendWaitFlag(info.hardevent, info.flag_var));
       } else if (info.mode == 2) {
         stmts[info.warpgroup_id].push_back(
-            makeAscendCrossCoreWaitFlag(4, info.hardevent, info.flag_var));
+            MakeAscendCrossCoreWaitFlag(4, info.hardevent, info.flag_var));
       }
     }
     if (has_wg0) {

@@ -1,4 +1,5 @@
 #pragma once
+#include <tvm/arith/analyzer.h>
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/function.h>
 #include <tvm/target/target.h>
@@ -359,6 +360,19 @@ public:
       }
     }
     std::map<Buffer, int64_t> annotated_buffer_versions;
+    auto get_buffer_size = [](const Buffer &buffer) -> int64_t {
+      int64_t elem_size = buffer->dtype.bits() * buffer->dtype.lanes() / 8;
+      PrimExpr size = IntImm(DataType::Int(64), elem_size);
+      for (const auto &dim : buffer->shape) {
+        size *= dim;
+      }
+      arith::Analyzer analyzer;
+      auto size_val = analyzer.Simplify(size);
+      if (const auto *int_imm = size_val.as<IntImmNode>()) {
+        return int_imm->value;
+      }
+      return 0;
+    };
     auto enumerate_buffers = [&](auto &&visit) {
       for (const auto &r : ctrl->GetReadRegions())
         visit(r->buffer);
@@ -392,7 +406,7 @@ public:
         // These buffers cannot be multi-buffered, and cannot share memory with
         // other buffers either, so we directly reduce the capacity of the
         // memory group by their size
-        group_capacities[group_id] -= GetBufferSize(buffer);
+        group_capacities[group_id] -= get_buffer_size(buffer);
       } else {
         // Check if this buffer has a manually annotated version count
         auto override_it =
@@ -400,11 +414,11 @@ public:
         if (override_it != buffer_versions_overrides_.end()) {
           int64_t override_val = override_it->second;
           annotated_buffer_versions[buffer] = override_val;
-          group_capacities[group_id] -= GetBufferSize(buffer) * override_val;
+          group_capacities[group_id] -= get_buffer_size(buffer) * override_val;
         } else {
           buffer_var_id[buffer] = buffer_sizes.size();
           group_indices[group_id].push_back((int64_t)buffer_sizes.size());
-          buffer_sizes.push_back(GetBufferSize(buffer));
+          buffer_sizes.push_back(get_buffer_size(buffer));
         }
       }
     });
@@ -639,16 +653,20 @@ public:
     // stages.
     std::vector<int> raw_k(n, 0);
     int min_k_raw = std::numeric_limits<int>::max();
+    int64_t min_start_time = std::numeric_limits<int64_t>::max();
     for (size_t i = 0; i < n; ++i) {
-      units[i]->SetStartTime(start_times[i]);
       int k = (ii > 0) ? static_cast<int>(start_times[i] / ii) : 0;
       raw_k[i] = k;
       min_k_raw = std::min(min_k_raw, k);
+      min_start_time = std::min(min_start_time, start_times[i]);
     }
     for (size_t i = 0; i < n; ++i) {
       // When offset is disabled, collapse every task into a single pipeline
       // stage so warpgroup_partition emits a flat (non-pipelined) loop body.
       units[i]->stage = enable_offset ? (min_k_raw - raw_k[i]) : 0;
+      // Adjust start_time to be relative to the earliest start_time, so that
+      // the first task starts at 0.
+      units[i]->SetStartTime(start_times[i] - min_start_time);
     }
     auto phys_time = [&](const std::shared_ptr<IRStructure> &c) -> int64_t {
       auto *u = static_cast<ScheduleUnit *>(c.get());

@@ -17,6 +17,7 @@ import example_simtvf_vecadd
 import example_simtvf_vecadd_mutex
 import example_simdvf_per_token_cast_to_fp8
 import example_simtvf_per_token_cast_to_fp8
+import example_crosslevel_multibuffer
 
 
 def _safe_process(func, name, **kwargs):
@@ -106,6 +107,10 @@ def regression_simdvf_per_token_cast_to_fp8():
 
 def regression_simtvf_per_token_cast_to_fp8():
     _safe_process(example_simtvf_per_token_cast_to_fp8.run_regression_perf, "ascend_simtvf_per_token_cast_to_fp8")
+
+
+def regression_crosslevel_multibuffer():
+    _safe_process(example_crosslevel_multibuffer.run_regression_perf, "ascend_crosslevel_multibuffer")
 
 
 if __name__ == "__main__":
