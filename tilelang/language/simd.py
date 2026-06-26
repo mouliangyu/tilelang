@@ -5,8 +5,8 @@ Function names match the underlying CCE intrinsics directly.
 
 from tvm import tirx
 from tvm.tirx import BufferLoad
-from tvm.tirx.script.builder.ir import alloc_buffer as _alloc_buffer
-
+from tilelang._typing import DType, ShapeType
+from .allocate import alloc_var as _alloc_var, alloc_local as _alloc_local
 from .builtin import access_ptr
 
 _Op = tirx.op.Op.get
@@ -98,9 +98,26 @@ def psel(src0, src1, mask):
     return tirx.call_intrin("boolx256", _Op("tl.simd.psel"), src0, src1, mask)
 
 
-def alloc_var(dtype: str):
-    """Allocate a mutable SIMD variable for return-value style SIMD code."""
-    return _alloc_buffer([1], _vec_dtype(dtype), scope="local.var")
+def alloc_var(dtype: DType):
+    """Allocate a single mutable SIMD register variable (return-value style).
+
+    Uses ``local.var`` scope and behaves as one vector register value. For an
+    addressable array of registers (``v[i]``), use :func:`alloc_local`.
+    """
+    return _alloc_var(_vec_dtype(dtype), scope="local.var")
+
+
+def alloc_local(shape: ShapeType, dtype: DType):
+    """Allocate an addressable array of mutable SIMD register variables.
+
+    Uses ``local`` scope so each element is an individually addressable
+    register, allowing indexed access like ``v[i]``::
+
+        v = T.simd.alloc_local(4, "float32")
+        for i in T.Unroll(4, explicit=True):
+            v[i] = vld(s_ub[i * VL])
+    """
+    return _alloc_local(shape, _vec_dtype(dtype), scope="local")
 
 
 # -- Data movement ---------------------------------------------------------------

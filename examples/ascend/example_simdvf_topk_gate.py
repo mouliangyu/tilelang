@@ -79,10 +79,8 @@ def topk_gate(num_experts: int, num_topk: int):
                     T.copy(scores[row, :], s_ub[:num_experts])
 
                     with T.SimdVF():
-                        v0 = T.simd.alloc_var("float32")
-                        v1 = T.simd.alloc_var("float32")
-                        v2 = T.simd.alloc_var("float32")
-                        v3 = T.simd.alloc_var("float32")
+                        v = T.simd.alloc_local((4), "float32")
+                        r = T.simd.alloc_local((4), "int32")
 
                         full = pset(32, "PAT_ALL")
                         one = pset(32, "PAT_VL1")
@@ -90,33 +88,25 @@ def topk_gate(num_experts: int, num_topk: int):
                         neg_inf = vdup(-T.infinity(T.float32), "float32", full)
                         int_max = vdup(T.max_value(T.int32), "int32", full)
 
-                        v0 = vld(s_ub[0])
-                        v1 = vld(s_ub[VL])
-                        v2 = vld(s_ub[2 * VL])
-                        v3 = vld(s_ub[3 * VL])
-
-                        r0 = vci(T.int32(0), "int32")
-                        r1 = vci(T.int32(VL), "int32")
-                        r2 = vci(T.int32(2 * VL), "int32")
-                        r3 = vci(T.int32(3 * VL), "int32")
+                        for i in T.Unroll(4, explicit=True):
+                            v[i] = vld(s_ub[i * VL])
+                            r[i] = vci(T.int32(i * VL), "int32")
 
                         for k in range(num_topk):
                             # Max value across the 4 partial vregs, broadcast.
-                            mx = vdupv(vcmax(vmax(vmax(v0, v1, full), vmax(v2, v3, full), full), full), full)
+                            mx = vdupv(vcmax(vmax(vmax(v[0], v[1], full), vmax(v[2], v[3], full), full), full), full)
                             # Per-lane: keep index where value == max, else INT_MAX.
-                            idx0 = vsel(r0, int_max, vcmp(v0, mx, full, "eq"))
-                            idx1 = vsel(r1, int_max, vcmp(v1, mx, full, "eq"))
-                            idx2 = vsel(r2, int_max, vcmp(v2, mx, full, "eq"))
-                            idx3 = vsel(r3, int_max, vcmp(v3, mx, full, "eq"))
+                            idx0 = vsel(r[0], int_max, vcmp(v[0], mx, full, "eq"))
+                            idx1 = vsel(r[1], int_max, vcmp(v[1], mx, full, "eq"))
+                            idx2 = vsel(r[2], int_max, vcmp(v[2], mx, full, "eq"))
+                            idx3 = vsel(r[3], int_max, vcmp(v[3], mx, full, "eq"))
                             # Min-reduce gives the smallest index (tie-break).
                             idx = vdupv(vcmin(vmin(vmin(idx0, idx1, full), vmin(idx2, idx3, full), full), full), full)
                             # Store winner index.
                             vsts(out_ub[k], idx, one, "ONEPT_B32")
                             # Mask out the winner lane in each vreg so the next k picks the next best.
-                            v0 = vsel(neg_inf, v0, vcmp(r0, idx, full, "eq"))
-                            v1 = vsel(neg_inf, v1, vcmp(r1, idx, full, "eq"))
-                            v2 = vsel(neg_inf, v2, vcmp(r2, idx, full, "eq"))
-                            v3 = vsel(neg_inf, v3, vcmp(r3, idx, full, "eq"))
+                            for i in T.Unroll(4, explicit=True):
+                                v[i] = vsel(neg_inf, v[i], vcmp(r[i], idx, full, "eq"))
 
                     T.copy(out_ub[:num_topk], topk_idx[row, :])
 
