@@ -179,6 +179,11 @@ def vmul(src0, src1, mask, mode="MODE_ZEROING"):
     return tirx.call_intrin(str(src0.dtype), _Op("tl.simd.vmul"), src0, src1, mask, mode)
 
 
+def vmula(acc, src0, src1, mask, mode="MODE_ZEROING"):
+    """Fused multiply-add: dst = acc + src0 * src1."""
+    return tirx.call_intrin(str(acc.dtype), _Op("tl.simd.vmula"), acc, src0, src1, mask, mode)
+
+
 def vdiv(src0, src1, mask, mode="MODE_ZEROING"):
     return tirx.call_intrin(str(src0.dtype), _Op("tl.simd.vdiv"), src0, src1, mask, mode)
 

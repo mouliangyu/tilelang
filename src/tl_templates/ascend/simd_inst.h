@@ -266,6 +266,14 @@ __simd_callee__ inline SrcVec vmul(SrcVec src_0, SrcVec src_1, vector_bool mask,
 }
 
 template <typename SrcVec, typename Mode>
+__simd_callee__ inline SrcVec vmula(SrcVec acc, SrcVec src_0, SrcVec src_1,
+                                    vector_bool mask, Mode mode) {
+  SrcVec dst = acc;
+  ::vmula(dst, src_0, src_1, mask, mode);
+  return dst;
+}
+
+template <typename SrcVec, typename Mode>
 __simd_callee__ inline SrcVec vdiv(SrcVec src_0, SrcVec src_1, vector_bool mask,
                                    Mode mode) {
   SrcVec dst;

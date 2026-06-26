@@ -1434,6 +1434,20 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[1], this->stream);
     this->stream << ");\n";
   }
+  // --- SimdVF FMA: vmula(acc, src0, src1, mask, mode) => acc + src0*src1 ---
+  else if (op->op.same_as(tl::simd_vmula())) {
+    ICHECK_EQ(op->args.size(), 5);
+    os << "simd_inst::vmula(";
+    PrintExpr(op->args[0], os); // acc
+    os << ", ";
+    PrintExpr(op->args[1], os); // src0
+    os << ", ";
+    PrintExpr(op->args[2], os); // src1
+    os << ", ";
+    PrintExpr(op->args[3], os);                            // mask
+    os << ", " << Downcast<StringImm>(op->args[4])->value; // mode
+    os << ")";
+  }
   // --- SimdVF binary ops: (src0, src1, mask, mode) ---
   else if (op->op.same_as(tl::simd_vadd()) || op->op.same_as(tl::simd_vsub()) ||
            op->op.same_as(tl::simd_vmul()) || op->op.same_as(tl::simd_vdiv()) ||
