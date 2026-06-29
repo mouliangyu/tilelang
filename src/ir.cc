@@ -241,14 +241,21 @@ ForFrame PersistentFor(const Array<PrimExpr> &domain, const PrimExpr &wave_size,
     bool needs_lastdim_guard =
         !analyzer.CanProveEqual(virtual_domain_size, domain_size);
     if (needs_total_guard || needs_lastdim_guard) {
-      PrimExpr guard_cond = const_true();
-      if (needs_total_guard) {
-        guard_cond = guard_cond && (linear_index < virtual_domain_size);
-      }
+      // Last-dim overflow (partial last group) is NOT monotonic: the partial
+      // group recurs once per outer-dim iteration, so we must skip these holes
+      // and keep iterating -> wrap the body in an if-guard.
       if (needs_lastdim_guard) {
-        guard_cond = guard_cond && (last_dim_coord < domain[domain.size() - 1]);
+        new_body =
+            IfThenElse(last_dim_coord < domain[domain.size() - 1], new_body);
       }
-      new_body = IfThenElse(guard_cond, body);
+      // Total overflow is monotonic: once linear_index exceeds the virtual
+      // domain it never re-enters, so break out of the loop early.
+      if (needs_total_guard) {
+        Stmt brk = IfThenElse(linear_index >= virtual_domain_size,
+                              tvm::tirx::Evaluate(tvm::tirx::Call(
+                                  DataType::Handle(), tl::loop_break(), {})));
+        new_body = SeqStmt({brk, new_body});
+      }
     }
     Optional<PrimExpr> step =
         !steps.empty() ? steps[0] : Optional<PrimExpr>(std::nullopt);
