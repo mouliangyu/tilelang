@@ -93,6 +93,14 @@ void AnalyzeAndInsertBarriers(IRStructure *node, EventIdMap &event_id_map,
                               std::vector<MultiVersionBufferInfo> &buffer_infos,
                               MultiVersionBufferMap &buffer_info_map);
 
+// List overload: analyze barriers across the root ordered list.
+void AnalyzeAndInsertBarriers(std::vector<std::shared_ptr<IRStructure>> &root,
+                              EventIdMap &event_id_map,
+                              FlagInfoList &flag_infos, Var sid,
+                              LoopNestingInfo &loop_info,
+                              std::vector<MultiVersionBufferInfo> &buffer_infos,
+                              MultiVersionBufferMap &buffer_info_map);
+
 inline Stmt MakeAscendSetFlag(const std::string &hard_event,
                               PrimExpr event_id) {
   return Evaluate(Call(DataType::Handle(), ascend_set_flag(),

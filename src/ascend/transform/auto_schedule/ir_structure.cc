@@ -69,190 +69,10 @@ const TaskNode *BufferAccessPoint::task() const {
   return static_cast<const TaskNode *>(path.back());
 }
 
-// SequenceNode member function implementations
-uint16_t SequenceNode::GetPipeMask() const {
-  uint16_t mask = 0;
-  for (const auto &child : children) {
-    if (child)
-      mask |= child->GetPipeMask();
-  }
-  return mask;
-}
-
-uint16_t SequenceNode::GetHbmMask() const {
-  uint16_t mask = 0;
-  for (const auto &child : children) {
-    if (child)
-      mask |= child->GetHbmMask();
-  }
-  return mask;
-}
-
-std::vector<BufferRegion> SequenceNode::GetReadRegions() const {
-  std::vector<BufferRegion> all_read_regions;
-  for (const auto &child : children) {
-    if (child) {
-      auto child_read_regions = child->GetReadRegions();
-      all_read_regions.insert(all_read_regions.end(),
-                              child_read_regions.begin(),
-                              child_read_regions.end());
-    }
-  }
-  // Remove duplicates (by buffer and region equality)
-  // This is a simplified deduplication - in practice might need more
-  // sophisticated logic
-  std::vector<BufferRegion> deduplicated;
-  for (const auto &region : all_read_regions) {
-    bool found = false;
-    for (const auto &existing : deduplicated) {
-      if (existing->buffer.same_as(region->buffer) &&
-          RegionsEqual(existing->region, region->region)) {
-        found = true;
-        break;
-      }
-    }
-    if (!found)
-      deduplicated.push_back(region);
-  }
-  return deduplicated;
-}
-
-std::vector<Var> SequenceNode::GetReadVars() const {
-  std::vector<Var> all_vars;
-  for (const auto &child : children) {
-    if (child) {
-      auto child_read_vars = child->GetReadVars();
-      all_vars.insert(all_vars.end(), child_read_vars.begin(),
-                      child_read_vars.end());
-    }
-  }
-  return all_vars;
-}
-
-std::vector<Var> SequenceNode::GetIndirectReadVars() const {
-  std::vector<Var> all_vars;
-  for (const auto &child : children) {
-    if (child) {
-      auto child_vars = child->GetIndirectReadVars();
-      all_vars.insert(all_vars.end(), child_vars.begin(), child_vars.end());
-    }
-  }
-  return all_vars;
-}
-
-std::vector<BufferRegion> SequenceNode::GetIndirectReadRegions() const {
-  std::vector<BufferRegion> all_regions;
-  for (const auto &child : children) {
-    if (child) {
-      auto child_regions = child->GetIndirectReadRegions();
-      all_regions.insert(all_regions.end(), child_regions.begin(),
-                         child_regions.end());
-    }
-  }
-  // Remove duplicates (by buffer and region equality)
-  std::vector<BufferRegion> deduplicated;
-  for (const auto &region : all_regions) {
-    bool found = false;
-    for (const auto &existing : deduplicated) {
-      if (existing->buffer.same_as(region->buffer) &&
-          RegionsEqual(existing->region, region->region)) {
-        found = true;
-        break;
-      }
-    }
-    if (!found)
-      deduplicated.push_back(region);
-  }
-  return deduplicated;
-}
-
-std::vector<BufferRegion> SequenceNode::GetWriteRegions() const {
-  std::vector<BufferRegion> all_write_regions;
-  for (const auto &child : children) {
-    if (child) {
-      auto child_write_regions = child->GetWriteRegions();
-      all_write_regions.insert(all_write_regions.end(),
-                               child_write_regions.begin(),
-                               child_write_regions.end());
-    }
-  }
-  // Remove duplicates (by buffer and region equality)
-  std::vector<BufferRegion> deduplicated;
-  for (const auto &region : all_write_regions) {
-    bool found = false;
-    for (const auto &existing : deduplicated) {
-      if (existing->buffer.same_as(region->buffer) &&
-          RegionsEqual(existing->region, region->region)) {
-        found = true;
-        break;
-      }
-    }
-    if (!found)
-      deduplicated.push_back(region);
-  }
-  return deduplicated;
-}
-
-std::vector<Var> SequenceNode::GetWriteVars() const {
-  std::vector<Var> all_vars;
-  for (const auto &child : children) {
-    if (child) {
-      auto child_write_vars = child->GetWriteVars();
-      all_vars.insert(all_vars.end(), child_write_vars.begin(),
-                      child_write_vars.end());
-    }
-  }
-  return all_vars;
-}
-
-int64_t SequenceNode::GetLatency() const { return latency_; }
-
-int64_t SequenceNode::GetII() const { return ii_; }
-
-void SequenceNode::SetPipeMask(uint16_t mask) {
-  for (auto &child : children) {
-    if (child)
-      child->SetPipeMask(mask);
-  }
-}
-
-void SequenceNode::SetReadRegions(const std::vector<BufferRegion> &regions) {
-  // Not clear what this means for SequenceNode - maybe set on first child?
-  if (!children.empty() && children[0]) {
-    children[0]->SetReadRegions(regions);
-  }
-}
-
-void SequenceNode::SetWriteRegions(const std::vector<BufferRegion> &regions) {
-  if (!children.empty() && children[0]) {
-    children[0]->SetWriteRegions(regions);
-  }
-}
-
-void SequenceNode::SetLatency(int64_t latency) { latency_ = latency; }
-
-void SequenceNode::SetII(int64_t ii) { ii_ = ii; }
-
-std::shared_ptr<IRStructure> SequenceNode::Clone() const {
-  auto new_seq = std::make_shared<SequenceNode>();
-  new_seq->children.reserve(children.size());
-  for (const auto &child : children) {
-    if (child) {
-      new_seq->children.push_back(child->Clone());
-    } else {
-      new_seq->children.push_back(nullptr);
-    }
-  }
-  // Copy latency and II
-  new_seq->SetLatency(GetLatency());
-  new_seq->SetII(GetII());
-  return new_seq;
-}
-
 std::shared_ptr<IRStructure> TaskNode::Clone() const {
   auto new_task = std::make_shared<TaskNode>();
-  // Copy statements
-  new_task->stmts = stmts;
+  // Copy statement
+  new_task->stmt = stmt;
   // Copy resource pipe mask
   new_task->SetPipeMask(GetPipeMask());
   new_task->SetHbmMask(GetHbmMask());
@@ -277,6 +97,7 @@ std::shared_ptr<IRStructure> TaskNode::Clone() const {
   new_task->SetWarpgroupId(GetWarpgroupId());
   // Copy loop_break cache
   new_task->contains_loop_break_cache_ = contains_loop_break_cache_;
+  new_task->CopyBaseMetadataFrom(*this);
   return new_task;
 }
 
@@ -286,29 +107,17 @@ bool TaskNode::ContainsLoopBreak() const {
     return contains_loop_break_cache_.value();
   }
 
-  // Check if any statement in this task contains a loop_break call
+  // Check if this task's statement contains a loop_break call
   bool found_loop_break = false;
-  for (const auto &stmt : stmts) {
-    // Helper function to check if a statement contains loop_break
-    auto contains_loop_break = [](const Stmt &stmt) -> bool {
-      bool found = false;
-      PostOrderVisit(stmt, [&found](const ObjectRef &node) {
-        if (found)
-          return;
-        if (const auto *call = node.as<CallNode>()) {
-          if (call->op.same_as(tl::loop_break())) {
-            found = true;
-          }
-        }
-      });
-      return found;
-    };
-
-    if (contains_loop_break(stmt)) {
-      found_loop_break = true;
-      break;
+  PostOrderVisit(stmt, [&found_loop_break](const ObjectRef &node) {
+    if (found_loop_break)
+      return;
+    if (const auto *call = node.as<CallNode>()) {
+      if (call->op.same_as(tl::loop_break())) {
+        found_loop_break = true;
+      }
     }
-  }
+  });
 
   contains_loop_break_cache_ = found_loop_break;
   return found_loop_break;
@@ -318,60 +127,16 @@ std::shared_ptr<IRStructure> ControlNode::Clone() const {
   auto new_ctrl = std::make_shared<ControlNode>();
   // Copy For control (For is a TVM object with reference counting)
   new_ctrl->control = control;
-  // Clone child if exists
-  if (child) {
-    new_ctrl->child = child->Clone();
+  // Clone children
+  new_ctrl->children.reserve(children.size());
+  for (const auto &child : children) {
+    new_ctrl->children.push_back(child ? child->Clone() : nullptr);
   }
   // Copy latency and II
   new_ctrl->SetLatency(GetLatency());
   new_ctrl->SetII(GetII());
+  new_ctrl->CopyBaseMetadataFrom(*this);
   return new_ctrl;
-}
-
-std::shared_ptr<IRStructure> WrapperNode::Clone() const {
-  auto new_wrapper = std::make_shared<WrapperNode>();
-  // Copy var and value (TVM objects with reference counting)
-  new_wrapper->wrapper = wrapper;
-  // Clone child if exists
-  if (child) {
-    new_wrapper->child = child->Clone();
-  }
-  // Copy latency and II
-  new_wrapper->SetLatency(GetLatency());
-  new_wrapper->SetII(GetII());
-  return new_wrapper;
-}
-
-std::shared_ptr<IRStructure> ScheduleUnit::Clone() const {
-  auto new_unit = std::make_shared<ScheduleUnit>();
-  // Copy var and value (TVM objects with reference counting)
-  // Clone child if exists
-  if (child) {
-    new_unit->child = child->Clone();
-  }
-  // Copy latency and II
-  new_unit->SetLatency(GetLatency());
-  new_unit->SetII(GetII());
-  new_unit->SetStartTime(GetStartTime());
-  new_unit->stage = stage;
-  return new_unit;
-}
-
-std::shared_ptr<IRStructure> IfNode::Clone() const {
-  auto new_if = std::make_shared<IfNode>();
-  new_if->condition = condition;
-  if (then_child) {
-    new_if->then_child = then_child->Clone();
-  }
-  if (else_child) {
-    new_if->else_child = else_child->Clone();
-  }
-  if (task) {
-    new_if->task = std::static_pointer_cast<TaskNode>(task->Clone());
-  }
-  new_if->SetLatency(GetLatency());
-  new_if->SetII(GetII());
-  return new_if;
 }
 
 // Helper function to collect all TaskNodes with context information
@@ -387,43 +152,13 @@ void CollectAllTaskNodesWithContext(IRStructure *node,
     task_ctx.task = task;
     task_ctx.control_node = current_control_node;
 
-    // Calculate tripcount if inside a loop
-    if (current_control_node) {
-      task_ctx.tripcount = current_control_node->GetTripCount();
-    } else {
-      task_ctx.tripcount = 1; // Not inside a loop
-    }
-
     all_tasks.push_back(task_ctx);
-  } else if (node->IsSequence()) {
-    auto seq = static_cast<const SequenceNode *>(node);
-    for (const auto &child : seq->children) {
-      CollectAllTaskNodesWithContext(child.get(), all_tasks,
-                                     current_control_node);
-    }
   } else if (node->IsControl()) {
     auto control = static_cast<const ControlNode *>(node);
     // When entering a control node, update the current control context
-    CollectAllTaskNodesWithContext(control->child.get(), all_tasks,
-                                   const_cast<ControlNode *>(control));
-  } else if (node->IsWrapper()) {
-    auto wrapper = static_cast<const WrapperNode *>(node);
-    // Wrapper nodes don't change control context, just recurse into child
-    CollectAllTaskNodesWithContext(wrapper->child.get(), all_tasks,
-                                   current_control_node);
-  } else if (node->IsScheduleUnit()) {
-    auto promote = static_cast<const ScheduleUnit *>(node);
-    // Promote nodes don't change control context, just recurse into child
-    CollectAllTaskNodesWithContext(promote->child.get(), all_tasks,
-                                   current_control_node);
-  } else if (node->IsIf()) {
-    auto if_node = static_cast<const IfNode *>(node);
-    // Recurse into both branches
-    CollectAllTaskNodesWithContext(if_node->then_child.get(), all_tasks,
-                                   current_control_node);
-    if (if_node->else_child) {
-      CollectAllTaskNodesWithContext(if_node->else_child.get(), all_tasks,
-                                     current_control_node);
+    for (const auto &child : control->children) {
+      CollectAllTaskNodesWithContext(child.get(), all_tasks,
+                                     const_cast<ControlNode *>(control));
     }
   } else {
     LOG(FATAL);
@@ -454,27 +189,34 @@ static bool LoopMustExecute(const ControlNode *ctrl) {
 }
 
 // An entry in the unified sequence helper. `node` is the IR-tree node to
-// recurse into; `path_prefix` lists the real IR-tree nodes to push onto the
-// access-point path before recursing (so the recorded chain reflects ancestor
-// wrappers — typically the enclosing `ScheduleUnit`, plus the `IfNode` itself
-// when we descend into an if-branch); `start_time` is the entry's offset
-// relative to the enclosing sequence's start.
+// recurse into; `start_time` is the entry's offset relative to the enclosing
+// sequence's start.
 //
-// At a regular Sequence level, each entry corresponds to one `ScheduleUnit`
-// child: `node = unit->child`, `path_prefix = {unit}`. When the helper merges
-// an if-group and descends into branches, each branch becomes a new
-// SequenceEntry whose `path_prefix` extends to include the enclosing IfNode,
-// so inner if-groups (and arbitrary nesting) are handled by the same helper.
+// Conditional execution is carried by each node's `conditions` delta rather
+// than by a dedicated IfNode, so the helper dispatches entries in order;
+// conditional accesses are recorded as candidates but do not terminate the
+// first/last scan.
 struct SequenceEntry {
   const IRStructure *node;
-  std::vector<const IRStructure *> path_prefix;
   int64_t start_time;
 };
 
-static const IfNode *AsIfNode(const IRStructure *node) {
-  if (node && node->IsIf())
-    return static_cast<const IfNode *>(node);
-  return nullptr;
+// A buffer access is "must happen" at its sequence position only if neither the
+// accessing node nor any structural ancestor on its path is conditional. A
+// conditional access (some node carries a `conditions` delta) is recorded as a
+// candidate access point but must NOT terminate the first/last scan, because a
+// guarded statement may be skipped at runtime — the conservative choice is to
+// keep scanning so sibling / earlier / later accesses are also collected (more
+// sync points, never fewer).
+static bool AnyConditionalOnPath(const std::vector<const IRStructure *> &path,
+                                 const IRStructure *leaf) {
+  if (leaf && leaf->HasConditions())
+    return true;
+  for (const auto *p : path) {
+    if (p && p->HasConditions())
+      return true;
+  }
+  return false;
 }
 
 static bool SequenceCollectFirstAccessPoints(
@@ -483,19 +225,9 @@ static bool SequenceCollectFirstAccessPoints(
     int64_t base_offset) {
   int n = static_cast<int>(entries.size());
 
-  auto push_prefix = [&](const SequenceEntry &e) {
-    for (auto *p : e.path_prefix)
-      path.push_back(p);
-  };
-  auto pop_prefix = [&](const SequenceEntry &e) {
-    for (size_t k = 0; k < e.path_prefix.size(); ++k)
-      path.pop_back();
-  };
   auto dispatch = [&](const SequenceEntry &e) -> bool {
-    push_prefix(e);
     bool m = e.node->CollectFirstAccessPoints(pred, result, path,
                                               base_offset + e.start_time);
-    pop_prefix(e);
     return m;
   };
 
@@ -523,73 +255,11 @@ static bool SequenceCollectFirstAccessPoints(
     }
     return false;
   }
-  int i = 0;
-  while (i < n) {
-    const IfNode *if_node = AsIfNode(entries[i].node);
-    if (if_node) {
-      int group_start = i;
-      while (i + 1 < n) {
-        const IfNode *next_if = AsIfNode(entries[i + 1].node);
-        if (!next_if)
-          break;
-        if (!StructuralEqual()(if_node->condition, next_if->condition))
-          break;
-        ++i;
-      }
-      int group_end = i;
-      ++i;
-      // Condition task belongs to the IfNode itself. Use the first entry's
-      // ancestor chain + the IfNode for the task's path; the start_time also
-      // comes from the first entry of the group.
-      const SequenceEntry &first_entry = entries[group_start];
-      push_prefix(first_entry);
-      path.push_back(if_node);
-      bool task_matched = false;
-      if (if_node->task) {
-        task_matched = if_node->task->CollectFirstAccessPoints(
-            pred, result, path, base_offset + first_entry.start_time);
-      }
-      path.pop_back();
-      pop_prefix(first_entry);
-      if (task_matched)
-        return true;
-
-      // Build branch virtual sub-sequences. Each branch entry inherits the
-      // outer ancestor chain (entries[j].path_prefix) and extends it with the
-      // enclosing IfNode, so the branch's children record the full chain.
-      std::vector<SequenceEntry> then_entries, else_entries;
-      for (int j = group_start; j <= group_end; ++j) {
-        const SequenceEntry &je = entries[j];
-        const IfNode *cur_if = AsIfNode(je.node);
-        ICHECK(cur_if);
-        auto make_branch_entry = [&](const std::shared_ptr<IRStructure> &branch,
-                                     std::vector<SequenceEntry> &out) {
-          if (!branch)
-            return;
-          SequenceEntry sub;
-          sub.node = branch.get();
-          sub.path_prefix = je.path_prefix;
-          sub.path_prefix.push_back(cur_if);
-          sub.start_time = je.start_time;
-          out.push_back(std::move(sub));
-        };
-        make_branch_entry(cur_if->then_child, then_entries);
-        make_branch_entry(cur_if->else_child, else_entries);
-      }
-      bool then_must = false, else_must = false;
-      if (!then_entries.empty())
-        then_must = SequenceCollectFirstAccessPoints(then_entries, pred, result,
-                                                     path, base_offset);
-      if (!else_entries.empty())
-        else_must = SequenceCollectFirstAccessPoints(else_entries, pred, result,
-                                                     path, base_offset);
-      if (then_must && else_must)
-        return true;
-    } else {
-      if (dispatch(entries[i]))
-        return true;
-      ++i;
-    }
+  for (int i = 0; i < n; ++i) {
+    // Conditional entries record their point but return false, so the scan
+    // naturally continues past them to find unconditional first accesses.
+    if (dispatch(entries[i]))
+      return true;
   }
   return false;
 }
@@ -600,19 +270,9 @@ static bool SequenceCollectLastAccessPoints(
     int64_t base_offset) {
   int n = static_cast<int>(entries.size());
 
-  auto push_prefix = [&](const SequenceEntry &e) {
-    for (auto *p : e.path_prefix)
-      path.push_back(p);
-  };
-  auto pop_prefix = [&](const SequenceEntry &e) {
-    for (size_t k = 0; k < e.path_prefix.size(); ++k)
-      path.pop_back();
-  };
   auto dispatch = [&](const SequenceEntry &e) -> bool {
-    push_prefix(e);
     bool m = e.node->CollectLastAccessPoints(pred, result, path,
                                              base_offset + e.start_time);
-    pop_prefix(e);
     return m;
   };
 
@@ -637,93 +297,24 @@ static bool SequenceCollectLastAccessPoints(
     }
     return false;
   }
-  int i = n - 1;
-  while (i >= 0) {
-    const IfNode *if_node = AsIfNode(entries[i].node);
-    if (if_node) {
-      int group_end = i;
-      while (i - 1 >= 0) {
-        const IfNode *prev_if = AsIfNode(entries[i - 1].node);
-        if (!prev_if)
-          break;
-        if (!StructuralEqual()(if_node->condition, prev_if->condition))
-          break;
-        --i;
-      }
-      int group_start = i;
-      --i;
-
-      std::vector<SequenceEntry> then_entries, else_entries;
-      for (int j = group_start; j <= group_end; ++j) {
-        const SequenceEntry &je = entries[j];
-        const IfNode *cur_if = AsIfNode(je.node);
-        ICHECK(cur_if);
-        auto make_branch_entry = [&](const std::shared_ptr<IRStructure> &branch,
-                                     std::vector<SequenceEntry> &out) {
-          if (!branch)
-            return;
-          SequenceEntry sub;
-          sub.node = branch.get();
-          sub.path_prefix = je.path_prefix;
-          sub.path_prefix.push_back(cur_if);
-          sub.start_time = je.start_time;
-          out.push_back(std::move(sub));
-        };
-        make_branch_entry(cur_if->then_child, then_entries);
-        make_branch_entry(cur_if->else_child, else_entries);
-      }
-      bool then_must = false, else_must = false;
-      if (!then_entries.empty())
-        then_must = SequenceCollectLastAccessPoints(then_entries, pred, result,
-                                                    path, base_offset);
-      if (!else_entries.empty())
-        else_must = SequenceCollectLastAccessPoints(else_entries, pred, result,
-                                                    path, base_offset);
-      if (then_must && else_must)
-        return true;
-
-      // After branches, attribute the condition task of the last if-unit to
-      // the group. Uses entries[group_end]'s ancestor chain.
-      const SequenceEntry &last_entry = entries[group_end];
-      const IfNode *last_if = AsIfNode(last_entry.node);
-      ICHECK(last_if);
-      push_prefix(last_entry);
-      path.push_back(last_if);
-      bool task_matched = false;
-      if (last_if->task) {
-        task_matched = last_if->task->CollectLastAccessPoints(
-            pred, result, path, base_offset + last_entry.start_time);
-      }
-      path.pop_back();
-      pop_prefix(last_entry);
-      if (task_matched)
-        return true;
-    } else {
-      if (dispatch(entries[i]))
-        return true;
-      --i;
-    }
+  for (int i = n - 1; i >= 0; --i) {
+    // Conditional entries record their point but return false, so the scan
+    // continues past them to find unconditional last accesses.
+    if (dispatch(entries[i]))
+      return true;
   }
   return false;
 }
 
-// Build a SequenceEntry list from a real SequenceNode's children. Each
-// ScheduleUnit child becomes one entry — the ScheduleUnit goes into the
-// path_prefix and dispatch lands directly on its inner child.
-static std::vector<SequenceEntry> MakeSequenceEntriesFromUnits(
-    const std::vector<std::shared_ptr<IRStructure>> &children) {
+// Build a SequenceEntry list from an ordered list of scheduled children.
+static std::vector<SequenceEntry>
+MakeSequenceEntries(const std::vector<std::shared_ptr<IRStructure>> &children) {
   std::vector<SequenceEntry> entries;
   entries.reserve(children.size());
   for (const auto &c : children) {
-    ICHECK(c->IsScheduleUnit())
-        << "Sequence child must be a ScheduleUnit post-scheduling";
-    const ScheduleUnit *unit = static_cast<const ScheduleUnit *>(c.get());
-    ICHECK(unit->child)
-        << "ScheduleUnit must wrap a child IRStructure post-scheduling";
     SequenceEntry e;
-    e.node = unit->child.get();
-    e.path_prefix = {unit};
-    e.start_time = unit->GetStartTime();
+    e.node = c.get();
+    e.start_time = c->GetStartTime();
     entries.push_back(std::move(e));
   }
   return entries;
@@ -737,7 +328,9 @@ bool TaskNode::CollectFirstAccessPoints(const TaskAccessPredicate &pred,
     std::vector<const IRStructure *> point_path = path;
     point_path.push_back(this);
     result.emplace(time_offset, std::move(point_path));
-    return true;
+    // A conditional access may be skipped at runtime, so it is a candidate
+    // but does not establish a definite first access — keep scanning.
+    return !AnyConditionalOnPath(path, this);
   }
   return false;
 }
@@ -750,118 +343,10 @@ bool TaskNode::CollectLastAccessPoints(const TaskAccessPredicate &pred,
     std::vector<const IRStructure *> point_path = path;
     point_path.push_back(this);
     result.emplace(time_offset, std::move(point_path));
-    return true;
+    // A conditional access may be skipped at runtime, so it is a candidate
+    // but does not establish a definite last access — keep scanning.
+    return !AnyConditionalOnPath(path, this);
   }
-  return false;
-}
-
-bool ScheduleUnit::CollectFirstAccessPoints(
-    const TaskAccessPredicate &pred, std::set<BufferAccessPoint> &result,
-    std::vector<const IRStructure *> &path, int64_t time_offset) const {
-  if (!child)
-    return false;
-  path.push_back(this);
-  bool r = child->CollectFirstAccessPoints(pred, result, path, time_offset);
-  path.pop_back();
-  return r;
-}
-
-bool ScheduleUnit::CollectLastAccessPoints(
-    const TaskAccessPredicate &pred, std::set<BufferAccessPoint> &result,
-    std::vector<const IRStructure *> &path, int64_t time_offset) const {
-  if (!child)
-    return false;
-  path.push_back(this);
-  bool r = child->CollectLastAccessPoints(pred, result, path, time_offset);
-  path.pop_back();
-  return r;
-}
-
-bool WrapperNode::CollectFirstAccessPoints(
-    const TaskAccessPredicate &pred, std::set<BufferAccessPoint> &result,
-    std::vector<const IRStructure *> &path, int64_t time_offset) const {
-  path.push_back(this);
-  if (task) {
-    if (task->CollectFirstAccessPoints(pred, result, path, time_offset)) {
-      path.pop_back();
-      return true;
-    }
-  }
-  if (child) {
-    if (child->CollectFirstAccessPoints(pred, result, path, time_offset)) {
-      path.pop_back();
-      return true;
-    }
-  }
-  path.pop_back();
-  return false;
-}
-
-bool WrapperNode::CollectLastAccessPoints(
-    const TaskAccessPredicate &pred, std::set<BufferAccessPoint> &result,
-    std::vector<const IRStructure *> &path, int64_t time_offset) const {
-  path.push_back(this);
-  if (child) {
-    if (child->CollectLastAccessPoints(pred, result, path, time_offset)) {
-      path.pop_back();
-      return true;
-    }
-  }
-  if (task) {
-    if (task->CollectLastAccessPoints(pred, result, path, time_offset)) {
-      path.pop_back();
-      return true;
-    }
-  }
-  path.pop_back();
-  return false;
-}
-
-bool IfNode::CollectFirstAccessPoints(const TaskAccessPredicate &pred,
-                                      std::set<BufferAccessPoint> &result,
-                                      std::vector<const IRStructure *> &path,
-                                      int64_t time_offset) const {
-  path.push_back(this);
-  if (task) {
-    if (task->CollectFirstAccessPoints(pred, result, path, time_offset)) {
-      path.pop_back();
-      return true;
-    }
-  }
-  bool then_must = false, else_must = false;
-  if (then_child)
-    then_must =
-        then_child->CollectFirstAccessPoints(pred, result, path, time_offset);
-  if (else_child)
-    else_must =
-        else_child->CollectFirstAccessPoints(pred, result, path, time_offset);
-  path.pop_back();
-  return then_must && else_must;
-}
-
-bool IfNode::CollectLastAccessPoints(const TaskAccessPredicate &pred,
-                                     std::set<BufferAccessPoint> &result,
-                                     std::vector<const IRStructure *> &path,
-                                     int64_t time_offset) const {
-  path.push_back(this);
-  bool then_must = false, else_must = false;
-  if (then_child)
-    then_must =
-        then_child->CollectLastAccessPoints(pred, result, path, time_offset);
-  if (else_child)
-    else_must =
-        else_child->CollectLastAccessPoints(pred, result, path, time_offset);
-  if (then_must && else_must) {
-    path.pop_back();
-    return true;
-  }
-  if (task) {
-    if (task->CollectLastAccessPoints(pred, result, path, time_offset)) {
-      path.pop_back();
-      return true;
-    }
-  }
-  path.pop_back();
   return false;
 }
 
@@ -875,26 +360,13 @@ bool ControlNode::CollectFirstAccessPoints(
       return true;
     }
   }
-  bool body_must = false;
-  if (child && child->IsSequence()) {
-    auto *seq = static_cast<const SequenceNode *>(child.get());
-    auto ordered = seq->children;
-    std::stable_sort(ordered.begin(), ordered.end(),
-                     [](const auto &a, const auto &b) {
-                       auto *ua = dynamic_cast<const ScheduleUnit *>(a.get());
-                       auto *ub = dynamic_cast<const ScheduleUnit *>(b.get());
-                       if (ua && ub)
-                         return ua->stage > ub->stage;
-                       return false;
-                     });
-    path.push_back(seq);
-    body_must = SequenceCollectFirstAccessPoints(
-        MakeSequenceEntriesFromUnits(ordered), pred, result, path, time_offset);
-    path.pop_back();
-  } else if (child) {
-    body_must =
-        child->CollectFirstAccessPoints(pred, result, path, time_offset);
-  }
+  auto ordered = children;
+  std::stable_sort(ordered.begin(), ordered.end(),
+                   [](const auto &a, const auto &b) {
+                     return a->GetStage() > b->GetStage();
+                   });
+  bool body_must = SequenceCollectFirstAccessPoints(
+      MakeSequenceEntries(ordered), pred, result, path, time_offset);
   path.pop_back();
   if (body_must && LoopMustExecute(this))
     return true;
@@ -910,25 +382,13 @@ bool ControlNode::CollectLastAccessPoints(
   int64_t last_iter_offset =
       (trip_count > 0 ? (trip_count - 1) : 0) * ii_per_iter;
   int64_t body_offset = time_offset + last_iter_offset;
-  bool body_must = false;
-  if (child && child->IsSequence()) {
-    auto *seq = static_cast<const SequenceNode *>(child.get());
-    auto ordered = seq->children;
-    std::stable_sort(ordered.begin(), ordered.end(),
-                     [](const auto &a, const auto &b) {
-                       auto *ua = dynamic_cast<const ScheduleUnit *>(a.get());
-                       auto *ub = dynamic_cast<const ScheduleUnit *>(b.get());
-                       if (ua && ub)
-                         return ua->stage > ub->stage;
-                       return false;
-                     });
-    path.push_back(seq);
-    body_must = SequenceCollectLastAccessPoints(
-        MakeSequenceEntriesFromUnits(ordered), pred, result, path, body_offset);
-    path.pop_back();
-  } else if (child) {
-    body_must = child->CollectLastAccessPoints(pred, result, path, body_offset);
-  }
+  auto ordered = children;
+  std::stable_sort(ordered.begin(), ordered.end(),
+                   [](const auto &a, const auto &b) {
+                     return a->GetStage() > b->GetStage();
+                   });
+  bool body_must = SequenceCollectLastAccessPoints(
+      MakeSequenceEntries(ordered), pred, result, path, body_offset);
   if (body_must && LoopMustExecute(this)) {
     path.pop_back();
     return true;
@@ -941,26 +401,6 @@ bool ControlNode::CollectLastAccessPoints(
   }
   path.pop_back();
   return false;
-}
-
-bool SequenceNode::CollectFirstAccessPoints(
-    const TaskAccessPredicate &pred, std::set<BufferAccessPoint> &result,
-    std::vector<const IRStructure *> &path, int64_t time_offset) const {
-  path.push_back(this);
-  bool r = SequenceCollectFirstAccessPoints(
-      MakeSequenceEntriesFromUnits(children), pred, result, path, time_offset);
-  path.pop_back();
-  return r;
-}
-
-bool SequenceNode::CollectLastAccessPoints(
-    const TaskAccessPredicate &pred, std::set<BufferAccessPoint> &result,
-    std::vector<const IRStructure *> &path, int64_t time_offset) const {
-  path.push_back(this);
-  bool r = SequenceCollectLastAccessPoints(
-      MakeSequenceEntriesFromUnits(children), pred, result, path, time_offset);
-  path.pop_back();
-  return r;
 }
 
 inline bool WarpgroupMatches(const TaskNode *task, int wg_id) {
@@ -1070,28 +510,28 @@ BufferRegion TaskRegionFor(const TaskNode *task, const Buffer &buffer,
 }
 
 std::vector<DepInfo>
-AnalyzeDependencies(const std::vector<ScheduleUnit *> &units,
+AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
                     std::optional<For> current_loop) {
-  const size_t n = units.size();
+  const size_t n = nodes.size();
   std::vector<DepInfo> deps;
 
   std::set<Buffer> buffers;
   for (size_t i = 0; i < n; ++i) {
-    for (const auto &region : units[i]->GetReadRegions()) {
+    for (const auto &region : nodes[i]->GetReadRegions()) {
       buffers.insert(region->buffer);
     }
-    for (const auto &region : units[i]->GetWriteRegions()) {
+    for (const auto &region : nodes[i]->GetWriteRegions()) {
       buffers.insert(region->buffer);
     }
   }
 
   for (const auto &buffer : buffers) {
     auto touches = [&](size_t u) {
-      for (const auto &region : units[u]->GetReadRegions()) {
+      for (const auto &region : nodes[u]->GetReadRegions()) {
         if (region->buffer.same_as(buffer))
           return true;
       }
-      for (const auto &region : units[u]->GetWriteRegions()) {
+      for (const auto &region : nodes[u]->GetWriteRegions()) {
         if (region->buffer.same_as(buffer))
           return true;
       }
@@ -1111,10 +551,10 @@ AnalyzeDependencies(const std::vector<ScheduleUnit *> &units,
         if (!same_iter && !cross)
           continue;
 
-        auto a_w = units[i]->GetLastAccessPoints(buffer, /*is_write=*/true);
-        auto a_r = units[i]->GetLastAccessPoints(buffer, /*is_write=*/false);
-        auto b_r = units[j]->GetFirstAccessPoints(buffer, /*is_write=*/false);
-        auto b_w = units[j]->GetFirstAccessPoints(buffer, /*is_write=*/true);
+        auto a_w = nodes[i]->GetLastAccessPoints(buffer, /*is_write=*/true);
+        auto a_r = nodes[i]->GetLastAccessPoints(buffer, /*is_write=*/false);
+        auto b_r = nodes[j]->GetFirstAccessPoints(buffer, /*is_write=*/false);
+        auto b_w = nodes[j]->GetFirstAccessPoints(buffer, /*is_write=*/true);
 
         std::set<BufferAccessPoint> prod_pts, cons_pts;
         int64_t latency = -1;
@@ -1146,7 +586,7 @@ AnalyzeDependencies(const std::vector<ScheduleUnit *> &units,
 
         if (latency >= 0) {
           deps.push_back(
-              {units[i], units[j], buffer,
+              {nodes[i], nodes[j], buffer,
                std::vector<BufferAccessPoint>(prod_pts.begin(), prod_pts.end()),
                std::vector<BufferAccessPoint>(cons_pts.begin(), cons_pts.end()),
                cross, latency});

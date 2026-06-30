@@ -1,7 +1,6 @@
 /*!
  * \file if_condition_extract.cc
- * \brief Extract if conditions into temporary LetStmt variables, then expand if
- * statements to all branches.
+ * \brief Extract complex if conditions into temporary Bind variables.
  */
 
 #include <tvm/ffi/reflection/registry.h>
@@ -46,62 +45,19 @@ private:
       else_case = VisitStmt(else_case.value());
     }
 
+    if (IsSimpleVar(condition)) {
+      // The condition is already a simple variable; keep the if as-is.
+      return IfThenElse(condition, then_case, else_case);
+    }
+
+    // Extract the complex condition into a temporary bind variable so its
+    // value is computed once and consumers (e.g. AutoSchedule) see a flat var,
+    // but keep the if-then-else as a single node. AutoSchedule's
+    // IRStructureBuilder already handles both branches natively.
     std::string var_name = "__cond_" + std::to_string(counter_++);
     Var cond_var(var_name, DataType::Bool());
-    bool is_simple = true;
-
-    if (IsSimpleVar(condition)) {
-      // If the condition is already a simple variable, no need to extract it.
-      cond_var = Downcast<Var>(condition);
-    } else {
-      is_simple = false;
-    }
-
-    auto bind_cond_var_body = [&](const Optional<Stmt> &body,
-                                  const PrimExpr &cond) -> Stmt {
-      if (!body.defined()) {
-        return Stmt();
-      }
-      auto seq = body.as<SeqStmtNode>();
-      if (!seq) {
-        return IfThenElse(cond, body.value());
-      }
-      Array<Stmt> new_seq;
-      Array<Stmt> bundle;
-      bool bundling = false;
-      for (auto sentence : seq->seq) {
-        if (!bundling && sentence.as<BindNode>()) {
-          bundling = true;
-        }
-        if (bundling) {
-          bundle.push_back(sentence);
-        } else {
-          new_seq.push_back(IfThenElse(cond, sentence));
-        }
-      }
-      if (!bundle.empty()) {
-        Stmt bundled =
-            bundle.size() == 1 ? bundle[0] : SeqStmt(std::move(bundle));
-        new_seq.push_back(IfThenElse(cond, bundled));
-      }
-      return new_seq.size() == 1 ? new_seq[0] : SeqStmt(std::move(new_seq));
-    };
-
-    Array<Stmt> new_seq;
-    new_seq.insert(new_seq.end(), bind_cond_var_body(then_case, cond_var));
-    if (else_case.defined())
-      new_seq.insert(new_seq.end(),
-                     bind_cond_var_body(else_case, !((PrimExpr)cond_var)));
-
-    Stmt body =
-        new_seq.empty()
-            ? Stmt()
-            : (new_seq.size() == 1 ? new_seq[0] : SeqStmt(std::move(new_seq)));
-    if (is_simple) {
-      return body;
-    } else {
-      return SeqStmt({tirx::Bind(cond_var, condition), body});
-    }
+    Stmt new_if = IfThenElse(cond_var, then_case, else_case);
+    return SeqStmt({tirx::Bind(cond_var, condition), new_if});
   }
 
   Stmt VisitStmt_(const SeqStmtNode *op) final {

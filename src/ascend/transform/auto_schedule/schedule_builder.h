@@ -26,72 +26,42 @@ namespace tl {
 
 using namespace tirx;
 
-class TaskUnionFind;
-struct ComponentInfo;
-
-// Warp specialization architecture enum
-enum class WarpSpecializeArch : uint8_t {
-  kHopper,
-  kBlackwell,
-  kAscend,
-  kUnsupported,
-};
-
-// Configuration for warp specialization
-struct WarpSpecializeConfig {
-  WarpSpecializeArch arch = WarpSpecializeArch::kUnsupported;
-};
-
-// Extract all sequential task nodes from the IR structure tree
-void GatherTaskNodes(const std::vector<std::shared_ptr<IRStructure>> &nodes,
-                     std::vector<std::shared_ptr<IRStructure>> &task_nodes);
-void GatherTaskNodesSingle(
-    const std::shared_ptr<IRStructure> &node,
-    std::vector<std::shared_ptr<IRStructure>> &task_nodes);
-
 // Check if two variables are the same
 bool SameVar(const Var &a, const Var &b);
 
 // Check if there is a variable dependency between two IRStructures
 bool HasVarDependency(const IRStructure *a, const IRStructure *b);
 
-// Check if an IRStructure has any register region
-bool HasRegisterRegion(const IRStructure *node);
-
 // Check if two IRStructures have resource dependency (use same hardware
 // resource)
 bool HasResourceDependency(const IRStructure *a, const IRStructure *b);
 
-// Builder that collects ScheduleUnits from IRStructure
-class ScheduleUnitBuilder {
+// Builder that schedules TaskNode/ControlNode children in IRStructure
+class ScheduleBuilder {
 public:
-  void Build(std::shared_ptr<IRStructure> &root) { ScheduleRecursive(root); }
-
   // Recursive scheduling function
   // Directly schedules the entire IRStructure tree recursively in place
   void ScheduleRecursive(std::shared_ptr<IRStructure> &node);
 
+  // Schedule an ordered child list in place (root list or a ControlNode body):
+  // gather + recurse into each child, then Z3-schedule and write the reordered
+  // list back.
+  void ScheduleList(std::vector<std::shared_ptr<IRStructure>> &children);
+
   // Z3-based scheduler that calls Python implementation via FFI.
-  // Wraps each scheduled child in a ScheduleUnit carrying its start_time and
-  // returns the units (as shared_ptr<IRStructure>) in start_time order (ties
-  // broken by original index). Callers can assign the result directly to a
-  // SequenceNode's children.
+  // Writes start_time onto each scheduled child and returns the children in
+  // start_time order (ties broken by original index). Callers can assign the
+  // result directly to an ordered child list (root list or ControlNode body).
   std::vector<std::shared_ptr<IRStructure>>
-  Z3SchedulePython(const std::vector<std::shared_ptr<IRStructure>> &nodes) {
-    size_t n = nodes.size();
-    std::vector<std::shared_ptr<IRStructure>> wrapped;
-    wrapped.reserve(n);
-    for (size_t i = 0; i < n; ++i) {
-      auto unit = std::make_shared<ScheduleUnit>();
-      unit->child = nodes[i];
-      unit->SetStartTime(0);
-      unit->SetLatency(unit->child->GetLatency());
-      unit->SetII(unit->child->GetII());
-      wrapped.push_back(std::move(unit));
+  Z3SchedulePython(const std::vector<std::shared_ptr<IRStructure>> &children) {
+    size_t n = children.size();
+    std::vector<std::shared_ptr<IRStructure>> scheduled = children;
+    for (const auto &node : scheduled) {
+      node->SetStartTime(0);
     }
 
     if (n <= 1) {
-      return wrapped;
+      return scheduled;
     }
 
     try {
@@ -101,13 +71,13 @@ public:
       if (!z3_schedule_func.has_value()) {
         LOG(WARNING) << "Python Z3 scheduler not registered, falling back to "
                         "topological sort";
-        return wrapped;
+        return scheduled;
       }
 
-      std::vector<ScheduleUnit *> units;
-      units.reserve(n);
-      for (const auto &u : wrapped) {
-        units.push_back(static_cast<ScheduleUnit *>(u.get()));
+      std::vector<IRStructure *> nodes;
+      nodes.reserve(n);
+      for (const auto &u : scheduled) {
+        nodes.push_back(u.get());
       }
 
       // Prepare input data
@@ -122,7 +92,7 @@ public:
       resource_flags.reserve(n);
 
       for (size_t i = 0; i < n; ++i) {
-        const IRStructure *node = units[i];
+        const IRStructure *node = nodes[i];
         latencies.push_back(node->GetLatency());
         iis.push_back(node->GetII());
 
@@ -133,7 +103,7 @@ public:
       // Variable (Let-var write -> read) data dependencies
       for (size_t i = 0; i < n; ++i) {
         for (size_t j = i + 1; j < n; ++j) {
-          if (HasVarDependency(units[i], units[j])) {
+          if (HasVarDependency(nodes[i], nodes[j])) {
             data_deps.emplace_back(i, j, latencies[i]);
           }
         }
@@ -141,7 +111,7 @@ public:
 
       // Loop-break control dependencies
       for (size_t i = 0; i < n; ++i) {
-        if (!units[i]->ContainsLoopBreak())
+        if (!nodes[i]->ContainsLoopBreak())
           continue;
         for (size_t j = 0; j < n; ++j) {
           if (i < j) {
@@ -153,21 +123,21 @@ public:
       }
 
       // Buffer-region data dependencies
-      auto deps = AnalyzeDependencies(units, /*current_loop=*/std::nullopt);
-      std::unordered_map<ScheduleUnit *, size_t> unit_idx;
+      auto deps = AnalyzeDependencies(nodes, /*current_loop=*/std::nullopt);
+      std::unordered_map<IRStructure *, size_t> node_idx;
       for (size_t i = 0; i < n; ++i) {
-        unit_idx[units[i]] = i;
+        node_idx[nodes[i]] = i;
       }
       for (const auto &dep : deps) {
-        size_t i = unit_idx[dep.prod_unit];
-        size_t j = unit_idx[dep.cons_unit];
+        size_t i = node_idx[dep.prod_node];
+        size_t j = node_idx[dep.cons_node];
         data_deps.emplace_back(i, j, dep.latency);
       }
 
       // Collect resource dependencies
       for (size_t i = 0; i < n; ++i) {
         for (size_t j = i + 1; j < n; ++j) {
-          if (HasResourceDependency(units[i], units[j])) {
+          if (HasResourceDependency(nodes[i], nodes[j])) {
             resource_deps.emplace_back(i, j);
           }
         }
@@ -215,72 +185,49 @@ public:
       if (start_times.size() != n) {
         LOG(WARNING) << "Python Z3 scheduler returned invalid results (size "
                         "mismatch), falling back to topological sort";
-        return wrapped;
+        return scheduled;
       }
 
-      // Write start_times onto the already-wrapped units, then sort them in
-      // place by start_time (stable: ties keep original program order).
+      // Write start_times onto the scheduled nodes, then sort them in place by
+      // start_time (stable: ties keep original program order).
       for (size_t i = 0; i < n; ++i) {
-        units[i]->SetStartTime(start_times[i]);
+        nodes[i]->SetStartTime(start_times[i]);
       }
 
-      std::stable_sort(
-          wrapped.begin(), wrapped.end(),
-          [](const std::shared_ptr<IRStructure> &a,
-             const std::shared_ptr<IRStructure> &b) {
-            return static_cast<ScheduleUnit *>(a.get())->GetStartTime() <
-                   static_cast<ScheduleUnit *>(b.get())->GetStartTime();
-          });
-      return wrapped;
+      std::stable_sort(scheduled.begin(), scheduled.end(),
+                       [](const std::shared_ptr<IRStructure> &a,
+                          const std::shared_ptr<IRStructure> &b) {
+                         return a->GetStartTime() < b->GetStartTime();
+                       });
+      return scheduled;
 
     } catch (const std::exception &e) {
       LOG(WARNING) << "Python Z3 scheduler failed with exception: " << e.what()
                    << ", falling back to topological sort";
-      return wrapped;
+      return scheduled;
     } catch (...) {
       LOG(WARNING) << "Python Z3 scheduler failed with unknown exception, "
                       "falling back to topological sort";
-      return wrapped;
+      return scheduled;
     }
   }
 
   // Z3-based scheduler for loops that calls Python implementation via FFI
   // with distance-aware dependencies
   void Z3SchedulePythonLoop(ControlNode *ctrl) {
-    if (ctrl->child == nullptr) {
+    if (ctrl->children.empty()) {
       LOG(WARNING)
-          << "Z3SchedulePythonLoop called on a control node without child";
+          << "Z3SchedulePythonLoop called on a control node without children";
       return;
     }
-    std::vector<std::shared_ptr<IRStructure>> flat_children;
-    if (!ctrl->child->IsSequence()) {
-      GatherTaskNodesSingle(ctrl->child, flat_children);
-    } else {
-      auto seq_node = static_cast<SequenceNode *>(ctrl->child.get());
-      GatherTaskNodes(seq_node->children, flat_children);
-    }
-    auto seq_node = std::make_shared<SequenceNode>();
-    seq_node->children = flat_children;
-    ctrl->child = std::move(seq_node);
 
-    auto seq_body = static_cast<SequenceNode *>(ctrl->child.get());
-
-    // Wrap each loop-body child in a ScheduleUnit
-    for (auto &child : seq_body->children) {
-      auto unit = std::make_shared<ScheduleUnit>();
-      unit->child = std::move(child);
-      unit->SetLatency(unit->child->GetLatency());
-      unit->SetII(unit->child->GetII());
-      child = std::move(unit);
+    std::vector<IRStructure *> nodes;
+    nodes.reserve(ctrl->children.size());
+    for (const auto &child : ctrl->children) {
+      nodes.push_back(child.get());
     }
 
-    std::vector<ScheduleUnit *> units;
-    units.reserve(seq_body->children.size());
-    for (const auto &child : seq_body->children) {
-      units.push_back(static_cast<ScheduleUnit *>(child.get()));
-    }
-
-    size_t n = units.size();
+    size_t n = nodes.size();
 
     auto num_stages = 1;
     auto num_stages_val = ctrl->control.get()->annotations.Get("num_stages");
@@ -319,7 +266,7 @@ public:
     resource_flags.reserve(n);
 
     for (size_t i = 0; i < n; ++i) {
-      const IRStructure *node = units[i];
+      const IRStructure *node = nodes[i];
       latencies.push_back(node->GetLatency());
       iis.push_back(node->GetII());
       resource_flags.push_back(static_cast<int64_t>(node->GetPipeMask()));
@@ -455,7 +402,7 @@ public:
     // Variable (Let-var write -> read) data dependencies
     for (size_t i = 0; i < n; ++i) {
       for (size_t j = i + 1; j < n; ++j) {
-        if (HasVarDependency(units[i], units[j])) {
+        if (HasVarDependency(nodes[i], nodes[j])) {
           data_deps.emplace_back(i, j, 0, latencies[i]);
         }
       }
@@ -463,7 +410,7 @@ public:
 
     // Loop-break control dependencies
     for (size_t i = 0; i < n; ++i) {
-      if (!units[i]->ContainsLoopBreak())
+      if (!nodes[i]->ContainsLoopBreak())
         continue;
       for (size_t j = 0; j < n; ++j) {
         if (i < j) {
@@ -477,14 +424,14 @@ public:
     }
 
     // Buffer-region data dependencies
-    auto deps = AnalyzeDependencies(units, /*current_loop=*/ctrl->control);
-    std::unordered_map<ScheduleUnit *, size_t> unit_idx;
+    auto deps = AnalyzeDependencies(nodes, /*current_loop=*/ctrl->control);
+    std::unordered_map<IRStructure *, size_t> node_idx;
     for (size_t i = 0; i < n; ++i) {
-      unit_idx[units[i]] = i;
+      node_idx[nodes[i]] = i;
     }
     for (const auto &dep : deps) {
-      size_t i = unit_idx[dep.prod_unit];
-      size_t j = unit_idx[dep.cons_unit];
+      size_t i = node_idx[dep.prod_node];
+      size_t j = node_idx[dep.cons_node];
       if (!dep.cross_iter) {
         data_deps.emplace_back(i, j, 0, dep.latency);
       } else {
@@ -509,7 +456,7 @@ public:
     // Collect resource dependencies
     for (size_t i = 0; i < n; ++i) {
       for (size_t j = i + 1; j < n; ++j) {
-        if (HasResourceDependency(units[i], units[j])) {
+        if (HasResourceDependency(nodes[i], nodes[j])) {
           resource_deps.emplace_back(i, j);
         }
       }
@@ -525,9 +472,9 @@ public:
     // before the write — otherwise the clone reads a stale/overwritten buffer.
     //
     // AnalyzeDependencies already feeds the Let's own WAR edge to Z3, but only
-    // constrains the Let's original stage, not the stages of units that will
-    // receive a copy. Here we add: for every unit U that (transitively) reads a
-    // Let-defined var, and every WAR consumer W of that Let (a unit that writes
+    // constrains the Let's original stage, not the stages of nodes that will
+    // receive a copy. Here we add: for every node U that (transitively) reads a
+    // Let-defined var, and every WAR consumer W of that Let (a node that writes
     // the buffer the Let reads, same-iter or cross-iter), require k_U <= k_W in
     // the Z3 (k, r) model. Equality is allowed because the clone is placed at
     // the front of the loop body, so it reads before any write in that
@@ -535,35 +482,33 @@ public:
     if (enable_offset) {
 
       auto bind_of = [&](size_t idx) -> const BindNode * {
-        IRStructure *node = units[idx]->child.get();
+        IRStructure *node = nodes[idx];
         if (node && node->IsTask()) {
           auto task = static_cast<TaskNode *>(node);
-          if (task->stmts.size() == 1) {
-            return task->stmts[0].as<BindNode>();
-          }
+          return task->stmt.as<BindNode>();
         }
         return nullptr;
       };
-      std::unordered_map<const VarNode *, size_t> let_var_to_unit;
+      std::unordered_map<const VarNode *, size_t> let_var_to_node;
       for (size_t i = 0; i < n; ++i) {
         if (auto *bind = bind_of(i)) {
-          let_var_to_unit[bind->var.get()] = i;
+          let_var_to_node[bind->var.get()] = i;
         }
       }
       std::vector<std::set<size_t>> unit_let_deps(n);
       for (size_t i = 0; i < n; ++i) {
-        for (const auto &rv : units[i]->GetIndirectReadVars()) {
-          auto it = let_var_to_unit.find(rv.get());
-          if (it != let_var_to_unit.end())
+        for (const auto &rv : nodes[i]->GetIndirectReadVars()) {
+          auto it = let_var_to_node.find(rv.get());
+          if (it != let_var_to_node.end())
             unit_let_deps[i].insert(it->second);
         }
       }
-      // Collect WAR consumers per Let unit
+      // Collect WAR consumers per Let node
       std::vector<std::set<size_t>> let_war_consumers(n);
       for (const auto &dep : deps) {
-        size_t p = unit_idx[dep.prod_unit];
+        size_t p = node_idx[dep.prod_node];
         if (bind_of(p) != nullptr) {
-          let_war_consumers[p].insert(unit_idx[dep.cons_unit]);
+          let_war_consumers[p].insert(node_idx[dep.cons_node]);
         }
       }
       for (size_t u = 0; u < n; ++u) {
@@ -663,109 +608,145 @@ public:
     for (size_t i = 0; i < n; ++i) {
       // When offset is disabled, collapse every task into a single pipeline
       // stage so warpgroup_partition emits a flat (non-pipelined) loop body.
-      units[i]->stage = enable_offset ? (min_k_raw - raw_k[i]) : 0;
+      nodes[i]->SetStage(enable_offset ? (min_k_raw - raw_k[i]) : 0);
       // Adjust start_time to be relative to the earliest start_time, so that
       // the first task starts at 0.
-      units[i]->SetStartTime(start_times[i] - min_start_time);
+      nodes[i]->SetStartTime(start_times[i] - min_start_time);
     }
     auto phys_time = [&](const std::shared_ptr<IRStructure> &c) -> int64_t {
-      auto *u = static_cast<ScheduleUnit *>(c.get());
-      return u->GetStartTime() + u->stage * ii;
+      return c->GetStartTime() + c->GetStage() * ii;
     };
-    std::stable_sort(seq_body->children.begin(), seq_body->children.end(),
+    std::stable_sort(ctrl->children.begin(), ctrl->children.end(),
                      [&](const std::shared_ptr<IRStructure> &a,
                          const std::shared_ptr<IRStructure> &b) {
                        return phys_time(a) < phys_time(b);
                      });
 
-    // Reorder & Copy Let-defined variables. Children are ScheduleUnit
-    // wrappers; unwrap to reach the underlying TaskNode.
-    auto is_var_decl = [&](const ScheduleUnit *unit) -> bool {
-      if (!unit || !unit->child)
+    // Reorder & Copy Let-defined variables.
+    auto is_var_decl = [&](const IRStructure *node) -> bool {
+      if (!node)
         return false;
-      IRStructure *node = unit->child.get();
       if (node->IsTask()) {
-        auto task = static_cast<TaskNode *>(node);
-        if (task->stmts.size() == 1) {
-          return task->stmts[0].as<BindNode>() != nullptr;
-        }
+        auto task = static_cast<const TaskNode *>(node);
+        return task->stmt.as<BindNode>() != nullptr;
       }
       return false;
     };
-    auto solve_conflict_var = [&]() -> bool {
-      for (size_t i = 0; i < n; ++i) {
-        auto unit_i = static_cast<ScheduleUnit *>(seq_body->children[i].get());
-        if (is_var_decl(unit_i)) {
-          for (size_t j = 0; j < n; ++j) {
-            if (i == j)
-              continue;
-            auto unit_j =
-                static_cast<ScheduleUnit *>(seq_body->children[j].get());
-            if (!HasVarDependency(unit_i, unit_j))
-              continue;
-            if (unit_j->stage == unit_i->stage)
-              continue;
-            auto node_i_task = static_cast<TaskNode *>(unit_i->child.get());
-            auto node_i_bind = node_i_task->stmts[0].as<BindNode>();
+    // Map each Let-defined var to the node that declares it.
+    std::unordered_map<const VarNode *, size_t> let_var_to_node;
+    for (size_t i = 0; i < n; ++i) {
+      if (is_var_decl(ctrl->children[i].get())) {
+        auto *bind = static_cast<TaskNode *>(ctrl->children[i].get())
+                         ->stmt.as<BindNode>();
+        let_var_to_node[bind->var.get()] = i;
+      }
+    }
 
-            // Clone the producer task, then rename its Let var so the
-            // conflicting consumer stage gets its own copy.
-            auto cloned_bind = Bind(node_i_bind->var.copy_with_suffix(""),
-                                    node_i_bind->value, node_i_bind->span);
-            auto cloned_task =
-                std::static_pointer_cast<TaskNode>(node_i_task->Clone());
-            cloned_task->stmts = {cloned_bind};
-            cloned_task->SetReadVars(node_i_task->GetReadVars());
-            {
-              auto write_vars = node_i_task->GetWriteVars();
-              for (auto &v : write_vars) {
-                if (v.same_as(node_i_bind->var)) {
-                  v = cloned_bind->var;
-                }
-              }
-              cloned_task->SetWriteVars(write_vars);
+    // Resolve Let-var stage conflicts
+    std::map<int, std::set<size_t>>
+        stage_to_decls;                      // stage -> decl node indices
+    std::map<int, int64_t> stage_base_start; // stage -> floored start time
+    for (size_t u = 0; u < n; ++u) {
+      int s = ctrl->children[u]->GetStage();
+      for (const auto &rv : ctrl->children[u]->GetIndirectReadVars()) {
+        auto it = let_var_to_node.find(rv.get());
+        if (it == let_var_to_node.end())
+          continue;
+        size_t d = it->second;
+        if (ctrl->children[d]->GetStage() == s)
+          continue; // decl already in the consumer's stage: no clone needed
+        stage_to_decls[s].insert(d);
+        int64_t st = ctrl->children[u]->GetStartTime();
+        auto bit = stage_base_start.find(s);
+        if (bit == stage_base_start.end())
+          stage_base_start[s] = st;
+        else
+          bit->second = std::min(bit->second, st);
+      }
+    }
+
+    std::vector<std::shared_ptr<IRStructure>> new_clones;
+    for (auto &[s, decls] : stage_to_decls) {
+      int64_t base_start = (ii > 0) ? stage_base_start[s] / ii * ii : 0;
+      std::vector<std::pair<Var, Var>> renames; // old var -> fresh clone var
+      std::vector<std::shared_ptr<TaskNode>> stage_clones;
+      for (size_t d : decls) {
+        auto *decl_task = static_cast<TaskNode *>(ctrl->children[d].get());
+        auto *decl_bind = decl_task->stmt.as<BindNode>();
+        auto new_var = decl_bind->var.copy_with_suffix("");
+        auto cloned_task =
+            std::static_pointer_cast<TaskNode>(decl_task->Clone());
+        cloned_task->stmt = Bind(new_var, decl_bind->value, decl_bind->span);
+        cloned_task->SetReadVars(decl_task->GetReadVars());
+        auto write_vars = decl_task->GetWriteVars();
+        for (auto &v : write_vars) {
+          if (v.same_as(decl_bind->var))
+            v = new_var;
+        }
+        cloned_task->SetWriteVars(write_vars);
+        cloned_task->SetStage(s);
+        cloned_task->SetStartTime(base_start);
+        renames.emplace_back(decl_bind->var, new_var);
+        stage_clones.push_back(cloned_task);
+      }
+      // Rewire chained references among the clones
+      for (auto &clone : stage_clones)
+        for (auto &[old_var, new_var] : renames)
+          clone->SubstituteVar(old_var, new_var);
+      for (size_t u = 0; u < n; ++u) {
+        if (ctrl->children[u]->GetStage() != s)
+          continue;
+        for (auto &[old_var, new_var] : renames)
+          ctrl->children[u]->SubstituteVar(old_var, new_var);
+      }
+      // Emit the clones defs-before-uses
+      std::set<const VarNode *> clone_writes;
+      for (auto &c : stage_clones)
+        for (auto &w : c->GetWriteVars())
+          clone_writes.insert(w.get());
+      std::vector<bool> emitted(stage_clones.size(), false);
+      std::set<const VarNode *> available;
+      size_t done = 0;
+      while (done < stage_clones.size()) {
+        bool progress = false;
+        for (size_t ci = 0; ci < stage_clones.size(); ++ci) {
+          if (emitted[ci])
+            continue;
+          bool ready = true;
+          for (auto &rv : stage_clones[ci]->GetReadVars()) {
+            if (clone_writes.count(rv.get()) && !available.count(rv.get())) {
+              ready = false;
+              break;
             }
-            // Wrap the clone in a ScheduleUnit at the consumer stage, sharing
-            // the producer's start_time.
-            auto cloned_unit = std::make_shared<ScheduleUnit>();
-            cloned_unit->child = cloned_task;
-            cloned_unit->stage = unit_j->stage;
-            cloned_unit->SetStartTime(unit_j->GetStartTime() / ii * ii);
-            cloned_unit->SetLatency(cloned_task->GetLatency());
-            cloned_unit->SetII(cloned_task->GetII());
-
-            for (size_t k = j; k < n; ++k) {
-              auto unit_k =
-                  static_cast<ScheduleUnit *>(seq_body->children[k].get());
-              if (unit_j->stage != unit_k->stage)
-                continue;
-              if (HasVarDependency(unit_i, unit_k)) {
-                unit_k->SubstituteVar(node_i_bind->var, cloned_bind->var);
-                unit_k->stage = unit_j->stage;
-              }
+          }
+          if (!ready)
+            continue;
+          for (auto &w : stage_clones[ci]->GetWriteVars())
+            available.insert(w.get());
+          new_clones.push_back(stage_clones[ci]);
+          emitted[ci] = true;
+          ++done;
+          progress = true;
+        }
+        if (!progress) { // defensive: emit any remainder (no cycle expected)
+          for (size_t ci = 0; ci < stage_clones.size(); ++ci) {
+            if (!emitted[ci]) {
+              new_clones.push_back(stage_clones[ci]);
+              emitted[ci] = true;
+              ++done;
             }
-
-            seq_body->children.insert(seq_body->children.begin(),
-                                      std::move(cloned_unit));
-            n += 1;
-            return true; // Conflict resolved, restart the loop
           }
         }
       }
-      return false;
-    };
-    // Resolve conflicts until no more conflicts exist or max iterations
-    // reached (to avoid infinite loop)
-    int conflict_count = 0;
-    while (solve_conflict_var() && ++conflict_count < 100)
-      ;
+    }
+    ctrl->children.insert(ctrl->children.begin(), new_clones.begin(),
+                          new_clones.end());
 
-    // Estimate overall latency: II * tripcount
+    // Estimate overall latency across loop iterations.
     int64_t overall_latency = 0;
-    for (const auto &child : seq_body->children) {
-      auto unit = static_cast<ScheduleUnit *>(child.get());
-      overall_latency =
-          std::max(overall_latency, unit->GetStartTime() + unit->GetLatency());
+    for (const auto &child : ctrl->children) {
+      overall_latency = std::max(overall_latency,
+                                 child->GetStartTime() + child->GetLatency());
     }
     overall_latency += ii * (ctrl->GetTripCount() - 1);
 

@@ -642,10 +642,8 @@ public:
       // Use OperationCounter visitor to count operations and estimate latency
       OperationCounter counter(thread_count_, &params_);
 
-      // Visit all statements in the task
-      for (const auto &stmt : task->stmts) {
-        counter(stmt);
-      }
+      // Visit the task's statement
+      counter(task->stmt);
 
       // Get estimated latency
       compute_latency = counter.GetEstimatedLatency();
@@ -851,9 +849,7 @@ private:
     };
 
     VFLatencyReader reader;
-    for (const auto &stmt : task->stmts) {
-      reader(stmt);
-    }
+    reader(task->stmt);
     return reader.latency;
   }
 
@@ -1148,8 +1144,7 @@ private:
       } else {
         // Op-count path (TIR visitor).
         OperationCounter counter(thread_count_, &params_);
-        for (const auto &stmt : task->stmts)
-          counter(stmt);
+        counter(task->stmt);
         int64_t op_count_latency = counter.GetEstimatedLatency();
 
         // Bandwidth-bound path: total bytes the VALU consumes / valu_bandwidth.
@@ -1198,8 +1193,9 @@ private:
 
     if (has_scl && !has_vec) {
       // Pure scalar tasks (set/wait_flag bodies, address compute). Charge
-      // a flat per-stmt cost — scalar pipe throughput is the divisor.
-      int64_t scalar_ops = static_cast<int64_t>(task->stmts.size());
+      // a flat per-stmt cost — scalar pipe throughput is the divisor. A task
+      // carries exactly one statement.
+      int64_t scalar_ops = 1;
       scalar_latency =
           params_.scalar_op_throughput > 0
               ? safe_div_ceil(scalar_ops, params_.scalar_op_throughput)
@@ -1280,12 +1276,12 @@ private:
     }
 
     // Queue-depth-limited floor: a pipe with finite queue depth can never
-    // issue faster than ops/queue_depth. Approximate "ops" by number of
-    // stmts on that pipe — coarse but at least monotone in workload.
+    // issue faster than ops/queue_depth. A task carries exactly one stmt, so
+    // "ops" is 1 — coarse but at least monotone in workload.
     auto queue_bound = [&](int64_t depth, int64_t ops) {
       return depth > 0 ? safe_div_ceil(ops, depth) : 0;
     };
-    int64_t num_stmts = static_cast<int64_t>(task->stmts.size());
+    int64_t num_stmts = 1;
     if (has_mte1)
       ii = std::max(ii, queue_bound(params_.mte1_queue_depth, num_stmts));
     if (has_mte2)

@@ -265,23 +265,38 @@ private:
 // recursion to keep the stack accurate.
 class IRStructureBuilder : public ConstrVisitor {
 public:
-  std::shared_ptr<IRStructure> Build(const Stmt &stmt,
-                                     Target target = Target()) {
+  // Build an ordered list of IRStructure nodes from a statement. The old
+  // SequenceNode wrapper is gone: a SeqStmt simply contributes its children to
+  // the current list inline.
+  std::vector<std::shared_ptr<IRStructure>> Build(const Stmt &stmt,
+                                                  Target target = Target()) {
     target_ = target;
-    VisitStmt(stmt);
-    if (!root_) {
-      LOG(WARNING)
-          << "IRStructureBuilder: root_ is null after visiting statement. "
-          << "This may indicate an unhandled statement type.";
-      // Return an empty TaskNode as fallback
+    auto list = BuildList(stmt);
+    if (list.empty()) {
+      LOG(WARNING) << "IRStructureBuilder: produced empty list after visiting "
+                      "statement. "
+                   << "This may indicate an unhandled statement type.";
       auto task_node = std::make_shared<TaskNode>();
-      task_node->stmts.push_back(stmt);
-      return task_node;
+      task_node->stmt = stmt;
+      list.push_back(std::move(task_node));
     }
-    return std::move(root_);
+    return list;
   }
 
 protected:
+  // Visit `stmt` into a fresh accumulator list and return it. Nested visits
+  // (loop bodies, if-branches) use this to collect their own ordered list
+  // without disturbing the caller's.
+  std::vector<std::shared_ptr<IRStructure>> BuildList(const Stmt &stmt) {
+    std::vector<std::shared_ptr<IRStructure>> saved;
+    saved.swap(result_);
+    VisitStmt(stmt);
+    std::vector<std::shared_ptr<IRStructure>> out;
+    out.swap(result_);
+    result_.swap(saved);
+    return out;
+  }
+
   // Stamp the current ConstrVisitor stack snapshot onto a freshly-built
   // TaskNode, so RegionsMayConflict later sees the symbol
   // environment (ancestor For ranges, Let bindings, thread_extents,
@@ -289,15 +304,9 @@ protected:
   void StampCtx(TaskNode *task) { task->outer_ctx = GetConstrSet(); }
 
   void VisitStmt_(const SeqStmtNode *op) override {
-    auto seq_node = std::make_shared<SequenceNode>();
-
     for (size_t i = 0; i < op->seq.size(); i++) {
       VisitStmt(op->seq[i]);
-      if (root_) {
-        seq_node->children.push_back(std::move(root_));
-      }
     }
-    root_ = std::move(seq_node);
   }
 
   void VisitStmt_(const ForNode *op) override {
@@ -307,9 +316,9 @@ protected:
       auto control_node = std::make_shared<ControlNode>();
       control_node->control = GetRef<For>(op);
       control_node->task = std::make_shared<TaskNode>();
-      control_node->task->stmts.push_back(
+      control_node->task->stmt =
           For(op->loop_var, op->min, op->extent, op->kind, Evaluate(0),
-              op->thread_binding, op->annotations, op->step, op->span));
+              op->thread_binding, op->annotations, op->step, op->span);
       AnalyzeResourceUsage(Evaluate(op->min), control_node->task.get(), true);
       AnalyzeResourceUsage(Evaluate(op->extent), control_node->task.get(),
                            true);
@@ -323,18 +332,14 @@ protected:
       {
         auto guard =
             MakeGuard(op->loop_var, Range::FromMinExtent(op->min, op->extent));
-        VisitStmt(op->body);
-      }
-      if (root_) {
-        control_node->child = std::move(root_);
-      } else {
+        control_node->children = BuildList(op->body);
       }
 
-      root_ = std::move(control_node);
+      result_.push_back(std::move(control_node));
     } else {
       // Parallel For -> TaskNode
       auto task_node = std::make_shared<TaskNode>();
-      task_node->stmts.push_back(GetRef<Stmt>(op));
+      task_node->stmt = GetRef<Stmt>(op);
 
       // Analyze the loop body for resource usage)
       AnalyzeResourceUsage(op->body, task_node.get());
@@ -345,124 +350,144 @@ protected:
                              task_node.get(), true);
       StampCtx(task_node.get());
 
-      root_ = std::move(task_node);
+      result_.push_back(std::move(task_node));
     }
   }
 
   void VisitStmt_(const EvaluateNode *op) override {
     // Evaluate statement (usually a Call) -> TaskNode
     auto task_node = std::make_shared<TaskNode>();
-    task_node->stmts.push_back(GetRef<Stmt>(op));
+    task_node->stmt = GetRef<Stmt>(op);
 
     // Analyze the expression for resource usage
     AnalyzeResourceUsage(GetRef<Stmt>(op), task_node.get());
     StampCtx(task_node.get());
 
-    root_ = std::move(task_node);
+    result_.push_back(std::move(task_node));
   }
 
   void VisitStmt_(const BufferStoreNode *op) override {
     auto task_node = std::make_shared<TaskNode>();
-    task_node->stmts.push_back(GetRef<Stmt>(op));
+    task_node->stmt = GetRef<Stmt>(op);
 
     AnalyzeResourceUsage(GetRef<Stmt>(op), task_node.get());
     StampCtx(task_node.get());
 
-    root_ = std::move(task_node);
+    result_.push_back(std::move(task_node));
+  }
+
+  // Stamp a guard condition onto every schedule candidate produced for an
+  // if-branch
+  void StampConditionOnBranch(IRStructure *node, const PrimExpr &cond) {
+    if (!node)
+      return;
+    auto stamp_task = [&](IRStructure *item, TaskNode *sink) {
+      item->PrependCondition(cond);
+      if (sink) {
+        AnalyzeResourceUsage(Evaluate(cond), sink, /*only_variables=*/true);
+      }
+    };
+    if (node->IsTask()) {
+      stamp_task(node, static_cast<TaskNode *>(node));
+    } else if (node->IsControl()) {
+      stamp_task(node, static_cast<ControlNode *>(node)->task.get());
+    } else {
+      // Post-scheduling-only metadata does not appear pre-scheduling; stamp
+      // defensively.
+      node->PrependCondition(cond);
+    }
+  }
+
+  // Stamp a `tl.assume` fact onto every schedule candidate produced for the
+  // assume's body
+  void StampAssumptionOnBranch(IRStructure *node, const PrimExpr &fact) {
+    if (!node)
+      return;
+    auto stamp_task = [&](IRStructure *item, TaskNode *sink) {
+      item->PrependAssumption(fact);
+      if (sink) {
+        AnalyzeResourceUsage(Evaluate(fact), sink, /*only_variables=*/true);
+      }
+    };
+    if (node->IsTask()) {
+      stamp_task(node, static_cast<TaskNode *>(node));
+    } else if (node->IsControl()) {
+      stamp_task(node, static_cast<ControlNode *>(node)->task.get());
+    } else {
+      node->PrependAssumption(fact);
+    }
   }
 
   void VisitStmt_(const IfThenElseNode *op) override {
-    // If statement -> IfNode with independently schedulable branches
-    auto if_node = std::make_shared<IfNode>();
-    if_node->condition = op->condition;
-
-    // Create task for condition expression resource analysis
-    auto cond_task = std::make_shared<TaskNode>();
-    cond_task->stmts.push_back(Evaluate(op->condition));
-    AnalyzeResourceUsage(Evaluate(op->condition), cond_task.get(), true);
-    StampCtx(cond_task.get());
-    if_node->task = std::move(cond_task);
-
-    // Recursively build then branch under the positive guard.
+    // No dedicated IfNode: the guard is stamped onto the branch's schedule
+    // candidates as a `conditions` delta (see StampConditionOnBranch).
+    // then/else become ordinary schedule candidates distinguished only by their
+    // conditions; both branches' candidates are spliced into the current list.
+    std::vector<std::shared_ptr<IRStructure>> then_list;
     {
       auto guard = MakeGuard(op->condition);
-      VisitStmt(op->then_case);
+      then_list = BuildList(op->then_case);
     }
-    if (root_) {
-      if_node->then_child = std::move(root_);
+    for (auto &node : then_list) {
+      StampConditionOnBranch(node.get(), op->condition);
+      result_.push_back(std::move(node));
     }
 
-    // Recursively build else branch (if present) under the negated guard.
     if (op->else_case) {
       auto guard = MakeGuard(Not(op->condition));
-      VisitStmt(op->else_case.value());
-      if (root_) {
-        if_node->else_child = std::move(root_);
+      auto else_list = BuildList(op->else_case.value());
+      for (auto &node : else_list) {
+        StampConditionOnBranch(node.get(), Not(op->condition));
+        result_.push_back(std::move(node));
       }
     }
-
-    root_ = std::move(if_node);
   }
 
   void VisitStmt_(const BindNode *op) override {
-    auto wrapper_node = std::make_shared<WrapperNode>();
-    wrapper_node->wrapper = GetLetDecl(op);
     auto task_node = std::make_shared<TaskNode>();
-    task_node->stmts.push_back(GetLetDecl(op));
+    task_node->stmt = GetLetDecl(op);
     AnalyzeResourceUsage(GetLetDecl(op), task_node.get());
     StampCtx(task_node.get());
-    wrapper_node->task = std::move(task_node);
-    VisitStmt(Evaluate(0));
-    wrapper_node->child = std::move(root_);
-    root_ = std::move(wrapper_node);
+    result_.push_back(std::move(task_node));
   }
 
   void VisitStmt_(const AttrStmtNode *op) override {
-    // Wrapper statement -> WrapperNode
-    auto wrapper_node = std::make_shared<WrapperNode>();
-    wrapper_node->wrapper = GetRef<Stmt>(op);
-    auto task_node = std::make_shared<TaskNode>();
-    task_node->stmts.push_back(GetAttrDecl(op));
-    AnalyzeResourceUsage(GetAttrDecl(op), task_node.get());
-    StampCtx(task_node.get());
-    wrapper_node->task = std::move(task_node);
+    ICHECK_EQ(op->attr_key, tirx::attr::tilelang_assume)
+        << "AutoSchedule IRStructureBuilder only supports AttrStmt "
+           "`tl.assume` inside the schedulable tilelang_root body. "
+           "Unsupported attr_key: "
+        << op->attr_key;
 
-    // Push thread_extent / virtual_thread / tilelang_assume into the ctx
-    // stack for the wrapper body — other AttrStmt kinds carry no
-    // prover-relevant constraint, so we just recurse without a guard.
-    auto recurse = [&]() {
-      VisitStmt(op->body);
-      if (root_) {
-        wrapper_node->child = std::move(root_);
-      }
-    };
-    if (op->attr_key == tirx::attr::thread_extent ||
-        op->attr_key == s_tir::attr::virtual_thread) {
-      auto iv = Downcast<IterVar>(op->node);
-      Range dom = Range::FromMinExtent(make_zero(op->value.dtype()), op->value);
-      auto guard = MakeGuard(iv->var, dom);
-      recurse();
-    } else if (op->attr_key == tirx::attr::tilelang_assume) {
-      auto expr = Downcast<PrimExpr>(op->node);
-      auto guard = MakeGuard(expr, true);
-      recurse();
-    } else {
-      recurse();
+    // No dedicated assume TaskNode: the fact is stamped onto the body's
+    // schedule candidates as an `is_assume` guard delta (see
+    // StampAssumptionOnBranch), mirroring how IfThenElse stamps conditions.
+    // Materializing it as its own task used to (a) inject spurious read-var
+    // dependencies and a wasted sequence slot, and (b) scope the fact to an
+    // empty body at codegen, hiding it from the loads/stores that actually
+    // need it. Keep the fact in the prover environment for region proving via
+    // MakeGuard while building the body.
+    auto fact = Downcast<PrimExpr>(op->node);
+    std::vector<std::shared_ptr<IRStructure>> body_list;
+    {
+      auto guard = MakeGuard(fact, /*is_assume=*/true);
+      body_list = BuildList(op->body);
     }
-
-    root_ = std::move(wrapper_node);
+    for (auto &node : body_list) {
+      StampAssumptionOnBranch(node.get(), fact);
+      result_.push_back(std::move(node));
+    }
   }
 
   void VisitStmt_(const WhileNode *op) override {
     auto task_node = std::make_shared<TaskNode>();
-    task_node->stmts.push_back(GetRef<Stmt>(op));
+    task_node->stmt = GetRef<Stmt>(op);
 
     // Analyze condition and body for resource usage
     AnalyzeResourceUsage(Evaluate(op->condition), task_node.get());
     AnalyzeResourceUsage(op->body, task_node.get());
     StampCtx(task_node.get());
 
-    root_ = std::move(task_node);
+    result_.push_back(std::move(task_node));
   }
 
   void VisitStmt_(const SBlockNode *op) override {
@@ -472,14 +497,14 @@ protected:
     // processing the entire function body (not extracted), which should only
     // happen when there's no tilelang_root block
     auto task_node = std::make_shared<TaskNode>();
-    task_node->stmts.push_back(GetRef<Stmt>(op));
+    task_node->stmt = GetRef<Stmt>(op);
     AnalyzeResourceUsage(GetRef<Stmt>(op), task_node.get());
     StampCtx(task_node.get());
-    root_ = std::move(task_node);
+    result_.push_back(std::move(task_node));
   }
 
 private:
-  std::shared_ptr<IRStructure> root_;
+  std::vector<std::shared_ptr<IRStructure>> result_;
   Target target_;
 
   void AnalyzeResourceUsage(const Stmt &stmt, TaskNode *task_node,
@@ -718,21 +743,20 @@ static bool HasWarpgroupId(IRStructure *node, int wg_id) {
     return false;
   if (node->IsTask())
     return static_cast<TaskNode *>(node)->GetWarpgroupId() == wg_id;
-  if (node->IsSequence()) {
-    for (auto &c : static_cast<SequenceNode *>(node)->children)
+  if (node->IsControl()) {
+    for (auto &c : static_cast<ControlNode *>(node)->children)
       if (HasWarpgroupId(c.get(), wg_id))
         return true;
-  } else if (node->IsControl()) {
-    return HasWarpgroupId(static_cast<ControlNode *>(node)->child.get(), wg_id);
-  } else if (node->IsWrapper()) {
-    return HasWarpgroupId(static_cast<WrapperNode *>(node)->child.get(), wg_id);
-  } else if (node->IsScheduleUnit()) {
-    return HasWarpgroupId(static_cast<ScheduleUnit *>(node)->child.get(),
-                          wg_id);
-  } else if (node->IsIf()) {
-    auto ifn = static_cast<IfNode *>(node);
-    return HasWarpgroupId(ifn->then_child.get(), wg_id) ||
-           (ifn->else_child && HasWarpgroupId(ifn->else_child.get(), wg_id));
+  }
+  return false;
+}
+
+static bool
+HasWarpgroupId(const std::vector<std::shared_ptr<IRStructure>> &nodes,
+               int wg_id) {
+  for (const auto &n : nodes) {
+    if (HasWarpgroupId(n.get(), wg_id))
+      return true;
   }
   return false;
 }
@@ -770,34 +794,25 @@ static void CollectBroadcastRegisterReads(
     auto ctrl = static_cast<ControlNode *>(node);
     if (ctrl->task)
       collect_from_structural_task(ctrl->task.get());
-    CollectBroadcastRegisterReads(ctrl->child.get(), reg_bufs);
-  } else if (node->IsWrapper()) {
-    auto wrapper = static_cast<WrapperNode *>(node);
-    if (wrapper->task)
-      collect_from_structural_task(wrapper->task.get());
-    CollectBroadcastRegisterReads(wrapper->child.get(), reg_bufs);
-  } else if (node->IsSequence()) {
-    auto seq = static_cast<SequenceNode *>(node);
-    for (auto &child : seq->children) {
+    for (auto &child : ctrl->children) {
       CollectBroadcastRegisterReads(child.get(), reg_bufs);
     }
-  } else if (node->IsScheduleUnit()) {
-    auto unit = static_cast<ScheduleUnit *>(node);
-    CollectBroadcastRegisterReads(unit->child.get(), reg_bufs);
-  } else if (node->IsIf()) {
-    auto if_node = static_cast<IfNode *>(node);
-    if (if_node->task)
-      collect_from_structural_task(if_node->task.get());
-    CollectBroadcastRegisterReads(if_node->then_child.get(), reg_bufs);
-    if (if_node->else_child)
-      CollectBroadcastRegisterReads(if_node->else_child.get(), reg_bufs);
+  }
+}
+
+static void CollectBroadcastRegisterReads(
+    const std::vector<std::shared_ptr<IRStructure>> &nodes,
+    std::unordered_set<const BufferNode *> &reg_bufs) {
+  for (const auto &n : nodes) {
+    CollectBroadcastRegisterReads(n.get(), reg_bufs);
   }
 }
 
 // Propagate broadcast: if a broadcast task reads a register buffer,
 // any leaf task that writes that register buffer must also be broadcast
 // (because each wg needs its own initialized copy).
-static void PropagateBroadcastWarpgroupId(IRStructure *root) {
+static void PropagateBroadcastWarpgroupId(
+    const std::vector<std::shared_ptr<IRStructure>> &root) {
   std::vector<TaskNodeWithContext> all_tasks;
   CollectAllTaskNodesWithContext(root, all_tasks);
 
@@ -890,26 +905,12 @@ static void PropagateBroadcastWarpgroupId(IRStructure *root) {
           if (node->IsControl()) {
             auto *c = static_cast<ControlNode *>(node);
             add_struct(c->task.get());
-            walk_structural(c->child.get());
-          } else if (node->IsWrapper()) {
-            auto *w = static_cast<WrapperNode *>(node);
-            add_struct(w->task.get());
-            walk_structural(w->child.get());
-          } else if (node->IsIf()) {
-            auto *i = static_cast<IfNode *>(node);
-            add_struct(i->task.get());
-            walk_structural(i->then_child.get());
-            walk_structural(i->else_child.get());
-          } else if (node->IsSequence()) {
-            auto *s = static_cast<SequenceNode *>(node);
-            for (auto &c : s->children)
-              walk_structural(c.get());
-          } else if (node->IsScheduleUnit()) {
-            auto *u = static_cast<ScheduleUnit *>(node);
-            walk_structural(u->child.get());
+            for (auto &child : c->children)
+              walk_structural(child.get());
           }
         };
-    walk_structural(root);
+    for (const auto &node : root)
+      walk_structural(node.get());
 
     std::unordered_set<const BufferNode *> cross_wg_buffers;
     for (const auto &kv : buffer_reader_wgs) {
@@ -971,7 +972,8 @@ static void PropagateBroadcastWarpgroupId(IRStructure *root) {
 }
 
 // Resolve scalar tasks to a concrete warpgroup just before barrier insertion.
-static void ResolveScalarWarpgroupId(IRStructure *root) {
+static void ResolveScalarWarpgroupId(
+    const std::vector<std::shared_ptr<IRStructure>> &root) {
   std::vector<TaskNodeWithContext> all_tasks;
   CollectAllTaskNodesWithContext(root, all_tasks);
 
@@ -1023,38 +1025,18 @@ static void ResolveScalarWarpgroupId(IRStructure *root) {
   }
 }
 
-// Local enumerator for PropagateReadRegions: in addition to leaf TaskNodes,
-// also include TaskNodes that live as WrapperNode::task (i.e. LetDecl /
-// AttrDecl tasks built by IRStructureBuilder::VisitStmt_(BindNode*) and
-// VisitStmt_(AttrStmtNode*)). The shared CollectAllTaskNodesWithContext
-// helper deliberately skips these wrapped tasks; other callers rely on that
-// behavior, so we do the collection locally here.
+// Local enumerator for PropagateReadRegions. IRStructureBuilder emits BindNode
+// and tl.assume AttrStmt as ordinary TaskNodes.
 static void CollectTaskNodesForPropagation(IRStructure *node,
                                            std::vector<TaskNode *> &out) {
   if (!node)
     return;
   if (node->IsTask()) {
     out.push_back(static_cast<TaskNode *>(node));
-  } else if (node->IsSequence()) {
-    auto seq = static_cast<const SequenceNode *>(node);
-    for (const auto &child : seq->children)
-      CollectTaskNodesForPropagation(child.get(), out);
   } else if (node->IsControl()) {
     auto ctrl = static_cast<const ControlNode *>(node);
-    CollectTaskNodesForPropagation(ctrl->child.get(), out);
-  } else if (node->IsWrapper()) {
-    auto wrapper = static_cast<const WrapperNode *>(node);
-    if (wrapper->task)
-      out.push_back(wrapper->task.get());
-    CollectTaskNodesForPropagation(wrapper->child.get(), out);
-  } else if (node->IsScheduleUnit()) {
-    auto unit = static_cast<const ScheduleUnit *>(node);
-    CollectTaskNodesForPropagation(unit->child.get(), out);
-  } else if (node->IsIf()) {
-    auto if_node = static_cast<const IfNode *>(node);
-    CollectTaskNodesForPropagation(if_node->then_child.get(), out);
-    if (if_node->else_child)
-      CollectTaskNodesForPropagation(if_node->else_child.get(), out);
+    for (const auto &child : ctrl->children)
+      CollectTaskNodesForPropagation(child.get(), out);
   } else {
     LOG(FATAL) << "Unknown IRStructure kind in "
                   "CollectTaskNodesForPropagation";
@@ -1063,9 +1045,11 @@ static void CollectTaskNodesForPropagation(IRStructure *node,
 
 // Compute indirect read regions/vars for every task: the direct reads plus
 // anything reached transitively through scalar Let bindings.
-static void PropagateReadRegions(IRStructure *root) {
+static void
+PropagateReadRegions(const std::vector<std::shared_ptr<IRStructure>> &root) {
   std::vector<TaskNode *> all_tasks;
-  CollectTaskNodesForPropagation(root, all_tasks);
+  for (const auto &node : root)
+    CollectTaskNodesForPropagation(node.get(), all_tasks);
 
   // Seed every task's indirect set from its direct reads.
   for (TaskNode *task : all_tasks)
@@ -1075,7 +1059,7 @@ static void PropagateReadRegions(IRStructure *root) {
   std::unordered_map<const VarNode *, TaskNode *> var_to_let_decl;
   for (TaskNode *task : all_tasks) {
     if (IsLetDeclTask(task)) {
-      const auto *bind = task->stmts[0].as<BindNode>();
+      const auto *bind = task->stmt.as<BindNode>();
       var_to_let_decl[bind->var.get()] = task;
     }
   }
@@ -1132,16 +1116,16 @@ static ScheduledKernelResult ScheduleSingleKernel(
   IRStructureBuilder builder;
   auto ir_structure = builder.Build(kernel_body, target);
 
-  ICHECK(ir_structure) << "IRStructure is null (empty body?)";
+  ICHECK(!ir_structure.empty()) << "IRStructure is empty (empty body?)";
 
   // Compute indirect read sets (direct reads + reads reached through scalar
   // Let bindings, e.g. m_tile → m_tile_3 → MTE copy) so warpgroup resolution
   // can see register buffers accessed indirectly. Direct read regions/vars are
   // left untouched for barrier/dependency analysis.
-  PropagateReadRegions(ir_structure.get());
+  PropagateReadRegions(ir_structure);
 
-  // Build ScheduleUnits from IRStructure (Z3 scheduling + Ascend sync)
-  ScheduleUnitBuilder unit_builder;
+  // Schedule IRStructure in place (Z3 scheduling + Ascend sync)
+  ScheduleBuilder unit_builder;
   int64_t shared_mem_limit = GetSharedMemoryLimit(target);
   if (TargetIsAscend(target) && !HasSimtVF(kernel_body)) {
     shared_mem_limit = 248 * 1024;
@@ -1156,12 +1140,12 @@ static ScheduledKernelResult ScheduleSingleKernel(
     unit_builder.SetMemoryLimit(scope, kUnlimitedMemory);
   }
   unit_builder.SetBufferVersionsOverride(buffer_versions_overrides);
-  unit_builder.ScheduleRecursive(ir_structure);
+  unit_builder.ScheduleList(ir_structure);
 
   // Assign warpgroup IDs based on pipe and buffer scopes
   {
     std::vector<TaskNodeWithContext> all_tasks;
-    CollectAllTaskNodesWithContext(ir_structure.get(), all_tasks);
+    CollectAllTaskNodesWithContext(ir_structure, all_tasks);
     for (auto &task_ctx : all_tasks) {
       auto *t = task_ctx.task;
       uint16_t m = t->GetPipeMask();
@@ -1191,8 +1175,8 @@ static ScheduledKernelResult ScheduleSingleKernel(
 
   // Propagate broadcast warpgroup IDs for register buffers accessed
   // across warp groups.
-  PropagateBroadcastWarpgroupId(ir_structure.get());
-  ResolveScalarWarpgroupId(ir_structure.get());
+  PropagateBroadcastWarpgroupId(ir_structure);
+  ResolveScalarWarpgroupId(ir_structure);
 
   EventIdMap event_id_map;
   FlagInfoList flag_infos;
@@ -1204,22 +1188,22 @@ static ScheduledKernelResult ScheduleSingleKernel(
     sid = Var("sid", DataType::Int(32));
   }
   MultiVersionBufferMap buffer_info_map;
-  AnalyzeAndInsertBarriers(ir_structure.get(), event_id_map, flag_infos, sid,
+  AnalyzeAndInsertBarriers(ir_structure, event_id_map, flag_infos, sid,
                            loop_info, result.buffer_infos, buffer_info_map);
 
   Stmt wg0_body = Evaluate(0);
   Stmt wg1_body = Evaluate(0);
 
-  bool has_wg0 = HasWarpgroupId(ir_structure.get(), 0);
-  bool has_wg1 = HasWarpgroupId(ir_structure.get(), 1);
+  bool has_wg0 = HasWarpgroupId(ir_structure, 0);
+  bool has_wg1 = HasWarpgroupId(ir_structure, 1);
 
   if (has_wg0) {
-    auto wg = CloneIRStructureWithWarpgroupFilter(ir_structure.get(), 0);
-    wg0_body = ConvertIRStructureToStmt(wg.get(), sid);
+    auto wg = CloneIRStructureWithWarpgroupFilter(ir_structure, 0);
+    wg0_body = EmitWarpgroupBody(wg, sid);
   }
   if (has_wg1) {
-    auto wg = CloneIRStructureWithWarpgroupFilter(ir_structure.get(), 1);
-    wg1_body = ConvertIRStructureToStmt(wg.get(), sid);
+    auto wg = CloneIRStructureWithWarpgroupFilter(ir_structure, 1);
+    wg1_body = EmitWarpgroupBody(wg, sid);
   }
 
   if (!flag_infos.empty()) {

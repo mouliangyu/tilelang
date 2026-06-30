@@ -20,8 +20,6 @@ namespace tl {
 using namespace tirx;
 using ffi::Map;
 
-struct WarpSpecializeConfig;
-
 class VarRefCollector : public StmtExprVisitor {
 public:
   std::unordered_set<const VarNode *> vars;
@@ -35,13 +33,13 @@ bool ContainsLetDecl(const IRStructure *node);
 std::shared_ptr<IRStructure>
 CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
                                     Map<Var, PrimExpr> &var_remap);
-std::shared_ptr<IRStructure>
-CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id);
+// Entry point: filter the root ordered list for a warpgroup.
+std::vector<std::shared_ptr<IRStructure>> CloneIRStructureWithWarpgroupFilter(
+    const std::vector<std::shared_ptr<IRStructure>> &root, int warpgroup_id);
 
-std::shared_ptr<IRStructure>
-RemoveUnusedLetDecls(std::shared_ptr<IRStructure> root);
-
-Stmt ConvertIRStructureToStmt(IRStructure *root, Var sid = Var());
+// Emit one warpgroup body
+Stmt EmitWarpgroupBody(const std::vector<std::shared_ptr<IRStructure>> &nodes,
+                       Var sid = Var());
 
 Stmt ReNestLetStmts(const Stmt &stmt);
 

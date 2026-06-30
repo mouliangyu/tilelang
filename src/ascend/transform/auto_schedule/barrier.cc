@@ -30,22 +30,22 @@ Buffer CreateNewBuffer(const Buffer &buffer, int num_versions) {
   return Buffer(new_buffer);
 }
 
-void InsertStatementIntoScheduleUnit(ScheduleUnit *task, Stmt stmt,
-                                     bool at_beginning, int warpgroup_id,
-                                     const PrimExpr &guard = PrimExpr()) {
+void InsertStatementIntoScheduledNode(IRStructure *node, Stmt stmt,
+                                      bool at_beginning, int warpgroup_id,
+                                      const PrimExpr &guard = PrimExpr()) {
   if (guard.defined()) {
     stmt = IfThenElse(guard, stmt);
   }
   if (at_beginning) {
-    task->before[warpgroup_id].insert(task->before[warpgroup_id].begin(), stmt);
+    node->before[warpgroup_id].insert(node->before[warpgroup_id].begin(), stmt);
   } else {
-    task->after[warpgroup_id].push_back(stmt);
+    node->after[warpgroup_id].push_back(stmt);
   }
 }
 
-TaskNode *GetInnerTask(ScheduleUnit *unit) {
+TaskNode *GetInnerTask(IRStructure *node) {
   std::vector<TaskNodeWithContext> task_contexts;
-  CollectAllTaskNodesWithContext(unit, task_contexts);
+  CollectAllTaskNodesWithContext(node, task_contexts);
   if (task_contexts.size() == 1 && task_contexts[0].control_node == nullptr) {
     return task_contexts[0].task;
   } else {
@@ -53,25 +53,24 @@ TaskNode *GetInnerTask(ScheduleUnit *unit) {
   }
 }
 
-// Whether a same-unit (prod_unit == cons_unit) self-dependency can be skipped.
+// Whether a same-node (prod_node == cons_node) self-dependency can be skipped.
 // A self-dependency can be skipped only in two provably-safe shapes:
-//   (a) the unit uses ONLY the Cube (M) pipe, including the L1-gemm.
-//   (b) the unit's child is directly a For loop without a loop break.
+//   (a) the node uses ONLY the Cube (M) pipe, including the L1-gemm.
+//   (b) the node's child is directly a For loop without a loop break.
 // Any other shape may carry a real dependency.
-bool CanSkipSelfDependency(ScheduleUnit *unit) {
-  if (unit->UsesOnlyPipe(ResourcePipe::kCube))
+bool CanSkipSelfDependency(IRStructure *node) {
+  if (node->UsesOnlyPipe(ResourcePipe::kCube))
     return true;
-  if (unit->child && unit->child->IsControl() &&
-      !unit->child->ContainsLoopBreak())
+  if (node->IsControl() && !node->ContainsLoopBreak())
     return true;
   return false;
 }
 
 // Check if a TaskNode's operation has unit_flag_ctl/ctrl != 0.
 bool HasUnitFlagCtrl(const TaskNode *task) {
-  if (!task || task->stmts.size() != 1)
+  if (!task)
     return false;
-  auto *eval = task->stmts[0].as<EvaluateNode>();
+  auto *eval = task->stmt.as<EvaluateNode>();
   if (!eval)
     return false;
   auto *call = eval->value.as<CallNode>();
@@ -107,9 +106,9 @@ std::string GetPipeName(uint16_t mask) {
 
 std::string GetHardEvent(const TaskNode *producer, const TaskNode *consumer) {
   auto producer_pipe = GetPipeName(producer->GetPipeMask());
-  ICHECK(producer_pipe != "UNKNOWN") << producer->stmts[0];
+  ICHECK(producer_pipe != "UNKNOWN") << producer->stmt;
   auto consumer_pipe = GetPipeName(consumer->GetPipeMask());
-  ICHECK(consumer_pipe != "UNKNOWN") << consumer->stmts[0];
+  ICHECK(consumer_pipe != "UNKNOWN") << consumer->stmt;
   auto event = producer_pipe + "_" + consumer_pipe;
   if (event == "MTE2_M")
     return "MTE2_MTE1";
@@ -125,19 +124,21 @@ std::string GetHardEvent(const TaskNode *producer, const TaskNode *consumer) {
 enum class SyncType { CrossCore, IntraCore };
 
 struct SyncInsertionSite {
-  ScheduleUnit *unit;
+  IRStructure *node;
   PrimExpr guard;
   bool at_beginning;
-  std::vector<std::pair<const SequenceNode *, const ScheduleUnit *>> chain;
+  std::vector<std::pair<const std::vector<std::shared_ptr<IRStructure>> *,
+                        const IRStructure *>>
+      chain;
 };
 
 struct SyncPoint {
   SyncType type;
-  ScheduleUnit *prod_unit;
+  IRStructure *prod_node;
   int prod_wg;
   SyncInsertionSite prod_site;
   std::string prod_pipe;
-  ScheduleUnit *cons_unit;
+  IRStructure *cons_node;
   int cons_wg;
   SyncInsertionSite cons_site;
   std::string cons_pipe;
@@ -149,8 +150,9 @@ struct SyncPoint {
   int mode_id;
 };
 
-SyncInsertionSite GetInsertionSite(const std::set<BufferAccessPoint> &pts,
-                                   bool at_beginning) {
+SyncInsertionSite GetInsertionSite(
+    const std::set<BufferAccessPoint> &pts, bool at_beginning,
+    const std::vector<std::shared_ptr<IRStructure>> *top_level_container) {
   SyncInsertionSite site = {nullptr, PrimExpr(), at_beginning, {}};
   if (pts.empty()) {
     LOG(FATAL) << "No access points provided for insertion site.";
@@ -164,7 +166,11 @@ SyncInsertionSite GetInsertionSite(const std::set<BufferAccessPoint> &pts,
       accumulated_guard = accumulated_guard && term;
     }
   };
-  const SequenceNode *parent = nullptr;
+  // The ordered container that owns the node at this path depth. At the root
+  // it is the top-level list; once we descend through a ControlNode it becomes
+  // that loop's `children`.
+  const std::vector<std::shared_ptr<IRStructure>> *container =
+      top_level_container;
   for (size_t idx = 0; idx < pts.begin()->path.size(); ++idx) {
     const auto &node = pts.begin()->path[idx];
     bool all_match = true;
@@ -177,21 +183,30 @@ SyncInsertionSite GetInsertionSite(const std::set<BufferAccessPoint> &pts,
     if (!all_match) {
       break;
     }
-    if (node->IsScheduleUnit()) {
-      site.unit =
-          const_cast<ScheduleUnit *>(static_cast<const ScheduleUnit *>(node));
+    if (node->IsTask() || node->IsControl()) {
+      site.node = const_cast<IRStructure *>(node);
       site.guard = accumulated_guard;
-      site.chain.emplace_back(parent, site.unit);
-    } else if (node->IsIf()) {
+      site.chain.emplace_back(container, site.node);
+    }
+    if (node->HasConditions()) {
       break;
-    } else if (node->IsSequence()) {
-      parent = static_cast<const SequenceNode *>(node);
-    } else if (node->IsControl()) {
+    }
+    if (node->IsControl()) {
       const ControlNode *ctrl = static_cast<const ControlNode *>(node);
       const ForNode *for_node = ctrl->control.get();
-      if (ctrl->child->ContainsLoopBreak()) {
+      bool body_has_loop_break = false;
+      for (const auto &child : ctrl->children) {
+        if (child && child->ContainsLoopBreak()) {
+          body_has_loop_break = true;
+          break;
+        }
+      }
+      if (body_has_loop_break) {
         break;
       }
+      // Descending into the loop body: subsequent path nodes are ordered by
+      // this loop's `children`.
+      container = &ctrl->children;
       PrimExpr loop_var = for_node->loop_var;
       PrimExpr min = for_node->min;
       PrimExpr extent = for_node->extent;
@@ -206,21 +221,22 @@ SyncInsertionSite GetInsertionSite(const std::set<BufferAccessPoint> &pts,
       append_guard(term);
     }
   }
-  if (!site.unit) {
-    LOG(FATAL) << "Failed to find insertion ScheduleUnit for access points.";
+  if (!site.node) {
+    LOG(FATAL) << "Failed to find insertion node for access points.";
   }
   return site;
 }
 
-std::vector<SyncPoint>
-CollectSyncPoints(const std::vector<ScheduleUnit *> &units, int num_wgs,
-                  const MultiVersionBufferMap &buffer_info_map,
-                  const std::map<Buffer, int64_t> &buffer_num_versions = {},
-                  std::optional<For> current_loop = std::nullopt) {
-  auto deps = AnalyzeDependencies(units, current_loop);
+std::vector<SyncPoint> CollectSyncPoints(
+    const std::vector<IRStructure *> &nodes, int num_wgs,
+    const MultiVersionBufferMap &buffer_info_map,
+    const std::vector<std::shared_ptr<IRStructure>> *top_level_container,
+    const std::map<Buffer, int64_t> &buffer_num_versions = {},
+    std::optional<For> current_loop = std::nullopt) {
+  auto deps = AnalyzeDependencies(nodes, current_loop);
 
-  std::map<std::pair<ScheduleUnit *, int>,
-           std::map<std::pair<ScheduleUnit *, int>, std::vector<DepInfo>>>
+  std::map<std::pair<IRStructure *, int>,
+           std::map<std::pair<IRStructure *, int>, std::vector<DepInfo>>>
       sync_infos;
 
   // Expand a task's warpgroup id into the concrete wg ids it participates in.
@@ -254,14 +270,14 @@ CollectSyncPoints(const std::vector<ScheduleUnit *> &units, int num_wgs,
     for (auto &[pwg, ppts] : prod_by_wg) {
       for (auto &[cwg, cpts] : cons_by_wg) {
         DepInfo d;
-        d.prod_unit = dep.prod_unit;
-        d.cons_unit = dep.cons_unit;
+        d.prod_node = dep.prod_node;
+        d.cons_node = dep.cons_node;
         d.buffer = dep.buffer;
         d.producer_pts = ppts;
         d.consumer_pts = cpts;
         d.cross_iter = dep.cross_iter;
         d.latency = dep.latency;
-        sync_infos[{dep.prod_unit, pwg}][{dep.cons_unit, cwg}].push_back(
+        sync_infos[{dep.prod_node, pwg}][{dep.cons_node, cwg}].push_back(
             std::move(d));
       }
     }
@@ -275,17 +291,17 @@ CollectSyncPoints(const std::vector<ScheduleUnit *> &units, int num_wgs,
     return it != buffer_num_versions.end() ? static_cast<int>(it->second) : 1;
   };
 
-  for (auto prod_unit : units) {
+  for (auto prod_node : nodes) {
     for (int prod_wg = 0; prod_wg < 2; ++prod_wg) {
-      auto sync_it = sync_infos.find({prod_unit, prod_wg});
+      auto sync_it = sync_infos.find({prod_node, prod_wg});
       if (sync_it == sync_infos.end())
         continue;
       const auto &wait_map = sync_it->second;
       for (const auto &[cons_unit_info, dep_list] : wait_map) {
-        auto [cons_unit, cons_wg] = cons_unit_info;
+        auto [cons_node, cons_wg] = cons_unit_info;
         if (dep_list.empty())
           continue;
-        if (prod_unit == cons_unit && CanSkipSelfDependency(prod_unit))
+        if (prod_node == cons_node && CanSkipSelfDependency(prod_node))
           continue;
 
         // Bucket the producer/consumer access points by distance and the
@@ -334,16 +350,18 @@ CollectSyncPoints(const std::vector<ScheduleUnit *> &units, int num_wgs,
 
         for (const auto &[distance_event, pts] : group_by_distance_event) {
           const auto &[distance, hard_event] = distance_event;
-          auto prod_site = GetInsertionSite(pts.ppts, false);
-          auto cons_site = GetInsertionSite(pts.cpts, true);
+          auto prod_site =
+              GetInsertionSite(pts.ppts, false, top_level_container);
+          auto cons_site =
+              GetInsertionSite(pts.cpts, true, top_level_container);
           size_t pos = hard_event.find('_');
           std::string prod_pipe = "PIPE_" + hard_event.substr(0, pos);
           std::string cons_pipe = "PIPE_" + hard_event.substr(pos + 1);
           SyncType sync_type =
               (prod_wg == cons_wg) ? SyncType::IntraCore : SyncType::CrossCore;
           int mode_id = 4; // Default mode for cross-core syncs
-          sync_points.push_back({sync_type, prod_unit, prod_wg, prod_site,
-                                 prod_pipe, cons_unit, cons_wg, cons_site,
+          sync_points.push_back({sync_type, prod_node, prod_wg, prod_site,
+                                 prod_pipe, cons_node, cons_wg, cons_site,
                                  cons_pipe, distance, pts.num_versions,
                                  pts.flag_iteration, hard_event, mode_id});
         }
@@ -355,12 +373,15 @@ CollectSyncPoints(const std::vector<ScheduleUnit *> &units, int num_wgs,
 
 int CompareInsertionSites(const SyncInsertionSite &a_site,
                           const SyncInsertionSite &b_site) {
-  auto get_idx =
-      [](std::pair<const SequenceNode *, const ScheduleUnit *> p) -> size_t {
-    const SequenceNode *parent = p.first;
-    const ScheduleUnit *child = p.second;
-    for (size_t i = 0; i < parent->children.size(); ++i) {
-      if (parent->children[i].get() == child)
+  auto get_idx = [](std::pair<const std::vector<std::shared_ptr<IRStructure>> *,
+                              const IRStructure *>
+                        p) -> size_t {
+    const std::vector<std::shared_ptr<IRStructure>> *parent = p.first;
+    const IRStructure *child = p.second;
+    if (parent == nullptr)
+      return 0;
+    for (size_t i = 0; i < parent->size(); ++i) {
+      if ((*parent)[i].get() == child)
         return i;
     }
     LOG(FATAL) << "Child not found in parent";
@@ -415,8 +436,8 @@ FilterUnitFlagFixSyncs(const std::vector<SyncPoint> &sync_points) {
   for (const auto &sp : sync_points) {
     if (sp.type == SyncType::IntraCore &&
         sp.hard_event.find("FIX") != std::string::npos) {
-      auto *prod_task = GetInnerTask(sp.prod_unit);
-      auto *cons_task = GetInnerTask(sp.cons_unit);
+      auto *prod_task = GetInnerTask(sp.prod_node);
+      auto *cons_task = GetInnerTask(sp.cons_node);
       if ((prod_task && HasUnitFlagCtrl(prod_task)) ||
           (cons_task && HasUnitFlagCtrl(cons_task)))
         continue;
@@ -453,21 +474,21 @@ OptimizeSyncPoints(const std::vector<SyncPoint> &raw_sync_points) {
     const auto &ab = sync_points[i];
     for (size_t j = 0; j < sync_points.size(); ++j) {
       const auto &bc = sync_points[j];
-      // ab and bc must compose at the intermediate unit: same unit, same
+      // ab and bc must compose at the intermediate node: same node, same
       // in-order pipe + warpgroup, and B's consume-of-A must be at-or-before
       // B's produce-for-C on that shared in-order pipe.
       // TODO: this is conservative — it only handles the same-pipe-in-B case.
       // When ab.cons and bc.prod are on *different* pipes in B but B internally
       // synchronizes them, the chain is still valid; detecting that needs
       // looking inside B and is deferred.
-      if (ab.cons_unit != bc.prod_unit || ab.cons_pipe != bc.prod_pipe ||
+      if (ab.cons_node != bc.prod_node || ab.cons_pipe != bc.prod_pipe ||
           ab.cons_wg != bc.prod_wg ||
           CompareInsertionSites(ab.cons_site, bc.prod_site) > 0)
         continue;
       // Synthetic edge: producer side from ab, consumer side from bc, distances
       // summed.
       SyncPoint chain = ab;
-      chain.cons_unit = bc.cons_unit;
+      chain.cons_node = bc.cons_node;
       chain.cons_wg = bc.cons_wg;
       chain.cons_pipe = bc.cons_pipe;
       chain.cons_site = bc.cons_site;
@@ -537,15 +558,15 @@ void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
       if (!sp.prod_wg) {
         Stmt set_stmt =
             MakeAscendCrossCoreSetFlag(sp.mode_id, sp.prod_pipe, cc_event_id);
-        InsertStatementIntoScheduleUnit(sp.prod_site.unit, set_stmt, false,
-                                        sp.prod_wg, sp.prod_site.guard);
+        InsertStatementIntoScheduledNode(sp.prod_site.node, set_stmt, false,
+                                         sp.prod_wg, sp.prod_site.guard);
         for (unsigned s = 0; s != 2; ++s) {
           Stmt wait_stmt = MakeAscendCrossCoreWaitFlag(
               sp.mode_id, sp.cons_pipe,
               indexmod(sp.flag_iteration, Integer(sp.num_versions)) +
                   Integer(cc_base_id + 16 * s));
-          InsertStatementIntoScheduleUnit(sp.cons_site.unit, wait_stmt, true,
-                                          sp.cons_wg, sp.cons_site.guard);
+          InsertStatementIntoScheduledNode(sp.cons_site.node, wait_stmt, true,
+                                           sp.cons_wg, sp.cons_site.guard);
         }
       } else {
         for (unsigned s = 0; s != 2; ++s) {
@@ -553,13 +574,13 @@ void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
               sp.mode_id, sp.prod_pipe,
               indexmod(sp.flag_iteration, Integer(sp.num_versions)) +
                   Integer(cc_base_id + 16 * s));
-          InsertStatementIntoScheduleUnit(sp.prod_site.unit, set_stmt, false,
-                                          sp.prod_wg, sp.prod_site.guard);
+          InsertStatementIntoScheduledNode(sp.prod_site.node, set_stmt, false,
+                                           sp.prod_wg, sp.prod_site.guard);
         }
         Stmt wait_stmt =
             MakeAscendCrossCoreWaitFlag(sp.mode_id, sp.cons_pipe, cc_event_id);
-        InsertStatementIntoScheduleUnit(sp.cons_site.unit, wait_stmt, true,
-                                        sp.cons_wg, sp.cons_site.guard);
+        InsertStatementIntoScheduledNode(sp.cons_site.node, wait_stmt, true,
+                                         sp.cons_wg, sp.cons_site.guard);
       }
     } else if (sp.type == SyncType::IntraCore) {
       // When producer and consumer share the same pipe, insert a pipe_barrier
@@ -570,8 +591,8 @@ void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
           continue;
         }
         Stmt barrier = MakeAscendPipeBarrier(sp.prod_pipe);
-        InsertStatementIntoScheduleUnit(sp.cons_site.unit, barrier, true,
-                                        sp.cons_wg, sp.cons_site.guard);
+        InsertStatementIntoScheduledNode(sp.cons_site.node, barrier, true,
+                                         sp.cons_wg, sp.cons_site.guard);
         continue;
       }
       auto base_id = event_id_map.find(sp.hard_event);
@@ -593,31 +614,29 @@ void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
       }
 
       Stmt set_stmt = MakeAscendSetFlag(sp.hard_event, event_id);
-      InsertStatementIntoScheduleUnit(sp.prod_site.unit, set_stmt, false,
-                                      sp.prod_wg, sp.prod_site.guard);
+      InsertStatementIntoScheduledNode(sp.prod_site.node, set_stmt, false,
+                                       sp.prod_wg, sp.prod_site.guard);
 
       Stmt wait_stmt = MakeAscendWaitFlag(sp.hard_event, event_id);
-      InsertStatementIntoScheduleUnit(sp.cons_site.unit, wait_stmt, true,
-                                      sp.cons_wg, sp.cons_site.guard);
+      InsertStatementIntoScheduledNode(sp.cons_site.node, wait_stmt, true,
+                                       sp.cons_wg, sp.cons_site.guard);
     }
   }
 }
 
-void AnalyzeSequenceNodeBarriers(
-    SequenceNode *seq, EventIdMap &event_id_map, FlagInfoList &flag_infos,
-    Var sid, LoopNestingInfo &loop_info,
-    std::vector<MultiVersionBufferInfo> &buffer_infos,
-    MultiVersionBufferMap &buffer_info_map) {
-  if (!seq)
-    return;
-  std::vector<ScheduleUnit *> units;
-  for (auto &child : seq->children) {
-    auto unit = static_cast<ScheduleUnit *>(child.get());
-    units.push_back(unit);
-    AnalyzeAndInsertBarriers(unit->child.get(), event_id_map, flag_infos, sid,
-                             loop_info, buffer_infos, buffer_info_map);
+void AnalyzeListBarriers(std::vector<std::shared_ptr<IRStructure>> &children,
+                         EventIdMap &event_id_map, FlagInfoList &flag_infos,
+                         Var sid, LoopNestingInfo &loop_info,
+                         std::vector<MultiVersionBufferInfo> &buffer_infos,
+                         MultiVersionBufferMap &buffer_info_map) {
+  std::vector<IRStructure *> nodes;
+  for (auto &child : children) {
+    auto node = child.get();
+    nodes.push_back(node);
+    AnalyzeAndInsertBarriers(node, event_id_map, flag_infos, sid, loop_info,
+                             buffer_infos, buffer_info_map);
   }
-  auto sync_points = CollectSyncPoints(units, 2, buffer_info_map);
+  auto sync_points = CollectSyncPoints(nodes, 2, buffer_info_map, &children);
   sync_points = OptimizeSyncPoints(sync_points);
   InsertSyncPoints(sync_points, flag_infos, event_id_map);
 }
@@ -627,7 +646,7 @@ void AnalyzeControlNodeBarriers(
     Var sid, LoopNestingInfo &loop_info,
     std::vector<MultiVersionBufferInfo> &buffer_infos,
     MultiVersionBufferMap &buffer_info_map) {
-  if (!ctrl || !ctrl->child)
+  if (!ctrl || ctrl->children.empty())
     return;
   const ForNode *for_node = ctrl->control.get();
   if (!for_node)
@@ -654,24 +673,24 @@ void AnalyzeControlNodeBarriers(
     scoped_buffers.push_back(buffer);
   }
 
-  ICHECK(ctrl->child->IsSequence());
-  auto seq = static_cast<SequenceNode *>(ctrl->child.get());
-  std::vector<ScheduleUnit *> units;
-  for (auto &child : seq->children) {
-    auto unit = static_cast<ScheduleUnit *>(child.get());
-    units.push_back(unit);
-    AnalyzeAndInsertBarriers(unit->child.get(), event_id_map, flag_infos, sid,
-                             loop_info, buffer_infos, buffer_info_map);
+  std::vector<IRStructure *> nodes;
+  for (auto &child : ctrl->children) {
+    auto node = child.get();
+    nodes.push_back(node);
+    AnalyzeAndInsertBarriers(node, event_id_map, flag_infos, sid, loop_info,
+                             buffer_infos, buffer_info_map);
   }
 
-  // Sort units by stage (largest first) to match SW-pipelining order — the
+  // Sort nodes by stage (largest first) to match SW-pipelining order — the
   // latest stage produces a value first across iterations.
-  std::stable_sort(
-      units.begin(), units.end(),
-      [](ScheduleUnit *a, ScheduleUnit *b) { return a->stage > b->stage; });
+  std::stable_sort(nodes.begin(), nodes.end(),
+                   [](IRStructure *a, IRStructure *b) {
+                     return a->GetStage() > b->GetStage();
+                   });
 
-  auto sync_points = CollectSyncPoints(
-      units, 2, buffer_info_map, ctrl->buffer_num_versions, ctrl->control);
+  auto sync_points =
+      CollectSyncPoints(nodes, 2, buffer_info_map, &ctrl->children,
+                        ctrl->buffer_num_versions, ctrl->control);
   sync_points = OptimizeSyncPoints(sync_points);
   InsertSyncPoints(sync_points, flag_infos, event_id_map);
 
@@ -690,39 +709,27 @@ void AnalyzeAndInsertBarriers(IRStructure *node, EventIdMap &event_id_map,
   if (!node)
     return;
 
-  if (node->IsSequence()) {
-    AnalyzeSequenceNodeBarriers(static_cast<SequenceNode *>(node), event_id_map,
-                                flag_infos, sid, loop_info, buffer_infos,
-                                buffer_info_map);
-  } else if (node->IsControl()) {
+  if (node->IsControl()) {
     AnalyzeControlNodeBarriers(static_cast<ControlNode *>(node), event_id_map,
                                flag_infos, sid, loop_info, buffer_infos,
                                buffer_info_map);
-  } else if (node->IsWrapper()) {
-    auto wrapper = static_cast<WrapperNode *>(node);
-    AnalyzeAndInsertBarriers(wrapper->child.get(), event_id_map, flag_infos,
-                             sid, loop_info, buffer_infos, buffer_info_map);
-  } else if (node->IsIf()) {
-    auto if_node = static_cast<IfNode *>(node);
-    if (if_node->then_child) {
-      AnalyzeAndInsertBarriers(if_node->then_child.get(), event_id_map,
-                               flag_infos, sid, loop_info, buffer_infos,
-                               buffer_info_map);
-    }
-    if (if_node->else_child) {
-      AnalyzeAndInsertBarriers(if_node->else_child.get(), event_id_map,
-                               flag_infos, sid, loop_info, buffer_infos,
-                               buffer_info_map);
-    }
   } else if (node->IsTask()) {
     auto task = static_cast<TaskNode *>(node);
     MultiBufferAccessRewriter rewriter(buffer_info_map);
-    for (auto &stmt : task->stmts) {
-      stmt = rewriter(stmt);
-    }
+    task->stmt = rewriter(task->stmt);
   } else {
     LOG(FATAL);
   }
+}
+
+void AnalyzeAndInsertBarriers(std::vector<std::shared_ptr<IRStructure>> &root,
+                              EventIdMap &event_id_map,
+                              FlagInfoList &flag_infos, Var sid,
+                              LoopNestingInfo &loop_info,
+                              std::vector<MultiVersionBufferInfo> &buffer_infos,
+                              MultiVersionBufferMap &buffer_info_map) {
+  AnalyzeListBarriers(root, event_id_map, flag_infos, sid, loop_info,
+                      buffer_infos, buffer_info_map);
 }
 
 } // namespace tl

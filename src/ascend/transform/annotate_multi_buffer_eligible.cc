@@ -4,9 +4,10 @@
  *        buffers can be multi-buffered and record the set on the For's
  *        annotations under "multi_buffer_eligible".
  *
- *  Runs before IfConditionExtract so that the original if-then-else structure
- *  is still intact — IfConditionExtract splits one if into many small ifs,
- *  which makes "write-first" analysis overly conservative.
+ *  Runs before IfConditionExtract. IfConditionExtract only extracts complex
+ *  if conditions into Bind variables; it keeps the if-then-else intact, so the
+ *  ordering is not strictly required for correctness, but we keep this pass
+ *  first to operate on the untouched frontend structure.
  *
  *  A buffer is eligible inside For L iff
  *    1) it lives in on-chip memory (shared / shared.l1 / shared.l0c, including
@@ -442,7 +443,8 @@ public:
 //   - For (kSerial)    -> ControlNode: annotate + walk body
 //   - For (other kind) -> TaskNode: leaf, do not walk
 //   - IfThenElse       -> walk both branches
-//   - LetStmt/AttrStmt -> WrapperNode: walk body
+//   - LetStmt          -> leaf
+//   - AttrStmt         -> walk tl.assume body, reject other attrs downstream
 //   - Block / While    -> TaskNode: leaf
 //   - other            -> leaf
 // ---------------------------------------------------------------------------
