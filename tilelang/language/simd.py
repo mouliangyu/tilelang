@@ -51,16 +51,18 @@ _ELEM_BITS = {
 }
 
 
-def _elem_bits(dtype_str: str) -> int:
-    return _ELEM_BITS.get(str(dtype_str), 32)
-
-
-def _vreg_lanes(elem_bits: int) -> int:
+def _vreg_lanes(dtype_str: DType) -> int:
+    key = str(dtype_str)
+    if key == "bool":
+        return 256
+    if key not in _ELEM_BITS:
+        raise ValueError(f"Unknown element dtype '{key}'. Must be one of {sorted(_ELEM_BITS)}")
+    elem_bits = _ELEM_BITS[key]
     return 2048 // elem_bits
 
 
-def _vec_dtype(elem_dtype: str) -> str:
-    lanes = _vreg_lanes(_elem_bits(elem_dtype))
+def _vec_dtype(elem_dtype: DType) -> str:
+    lanes = _vreg_lanes(elem_dtype)
     return f"{elem_dtype}x{lanes}"
 
 
@@ -130,8 +132,7 @@ def vld(addr, dist="NORM", off=None):
     """
     if isinstance(addr, BufferLoad):
         elem_dtype = str(addr.buffer.dtype)
-        elem_bits = _elem_bits(elem_dtype)
-        lanes = _vreg_lanes(elem_bits)
+        lanes = _vreg_lanes(elem_dtype)
         extent = lanes
         if isinstance(dist, str):
             if dist.startswith("BRC_"):
@@ -142,8 +143,7 @@ def vld(addr, dist="NORM", off=None):
         vec_dtype = f"{elem_dtype}x{lanes}"
     else:
         inner_load = addr.args[0]
-        elem_dtype = str(inner_load.buffer.dtype)
-        vec_dtype = _vec_dtype(elem_dtype)
+        vec_dtype = _vec_dtype(inner_load.buffer.dtype)
 
     args = [addr, dist]
     if off is not None:
@@ -157,9 +157,7 @@ def vsts(addr, src, mask, dist="NORM_B32", off=None):
     addr can be a BufferLoad auto-wrapped as tl.access_ptr.
     """
     if isinstance(addr, BufferLoad):
-        elem_dtype = str(addr.buffer.dtype)
-        elem_bits = _elem_bits(elem_dtype)
-        lanes = _vreg_lanes(elem_bits)
+        lanes = _vreg_lanes(addr.buffer.dtype)
         extent = lanes
         if isinstance(dist, str):
             if dist.startswith("ONEPT_"):
@@ -176,8 +174,7 @@ def vsts(addr, src, mask, dist="NORM_B32", off=None):
 def vsstb(src, base, stride, mask):
     """Scatter-store 32B blocks with block stride: vsstb(src, base, stride, mask)."""
     if isinstance(base, BufferLoad):
-        elem_dtype = str(base.buffer.dtype)
-        base = access_ptr(base, "w", extent=_vreg_lanes(_elem_bits(elem_dtype)))
+        base = access_ptr(base, "w", extent=_vreg_lanes(base.buffer.dtype))
     return tirx.call_intrin("void", _Op("tl.simd.vsstb"), src, base, stride, mask)
 
 
@@ -259,7 +256,7 @@ def vrelu(src, mask, mode="MODE_ZEROING"):
 # -- Broadcast --------------------------------------------------------------------
 
 
-def vdup(src, dtype_str, mask, mode="MODE_ZEROING"):
+def vdup(src, dtype_str: DType, mask, mode="MODE_ZEROING"):
     """Broadcast scalar to all lanes: dst = vdup(scalar, dtype_str, mask).
 
     dtype_str specifies the target vector element type (e.g. "float32").
@@ -317,7 +314,7 @@ def vsqz(src, mask, mode="MODE_STORED"):
 # -- Index ramp / compare ---------------------------------------------------------
 
 
-def vci(index, dtype_str, order="INC_ORDER"):
+def vci(index, dtype_str: DType, order="INC_ORDER"):
     """Index ramp: dst = vci(index, dtype_str, order).
 
     dst[lane] = index + lane (INC_ORDER) / index - lane (DEC_ORDER).
@@ -387,13 +384,12 @@ def vpack(src, part=0):
 def vgatherb(base, index, mask=None):
     """Gather 32B blocks from base using vector_u32 block offsets. Returns a vector."""
     if isinstance(base, BufferLoad):
-        elem_dtype = str(base.buffer.dtype)
-        base = access_ptr(base, "r", extent=_vreg_lanes(_elem_bits(elem_dtype)))
+        elem_dtype = base.buffer.dtype
+        base = access_ptr(base, "r", extent=_vreg_lanes(elem_dtype))
         vec_dtype = _vec_dtype(elem_dtype)
     else:
         inner_load = base.args[0]
-        elem_dtype = str(inner_load.buffer.dtype)
-        vec_dtype = _vec_dtype(elem_dtype)
+        vec_dtype = _vec_dtype(inner_load.buffer.dtype)
     args = [base, index]
     if mask is not None:
         args.append(mask)
@@ -404,7 +400,7 @@ def vgather2(base, index, mask):
     """Gather elements from base using per-lane offsets."""
     if isinstance(base, BufferLoad):
         elem_dtype = str(base.buffer.dtype)
-        base = access_ptr(base, "r", extent=_vreg_lanes(_elem_bits(elem_dtype)))
+        base = access_ptr(base, "r", extent=_vreg_lanes(elem_dtype))
     else:
         inner_load = base.args[0]
         elem_dtype = str(inner_load.buffer.dtype)
@@ -435,7 +431,7 @@ def vexpdif(src0, src1, mask, part=0):
 def vcvt(
     src,
     mask,
-    target_dtype,
+    target_dtype: DType,
     round="ROUND_R",
     sat=True,
     part=0,
@@ -491,6 +487,7 @@ def vcvt(
     * Int→Int: Most s/u{8,16,32,64} widening/narrowing pairs.
     """
 
+    target_dtype = str(target_dtype)
     src_dtype = str(src.dtype).split("x", 1)[0]
     fp16_dtypes = ("float16", "bfloat16")
     fp8_dtypes = ("float8_e4m3", "float8_e4m3fn", "float8_e5m2")
