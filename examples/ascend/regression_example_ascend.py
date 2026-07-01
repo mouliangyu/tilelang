@@ -41,6 +41,7 @@ _DEFAULT_ENTRY_TIMEOUT = 900.0
 _ENTRIES: list[tuple[str, str, dict]] = [
     ("ascend_gemm_bf16", "example_gemm", {"dtype": "bfloat16"}),
     ("ascend_gemm_fp32", "example_gemm", {"dtype": "float32"}),
+    ("ascend_gemm_fp32_hf32", "example_gemm", {"dtype": "float32", "hf32": "nearest_even"}),
     ("ascend_gemm_l0", "example_gemm_l0", {}),
     ("ascend_gemm_mix_manual", "example_gemm_mix_manual", {}),
     ("ascend_gemm_mixedkernel", "example_gemm_mixedkernel", {}),

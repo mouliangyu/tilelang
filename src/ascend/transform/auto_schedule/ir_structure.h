@@ -307,6 +307,9 @@ public:
   // Check if this node (or any descendant) contains a loop_break call
   virtual bool ContainsLoopBreak() const = 0;
 
+  // Check if this node (or any descendant) contains a set_hf32_mode call
+  virtual bool ContainsHf32Mode() const { return false; }
+
 private:
   std::vector<Guard> guards_;
   int stage_{0};
@@ -550,6 +553,9 @@ public:
   // Check if this task contains loop_break call
   bool ContainsLoopBreak() const override;
 
+  // Check if this task contains a set_hf32_mode call
+  bool ContainsHf32Mode() const override;
+
 private:
   // Resource pipe mask (bitmask of ResourcePipe values)
   uint16_t pipe_mask_{0};
@@ -586,6 +592,9 @@ private:
 
   // Cached flag for loop_break detection
   mutable std::optional<bool> contains_loop_break_cache_;
+
+  // Cached flag for set_hf32_mode detection
+  mutable std::optional<bool> contains_hf32_mode_cache_;
 };
 
 // Control node: contains a For operation and an ordered list of child

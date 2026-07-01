@@ -122,6 +122,23 @@ public:
         }
       }
 
+      // HF32 mode must be set before Cube op runs.
+      for (size_t i = 0; i < n; ++i) {
+        if (!nodes[i]->ContainsHf32Mode())
+          continue;
+        for (size_t j = 0; j < n; ++j) {
+          if (j == i)
+            continue;
+          if (nodes[j]->UsesPipe(ResourcePipe::kCube)) {
+            if (i < j) {
+              data_deps.emplace_back(i, j, latencies[i]);
+            } else if (i > j) {
+              data_deps.emplace_back(j, i, 0);
+            }
+          }
+        }
+      }
+
       // Buffer-region data dependencies
       auto deps = AnalyzeDependencies(nodes, /*current_loop=*/std::nullopt);
       std::unordered_map<IRStructure *, size_t> node_idx;
@@ -419,6 +436,25 @@ public:
         } else if (i > j) {
           data_deps.emplace_back(i, j, 1, latencies[i]);
           data_deps.emplace_back(j, i, 0, 0);
+        }
+      }
+    }
+
+    // HF32 mode must be set before Cube op runs.
+    for (size_t i = 0; i < n; ++i) {
+      if (!nodes[i]->ContainsHf32Mode())
+        continue;
+      for (size_t j = 0; j < n; ++j) {
+        if (j == i)
+          continue;
+        if (nodes[j]->UsesPipe(ResourcePipe::kCube)) {
+          if (i < j) {
+            data_deps.emplace_back(i, j, 0, latencies[i]);
+            data_deps.emplace_back(j, i, 1, 0);
+          } else if (i > j) {
+            data_deps.emplace_back(i, j, 1, latencies[i]);
+            data_deps.emplace_back(j, i, 0, 0);
+          }
         }
       }
     }

@@ -1167,6 +1167,9 @@ static ScheduledKernelResult ScheduleSingleKernel(
           }
         }
         t->SetWarpgroupId(to_l1 ? 1 : 0);
+      } else if (t->ContainsHf32Mode()) {
+        // HF32 mode configures the Cube (AIC) unit
+        t->SetWarpgroupId(1);
       } else if (t->UsesPipe(ResourcePipe::kScalar) || m == 0) {
         t->SetWarpgroupId(kWarpgroupBroadcast);
       }
