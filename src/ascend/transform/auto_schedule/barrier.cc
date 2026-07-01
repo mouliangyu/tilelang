@@ -656,6 +656,7 @@ void AnalyzeControlNodeBarriers(
   // Create new buffers for multi-buffer before recursing so nested accesses
   // can use the claim-level iteration for both data and flags.
   std::vector<Buffer> scoped_buffers;
+  std::set<const VarNode *> scoped_storages;
   for (auto &region : ctrl->GetWriteRegions()) {
     auto &buffer = region.get()->buffer;
     if (buffer_info_map.find(buffer) != buffer_info_map.end())
@@ -668,6 +669,22 @@ void AnalyzeControlNodeBarriers(
       continue;
     auto new_buffer = CreateNewBuffer(buffer, num_versions);
     MultiVersionBufferInfo info(buffer, num_versions, new_buffer, loop_info);
+    buffer_info_map.emplace(buffer, info);
+    buffer_infos.push_back(std::move(info));
+    scoped_buffers.push_back(buffer);
+    scoped_storages.insert(buffer->data.get());
+  }
+  for (auto &region : ctrl->GetReadRegions()) {
+    const auto &buffer = region.get()->buffer;
+    if (buffer_info_map.find(buffer) != buffer_info_map.end())
+      continue;
+    if (!scoped_storages.count(buffer->data.get()))
+      continue;
+    auto it = ctrl->buffer_num_versions.find(buffer);
+    if (it == ctrl->buffer_num_versions.end() || it->second == 1)
+      continue;
+    MultiVersionBufferInfo info(buffer, it->second,
+                                CreateNewBuffer(buffer, it->second), loop_info);
     buffer_info_map.emplace(buffer, info);
     buffer_infos.push_back(std::move(info));
     scoped_buffers.push_back(buffer);

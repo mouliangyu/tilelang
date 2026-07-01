@@ -433,19 +433,64 @@ inline bool WarpgroupMatches(const TaskNode *task, int wg_id) {
          wg_id == task_wg;
 }
 
-TaskAccessPredicate MakeBufferAccessPredicate(const Buffer &buffer,
-                                              bool is_write, int wg_id) {
-  return [buffer, is_write, wg_id](const TaskNode *task) -> bool {
+inline const VarNode *StorageKey(const Buffer &buffer) {
+  return buffer->data.get();
+}
+
+inline bool RegionUsesStorage(const BufferRegion &region,
+                              const VarNode *storage_key) {
+  return StorageKey(region->buffer) == storage_key;
+}
+
+TaskAccessPredicate MakeStorageAccessPredicate(const VarNode *storage_key,
+                                               bool is_write, int wg_id) {
+  return [storage_key, is_write, wg_id](const TaskNode *task) -> bool {
     if (!WarpgroupMatches(task, wg_id))
       return false;
     const auto &regions =
         is_write ? task->GetWriteRegions() : task->GetReadRegions();
     for (const auto &region : regions) {
-      if (region->buffer == buffer)
+      if (RegionUsesStorage(region, storage_key))
         return true;
     }
     return false;
   };
+}
+
+std::set<BufferAccessPoint>
+GetFirstAccessPointsByStorage(const IRStructure *node,
+                              const VarNode *storage_key, bool is_write,
+                              int wg_id = kWarpgroupBroadcast) {
+  std::set<BufferAccessPoint> result;
+  std::vector<const IRStructure *> path;
+  node->CollectFirstAccessPoints(
+      MakeStorageAccessPredicate(storage_key, is_write, wg_id), result, path);
+  return result;
+}
+
+std::set<BufferAccessPoint>
+GetLastAccessPointsByStorage(const IRStructure *node,
+                             const VarNode *storage_key, bool is_write,
+                             int wg_id = kWarpgroupBroadcast) {
+  std::set<BufferAccessPoint> result;
+  std::vector<const IRStructure *> path;
+  node->CollectLastAccessPoints(
+      MakeStorageAccessPredicate(storage_key, is_write, wg_id), result, path);
+  return result;
+}
+
+std::vector<BufferRegion> TaskRegionsForStorage(const TaskNode *task,
+                                                const VarNode *storage_key,
+                                                bool is_write) {
+  std::vector<BufferRegion> result;
+  const auto &regions =
+      is_write ? task->GetWriteRegions() : task->GetReadRegions();
+  for (const auto &region : regions) {
+    if (RegionUsesStorage(region, storage_key)) {
+      result.push_back(region);
+    }
+  }
+  return result;
 }
 
 // ============================================================================
@@ -455,8 +500,16 @@ TaskAccessPredicate MakeBufferAccessPredicate(const Buffer &buffer,
 bool RegionsMayConflict(const TaskNode *a_task, const BufferRegion &a_region,
                         const TaskNode *b_task, const BufferRegion &b_region,
                         std::optional<For> current_loop, bool cross) {
-  if (!a_region->buffer.same_as(b_region->buffer))
+  if (!a_region->buffer->data.same_as(b_region->buffer->data))
     return false;
+
+  // Same data Var but different logical Buffer, e.g. T.view/T.reshape.  Their
+  // regions may have different ranks/dtypes/strides, so do not compare them
+  // dimension-by-dimension.  Conservatively keep the dependency.
+  bool same_logical_buffer = a_region->buffer.same_as(b_region->buffer);
+  if (!same_logical_buffer)
+    return true;
+
   const Array<Range> &a_rng = a_region->region;
   const Array<Range> &b_rng = b_region->region;
   if (a_rng.size() != b_rng.size())
@@ -517,46 +570,30 @@ bool RegionsMayConflict(const TaskNode *a_task, const BufferRegion &a_region,
   return true; // no dim proved disjoint ⇒ conservatively overlap
 }
 
-BufferRegion TaskRegionFor(const TaskNode *task, const Buffer &buffer,
-                           bool is_write) {
-  const auto &regions =
-      is_write ? task->GetWriteRegions() : task->GetReadRegions();
-  std::optional<BufferRegion> found;
-  for (const auto &r : regions) {
-    if (r->buffer.same_as(buffer)) {
-      ICHECK(!found) << "Buffer " << buffer->name
-                     << " appears in more than one region of the task";
-      found = r;
-    }
-  }
-  ICHECK(found) << "Buffer " << buffer->name << " not found in task regions";
-  return *found;
-}
-
 std::vector<DepInfo>
 AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
                     std::optional<For> current_loop) {
   const size_t n = nodes.size();
   std::vector<DepInfo> deps;
 
-  std::set<Buffer> buffers;
+  std::set<const VarNode *> storage_keys;
   for (size_t i = 0; i < n; ++i) {
     for (const auto &region : nodes[i]->GetReadRegions()) {
-      buffers.insert(region->buffer);
+      storage_keys.insert(StorageKey(region->buffer));
     }
     for (const auto &region : nodes[i]->GetWriteRegions()) {
-      buffers.insert(region->buffer);
+      storage_keys.insert(StorageKey(region->buffer));
     }
   }
 
-  for (const auto &buffer : buffers) {
+  for (const auto *storage_key : storage_keys) {
     auto touches = [&](size_t u) {
       for (const auto &region : nodes[u]->GetReadRegions()) {
-        if (region->buffer.same_as(buffer))
+        if (RegionUsesStorage(region, storage_key))
           return true;
       }
       for (const auto &region : nodes[u]->GetWriteRegions()) {
-        if (region->buffer.same_as(buffer))
+        if (RegionUsesStorage(region, storage_key))
           return true;
       }
       return false;
@@ -575,42 +612,61 @@ AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
         if (!same_iter && !cross)
           continue;
 
-        auto a_w = nodes[i]->GetLastAccessPoints(buffer, /*is_write=*/true);
-        auto a_r = nodes[i]->GetLastAccessPoints(buffer, /*is_write=*/false);
-        auto b_r = nodes[j]->GetFirstAccessPoints(buffer, /*is_write=*/false);
-        auto b_w = nodes[j]->GetFirstAccessPoints(buffer, /*is_write=*/true);
+        auto a_w = GetLastAccessPointsByStorage(nodes[i], storage_key,
+                                                /*is_write=*/true);
+        auto a_r = GetLastAccessPointsByStorage(nodes[i], storage_key,
+                                                /*is_write=*/false);
+        auto b_r = GetFirstAccessPointsByStorage(nodes[j], storage_key,
+                                                 /*is_write=*/false);
+        auto b_w = GetFirstAccessPointsByStorage(nodes[j], storage_key,
+                                                 /*is_write=*/true);
 
         std::set<BufferAccessPoint> prod_pts, cons_pts;
+        std::optional<Buffer> dep_buffer;
         int64_t latency = -1;
 
-        auto consider = [&](const std::set<BufferAccessPoint> &a_pts,
-                            bool a_write,
-                            const std::set<BufferAccessPoint> &b_pts,
-                            bool b_write) {
-          for (const auto &a : a_pts) {
-            BufferRegion rA = TaskRegionFor(a.task(), buffer, a_write);
-            for (const auto &b : b_pts) {
-              BufferRegion rB = TaskRegionFor(b.task(), buffer, b_write);
-              if (!RegionsMayConflict(a.task(), rA, b.task(), rB, current_loop,
-                                      cross))
-                continue;
-              prod_pts.insert(a);
-              cons_pts.insert(b);
-              int64_t l = a.timestamp + a.task()->GetLatency() - b.timestamp;
-              if (l < 0)
-                l = 0;
-              if (l > latency)
-                latency = l;
-            }
-          }
-        };
+        auto consider =
+            [&](const std::set<BufferAccessPoint> &a_pts, bool a_write,
+                const std::set<BufferAccessPoint> &b_pts, bool b_write) {
+              for (const auto &a : a_pts) {
+                std::vector<BufferRegion> a_regions =
+                    TaskRegionsForStorage(a.task(), storage_key, a_write);
+                for (const auto &b : b_pts) {
+                  std::vector<BufferRegion> b_regions =
+                      TaskRegionsForStorage(b.task(), storage_key, b_write);
+                  for (const auto &rA : a_regions) {
+                    for (const auto &rB : b_regions) {
+                      if (!RegionsMayConflict(a.task(), rA, b.task(), rB,
+                                              current_loop, cross))
+                        continue;
+                      // For alias buffers that share one data Var, use the
+                      // write-side logical buffer as the dependency buffer.
+                      if (!dep_buffer.has_value()) {
+                        dep_buffer = a_write ? rA->buffer : rB->buffer;
+                      }
+                      prod_pts.insert(a);
+                      cons_pts.insert(b);
+                      int64_t l =
+                          a.timestamp + a.task()->GetLatency() - b.timestamp;
+                      if (l < 0)
+                        l = 0;
+                      if (l > latency)
+                        latency = l;
+                    }
+                  }
+                }
+              }
+            };
         consider(a_w, /*a_write=*/true, b_r, /*b_write=*/false);
         consider(a_w, /*a_write=*/true, b_w, /*b_write=*/true);
         consider(a_r, /*a_write=*/false, b_w, /*b_write=*/true);
 
         if (latency >= 0) {
+          ICHECK(dep_buffer.has_value())
+              << "Dependency found without a representative write buffer for "
+              << storage_key->name_hint;
           deps.push_back(
-              {nodes[i], nodes[j], buffer,
+              {nodes[i], nodes[j], dep_buffer.value(),
                std::vector<BufferAccessPoint>(prod_pts.begin(), prod_pts.end()),
                std::vector<BufferAccessPoint>(cons_pts.begin(), cons_pts.end()),
                cross, latency});

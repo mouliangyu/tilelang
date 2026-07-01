@@ -119,15 +119,10 @@ inline bool IsWarpgroupBroadcast(int wg_id) {
 
 // Predicate the Collect*AccessPoints walks use to decide whether a leaf
 // TaskNode "matches": pred(task) returns true if the task has a matching
-// access. The (is_write, wg_id) filter is baked in by the factory below.
-//
-// Concrete predicates are produced by:
-//   - MakeBufferAccessPredicate(buffer, is_write, wg_id)
+// access. The caller bakes in any buffer/storage, is_write, and warpgroup
+// filters.
 class TaskNode;
 using TaskAccessPredicate = std::function<bool(const TaskNode *task)>;
-
-TaskAccessPredicate MakeBufferAccessPredicate(const Buffer &buffer,
-                                              bool is_write, int wg_id);
 
 // A guard introduced at a node relative to its nearest surviving
 // structural ancestor.
@@ -263,10 +258,7 @@ public:
   // `this` before recursing into children and pops it on return; TaskNode
   // copies the path (with itself appended) into the BufferAccessPoint.
   //
-  // `pred(task)` returns true if the task has a matching access (the factory
-  // bakes is_write / wg_id into the predicate). Use
-  // `MakeBufferAccessPredicate(buffer, is_write, wg_id)` for buffer-keyed
-  // queries.
+  // `pred(task)` returns true if the task has a matching access.
   virtual bool CollectFirstAccessPoints(const TaskAccessPredicate &pred,
                                         std::set<BufferAccessPoint> &result,
                                         std::vector<const IRStructure *> &path,
@@ -275,26 +267,6 @@ public:
                                        std::set<BufferAccessPoint> &result,
                                        std::vector<const IRStructure *> &path,
                                        int64_t time_offset = 0) const = 0;
-
-  // Convenience wrappers — buffer-keyed.
-  std::set<BufferAccessPoint>
-  GetFirstAccessPoints(const Buffer &buffer, bool is_write,
-                       int wg_id = kWarpgroupBroadcast) const {
-    std::set<BufferAccessPoint> result;
-    std::vector<const IRStructure *> path;
-    CollectFirstAccessPoints(MakeBufferAccessPredicate(buffer, is_write, wg_id),
-                             result, path);
-    return result;
-  }
-  std::set<BufferAccessPoint>
-  GetLastAccessPoints(const Buffer &buffer, bool is_write,
-                      int wg_id = kWarpgroupBroadcast) const {
-    std::set<BufferAccessPoint> result;
-    std::vector<const IRStructure *> path;
-    CollectLastAccessPoints(MakeBufferAccessPredicate(buffer, is_write, wg_id),
-                            result, path);
-    return result;
-  }
 
   // Substitute a variable throughout this IR node
   virtual void SubstituteVar(const Var &old_var, const Var &new_var) = 0;

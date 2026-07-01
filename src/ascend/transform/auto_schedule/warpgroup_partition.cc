@@ -227,6 +227,12 @@ bool IsLetDeclTask(const TaskNode *task) {
   return task->stmt.as<BindNode>() != nullptr;
 }
 
+// A LetDecl whose bound value is a handle/pointer.
+bool IsHandleLetDeclTask(const TaskNode *task) {
+  const auto *bind = task->stmt.as<BindNode>();
+  return bind != nullptr && bind->value.dtype().is_handle();
+}
+
 // Helper: check if an IRStructure node is a LetDecl task.
 bool IsLetDeclNode(const IRStructure *node) {
   if (!node)
@@ -519,11 +525,13 @@ static void PrescanConditionalLetDecls(
         node->HasGuards()) {
       const auto *task = static_cast<const TaskNode *>(node);
       const auto *bind = task->stmt.as<BindNode>();
-      ICHECK(!bind->value.dtype().is_handle())
-          << "Guarded LetDecl with a handle/pointer value is not supported "
-             "by the alloc-var lowering (a size-1 local.var scalar cannot hold "
-             "a pointer): "
-          << bind->var;
+      // Handle/pointer LetDecls (e.g. a T.make_tensor pointer backing a
+      // Buffer's `data`) can't become a size-1 local.var scalar — `data` must
+      // stay a Var. Leave them out of the local.var machinery; they are emitted
+      // as a plain unconditional Bind below.
+      if (IsHandleLetDeclTask(task)) {
+        continue;
+      }
       Buffer buf =
           decl_buffer({IntImm(DataType::Int(32), 1)}, bind->value.dtype(),
                       bind->var->name_hint, "local.var");
@@ -549,6 +557,9 @@ static Stmt ConvertIRStructureToStmt(IRStructure *structure, Var sid,
         IsLetDeclTask(static_cast<const TaskNode *>(structure))) {
       const auto *task = static_cast<const TaskNode *>(structure);
       const auto *bind = task->stmt.as<BindNode>();
+      if (IsHandleLetDeclTask(task)) {
+        return body;
+      }
       auto it = ctx.buf_of.find(task);
       ICHECK(it != ctx.buf_of.end())
           << "Guarded LetDecl not registered by prescan: " << bind->var;

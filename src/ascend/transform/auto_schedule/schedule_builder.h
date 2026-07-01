@@ -293,12 +293,12 @@ public:
     // The pass runs before IfConditionExtract and records on the For loop
     // which on-chip buffers are safe to multi-buffer (written before any
     // read inside the loop, not referenced outside).
-    std::set<Buffer> eligible_set;
+    std::set<const VarNode *> eligible_storage_set;
     {
       auto v = ctrl->control->annotations.Get("multi_buffer_eligible");
       if (v.has_value()) {
         for (const auto &b : v.value().cast<Array<Buffer>>()) {
-          eligible_set.insert(b);
+          eligible_storage_set.insert(b->data.get());
         }
       }
     }
@@ -307,7 +307,7 @@ public:
     // Then we need to add variables and constraints in Z3 scheduler for these
     // buffers.
     std::vector<int64_t> buffer_sizes;
-    std::set<Buffer> visited_buffers;
+    std::map<const VarNode *, std::vector<Buffer>> storage_to_buffers;
     std::map<Buffer, size_t> buffer_var_id;
     // Build memory groups from memory_limits_ map.
     // std::map iteration is ordered by key: "shared" then "shared.l1".
@@ -349,10 +349,21 @@ public:
           !IsL0BBuffer(buffer)) {
         return; // Only consider on-chip buffers for multi-buffer
       }
-      if (visited_buffers.count(buffer)) {
-        return;
+      auto &aliases = storage_to_buffers[buffer->data.get()];
+      bool seen_alias = false;
+      for (const auto &alias : aliases) {
+        if (alias.same_as(buffer)) {
+          seen_alias = true;
+          break;
+        }
       }
-      visited_buffers.insert(buffer);
+      if (!seen_alias)
+        aliases.push_back(buffer);
+    });
+
+    for (const auto &[storage_key, buffers] : storage_to_buffers) {
+      ICHECK(!buffers.empty());
+      const Buffer &buffer = buffers.front();
       std::string scope;
       if (IsL1Buffer(buffer)) {
         scope = "shared.l1";
@@ -366,26 +377,35 @@ public:
         scope = "shared";
       }
       int group_id = scope_to_group[scope];
-      if (!eligible_set.count(buffer)) {
+      if (!eligible_storage_set.count(storage_key)) {
         // These buffers cannot be multi-buffered, and cannot share memory with
         // other buffers either, so we directly reduce the capacity of the
         // memory group by their size
         group_capacities[group_id] -= get_buffer_size(buffer);
       } else {
+        // Alias buffers created by T.view/T.reshape share one storage Var. They
+        // must share one version variable so dependency distances and barrier
+        // ring sizes stay consistent no matter which logical Buffer appears at
+        // an access point.
         // Check if this buffer has a manually annotated version count
         auto override_it =
-            buffer_versions_overrides_.find(buffer->data->name_hint);
+            buffer_versions_overrides_.find(storage_key->name_hint);
         if (override_it != buffer_versions_overrides_.end()) {
           int64_t override_val = override_it->second;
-          annotated_buffer_versions[buffer] = override_val;
+          for (const auto &alias : buffers) {
+            annotated_buffer_versions[alias] = override_val;
+          }
           group_capacities[group_id] -= get_buffer_size(buffer) * override_val;
         } else {
-          buffer_var_id[buffer] = buffer_sizes.size();
-          group_indices[group_id].push_back((int64_t)buffer_sizes.size());
+          size_t id = buffer_sizes.size();
+          for (const auto &alias : buffers) {
+            buffer_var_id[alias] = id;
+          }
+          group_indices[group_id].push_back((int64_t)id);
           buffer_sizes.push_back(get_buffer_size(buffer));
         }
       }
-    });
+    }
 
     // Validate buffer capacities upfront: if the minimum requirement (one
     // version of each eligible buffer) already exceeds the remaining capacity,
