@@ -92,7 +92,6 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.ConfigIndexBitwidth()(mod)
     mod = tirx.transform.Simplify()(mod)
     mod = tilelang.transform.VectorizeLoop(enable_vectorize=allow_vectorize(pass_ctx=pass_ctx))(mod)
-    mod = tilelang.transform.StorageRewrite()(mod)
 
     if not _has_vf_region(mod):
         mod = tilelang.transform.LoopUnswitching()(mod)

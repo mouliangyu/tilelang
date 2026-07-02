@@ -87,6 +87,46 @@ static bool IsScopeMemory(Var buffer_var, const std::string &target_scope) {
   return scope == target_scope;
 }
 
+// Minimum byte alignment a merged sub-buffer must respect, derived from its
+// storage scope. On Ascend the merged arena base is the physical bank base
+// (address 0), so a sub-buffer's *byte offset* within the arena is also its
+// physical alignment. The Cube-side scopes (L1/L0A/L0B/L0C) hold NZ
+// fractal-tiled data whose MTE/FixPipe strides and mad positions are computed
+// in fractal units, so a sub-buffer base that is not on a fractal boundary
+// shifts the whole fractal grid relative to base-0 and makes
+// load_cbuf_to_ca/cb, mad and copy_matrix_cc_to_ub address the wrong fractals.
+//
+// Fractal sizes are fixed by the hardware:
+//   - L1 / L0A / L0B: NZ fractal is 16 x (32B / sizeof(dtype)) = 512 bytes,
+//     independent of dtype.
+//   - L0C: 16x16 accumulator fractal; L0C is fp32-only, so 16*16*4 = 1024
+//     bytes.
+//
+// UB (shared/shared.dyn) is intentionally NOT bumped here: the SIMD MicroAPI
+// LoadAlign/StoreAlign NORM constraint is only 32B, which the pass-level
+// align_bytes (32) already satisfies. The GM<->UB 512B recommendation is a
+// bandwidth hint on the GM address, not a UB base-alignment requirement, so
+// forcing every UB sub-buffer to 512B would only waste the (scarce) Unified
+// Buffer.
+//
+// The returned value is a lower bound; callers still std::max it with the
+// pass-level align_bytes and any explicit alignment-map entry.
+static int AscendScopeAlignBytes(const std::string &scope) {
+  if (scope == "shared.l0c" || scope == "shared.l0c.dyn")
+    return 1024;
+  if (scope == "shared.l1" || scope == "shared.l1.dyn" ||
+      scope == "shared.l0a" || scope == "shared.l0a.dyn" ||
+      scope == "shared.l0b" || scope == "shared.l0b.dyn")
+    return 512;
+  return 0;
+}
+
+static int AscendScopeAlignBytes(const AllocBufferNode *alloc) {
+  if (alloc == nullptr)
+    return 0;
+  return AscendScopeAlignBytes(GetPtrStorageScope(alloc->buffer->data));
+}
+
 /*!
  * \brief Collect the mapping from buffer var to its AllocBufferNode.
  */
@@ -1425,8 +1465,15 @@ public:
       return static_cast<size_t>(const_ext.value() * bytes_per_elem);
     };
     auto get_buf_align = [&](const VarNode *var) -> int {
-      auto al_it = alignment_map.find(var);
       int al = align_bytes;
+      // Fractal / MicroAPI alignment implied by the buffer's storage scope
+      // (see AscendScopeAlignBytes). This is what makes L0C/L1 sub-buffers
+      // land on fractal boundaries instead of relying on their sizes happening
+      // to be fractal multiples.
+      auto alloc_it = shmem_allocs.find(var);
+      if (alloc_it != shmem_allocs.end())
+        al = std::max(al, AscendScopeAlignBytes(alloc_it->second));
+      auto al_it = alignment_map.find(var);
       if (al_it != alignment_map.end())
         al = std::max(al, al_it->second);
       return al;
@@ -1914,6 +1961,10 @@ private:
       }
 
       int alignment = align_bytes_;
+      // Scope-derived fractal / MicroAPI alignment, mirroring Pack's
+      // get_buf_align so the no-reuse path places L0C/L1 sub-buffers on the
+      // same fractal boundaries.
+      alignment = std::max(alignment, AscendScopeAlignBytes(alloc));
       auto align_it = shmem_alignment_map_.find(var);
       if (align_it != shmem_alignment_map_.end()) {
         alignment = std::max(alignment, align_it->second);
@@ -1975,6 +2026,32 @@ private:
       return AttrStmt(op->node, op->attr_key, op->value, new_body, op->span);
     }
     return StmtMutator::VisitStmt_(op);
+  }
+
+  Stmt VisitStmt_(const SeqStmtNode *op) final {
+    Array<Stmt> seq;
+    for (const Stmt &stmt : op->seq) {
+      Stmt new_stmt = VisitStmt(stmt);
+      if (!new_stmt.defined()) {
+        continue;
+      }
+      if (const auto *eval = new_stmt.as<EvaluateNode>()) {
+        if (const auto *imm = eval->value.as<IntImmNode>()) {
+          if (imm->value == 0) {
+            continue;
+          }
+        }
+      }
+      if (const auto *seq_node = new_stmt.as<SeqStmtNode>()) {
+        seq.insert(seq.end(), seq_node->seq.begin(), seq_node->seq.end());
+      } else {
+        seq.push_back(new_stmt);
+      }
+    }
+    if (seq.empty()) {
+      return Evaluate(0);
+    }
+    return SeqStmt(std::move(seq));
   }
 
   Stmt VisitStmt_(const AllocBufferNode *op) final {

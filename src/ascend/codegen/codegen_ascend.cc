@@ -747,25 +747,29 @@ void CodeGenTileLangAscend::VisitStmt_(const SBlockNode *op) {
   }
   if (op->name_hint == "SIMT_VF") {
     int64_t thread_x = 1, thread_y = 1, thread_z = 1;
-    {
-      const Stmt *cur = &op->body;
-      while (const auto *attr = (*cur).as<AttrStmtNode>()) {
-        if (attr->attr_key != tirx::attr::thread_extent)
-          break;
-        const auto *iv = attr->node.as<IterVarNode>();
-        if (!iv)
-          break;
-        if (const auto *imm = attr->value.as<IntImmNode>()) {
-          if (iv->thread_tag == "threadIdx.x")
-            thread_x = imm->value;
-          else if (iv->thread_tag == "threadIdx.y")
-            thread_y = imm->value;
-          else if (iv->thread_tag == "threadIdx.z")
-            thread_z = imm->value;
-        }
-        cur = &attr->body;
+    // Detect the threadIdx.{x,y,z} extents with a visitor rather than assuming
+    // the thread_extent AttrStmts lead the block body. Earlier passes (e.g.
+    // buffer allocation planning) may emit AllocBuffer/DeclBuffer statements
+    // before the thread bindings; a positional scan would then miss them and
+    // wrongly fall back to a single thread.
+    tirx::PostOrderVisit(op->body, [&](const ffi::ObjectRef &node) {
+      const auto *attr = node.as<AttrStmtNode>();
+      if (attr == nullptr || attr->attr_key != tirx::attr::thread_extent) {
+        return;
       }
-    }
+      const auto *iv = attr->node.as<IterVarNode>();
+      const auto *imm = attr->value.as<IntImmNode>();
+      if (iv == nullptr || imm == nullptr) {
+        return;
+      }
+      if (iv->thread_tag == "threadIdx.x") {
+        thread_x = imm->value;
+      } else if (iv->thread_tag == "threadIdx.y") {
+        thread_y = imm->value;
+      } else if (iv->thread_tag == "threadIdx.z") {
+        thread_z = imm->value;
+      }
+    });
 
     auto captures = CollectVFCaptures(op);
     int64_t vf_idx = simtvf_helper_counter_++;
@@ -1391,11 +1395,10 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     bool needs_ptr_arith = (scope.find("l0") != std::string::npos ||
                             scope.find("l1") != std::string::npos);
     if (needs_ptr_arith) {
-      os << "(";
+      os << "((";
       PrintStorageScope(scope, os);
       PrintType(load->dtype, os);
-      os << "*)(";
-      os << GetVarID(buf_var);
+      os << "*)" << GetVarID(buf_var);
       if (load->indices.size() == 1) {
         PrimExpr idx = load->indices[0];
         if (!is_zero(idx)) {
