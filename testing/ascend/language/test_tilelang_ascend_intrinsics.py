@@ -130,6 +130,7 @@ def test_ascend_simd_3510_intrinsics_codegen():
                 b = T.simd.vadd(b, T.simd.vcmin(a, pred), pred)
                 b = T.simd.vadd(b, T.simd.vcgadd(a, pred), pred)
                 b = T.simd.vadd(b, T.simd.vcgmax(a, pred), pred)
+                b = T.simd.vadd(b, T.simd.vcgmin(a, pred), pred)
                 a, b = T.simd.vintlv(a, b)
                 a, b = T.simd.vdintlv(a, b)
                 a = T.simd.vadd(a, b, pred)

@@ -861,6 +861,7 @@ TVM_DLL const Op &simd_vcmax();
 TVM_DLL const Op &simd_vcmin();
 TVM_DLL const Op &simd_vcgadd();
 TVM_DLL const Op &simd_vcgmax();
+TVM_DLL const Op &simd_vcgmin();
 TVM_DLL const Op &simd_vsqz();
 
 // -- Index ramp / compare

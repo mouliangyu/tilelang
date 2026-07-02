@@ -611,6 +611,9 @@ TIR_DEFINE_TL_SIMD_BUILTIN(vcgadd).set_num_inputs(-1).set_attr<TCallEffectKind>(
 TIR_DEFINE_TL_SIMD_BUILTIN(vcgmax).set_num_inputs(-1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_SIMD_BUILTIN(vcgmin).set_num_inputs(-1).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_SIMD_BUILTIN(vsqz).set_num_inputs(-1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 

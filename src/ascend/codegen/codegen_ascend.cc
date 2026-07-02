@@ -1563,12 +1563,14 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
            op->op.same_as(tl::simd_vcadd()) ||
            op->op.same_as(tl::simd_vcgadd()) ||
            op->op.same_as(tl::simd_vcgmax()) ||
+           op->op.same_as(tl::simd_vcgmin()) ||
            op->op.same_as(tl::simd_vsqz())) {
     ICHECK_EQ(op->args.size(), 3);
     const char *name = op->op.same_as(tl::simd_vcmax())    ? "vcmax"
                        : op->op.same_as(tl::simd_vcmin())  ? "vcmin"
                        : op->op.same_as(tl::simd_vcgadd()) ? "vcgadd"
                        : op->op.same_as(tl::simd_vcgmax()) ? "vcgmax"
+                       : op->op.same_as(tl::simd_vcgmin()) ? "vcgmin"
                        : op->op.same_as(tl::simd_vsqz())   ? "vsqz"
                                                            : "vcadd";
     os << "simd_inst::" << name << "(";

@@ -474,6 +474,13 @@ __simd_callee__ inline SrcVec vcgmax(SrcVec src, vector_bool mask, Mode mode) {
 }
 
 template <typename SrcVec, typename Mode>
+__simd_callee__ inline SrcVec vcgmin(SrcVec src, vector_bool mask, Mode mode) {
+  SrcVec dst;
+  ::vcgmin(dst, src, mask, mode);
+  return dst;
+}
+
+template <typename SrcVec, typename Mode>
 __simd_callee__ inline SrcVec vsqz(SrcVec src, vector_bool mask, Mode mode) {
   SrcVec dst;
   ::vsqz(dst, src, mask, mode);

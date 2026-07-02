@@ -306,6 +306,11 @@ def vcgmax(src, mask, mode="MODE_ZEROING"):
     return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vcgmax"), src, mask, mode)
 
 
+def vcgmin(src, mask, mode="MODE_ZEROING"):
+    """Grouped min reduction: dst = vcgmin(src, mask)."""
+    return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vcgmin"), src, mask, mode)
+
+
 def vsqz(src, mask, mode="MODE_STORED"):
     """Squeeze selected lanes toward the low lanes: dst = vsqz(src, mask)."""
     return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vsqz"), src, mask, mode)
