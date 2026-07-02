@@ -1,4 +1,5 @@
 import tilelang.language as T
+import tilelang.testing
 from tilelang.engine.lower import lower
 
 
@@ -75,6 +76,4 @@ def test_ascend_dcache_bypass_mte_write():
 
 
 if __name__ == "__main__":
-    test_ascend_dcache_bypass_scalar_write()
-    test_ascend_dcache_bypass_mte_write()
-    print("[ok] All ascend dcache bypass tests passed.")
+    tilelang.testing.main()

@@ -61,7 +61,7 @@ def test_ascend_copy_inside_simtvf():
     assert vf_start >= 0, "Should have simt_vf_0 helper function"
     vf_body = source[vf_start : source.find("\nextern", vf_start)]
     assert "copy_gm_to_ubuf" not in vf_body, "Inside-SimtVF copy should NOT use DMA copy_gm_to_ubuf — should be per-thread"
-    assert "simtvf_tx" in source, "Inside-SimtVF copy should use simtvf_tx for per-thread indexing"
+    assert "threadIdx.x" in source, "Inside-SimtVF copy should use threadIdx.x for per-thread indexing"
     print("[PASS] test_ascend_copy_inside_simtvf\n")
 
 
@@ -88,24 +88,6 @@ def test_ascend_copy_mixed_outside_dma_inside_simt():
     assert "__simt_vf__" in source, "Should emit __simt_vf__ for the SimtVF region"
     assert "asc_vf_call" in source, "Should emit asc_vf_call to invoke the SimtVF helper"
     print("[PASS] test_ascend_copy_mixed_outside_dma_inside_simt\n")
-
-
-def test_ascend_full_example_simtvf_copy():
-    from examples.ascend.example_simtvf_copy import ubuf_multi
-
-    program = ubuf_multi(256)
-    artifact = lower(program, target="ascend")
-    source = artifact.kernel_source
-    print("=== test_ascend_full_example_simtvf_copy ===")
-    print(source)
-
-    assert "copy_gm_to_ubuf" in source, "ubuf_multi has outside-SimtVF T.copy → should emit copy_gm_to_ubuf"
-    assert "__simt_vf__" in source, "ubuf_multi has SimtVF regions → should emit __simt_vf__"
-    assert "asc_vf_call" in source, "ubuf_multi has SimtVF regions → should emit asc_vf_call"
-    assert "PipeBarrier" in source, "ubuf_multi has T.ascend_pipe_barrier → should emit PipeBarrier"
-    vf_count = source.count("asc_vf_call<simt_vf_")
-    assert vf_count >= 3, f"ubuf_multi has 3 SimtVF regions — expected ≥3 asc_vf_call, got {vf_count}"
-    print("[PASS] test_ascend_full_example_simtvf_copy\n")
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ from tilelang import tvm
 from tilelang.engine.phase import LowerAndLegalize, OptimizeForTarget, PreLowerSemanticCheck
 from tilelang.backend.target import determine_target
 
-from testing.python.language.simtvf._inspect_utils import (
+from testing.ascend.language.simtvf._inspect_utils import (
     collect_simtvf_blocks,
     collect_thread_extent_tags_outside_simtvf,
     contains_parallel_for,

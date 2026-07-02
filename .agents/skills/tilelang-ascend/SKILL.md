@@ -728,3 +728,16 @@ All examples are in `examples/ascend/`. Key files organized by category:
 |---|---|
 | `example_buffer_version_annotation.py` | Buffer version annotation for pipelining |
 | `example_ascend_postproc_callback.py` | Post-processing codegen callback |
+
+### Tests
+
+Ascend unit tests live under `testing/ascend/`, not in `examples/`:
+- `testing/ascend/analysis/` — compile-time pass/analysis checks (`test_ascend_*`),
+  e.g. VF checker, dcache-bypass detection. No NPU execution.
+- `testing/ascend/language/` — DSL primitive / codegen correctness (`test_tilelang_ascend_*`),
+  e.g. copy, reduce, cast, print. Some execute on NPU.
+- `testing/ascend/language/simtvf/` — SimtVF-specific semantics and checkers.
+
+Each test file ends with `if __name__ == "__main__": tilelang.testing.main()` so it can
+run standalone via `python <file>` or under `pytest`. Heavier kernel/integration tests that
+reuse an `example_*.py` still live alongside them in `examples/ascend/`.

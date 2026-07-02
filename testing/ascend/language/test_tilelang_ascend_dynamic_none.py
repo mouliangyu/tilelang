@@ -4,6 +4,7 @@ from typing import Any
 import torch
 import tilelang
 import tilelang.language as T
+import tilelang.testing
 
 
 @tilelang.jit(execution_backend="cython")
@@ -38,4 +39,4 @@ def test_dynamic_none():
 
 
 if __name__ == "__main__":
-    test_dynamic_none()
+    tilelang.testing.main()

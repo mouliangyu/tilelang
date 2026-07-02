@@ -3,15 +3,13 @@ Test: call the nd2nz scatter intrinsic directly (no T.copy, no Cube).
 
 Does:  UB ND (32, 64) float -> UB NZ (33, 64) bfloat16 via scatter.
 Then writes the NZ result back to GM and prints it.
-
-Run:
-    sudo -E env PATH=$PATH LD_LIBRARY_PATH=$LD_LIBRARY_PATH python examples/ascend/test_nd2nz_scatter_only.py
 """
 
 import pytest
 import torch
 import tilelang
 import tilelang.language as T
+import tilelang.testing
 from tvm import tirx
 
 
@@ -94,6 +92,4 @@ def test_nd2nz_scatter(sd, dd):
 
 
 if __name__ == "__main__":
-    for sd, dd in [(torch.bfloat16, torch.float32), (torch.float32, torch.float32), (torch.float32, torch.bfloat16)]:
-        test_nd2nz_scatter(sd, dd)
-        print(f"PASS: test_nd2nz_scatter sd={sd} dd={dd}")
+    tilelang.testing.main()

@@ -2,6 +2,7 @@ import pytest
 import torch
 import tilelang
 import tilelang.language as T
+import tilelang.testing
 
 
 THREADS = 128
@@ -93,3 +94,7 @@ def test_simtvf_cast(case, elems_per_thread):
 
     ref = x.to(out_torch_dtype)
     assert compare_result(name, x, y, ref), f"{name}, elems_per_thread={elems_per_thread}: FAIL"
+
+
+if __name__ == "__main__":
+    tilelang.testing.main()

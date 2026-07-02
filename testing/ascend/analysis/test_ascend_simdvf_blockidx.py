@@ -1,5 +1,6 @@
 import tilelang
 import tilelang.language as T
+import tilelang.testing
 
 
 @tilelang.jit()
@@ -25,5 +26,4 @@ def test_simdvf_blockidx_capture():
 
 
 if __name__ == "__main__":
-    test_simdvf_blockidx_capture()
-    print("PASS")
+    tilelang.testing.main()

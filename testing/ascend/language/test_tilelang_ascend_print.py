@@ -2,6 +2,7 @@
 
 import tilelang
 import tilelang.language as T
+import tilelang.testing
 
 
 def test_prim_expr_with_msg():
@@ -94,9 +95,4 @@ def test_float_var():
 
 
 if __name__ == "__main__":
-    test_prim_expr_with_msg()
-    test_shared_print()
-    test_global_print()
-    test_float_var()
-    test_simtvf_inside()
-    print("\nAll tests passed!")
+    tilelang.testing.main()

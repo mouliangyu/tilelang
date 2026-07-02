@@ -12,7 +12,7 @@ from tilelang import tvm
 from tilelang.backend.target import determine_target
 from tvm.tirx.stmt_functor import post_order_visit
 
-from testing.python.language.simtvf._inspect_utils import collect_simtvf_blocks
+from testing.ascend.language.simtvf._inspect_utils import collect_simtvf_blocks
 
 
 # ---------------------------------------------------------------------------

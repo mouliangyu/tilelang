@@ -4,6 +4,7 @@ import re
 
 import torch
 import tilelang
+import tilelang.testing
 from tilelang import language as T
 
 
@@ -47,5 +48,4 @@ def test_gm2ub_single_row_copy():
 
 
 if __name__ == "__main__":
-    test_gm2ub_single_row_copy()
-    print("PASS: test_gm2ub_single_row_copy")
+    tilelang.testing.main()

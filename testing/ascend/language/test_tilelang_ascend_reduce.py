@@ -4,6 +4,7 @@ import pytest
 import torch
 import tilelang
 import tilelang.language as T
+import tilelang.testing
 
 DTYPE_MAP = {"float32": torch.float32, "int32": torch.int32, "int64": torch.int64}
 REDUCER = {"sum": "SumOp", "max": "MaxOp", "min": "MinOp"}
@@ -98,6 +99,4 @@ def test_reduce(extent, scale, dtype, op):
 
 
 if __name__ == "__main__":
-    import tilelang.testing
-
     tilelang.testing.main()

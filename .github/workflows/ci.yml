@@ -212,7 +212,7 @@ jobs:
         run: |
           uv pip install -v .
 
-      - name: Run Ascend tests with Python ${{ matrix.python-version }}
+      - name: Run Ascend example tests with Python ${{ matrix.python-version }}
         run: |
           cd testing
           PYTEST=(
@@ -221,6 +221,16 @@ jobs:
           )
           "${PYTEST[@]}" --maxfail=3 \
             ../examples/ascend
+
+      - name: Run Ascend unit tests with Python ${{ matrix.python-version }}
+        run: |
+          cd testing
+          PYTEST=(
+            uv run --no-project -m --
+            pytest --verbose --color=yes --durations=0 --showlocals --cache-clear -n 4
+          )
+          "${PYTEST[@]}" --maxfail=3 \
+            ascend
 
       # Disabled on the asc branch while Ascend CI is split out from upstream multi-backend CI:
       # - CUDA examples: ../examples

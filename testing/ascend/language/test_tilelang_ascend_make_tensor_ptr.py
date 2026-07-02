@@ -3,6 +3,7 @@
 import torch
 import tilelang
 import tilelang.language as T
+import tilelang.testing
 
 
 def make_tensor_copy(n):
@@ -106,9 +107,4 @@ def test_make_tensor_ptr_guarded():
 
 
 if __name__ == "__main__":
-    test_make_tensor_ptr()
-    print("PASS: test_make_tensor_ptr")
-    test_make_tensor_ptr_both()
-    print("PASS: test_make_tensor_ptr_both")
-    test_make_tensor_ptr_guarded()
-    print("PASS: test_make_tensor_ptr_guarded")
+    tilelang.testing.main()

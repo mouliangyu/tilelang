@@ -2,6 +2,7 @@ import pytest
 import torch
 import tilelang
 import tilelang.language as T
+import tilelang.testing
 
 
 N = 128
@@ -211,3 +212,7 @@ def test_simdvf_cast(case):
     else:
         ref = x.to(out_torch_dtype)
     assert compare_result(name, x, y, ref), f"SimdVF {name} failed"
+
+
+if __name__ == "__main__":
+    tilelang.testing.main()

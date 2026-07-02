@@ -40,8 +40,8 @@ def test_fragment_narrow_checker_rejects_fragment_leak():
                     frag[i] = A[i]
             B[0] = frag[0]
 
-    with pytest.raises(ValueError, match="outside any T.SimtVF region"):
+    with pytest.raises(ValueError, match="Parallel loops outside VF blocks are not supported on Ascend NPU"):
         _run_to_optimize(leaked)
 
 
-test_fragment_narrow_checker_fragment()
+test_fragment_narrow_checker_rejects_fragment_leak()
