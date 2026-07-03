@@ -1429,13 +1429,16 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     ICHECK(addr && addr->op.same_as(tirx::builtin::address_of()));
     const auto *load = addr->args[0].as<BufferLoadNode>();
     ICHECK(load && load->indices.size() == 1);
+    // Evaluate ptr and value to strings first. The string PrintExpr overload
+    // flushes any SSA statements (e.g. from if_then_else) to this->stream
+    // before returning the expression text, so they land ahead of the call
+    // line instead of being injected into the argument list.
+    std::string ptr =
+        GetGmBypassPtr(load->dtype, load->buffer.get(), load->indices[0]);
+    std::string value = this->PrintExpr(op->args[1]);
     this->PrintIndent();
-    this->stream << "tl::write_gm_bypass_dcache("
-                 << GetGmBypassPtr(load->dtype, load->buffer.get(),
-                                   load->indices[0])
-                 << ", ";
-    this->PrintExpr(op->args[1], this->stream);
-    this->stream << ");\n";
+    this->stream << "tl::write_gm_bypass_dcache(" << ptr << ", " << value
+                 << ");\n";
   }
   // --- SimdVF FMA: (dst, src0, src1, mask, mode) ---
   else if (op->op.same_as(tl::simd_vmula()) ||
