@@ -148,8 +148,8 @@ def test_ascend_simd_3510_intrinsics_codegen():
                     a,
                     T.simd.vcvt(
                         T.simd.vld(h_ub[0], dist="UNPK_B16"),
-                        half,
                         "float32",
+                        half,
                         part=0,
                     ),
                     pred,
@@ -157,7 +157,7 @@ def test_ascend_simd_3510_intrinsics_codegen():
                 b = T.simd.vsqz(a, pred)
                 T.simd.vsts(c_ub[0], a, pred)
                 T.simd.vsts(c_ub[64], b, pred)
-                b = T.simd.vcvt(a, pred, "float16")
+                b = T.simd.vcvt(a, "float16", pred)
                 T.simd.vsts(h_ub[0], b, half, dist="PK_B32")
                 b = T.simd.vpack(a)
                 T.simd.vsts(h_ub[64], b, half, dist="PK_B32")

@@ -54,32 +54,30 @@ def per_token_cast_to_fp8(M, N):
 
                 T.copy(X[row * blk_m : (row + 1) * blk_m, row_g_id * tile_n : (row_g_id + 1) * tile_n], y_ub)
                 with T.SimdVF():
-                    mask_f32 = T.simd.pset(32)
-
-                    eps = T.simd.vdup(1e-4, "float32", mask_f32)
-                    fp8_max_reg = T.simd.vdup(fp8_max, "float32", mask_f32)
+                    eps = T.simd.vdup(1e-4, "float32")
+                    fp8_max_reg = T.simd.vdup(fp8_max, "float32")
 
                     for i in range(blk_m):
                         for j in range(group_block):
                             col = j * group_size
                             x0 = T.simd.vld(y_ub[i, col])
                             x1 = T.simd.vld(y_ub[i, col + 64])
-                            abs0 = T.simd.vabs(x0, mask_f32)
-                            abs1 = T.simd.vabs(x1, mask_f32)
-                            amax_0 = T.simd.vmax(abs0, abs1, mask_f32)
-                            amax_1 = T.simd.vcmax(amax_0, mask_f32)
-                            amax = T.simd.vmax(amax_1, eps, mask_f32)
-                            scale = T.simd.vdiv(amax, fp8_max_reg, mask_f32)
-                            scale_brc = T.simd.vdupv(scale, mask_f32)
-                            T.simd.vsts(y_s_ub[i, j], scale, mask_f32, dist="ONEPT_B32")
+                            abs0 = T.simd.vabs(x0)
+                            abs1 = T.simd.vabs(x1)
+                            amax_0 = T.simd.vmax(abs0, abs1)
+                            amax_1 = T.simd.vcmax(amax_0)
+                            amax = T.simd.vmax(amax_1, eps)
+                            scale = T.simd.vdiv(amax, fp8_max_reg)
+                            scale_brc = T.simd.vdupv(scale)
+                            T.simd.vsts(y_s_ub[i, j], scale, dist="ONEPT_B32")
 
-                            q0 = T.simd.vdiv(x0, scale_brc, mask_f32)
-                            q0_fp8 = T.simd.vcvt(q0, mask_f32, "float8_e4m3fn")
-                            T.simd.vsts(y_q_ub_fp8[i, col], q0_fp8, mask_f32, dist="PK4_B32")
+                            q0 = T.simd.vdiv(x0, scale_brc)
+                            q0_fp8 = T.simd.vcvt(q0, "float8_e4m3fn")
+                            T.simd.vsts(y_q_ub_fp8[i, col], q0_fp8, dist="PK4_B32")
 
-                            q1 = T.simd.vdiv(x1, scale_brc, mask_f32)
-                            q1_fp8 = T.simd.vcvt(q1, mask_f32, "float8_e4m3fn")
-                            T.simd.vsts(y_q_ub_fp8[i, col + 64], q1_fp8, mask_f32, dist="PK4_B32")
+                            q1 = T.simd.vdiv(x1, scale_brc)
+                            q1_fp8 = T.simd.vcvt(q1, "float8_e4m3fn")
+                            T.simd.vsts(y_q_ub_fp8[i, col + 64], q1_fp8, dist="PK4_B32")
 
                 T.copy(y_s_ub, X_amax[row * blk_m : (row + 1) * blk_m, row_g_id * group_block : (row_g_id + 1) * group_block])
                 T.copy(y_q_ub_fp8, X_fp8[row * blk_m : (row + 1) * blk_m, row_g_id * tile_n : (row_g_id + 1) * tile_n])

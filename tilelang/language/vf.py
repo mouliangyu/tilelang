@@ -84,6 +84,10 @@ class SimdVFFrame(TIRFrame):
     """
 
     def __enter__(self):
+        if _inside_simdvf[0] == 0:
+            from tilelang.language.simd import _reset_default_mask_cache
+
+            _reset_default_mask_cache()
         _inside_simdvf[0] += 1
         super().__enter__()
         return self
@@ -91,6 +95,10 @@ class SimdVFFrame(TIRFrame):
     def __exit__(self, ptype, value, trace):
         super().__exit__(ptype, value, trace)
         _inside_simdvf[0] -= 1
+        if _inside_simdvf[0] == 0:
+            from tilelang.language.simd import _reset_default_mask_cache
+
+            _reset_default_mask_cache()
 
 
 # Thread-local counter for nested SimdVF context

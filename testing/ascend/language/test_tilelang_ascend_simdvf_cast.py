@@ -51,82 +51,82 @@ def cast_kernel(n: int, in_dtype: T.dtype, out_dtype: T.dtype):
                     if out_dtype == F16:
                         for i in range(n // 64):
                             x = T.simd.vld(x_ub[i * 64])
-                            y = T.simd.vcvt(x, mask_f32, "float16")
+                            y = T.simd.vcvt(x, "float16", mask_f32)
                             T.simd.vsts(y_ub[i * 64], y, mask_f32, dist="PK_B32")
                     elif is_fp8_out:
                         for i in range(n // 64):
                             x = T.simd.vld(x_ub[i * 64])
-                            y = T.simd.vcvt(x, mask_f32, out_dtype)
+                            y = T.simd.vcvt(x, out_dtype, mask_f32)
                             T.simd.vsts(y_ub[i * 64], y, mask_f32, dist="PK4_B32")
                     elif out_dtype == INT32:
                         for i in range(n // 64):
                             x = T.simd.vld(x_ub[i * 64])
-                            y = T.simd.vcvt(x, mask_f32, "int32")
+                            y = T.simd.vcvt(x, "int32", mask_f32)
                             T.simd.vsts(y_ub[i * 64], y, mask_f32)
                 elif in_dtype in F16_TYPES:
                     mask_b16 = T.simd.pset(16)
                     if is_fp8_out:
                         for i in range(n // 64):
                             x = T.simd.vld(x_ub[i * 64], dist="UNPK_B16")
-                            x_f32 = T.simd.vcvt(x, mask_b16, "float32", part=0)
-                            y = T.simd.vcvt(x_f32, mask_f32, out_dtype)
+                            x_f32 = T.simd.vcvt(x, "float32", mask_b16, part=0)
+                            y = T.simd.vcvt(x_f32, out_dtype, mask_f32)
                             T.simd.vsts(y_ub[i * 64], y, mask_f32, dist="PK4_B32")
                     elif in_dtype == BF16 and out_dtype == FP4_E2M1:
                         for i in range(n // 64):
                             x = T.simd.vld(x_ub[i * 64], dist="UNPK_B16")
-                            y = T.simd.vcvt(x, mask_b16, out_dtype)
+                            y = T.simd.vcvt(x, out_dtype, mask_b16)
                             T.simd.vsts(y_ub[i * 64], y, mask_b16, dist="PK4_B32")
                     elif in_dtype == F16 and out_dtype == F32:
                         for i in range(n // 64):
                             x = T.simd.vld(x_ub[i * 64], dist="UNPK_B16")
-                            y = T.simd.vcvt(x, mask_b16, "float32", part=0)
+                            y = T.simd.vcvt(x, "float32", mask_b16, part=0)
                             T.simd.vsts(y_ub[i * 64], y, mask_f32)
                 elif in_dtype == FP4_E2M1:
                     mask_b16 = T.simd.pset(16)
                     if out_dtype == BF16:
                         for i in range(n // 64):
                             x = T.simd.vld(x_ub[i * 64], dist="UNPK4_B8", off=0)
-                            y = T.simd.vcvt(x, mask_b16, out_dtype)
+                            y = T.simd.vcvt(x, out_dtype, mask_b16)
                             T.simd.vsts(y_ub[i * 64], y, mask_b16, dist="PK_B32")
                 elif is_fp8_in:
                     if out_dtype == F32:
                         for i in range(n // 64):
                             x = T.simd.vld(x_ub[i * 64], dist="UNPK4_B8", off=0)
-                            y = T.simd.vcvt(x, mask_f32, "float32")
+                            y = T.simd.vcvt(x, "float32", mask_f32)
                             T.simd.vsts(y_ub[i * 64], y, mask_f32)
                     elif out_dtype in F16_TYPES:
                         for i in range(n // 64):
                             x = T.simd.vld(x_ub[i * 64], dist="UNPK4_B8", off=0)
-                            y_f32 = T.simd.vcvt(x, mask_f32, "float32")
-                            y = T.simd.vcvt(y_f32, mask_f32, out_dtype)
+                            y_f32 = T.simd.vcvt(x, "float32", mask_f32)
+                            y = T.simd.vcvt(y_f32, out_dtype, mask_f32)
                             T.simd.vsts(y_ub[i * 64], y, mask_f32, dist="PK_B32")
                 elif in_dtype == INT32:
                     if out_dtype == F32:
                         for i in range(n // 64):
                             x = T.simd.vld(x_ub[i * 64])
-                            y = T.simd.vcvt(x, mask_f32, "float32")
+                            y = T.simd.vcvt(x, "float32", mask_f32)
                             T.simd.vsts(y_ub[i * 64], y, mask_f32)
                     elif out_dtype == INT16:
                         for i in range(n // 64):
                             x = T.simd.vld(x_ub[i * 64])
-                            y = T.simd.vcvt(x, mask_f32, "int16")
+                            y = T.simd.vcvt(x, "int16", mask_f32)
                             T.simd.vsts(y_ub[i * 64], y, mask_f32, dist="PK_B32")
                 elif in_dtype == INT16:
                     mask_b16 = T.simd.pset(16)
                     if out_dtype == INT32:
                         for i in range(n // 64):
                             x = T.simd.vld(x_ub[i * 64], dist="UNPK_B16")
-                            y = T.simd.vcvt(x, mask_b16, "int32", part=0)
+                            y = T.simd.vcvt(x, "int32", mask_b16, part=0)
                             T.simd.vsts(y_ub[i * 64], y, mask_f32)
                     elif out_dtype == UINT8:
                         for i in range(n // 64):
                             x = T.simd.vld(x_ub[i * 64], dist="UNPK_B16")
-                            y = T.simd.vcvt(x, mask_b16, out_dtype)
+                            y = T.simd.vcvt(x, out_dtype, mask_b16)
                             T.simd.vsts(y_ub[i * 64], y, mask_b16, dist="PK4_B32")
                 elif in_dtype == INT8 and out_dtype == INT16:
                     for i in range(n // 64):
                         x = T.simd.vld(x_ub[i * 64], dist="UNPK4_B8", off=0)
-                        y = T.simd.vcvt(x, mask_f32, "int16")
+                        y = T.simd.vcvt(x, "int16", mask_f32)
                         T.simd.vsts(y_ub[i * 64], y, mask_f32, dist="PK_B32")
 
             T.copy(y_ub, Y)
