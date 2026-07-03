@@ -835,6 +835,7 @@ TVM_DLL const Op &simd_vadd();
 TVM_DLL const Op &simd_vsub();
 TVM_DLL const Op &simd_vmul();
 TVM_DLL const Op &simd_vmula();
+TVM_DLL const Op &simd_vmadd();
 TVM_DLL const Op &simd_vdiv();
 TVM_DLL const Op &simd_vmax();
 TVM_DLL const Op &simd_vmin();

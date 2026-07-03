@@ -193,9 +193,28 @@ def vmul(src0, src1, mask, mode="MODE_ZEROING"):
     return tirx.call_intrin(str(src0.dtype), _Op("tl.simd.vmul"), src0, src1, mask, mode)
 
 
-def vmula(acc, src0, src1, mask, mode="MODE_ZEROING"):
-    """Fused multiply-add: dst = acc + src0 * src1."""
-    return tirx.call_intrin(str(acc.dtype), _Op("tl.simd.vmula"), acc, src0, src1, mask, mode)
+def vmula(dst, src0, src1, mask, mode="MODE_ZEROING"):
+    """Fused multiply-add: dst = dst + src0 * src1."""
+    if not isinstance(dst, BufferLoad):
+        raise ValueError(
+            "vmula: `dst` must be a buffer access (e.g. c[0]) allocated with "
+            "T.simd.alloc_local()/alloc_var(), not an immutable register value. "
+            f"Got {type(dst).__name__} {dst}."
+        )
+    dst = access_ptr(dst, "rw")
+    return tirx.call_intrin("void", _Op("tl.simd.vmula"), dst, src0, src1, mask, mode)
+
+
+def vmadd(dst, src0, src1, mask, mode="MODE_ZEROING"):
+    """Fused multiply-add: dst = dst * src0 + src1."""
+    if not isinstance(dst, BufferLoad):
+        raise ValueError(
+            "vmadd: `dst` must be a buffer access (e.g. c[0]) allocated with "
+            "T.simd.alloc_local()/alloc_var(), not an immutable register value. "
+            f"Got {type(dst).__name__} {dst}."
+        )
+    dst = access_ptr(dst, "rw")
+    return tirx.call_intrin("void", _Op("tl.simd.vmadd"), dst, src0, src1, mask, mode)
 
 
 def vdiv(src0, src1, mask, mode="MODE_ZEROING"):
