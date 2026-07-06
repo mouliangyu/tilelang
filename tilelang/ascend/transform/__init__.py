@@ -28,18 +28,20 @@ def AscendSimdVFLowerParallel():
     return _ffi_api.AscendSimdVFLowerParallel()  # type: ignore
 
 
-def MergeUBAllocations(enable_aggressive_merge: bool = False, align_bytes: int = 16, disable_reuse: bool = False):
+def MergeUBAllocations(align_bytes: int = 16, disable_reuse: bool = False):
     """MergeUBAllocations
 
     Merge multiple Ascend Unified Buffer (and L0/L1) allocations into one,
     using synchronization-graph-based liveness analysis for UB reuse.
+
+    Buffer reuse is always performed unless ``disable_reuse`` is set.
 
     Returns
     -------
     fpass : tvm.transform.Pass
         The result pass
     """
-    return _ffi_api.MergeUBAllocations(enable_aggressive_merge, align_bytes, disable_reuse)  # type: ignore
+    return _ffi_api.MergeUBAllocations(align_bytes, disable_reuse)  # type: ignore
 
 
 def MarkScalarDcacheBypass():

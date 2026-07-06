@@ -115,7 +115,6 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
 
     disable_reuse = should_disable_shared_memory_reuse(pass_ctx=pass_ctx)
     mod = ascend_transform.MergeUBAllocations(
-        enable_aggressive_merge=False,
         align_bytes=32,
         disable_reuse=disable_reuse,
     )(mod)
