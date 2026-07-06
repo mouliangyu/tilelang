@@ -1394,7 +1394,22 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     bool needs_ptr_arith = (scope.find("l0") != std::string::npos ||
                             scope.find("l1") != std::string::npos);
-    if (needs_ptr_arith) {
+    // SimdVF: `local` vector-register array (alloc_local). access_ptr lowering
+    // expands the 64-lane element access into a Ramp index; recover the element
+    // index (ramp base / lanes) and take the address of that register slot.
+    bool is_local_vreg = (scope == "local" && load->indices.size() == 1 &&
+                          load->indices[0].dtype().lanes() >= 32);
+    if (is_local_vreg) {
+      PrimExpr index = load->indices[0];
+      const auto *ramp = index.as<RampNode>();
+      PrimExpr base = ramp ? ramp->base : index;
+      int lanes = index.dtype().lanes();
+      PrimExpr elem_idx =
+          analyzer_.Simplify(floordiv(base, make_const(base.dtype(), lanes)));
+      os << "(&(" << GetVarID(buf_var) << "[";
+      PrintExpr(elem_idx, os);
+      os << "]))";
+    } else if (needs_ptr_arith) {
       os << "((";
       PrintStorageScope(scope, os);
       PrintType(load->dtype, os);
