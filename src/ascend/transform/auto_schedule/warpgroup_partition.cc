@@ -200,13 +200,10 @@ static void CloneConditions(const IRStructure *src, IRStructure *dst,
 
 static void CloneSchedulingMetadata(const IRStructure *src, IRStructure *dst,
                                     int warpgroup_id,
-                                    const Map<Var, PrimExpr> &var_remap,
-                                    bool copy_sync) {
+                                    const Map<Var, PrimExpr> &var_remap) {
   CloneConditions(src, dst, var_remap);
   dst->SetStage(src->GetStage());
   dst->SetStartTime(src->GetStartTime());
-  if (!copy_sync)
-    return;
   auto copy_stmt_list = [&](const std::vector<Stmt> &src_stmts,
                             std::vector<Stmt> *dst_stmts) {
     dst_stmts->clear();
@@ -298,8 +295,7 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
       var_remap.Set(bind->var, new_var);
       auto new_task = std::make_shared<TaskNode>();
       new_task->stmt = Bind(new_var, new_value);
-      CloneSchedulingMetadata(task, new_task.get(), warpgroup_id, var_remap,
-                              false);
+      CloneSchedulingMetadata(task, new_task.get(), warpgroup_id, var_remap);
       return new_task;
     }
 
@@ -312,7 +308,7 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
       auto ct = static_cast<TaskNode *>(cloned.get());
       ct->stmt = SubstituteLetVars(ct->stmt, var_remap);
     }
-    CloneSchedulingMetadata(task, cloned.get(), warpgroup_id, var_remap, true);
+    CloneSchedulingMetadata(task, cloned.get(), warpgroup_id, var_remap);
     return cloned;
   } else if (node->IsControl()) {
     // A ControlNode is included if it contains the target warp group
@@ -345,8 +341,7 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
     }
     new_ctrl->children = CloneIRStructureListWithWarpgroupFilter(
         ctrl->children, warpgroup_id, var_remap);
-    CloneSchedulingMetadata(node, new_ctrl.get(), warpgroup_id, var_remap,
-                            true);
+    CloneSchedulingMetadata(node, new_ctrl.get(), warpgroup_id, var_remap);
     return new_ctrl;
   }
   LOG(FATAL);
