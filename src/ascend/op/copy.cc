@@ -164,21 +164,17 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
         make_access_ptr(op.dst, plan.dst_offset, plan_total_elems, 2);
     PrimExpr plan_total_bytes = plan.row_bytes * plan.n_rows;
 
-    auto as_int_plan = [](PrimExpr e) -> int64_t {
-      if (auto *imm = e.as<IntImmNode>()) {
-        return imm->value;
-      }
-      return -1;
-    };
-    int64_t nr_plan = as_int_plan(plan.n_rows);
-    int64_t rb_plan = as_int_plan(plan.row_bytes);
-    bool plan_single_row = nr_plan == 1 || (rb_plan >= 0 && rb_plan < 32);
-    if (!plan_single_row) {
-      ICHECK(rb_plan > 0 && rb_plan % 32 == 0)
-          << "Ascend MTE multi-row copy requires row_bytes to be a multiple "
-             "of 32B, but got row_bytes="
-          << rb_plan;
-    }
+    // Collapse into a single contiguous burst only when the region is truly
+    // contiguous on both sides: one row, or each side's inter-row stride equals
+    // the row byte length (consecutive rows back-to-back). A small row
+    // (row_bytes < 32) is NOT sufficient: strided rows must still be issued as
+    // separate bursts, otherwise rows 2+ are silently dropped. The align_v2 MTE
+    // intrinsics support byte-granular bursts, so sub-32B rows are valid in the
+    // multi-row path.
+    bool plan_single_row =
+        analyzer->CanProveEqual(plan.n_rows, I(1)) ||
+        (analyzer->CanProveEqual(plan.src_stride_bytes, plan.row_bytes) &&
+         analyzer->CanProveEqual(plan.dst_stride_bytes, plan.row_bytes));
 
     if (dma_path == 0) {
       if (plan_single_row) {
