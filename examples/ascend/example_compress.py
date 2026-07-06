@@ -46,6 +46,7 @@ def _compress_and_update_state_decode_tl_ascend(
     num_cores = 1
 
     if STAGE == "store":
+        N_STAGES = 3
 
         @T.prim_func
         def _update_state_decode(
@@ -71,7 +72,7 @@ def _compress_and_update_state_decode_tl_ascend(
                     for j in T.Parallel(DIM):
                         zeros[j] = 0
 
-                for idx in T.Persistent([total_q], num_cores, pid, group_size=32):
+                for idx in T.Persistent([total_q], num_cores, pid, group_size=32, num_stages=N_STAGES):
                     state_idx = T.int32(state_block_idx[idx])
                     T.assume(0 <= state_idx < num_state_slots)
                     klen = T.int32(context_lens[idx])
@@ -86,9 +87,9 @@ def _compress_and_update_state_decode_tl_ascend(
 
                     T.annotate_buffer_versions(
                         {
-                            score_cache_ub: 6,
-                            latent_cache_ub: 6,
-                            **({ape_ub: 6} if HAS_APE else {}),
+                            score_cache_ub: N_STAGES,
+                            latent_cache_ub: N_STAGES,
+                            **({ape_ub: N_STAGES} if HAS_APE else {}),
                         }
                     )
 
@@ -115,7 +116,7 @@ def _compress_and_update_state_decode_tl_ascend(
         DIM_BLK = math.gcd(128, DIM)
         N_DIM_BLKS = DIM // DIM_BLK
 
-        N_STAGES = 192 * 1024 // (2 * COMPRESS_RATIO_0 * DIM_BLK * 4)
+        N_STAGES = min(192 * 1024 // (2 * COMPRESS_RATIO_0 * DIM_BLK * 4), 4)
 
         @T.prim_func
         def _compress_decode(

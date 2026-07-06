@@ -101,14 +101,22 @@ schedule candidates.
 */
 void ScheduleBuilder::ScheduleList(
     std::vector<std::shared_ptr<IRStructure>> &children) {
+  std::vector<For> loop_stack;
   std::vector<std::shared_ptr<IRStructure>> origin_children = children;
+  for (size_t i = 0; i < origin_children.size(); ++i) {
+    origin_children[i]->SetIndex(i);
+  }
   for (auto &child : origin_children) {
-    ScheduleRecursive(child);
+    ScheduleRecursive(child, loop_stack);
   }
   children = Z3SchedulePython(origin_children);
+  for (size_t i = 0; i < children.size(); ++i) {
+    children[i]->SetIndex(i);
+  }
 }
 
-void ScheduleBuilder::ScheduleRecursive(std::shared_ptr<IRStructure> &node) {
+void ScheduleBuilder::ScheduleRecursive(std::shared_ptr<IRStructure> &node,
+                                        std::vector<For> &loop_stack) {
   if (!node)
     return;
 
@@ -117,10 +125,20 @@ void ScheduleBuilder::ScheduleRecursive(std::shared_ptr<IRStructure> &node) {
   } else if (node->IsControl()) {
     auto ctrl = static_cast<ControlNode *>(node.get());
     std::vector<std::shared_ptr<IRStructure>> origin_children = ctrl->children;
-    for (auto &child : origin_children) {
-      ScheduleRecursive(child);
+    for (size_t i = 0; i < origin_children.size(); ++i) {
+      origin_children[i]->SetIndex(i);
     }
-    Z3SchedulePythonLoop(ctrl);
+    // Children see this loop in their loop stack; this node's own Z3 schedule
+    // sees only its enclosing ancestors (not itself), so pop before scheduling.
+    loop_stack.push_back(ctrl->control);
+    for (auto &child : origin_children) {
+      ScheduleRecursive(child, loop_stack);
+    }
+    loop_stack.pop_back();
+    Z3SchedulePythonLoop(ctrl, loop_stack);
+    for (size_t i = 0; i < ctrl->children.size(); ++i) {
+      ctrl->children[i]->SetIndex(i);
+    }
     return;
   }
 

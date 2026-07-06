@@ -41,7 +41,8 @@ class ScheduleBuilder {
 public:
   // Recursive scheduling function
   // Directly schedules the entire IRStructure tree recursively in place
-  void ScheduleRecursive(std::shared_ptr<IRStructure> &node);
+  void ScheduleRecursive(std::shared_ptr<IRStructure> &node,
+                         std::vector<For> &loop_stack);
 
   // Schedule an ordered child list in place (root list or a ControlNode body):
   // gather + recurse into each child, then Z3-schedule and write the reordered
@@ -140,7 +141,7 @@ public:
       }
 
       // Buffer-region data dependencies
-      auto deps = AnalyzeDependencies(nodes, /*current_loop=*/std::nullopt);
+      auto deps = AnalyzeDependencies(nodes, /*loop_stack=*/{});
       std::unordered_map<IRStructure *, size_t> node_idx;
       for (size_t i = 0; i < n; ++i) {
         node_idx[nodes[i]] = i;
@@ -231,7 +232,8 @@ public:
 
   // Z3-based scheduler for loops that calls Python implementation via FFI
   // with distance-aware dependencies
-  void Z3SchedulePythonLoop(ControlNode *ctrl) {
+  void Z3SchedulePythonLoop(ControlNode *ctrl,
+                            const std::vector<For> &loop_stack) {
     if (ctrl->children.empty()) {
       LOG(WARNING)
           << "Z3SchedulePythonLoop called on a control node without children";
@@ -480,7 +482,9 @@ public:
     }
 
     // Buffer-region data dependencies
-    auto deps = AnalyzeDependencies(nodes, /*current_loop=*/ctrl->control);
+    std::vector<For> current_loop_stack = loop_stack;
+    current_loop_stack.push_back(ctrl->control);
+    auto deps = AnalyzeDependencies(nodes, current_loop_stack);
     std::unordered_map<IRStructure *, size_t> node_idx;
     for (size_t i = 0; i < n; ++i) {
       node_idx[nodes[i]] = i;

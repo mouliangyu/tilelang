@@ -124,6 +124,8 @@ inline bool IsWarpgroupBroadcast(int wg_id) {
 class TaskNode;
 using TaskAccessPredicate = std::function<bool(const TaskNode *task)>;
 
+PrimExpr CalculateIterationCount(const std::vector<For> &loops);
+
 // A guard introduced at a node relative to its nearest surviving
 // structural ancestor.
 struct Guard {
@@ -173,6 +175,11 @@ public:
   int GetStage() const { return stage_; }
   void SetStage(int stage) { stage_ = stage; }
 
+  // Position in the scheduled sibling list. Together with stage this determines
+  // the emitted software-pipeline order inside the current parent.
+  size_t GetIndex() const { return index_; }
+  void SetIndex(size_t index) { index_ = index; }
+
   // Helper methods for safe casting
   bool IsTask() const { return GetKind() == Kind::kTask; }
   bool IsControl() const { return GetKind() == Kind::kControl; }
@@ -204,6 +211,7 @@ public:
     before = other.before;
     after = other.after;
     stage_ = other.stage_;
+    index_ = other.index_;
     start_time_ = other.start_time_;
   }
 
@@ -251,23 +259,6 @@ public:
   virtual void SetLatency(int64_t latency) = 0;
   virtual void SetII(int64_t ii) = 0;
 
-  // Collect tasks that could possibly be the first/last to access something
-  // matching `pred` within this IR subtree, together with the earliest
-  // (First) / latest (Last) possible task start time relative to this
-  // subtree's root (in cycles). `path` is used as a stack: each impl pushes
-  // `this` before recursing into children and pops it on return; TaskNode
-  // copies the path (with itself appended) into the BufferAccessPoint.
-  //
-  // `pred(task)` returns true if the task has a matching access.
-  virtual bool CollectFirstAccessPoints(const TaskAccessPredicate &pred,
-                                        std::set<BufferAccessPoint> &result,
-                                        std::vector<const IRStructure *> &path,
-                                        int64_t time_offset = 0) const = 0;
-  virtual bool CollectLastAccessPoints(const TaskAccessPredicate &pred,
-                                       std::set<BufferAccessPoint> &result,
-                                       std::vector<const IRStructure *> &path,
-                                       int64_t time_offset = 0) const = 0;
-
   // Substitute a variable throughout this IR node
   virtual void SubstituteVar(const Var &old_var, const Var &new_var) = 0;
 
@@ -285,6 +276,7 @@ public:
 private:
   std::vector<Guard> guards_;
   int stage_{0};
+  size_t index_{0};
   int64_t start_time_{0};
 };
 
@@ -508,15 +500,6 @@ public:
     indirect_read_vars_.push_back(var);
   }
 
-  bool CollectFirstAccessPoints(const TaskAccessPredicate &pred,
-                                std::set<BufferAccessPoint> &result,
-                                std::vector<const IRStructure *> &path,
-                                int64_t time_offset = 0) const override;
-  bool CollectLastAccessPoints(const TaskAccessPredicate &pred,
-                               std::set<BufferAccessPoint> &result,
-                               std::vector<const IRStructure *> &path,
-                               int64_t time_offset = 0) const override;
-
   bool containWarpgroupId(int id) const override {
     return ContainsLoopBreak() || IsWarpgroupBroadcast(warpgroup_id_) ||
            warpgroup_id_ == id;
@@ -720,15 +703,6 @@ public:
   void SetLatency(int64_t latency) override { latency_ = latency; }
   void SetII(int64_t ii) override { ii_ = ii; }
 
-  bool CollectFirstAccessPoints(const TaskAccessPredicate &pred,
-                                std::set<BufferAccessPoint> &result,
-                                std::vector<const IRStructure *> &path,
-                                int64_t time_offset = 0) const override;
-  bool CollectLastAccessPoints(const TaskAccessPredicate &pred,
-                               std::set<BufferAccessPoint> &result,
-                               std::vector<const IRStructure *> &path,
-                               int64_t time_offset = 0) const override;
-
   void SetIIperIter(int64_t ii) { ii_per_iter_ = ii; }
 
   int64_t GetIIperIter() const { return ii_per_iter_; }
@@ -844,21 +818,27 @@ struct DepInfo {
   IRStructure *prod_node;
   IRStructure *cons_node;
   Buffer buffer;
-  std::vector<BufferAccessPoint> producer_pts; // prod's last accesses
-  std::vector<BufferAccessPoint> consumer_pts; // cons's first accesses
+  // Conflicting (producer access, consumer access) pairs. Each pair is a
+  // concrete producer→consumer ordering that needs a sync.
+  std::vector<std::pair<BufferAccessPoint, BufferAccessPoint>> task_pairs;
   bool cross_iter;
   int64_t latency;
 };
 
+std::set<BufferAccessPoint> CollectAccessPoints(const IRStructure *node,
+                                                const Buffer &buffer,
+                                                bool is_write,
+                                                bool producer_side);
+
 // Analyze data dependencies among scheduled TaskNode/ControlNode nodes.
-// `current_loop` is present iff this level is a ControlNode body, enabling
-// cross-iteration (loop back-edge) dependencies and driving the same-iter vs
-// cross-iter overlap test (see RegionsMayConflict in the .cc). The analysis is
-// warpgroup-agnostic (broadcast access-point queries); the barrier pass expands
-// per-warpgroup from the returned points.
+// `loop_stack` is the full enclosing serial loop stack at this level
+// (outermost-first). Empty means root/list level. Non-empty means the last loop
+// is the current loop body, enabling cross-iteration dependencies.
+// An `i == j` control-node self-dependency whose producer→consumer pairs are
+// already established anywhere inside that node's own subtree is dropped.
 std::vector<DepInfo>
 AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
-                    std::optional<For> current_loop);
+                    const std::vector<For> &loop_stack);
 
 // Helper function to print BufferRegion details
 inline void PrintBufferRegion(const BufferRegion &region,

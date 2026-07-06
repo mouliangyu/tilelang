@@ -62,6 +62,21 @@ namespace tl {
 using namespace tirx;
 using ffi::GetRef;
 
+PrimExpr CalculateIterationCount(const std::vector<For> &loops) {
+  PrimExpr total_iter = IntImm(DataType::Int(32), 0);
+  PrimExpr total_multiplier = IntImm(DataType::Int(32), 1);
+  for (size_t i = loops.size(); i-- > 0;) {
+    const ForNode *for_node = loops[i].get();
+    PrimExpr step = for_node->step.has_value() ? for_node->step.value()
+                                               : IntImm(DataType::Int(32), 1);
+    total_iter =
+        total_iter +
+        indexdiv(for_node->loop_var - for_node->min, step) * total_multiplier;
+    total_multiplier = total_multiplier * for_node->extent;
+  }
+  return total_iter;
+}
+
 // BufferAccessPoint::task — defined here so the inline `static_cast` sees the
 // full TaskNode definition via ir_structure.h.
 const TaskNode *BufferAccessPoint::task() const {
@@ -189,244 +204,6 @@ void CollectAllTaskNodesWithContext(IRStructure *node,
   }
 }
 
-// ============================================================================
-// CollectFirstAccessPoints / CollectLastAccessPoints implementations
-// ============================================================================
-
-static bool LoopMustExecute(const ControlNode *ctrl) {
-  if (!ctrl->control.defined())
-    return false;
-  const ForNode *for_node = ctrl->control.get();
-  const int64_t *extent_ptr = as_const_int(for_node->extent);
-  if (extent_ptr && *extent_ptr >= 1) {
-    if (for_node->step.has_value()) {
-      const int64_t *step_ptr = as_const_int(for_node->step.value());
-      if (step_ptr && *step_ptr >= 1)
-        return true;
-      if (!step_ptr)
-        return false;
-    } else {
-      return true;
-    }
-  }
-  return false;
-}
-
-// An entry in the unified sequence helper. `node` is the IR-tree node to
-// recurse into; `start_time` is the entry's offset relative to the enclosing
-// sequence's start.
-//
-// Conditional execution is carried by each node's `conditions` delta rather
-// than by a dedicated IfNode, so the helper dispatches entries in order;
-// conditional accesses are recorded as candidates but do not terminate the
-// first/last scan.
-struct SequenceEntry {
-  const IRStructure *node;
-  int64_t start_time;
-};
-
-// A buffer access is "must happen" at its sequence position only if neither the
-// accessing node nor any structural ancestor on its path is conditional. A
-// conditional access (some node carries a `conditions` delta) is recorded as a
-// candidate access point but must NOT terminate the first/last scan, because a
-// guarded statement may be skipped at runtime — the conservative choice is to
-// keep scanning so sibling / earlier / later accesses are also collected (more
-// sync points, never fewer).
-static bool AnyConditionalOnPath(const std::vector<const IRStructure *> &path,
-                                 const IRStructure *leaf) {
-  if (leaf && leaf->HasConditions())
-    return true;
-  for (const auto *p : path) {
-    if (p && p->HasConditions())
-      return true;
-  }
-  return false;
-}
-
-static bool SequenceCollectFirstAccessPoints(
-    const std::vector<SequenceEntry> &entries, const TaskAccessPredicate &pred,
-    std::set<BufferAccessPoint> &result, std::vector<const IRStructure *> &path,
-    int64_t base_offset) {
-  int n = static_cast<int>(entries.size());
-
-  auto dispatch = [&](const SequenceEntry &e) -> bool {
-    bool m = e.node->CollectFirstAccessPoints(pred, result, path,
-                                              base_offset + e.start_time);
-    return m;
-  };
-
-  int break_idx = -1;
-  for (int j = 0; j < n; ++j) {
-    if (entries[j].node->ContainsLoopBreak()) {
-      break_idx = j;
-      break;
-    }
-  }
-  if (break_idx >= 0) {
-    if (break_idx > 0) {
-      std::vector<SequenceEntry> before(entries.begin(),
-                                        entries.begin() + break_idx);
-      if (SequenceCollectFirstAccessPoints(before, pred, result, path,
-                                           base_offset))
-        return true;
-    }
-    if (dispatch(entries[break_idx]))
-      return true;
-    if (break_idx + 1 < n) {
-      std::vector<SequenceEntry> after(entries.begin() + break_idx + 1,
-                                       entries.end());
-      SequenceCollectFirstAccessPoints(after, pred, result, path, base_offset);
-    }
-    return false;
-  }
-  for (int i = 0; i < n; ++i) {
-    // Conditional entries record their point but return false, so the scan
-    // naturally continues past them to find unconditional first accesses.
-    if (dispatch(entries[i]))
-      return true;
-  }
-  return false;
-}
-
-static bool SequenceCollectLastAccessPoints(
-    const std::vector<SequenceEntry> &entries, const TaskAccessPredicate &pred,
-    std::set<BufferAccessPoint> &result, std::vector<const IRStructure *> &path,
-    int64_t base_offset) {
-  int n = static_cast<int>(entries.size());
-
-  auto dispatch = [&](const SequenceEntry &e) -> bool {
-    bool m = e.node->CollectLastAccessPoints(pred, result, path,
-                                             base_offset + e.start_time);
-    return m;
-  };
-
-  int break_idx = -1;
-  for (int j = n - 1; j >= 0; --j) {
-    if (entries[j].node->ContainsLoopBreak()) {
-      break_idx = j;
-      break;
-    }
-  }
-  if (break_idx >= 0) {
-    if (break_idx + 1 < n) {
-      std::vector<SequenceEntry> after(entries.begin() + break_idx + 1,
-                                       entries.end());
-      SequenceCollectLastAccessPoints(after, pred, result, path, base_offset);
-    }
-    dispatch(entries[break_idx]);
-    if (break_idx > 0) {
-      std::vector<SequenceEntry> before(entries.begin(),
-                                        entries.begin() + break_idx);
-      SequenceCollectLastAccessPoints(before, pred, result, path, base_offset);
-    }
-    return false;
-  }
-  for (int i = n - 1; i >= 0; --i) {
-    // Conditional entries record their point but return false, so the scan
-    // continues past them to find unconditional last accesses.
-    if (dispatch(entries[i]))
-      return true;
-  }
-  return false;
-}
-
-// Build a SequenceEntry list from an ordered list of scheduled children.
-static std::vector<SequenceEntry>
-MakeSequenceEntries(const std::vector<std::shared_ptr<IRStructure>> &children) {
-  std::vector<SequenceEntry> entries;
-  entries.reserve(children.size());
-  for (const auto &c : children) {
-    SequenceEntry e;
-    e.node = c.get();
-    e.start_time = c->GetStartTime();
-    entries.push_back(std::move(e));
-  }
-  return entries;
-}
-
-bool TaskNode::CollectFirstAccessPoints(const TaskAccessPredicate &pred,
-                                        std::set<BufferAccessPoint> &result,
-                                        std::vector<const IRStructure *> &path,
-                                        int64_t time_offset) const {
-  if (pred(this)) {
-    std::vector<const IRStructure *> point_path = path;
-    point_path.push_back(this);
-    result.emplace(time_offset, std::move(point_path));
-    // A conditional access may be skipped at runtime, so it is a candidate
-    // but does not establish a definite first access — keep scanning.
-    return !AnyConditionalOnPath(path, this);
-  }
-  return false;
-}
-
-bool TaskNode::CollectLastAccessPoints(const TaskAccessPredicate &pred,
-                                       std::set<BufferAccessPoint> &result,
-                                       std::vector<const IRStructure *> &path,
-                                       int64_t time_offset) const {
-  if (pred(this)) {
-    std::vector<const IRStructure *> point_path = path;
-    point_path.push_back(this);
-    result.emplace(time_offset, std::move(point_path));
-    // A conditional access may be skipped at runtime, so it is a candidate
-    // but does not establish a definite last access — keep scanning.
-    return !AnyConditionalOnPath(path, this);
-  }
-  return false;
-}
-
-bool ControlNode::CollectFirstAccessPoints(
-    const TaskAccessPredicate &pred, std::set<BufferAccessPoint> &result,
-    std::vector<const IRStructure *> &path, int64_t time_offset) const {
-  path.push_back(this);
-  if (task) {
-    if (task->CollectFirstAccessPoints(pred, result, path, time_offset)) {
-      path.pop_back();
-      return true;
-    }
-  }
-  auto ordered = children;
-  std::stable_sort(ordered.begin(), ordered.end(),
-                   [](const auto &a, const auto &b) {
-                     return a->GetStage() > b->GetStage();
-                   });
-  bool body_must = SequenceCollectFirstAccessPoints(
-      MakeSequenceEntries(ordered), pred, result, path, time_offset);
-  path.pop_back();
-  if (body_must && LoopMustExecute(this))
-    return true;
-  return false;
-}
-
-bool ControlNode::CollectLastAccessPoints(
-    const TaskAccessPredicate &pred, std::set<BufferAccessPoint> &result,
-    std::vector<const IRStructure *> &path, int64_t time_offset) const {
-  path.push_back(this);
-  int64_t trip_count = GetTripCount();
-  int64_t ii_per_iter = GetIIperIter();
-  int64_t last_iter_offset =
-      (trip_count > 0 ? (trip_count - 1) : 0) * ii_per_iter;
-  int64_t body_offset = time_offset + last_iter_offset;
-  auto ordered = children;
-  std::stable_sort(ordered.begin(), ordered.end(),
-                   [](const auto &a, const auto &b) {
-                     return a->GetStage() > b->GetStage();
-                   });
-  bool body_must = SequenceCollectLastAccessPoints(
-      MakeSequenceEntries(ordered), pred, result, path, body_offset);
-  if (body_must && LoopMustExecute(this)) {
-    path.pop_back();
-    return true;
-  }
-  if (task) {
-    if (task->CollectLastAccessPoints(pred, result, path, time_offset)) {
-      path.pop_back();
-      return true;
-    }
-  }
-  path.pop_back();
-  return false;
-}
-
 inline bool WarpgroupMatches(const TaskNode *task, int wg_id) {
   int task_wg = task->GetWarpgroupId();
   return IsWarpgroupBroadcast(wg_id) || IsWarpgroupBroadcast(task_wg) ||
@@ -457,28 +234,6 @@ TaskAccessPredicate MakeStorageAccessPredicate(const VarNode *storage_key,
   };
 }
 
-std::set<BufferAccessPoint>
-GetFirstAccessPointsByStorage(const IRStructure *node,
-                              const VarNode *storage_key, bool is_write,
-                              int wg_id = kWarpgroupBroadcast) {
-  std::set<BufferAccessPoint> result;
-  std::vector<const IRStructure *> path;
-  node->CollectFirstAccessPoints(
-      MakeStorageAccessPredicate(storage_key, is_write, wg_id), result, path);
-  return result;
-}
-
-std::set<BufferAccessPoint>
-GetLastAccessPointsByStorage(const IRStructure *node,
-                             const VarNode *storage_key, bool is_write,
-                             int wg_id = kWarpgroupBroadcast) {
-  std::set<BufferAccessPoint> result;
-  std::vector<const IRStructure *> path;
-  node->CollectLastAccessPoints(
-      MakeStorageAccessPredicate(storage_key, is_write, wg_id), result, path);
-  return result;
-}
-
 std::vector<BufferRegion> TaskRegionsForStorage(const TaskNode *task,
                                                 const VarNode *storage_key,
                                                 bool is_write) {
@@ -493,13 +248,69 @@ std::vector<BufferRegion> TaskRegionsForStorage(const TaskNode *task,
   return result;
 }
 
+// Collect access points for every task touching `storage_key`. Unlike the old
+// first/last-only collection, this gathers ALL matching points; the caller
+// pairs producer/consumer points and lets the closure prune redundancy.
+// `producer_side` shifts a loop body's timing to its last iteration so a
+// producer's latency is measured from the final write.
+static void CollectAllAccessPointsImpl(const IRStructure *node,
+                                       const TaskAccessPredicate &pred,
+                                       std::set<BufferAccessPoint> &result,
+                                       std::vector<const IRStructure *> &path,
+                                       int64_t time_offset,
+                                       bool producer_side) {
+  if (!node)
+    return;
+
+  if (node->IsTask()) {
+    const TaskNode *task = static_cast<const TaskNode *>(node);
+    if (pred(task)) {
+      std::vector<const IRStructure *> point_path = path;
+      point_path.push_back(node);
+      result.emplace(time_offset, std::move(point_path));
+    }
+    return;
+  }
+
+  const ControlNode *ctrl = static_cast<const ControlNode *>(node);
+  path.push_back(node);
+
+  int64_t body_offset = time_offset;
+  if (producer_side) {
+    int64_t trip_count = ctrl->GetTripCount();
+    int64_t ii_per_iter = ctrl->GetIIperIter();
+    body_offset += (trip_count > 0 ? (trip_count - 1) : 0) * ii_per_iter;
+  }
+
+  for (const auto &child : ctrl->children) {
+    CollectAllAccessPointsImpl(child.get(), pred, result, path,
+                               body_offset + child->GetStartTime(),
+                               producer_side);
+  }
+
+  path.pop_back();
+}
+
+std::set<BufferAccessPoint> CollectAccessPoints(const IRStructure *node,
+                                                const VarNode *storage_key,
+                                                bool is_write,
+                                                bool producer_side) {
+  std::set<BufferAccessPoint> result;
+  std::vector<const IRStructure *> path;
+  CollectAllAccessPointsImpl(
+      node,
+      MakeStorageAccessPredicate(storage_key, is_write, kWarpgroupBroadcast),
+      result, path, 0, producer_side);
+  return result;
+}
+
 // ============================================================================
 // Dependency analysis implementation
 // ============================================================================
 
 bool RegionsMayConflict(const TaskNode *a_task, const BufferRegion &a_region,
                         const TaskNode *b_task, const BufferRegion &b_region,
-                        std::optional<For> current_loop, bool cross) {
+                        const std::vector<For> &loop_stack, bool cross) {
   if (!a_region->buffer->data.same_as(b_region->buffer->data))
     return false;
 
@@ -518,31 +329,50 @@ bool RegionsMayConflict(const TaskNode *a_task, const BufferRegion &a_region,
 
   arith::Analyzer ana;
   Map<Var, PrimExpr> a_sub, b_sub;
-  if (current_loop.has_value()) {
-    const ForNode *fn = current_loop->get();
+  ConstrSet loop_ctx;
+  // Only the innermost loop (loop_stack.back()) is treated as cross-iteration:
+  // the consumer runs a later iteration of that loop while all outer loops are
+  // held fixed (shared var). Outer-loop reuse is analyzed at those outer
+  // levels.
+  const size_t last = loop_stack.empty() ? 0 : loop_stack.size() - 1;
+  for (size_t k = 0; k < loop_stack.size(); ++k) {
+    const ForNode *fn = loop_stack[k].get();
     Var lv = fn->loop_var;
-    if (!cross) {
-      // Same iteration: producer and consumer share one loop-var value.
+    // A loop that never executes carries no dependency, so we may assume its
+    // body runs (extent > 0).
+    loop_ctx.AddConstr(fn->extent > make_const(fn->extent.dtype(), 0));
+    if (!cross || k < last) {
       Var lv_s(lv->name_hint + "_s", lv.dtype());
-      ana.Bind(lv_s, Range::FromMinExtent(fn->min, fn->extent));
+      loop_ctx.AddConstr(lv_s, Range::FromMinExtent(fn->min, fn->extent));
       a_sub.Set(lv, lv_s);
       b_sub.Set(lv, lv_s);
     } else {
       // Loop back-edge: consumer runs d>=1 iterations after the producer.
-      // lv_p ranges the loop; lv_c = lv_p + d with d in [1, extent-1].
       Var lv_p(lv->name_hint + "_p", lv.dtype());
-      Var d(lv->name_hint + "_d", lv.dtype());
-      ana.Bind(lv_p, Range::FromMinExtent(fn->min, fn->extent));
-      // d in [1, extent-1]: at least one later iteration exists.
-      ana.Bind(
-          d, Range::FromMinExtent(IntImm(lv.dtype(), 1),
-                                  max(fn->extent - 1, IntImm(lv.dtype(), 1))));
+      Var lv_c(lv->name_hint + "_c", lv.dtype());
+      loop_ctx.AddConstr(lv_p, Range::FromMinExtent(fn->min, fn->extent));
+      loop_ctx.AddConstr(lv_c, Range::FromMinExtent(fn->min, fn->extent));
+      loop_ctx.AddConstr(lv_c > lv_p);
       a_sub.Set(lv, lv_p);
-      b_sub.Set(lv, lv_p + d);
+      b_sub.Set(lv, lv_c);
     }
   }
-  // Feed each side's surrounding-scope ConstrSet to the prover, after
-  // substituting the current_loop var with that side's loop-var map.
+  loop_ctx.Populate(ana);
+  auto rename_bindings = [](const TaskNode *task, const char *suffix,
+                            Map<Var, PrimExpr> &sub) {
+    if (!task)
+      return;
+    for (const auto &c : task->outer_ctx.constrs_) {
+      if (c.kind == Constr::kBindValue || c.kind == Constr::kBindRange) {
+        const Var &v = c.var;
+        if (!sub.count(v)) {
+          sub.Set(v, Var(v->name_hint + suffix, v.dtype()));
+        }
+      }
+    }
+  };
+  rename_bindings(a_task, "_p", a_sub);
+  rename_bindings(b_task, "_c", b_sub);
   if (a_task) {
     a_task->outer_ctx.Substitute(a_sub).Populate(ana);
   }
@@ -572,7 +402,7 @@ bool RegionsMayConflict(const TaskNode *a_task, const BufferRegion &a_region,
 
 std::vector<DepInfo>
 AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
-                    std::optional<For> current_loop) {
+                    const std::vector<For> &loop_stack) {
   const size_t n = nodes.size();
   std::vector<DepInfo> deps;
 
@@ -585,6 +415,40 @@ AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
       storage_keys.insert(StorageKey(region->buffer));
     }
   }
+
+  using CoveredKey =
+      std::tuple<const VarNode *, const TaskNode *, const TaskNode *>;
+  std::map<IRStructure *, std::set<CoveredKey>> covered_cache;
+  std::function<void(IRStructure *, std::vector<For> &, std::set<CoveredKey> &)>
+      collect_subtree_deps = [&](IRStructure *node, std::vector<For> &stack,
+                                 std::set<CoveredKey> &out) {
+        if (!node || !node->IsControl())
+          return;
+        auto *ctrl = static_cast<ControlNode *>(node);
+        std::vector<IRStructure *> children;
+        for (const auto &child : ctrl->children)
+          children.push_back(child.get());
+        stack.push_back(ctrl->control);
+        for (const auto &cdep : AnalyzeDependencies(children, stack)) {
+          const VarNode *ckey = StorageKey(cdep.buffer);
+          for (const auto &[cprod, ccons] : cdep.task_pairs) {
+            out.emplace(ckey, cprod.task(), ccons.task());
+          }
+        }
+        for (auto *child : children)
+          collect_subtree_deps(child, stack, out);
+        stack.pop_back();
+      };
+  auto subtree_covered =
+      [&](IRStructure *node) -> const std::set<CoveredKey> & {
+    auto cache_it = covered_cache.find(node);
+    if (cache_it != covered_cache.end())
+      return cache_it->second;
+    std::set<CoveredKey> covered;
+    std::vector<For> stack = loop_stack;
+    collect_subtree_deps(node, stack, covered);
+    return covered_cache.emplace(node, std::move(covered)).first->second;
+  };
 
   for (const auto *storage_key : storage_keys) {
     auto touches = [&](size_t u) {
@@ -603,25 +467,25 @@ AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
       if (!touches(i))
         continue;
       for (size_t j = 0; j < n; ++j) {
-        if (i == j && !current_loop.has_value())
+        if (i == j && loop_stack.empty())
           continue;
         if (!touches(j))
           continue;
         bool same_iter = (i < j);
-        bool cross = current_loop.has_value() && (i >= j);
+        bool cross = !loop_stack.empty() && (i >= j);
         if (!same_iter && !cross)
           continue;
 
-        auto a_w = GetLastAccessPointsByStorage(nodes[i], storage_key,
-                                                /*is_write=*/true);
-        auto a_r = GetLastAccessPointsByStorage(nodes[i], storage_key,
-                                                /*is_write=*/false);
-        auto b_r = GetFirstAccessPointsByStorage(nodes[j], storage_key,
-                                                 /*is_write=*/false);
-        auto b_w = GetFirstAccessPointsByStorage(nodes[j], storage_key,
-                                                 /*is_write=*/true);
+        auto a_w = CollectAccessPoints(nodes[i], storage_key, true,
+                                       /*producer_side=*/true);
+        auto a_r = CollectAccessPoints(nodes[i], storage_key, false,
+                                       /*producer_side=*/true);
+        auto b_r = CollectAccessPoints(nodes[j], storage_key, false,
+                                       /*producer_side=*/false);
+        auto b_w = CollectAccessPoints(nodes[j], storage_key, true,
+                                       /*producer_side=*/false);
 
-        std::set<BufferAccessPoint> prod_pts, cons_pts;
+        std::set<std::pair<BufferAccessPoint, BufferAccessPoint>> pairs;
         std::optional<Buffer> dep_buffer;
         int64_t latency = -1;
 
@@ -637,15 +501,14 @@ AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
                   for (const auto &rA : a_regions) {
                     for (const auto &rB : b_regions) {
                       if (!RegionsMayConflict(a.task(), rA, b.task(), rB,
-                                              current_loop, cross))
+                                              loop_stack, cross))
                         continue;
                       // For alias buffers that share one data Var, use the
                       // write-side logical buffer as the dependency buffer.
                       if (!dep_buffer.has_value()) {
                         dep_buffer = a_write ? rA->buffer : rB->buffer;
                       }
-                      prod_pts.insert(a);
-                      cons_pts.insert(b);
+                      pairs.emplace(a, b);
                       int64_t l =
                           a.timestamp + a.task()->GetLatency() - b.timestamp;
                       if (l < 0)
@@ -661,14 +524,28 @@ AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
         consider(a_w, /*a_write=*/true, b_w, /*b_write=*/true);
         consider(a_r, /*a_write=*/false, b_w, /*b_write=*/true);
 
-        if (latency >= 0) {
+        // Self-dependency on a control node: drop pairs already covered by the
+        // node's own subtree.
+        if (i == j && nodes[i]->IsControl()) {
+          const auto &covered = subtree_covered(nodes[i]);
+          for (auto it = pairs.begin(); it != pairs.end();) {
+            if (covered.count(
+                    {storage_key, it->first.task(), it->second.task()})) {
+              it = pairs.erase(it);
+            } else {
+              ++it;
+            }
+          }
+        }
+
+        if (!pairs.empty() && latency >= 0) {
           ICHECK(dep_buffer.has_value())
               << "Dependency found without a representative write buffer for "
               << storage_key->name_hint;
           deps.push_back(
               {nodes[i], nodes[j], dep_buffer.value(),
-               std::vector<BufferAccessPoint>(prod_pts.begin(), prod_pts.end()),
-               std::vector<BufferAccessPoint>(cons_pts.begin(), cons_pts.end()),
+               std::vector<std::pair<BufferAccessPoint, BufferAccessPoint>>(
+                   pairs.begin(), pairs.end()),
                cross, latency});
         }
       }

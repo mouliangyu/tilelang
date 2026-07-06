@@ -21,57 +21,16 @@ namespace tl {
 
 using namespace tirx;
 
-struct LoopNestingInfo {
-  std::vector<Var> loop_vars;
-  std::vector<PrimExpr> loop_starts;
-  std::vector<PrimExpr> loop_steps;
-  std::vector<PrimExpr> loop_extents;
-
-  void AddLoop(const ForNode *for_node) {
-    loop_vars.push_back(for_node->loop_var);
-    loop_starts.push_back(for_node->min);
-    loop_steps.push_back(for_node->step.has_value()
-                             ? for_node->step.value()
-                             : IntImm(DataType::Int(32), 1));
-    loop_extents.push_back(for_node->extent);
-  }
-
-  void PopLoop() {
-    if (!loop_vars.empty()) {
-      loop_vars.pop_back();
-      loop_starts.pop_back();
-      loop_steps.pop_back();
-      loop_extents.pop_back();
-    }
-  }
-
-  PrimExpr CalculateIterationCount() const {
-    PrimExpr total_iter = IntImm(DataType::Int(32), 0);
-    PrimExpr total_multiplier = IntImm(DataType::Int(32), 1);
-    for (size_t i = loop_vars.size(); i-- > 0;) {
-      PrimExpr normalized_iter =
-          indexdiv(loop_vars[i] - loop_starts[i], loop_steps[i]);
-      if (i == loop_vars.size() - 1) {
-        total_iter = normalized_iter;
-      } else {
-        total_iter = total_iter + normalized_iter * total_multiplier;
-      }
-      total_multiplier = total_multiplier * loop_extents[i];
-    }
-    return total_iter;
-  }
-};
-
 struct MultiVersionBufferInfo {
   Buffer buffer;
   int num_versions;
   Buffer new_buffer;
-  LoopNestingInfo claim_loop_info;
+  std::vector<For> claim_loops;
 
   MultiVersionBufferInfo(Buffer buffer, int num_versions, Buffer new_buffer,
-                         LoopNestingInfo claim_loop_info = LoopNestingInfo())
+                         std::vector<For> claim_loops = {})
       : buffer(buffer), num_versions(num_versions), new_buffer(new_buffer),
-        claim_loop_info(std::move(claim_loop_info)) {}
+        claim_loops(std::move(claim_loops)) {}
 };
 
 using MultiVersionBufferMap = std::unordered_map<Buffer, MultiVersionBufferInfo,
@@ -87,17 +46,9 @@ struct FlagInfo {
 };
 using FlagInfoList = std::vector<FlagInfo>;
 
-void AnalyzeAndInsertBarriers(IRStructure *node, EventIdMap &event_id_map,
-                              FlagInfoList &flag_infos, Var sid,
-                              LoopNestingInfo &loop_info,
-                              std::vector<MultiVersionBufferInfo> &buffer_infos,
-                              MultiVersionBufferMap &buffer_info_map);
-
-// List overload: analyze barriers across the root ordered list.
 void AnalyzeAndInsertBarriers(std::vector<std::shared_ptr<IRStructure>> &root,
                               EventIdMap &event_id_map,
-                              FlagInfoList &flag_infos, Var sid,
-                              LoopNestingInfo &loop_info,
+                              FlagInfoList &flag_infos,
                               std::vector<MultiVersionBufferInfo> &buffer_infos,
                               MultiVersionBufferMap &buffer_info_map);
 
@@ -143,7 +94,7 @@ private:
       const auto &info = it->second;
       auto *n = load.CopyOnWrite();
       n->buffer = info.new_buffer;
-      PrimExpr iteration = info.claim_loop_info.CalculateIterationCount();
+      PrimExpr iteration = CalculateIterationCount(info.claim_loops);
       n->indices.insert(n->indices.begin(),
                         indexmod(iteration, Integer(info.num_versions)));
     }
@@ -157,7 +108,7 @@ private:
       const auto &info = it->second;
       auto *n = store.CopyOnWrite();
       n->buffer = info.new_buffer;
-      PrimExpr iteration = info.claim_loop_info.CalculateIterationCount();
+      PrimExpr iteration = CalculateIterationCount(info.claim_loops);
       n->indices.insert(n->indices.begin(),
                         indexmod(iteration, Integer(info.num_versions)));
     }

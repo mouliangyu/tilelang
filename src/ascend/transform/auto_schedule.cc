@@ -1183,16 +1183,16 @@ static ScheduledKernelResult ScheduleSingleKernel(
 
   EventIdMap event_id_map;
   FlagInfoList flag_infos;
-  LoopNestingInfo loop_info;
+  MultiVersionBufferMap buffer_info_map;
+  AnalyzeAndInsertBarriers(ir_structure, event_id_map, flag_infos,
+                           result.buffer_infos, buffer_info_map);
+
   Var sid;
   if (external_sid.has_value()) {
     sid = external_sid.value();
   } else {
     sid = Var("sid", DataType::Int(32));
   }
-  MultiVersionBufferMap buffer_info_map;
-  AnalyzeAndInsertBarriers(ir_structure, event_id_map, flag_infos, sid,
-                           loop_info, result.buffer_infos, buffer_info_map);
 
   Stmt wg0_body = Evaluate(0);
   Stmt wg1_body = Evaluate(0);
