@@ -11,7 +11,7 @@ import tvm_ffi
 from tvm.ir import CallingConv
 from tvm.target import Target
 from tilelang.contrib import bisheng, hipcc, nvcc
-from tilelang.env import COMPOSABLE_KERNEL_INCLUDE_DIR, CUTLASS_INCLUDE_DIR, TILELANG_TEMPLATE_PATH
+from tilelang.env import COMPOSABLE_KERNEL_INCLUDE_DIR, CUTLASS_INCLUDE_DIR, TILELANG_TEMPLATE_PATH, env
 from tilelang.transform import PassConfigKey
 from tilelang.engine.param import KernelParam, CompiledArtifact
 from tilelang.engine.semantic_check import PreLowerSemanticCheck
@@ -101,12 +101,13 @@ def tilelang_callback_cuda_validate(device_mod):
 @tvm_ffi.register_global_func("tilelang_callback_cuda_compile", override=True)
 def tilelang_callback_cuda_compile(code, target, pass_config=None):
     target_arch, target_code = nvcc.get_target_arch_and_code(target)
+    target_code_list = nvcc.get_target_code_list(target_code)
     gencode_code = nvcc.format_target_code_for_gencode(target_code)
     if gencode_code is None:
         arch = [f"-arch=sm_{target_arch}"]
     else:
         arch = ["-gencode", f"arch=compute_{target_arch},code={gencode_code}"]
-    compile_format = "fatbin" if len(nvcc.get_target_code_list(target_code)) > 1 else "cubin"
+    compile_format = "fatbin" if len(target_code_list) > 1 else "cubin"
 
     # Read pass-config keys (string-valued) like in jit.adapter.libgen.compile_lib
     cfg = pass_config or {}
@@ -115,7 +116,6 @@ def tilelang_callback_cuda_compile(code, target, pass_config=None):
     ptxas_usage_level = cfg.get(PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL, None)
     if ptxas_usage_level is not None:
         ptxas_usage_level = int(ptxas_usage_level)
-    verbose_ptxas_output = bool(cfg.get(PassConfigKey.TL_ENABLE_PTXAS_VERBOSE_OUTPUT, False))
 
     options = [
         # tl_templates/cuda/reduce.h uses explicit lambda template parameters
@@ -140,15 +140,27 @@ def tilelang_callback_cuda_compile(code, target, pass_config=None):
                     tokens.append(str(flag))
         options += tokens
 
-    verbose = False
+    verbose = env.get_default_verbose()
     if enable_fast_math:
         options.append("--use_fast_math")
     if ptxas_usage_level is not None:
         options.append(f"--ptxas-options=--register-usage-level={ptxas_usage_level}")
-    if verbose_ptxas_output:
+    if verbose:
         options.append("--ptxas-options=--verbose")
         options.append("-w")  # Suppress warnings to make ptxas output more readable
-        verbose = True
+
+    from tilelang.cache.cuda_binary_cache import CUDABinaryCache
+
+    cache_key = CUDABinaryCache.make_key(
+        code=code,
+        target_kind=target.kind.name,
+        target_arch=target_arch,
+        target_code=target_code_list,
+        compile_format=compile_format,
+    )
+    cached_binary = CUDABinaryCache.load(cache_key, compile_format)
+    if cached_binary is not None:
+        return bytearray(cached_binary)
 
     ptx = nvcc.compile_cuda(
         code,
@@ -157,6 +169,7 @@ def tilelang_callback_cuda_compile(code, target, pass_config=None):
         options=options,
         verbose=verbose,
     )
+    CUDABinaryCache.save(cache_key, compile_format, ptx)
 
     return ptx
 
@@ -359,6 +372,21 @@ def lower(
     if enable_host_codegen:
         host_mod = host_codegen(host_mod, target_host, target=target)
         host_mod.import_module(codegen_mod)
-        return CompiledArtifact(host_mod, device_mod, params, kernel_source, rt_mod=host_mod)
+        return CompiledArtifact(
+            host_mod,
+            device_mod,
+            params,
+            kernel_source,
+            rt_mod=host_mod,
+            target=target,
+            target_host=target_host,
+        )
 
-    return CompiledArtifact(host_mod, device_mod, params, kernel_source)
+    return CompiledArtifact(
+        host_mod,
+        device_mod,
+        params,
+        kernel_source,
+        target=target,
+        target_host=target_host,
+    )

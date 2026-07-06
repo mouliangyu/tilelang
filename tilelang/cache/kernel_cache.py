@@ -7,6 +7,7 @@ import json
 import logging
 import errno
 import os
+import platform
 import shutil
 import threading
 import uuid
@@ -27,7 +28,6 @@ from tilelang.jit.adapter.base import CachedTextSource
 from tilelang.jit.diagnostics import jit_phase
 from tilelang.contrib.hip_resource_info import dump_to_file, load_from_file
 from tilelang import __version__
-import platform
 
 
 class KernelCache:
@@ -56,7 +56,7 @@ class KernelCache:
 
     @staticmethod
     @functools.cache
-    def _get_compile_args() -> dict:
+    def _get_source_compile_args() -> dict:
         if sys.platform == "win32":
             from tilelang.contrib.msvc import create_shared as msvc_create_shared
 
@@ -68,6 +68,16 @@ class KernelCache:
         from torch.utils import cpp_extension
 
         return {"options": ["-x", "objective-c++", "-g", "-std=gnu++17"] + ["-I" + i for i in cpp_extension.include_paths()]}
+
+    @staticmethod
+    @functools.cache
+    def _get_export_link_args() -> dict:
+        if sys.platform == "win32":
+            from tilelang.contrib.msvc import create_shared as msvc_create_shared
+
+            return {"fcompile": msvc_create_shared}
+
+        return {}
 
     @staticmethod
     @functools.cache
@@ -167,9 +177,10 @@ class KernelCache:
     @functools.cache
     def _get_base_key() -> dict:
         base = {"version": __version__, "platform": platform.machine()}
-        lib_stamp = KernelCache._get_tilelang_lib_stamp()
-        if lib_stamp:
-            base["tilelang_lib"] = lib_stamp
+        if env.should_use_kernel_cache_lib_stamp():
+            lib_stamp = KernelCache._get_tilelang_lib_stamp()
+            if lib_stamp:
+                base["tilelang_lib"] = lib_stamp
         pipeline_stamp = KernelCache._get_tilelang_pipeline_stamp()
         if pipeline_stamp:
             base["tilelang_pipeline"] = pipeline_stamp
@@ -199,8 +210,9 @@ class KernelCache:
     def _get_cache_namespace() -> str:
         base_key = KernelCache._get_base_key()
         version = KernelCache._format_version_namespace(str(base_key.get("version", "unknown")))
-        platform_name = KernelCache._sanitize_path_component(str(base_key.get("platform", "unknown")))
-        return f"{version}-{platform_name}"
+        host_platform = KernelCache._sanitize_path_component(sys.platform)
+        host_machine = KernelCache._sanitize_path_component(platform.machine())
+        return os.path.join(version, f"{host_platform}-{host_machine}")
 
     def __new__(cls):
         """
@@ -347,7 +359,7 @@ class KernelCache:
         Environment Variables
         ---------------------
         TILELANG_DEFAULT_TARGET : str
-            Default compilation target (e.g., "cuda", "llvm", or a dict-like target config string).
+            Default compilation target (e.g., "cuda", "llvm", or a JSON target config string).
             Defaults to "auto".
         TILELANG_EXECUTION_BACKEND : str
             Default execution backend. Defaults to "auto".
@@ -498,10 +510,10 @@ class KernelCache:
         # Use atomic POSIX replace, so other processes cannot see a partial write
         os.replace(temp_path, path)
 
-    @classmethod
-    def _safe_write_executable(cls, executable: Executable, path: str):
+    @staticmethod
+    def _safe_write_executable(executable: Executable, path: str, export_kwargs: dict | None = None):
         temp_path = os.path.join(env.TILELANG_TMP_DIR, f"{os.getpid()}_{uuid.uuid4()}.so")
-        executable.export_library(temp_path, **cls._get_compile_args())
+        executable.export_library(temp_path, **(export_kwargs or {}))
         os.replace(temp_path, path)
 
     def _save_kernel_to_disk(self, key: str, kernel: JITKernel, func: Callable = None, verbose: bool = False):
@@ -628,19 +640,29 @@ class KernelCache:
         except Exception:
             self.logger.exception("Error loading kernel parameters from disk")
 
-        kernel = self._build_kernel(
-            func=func,
-            host_kernel_source=CachedTextSource(path=host_kernel_path),
-            device_kernel_source=CachedTextSource(path=device_kernel_path),
-            kernel_lib_path=kernel_lib_path,
-            kernel_params=kernel_params,
-            target=target,
-            target_host=target_host,
-            out_idx=out_idx,
-            execution_backend=execution_backend,
-            pass_configs=pass_configs,
-            compile_flags=compile_flags,
-        )
+        try:
+            kernel = self._build_kernel(
+                func=func,
+                host_kernel_source=CachedTextSource(path=host_kernel_path),
+                device_kernel_source=CachedTextSource(path=device_kernel_path),
+                kernel_lib_path=kernel_lib_path,
+                kernel_params=kernel_params,
+                target=target,
+                target_host=target_host,
+                out_idx=out_idx,
+                execution_backend=execution_backend,
+                pass_configs=pass_configs,
+                compile_flags=compile_flags,
+            )
+        except Exception as err:
+            self.logger.warning(
+                "Failed to load kernel from disk cache at %s; treating it as a cache miss: %s",
+                cache_path,
+                err,
+                exc_info=verbose,
+            )
+            shutil.rmtree(cache_path, ignore_errors=True)
+            return None
         if kernel is not None:
             # Restore parsed kernel-resource-usage if a previous compile
             # persisted it; absent file is fine (older caches, non-HIP).

@@ -1,8 +1,7 @@
 from __future__ import annotations
-import ast
 import importlib.metadata
+import json
 import math
-import re
 import sys
 import os
 import pathlib
@@ -296,12 +295,11 @@ def _parse_target_config(value: str) -> TargetConfig | None:
     if not value.startswith("{"):
         return None
 
-    key_re = re.compile(r"([{\[,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)")
     try:
-        parsed = ast.literal_eval(key_re.sub(r'\1"\2"\3', value))
-    except (ValueError, SyntaxError) as err:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as err:
         raise ValueError(
-            'TILELANG_DEFAULT_TARGET looks like a dict but could not be parsed. Use syntax like {kind: "cuda", arch: "sm_100"}.'
+            'TILELANG_DEFAULT_TARGET looks like a dict but could not be parsed. Use JSON syntax like {"kind": "cuda", "arch": "sm_100"}.'
         ) from err
     if not isinstance(parsed, dict):
         raise ValueError("TILELANG_DEFAULT_TARGET must parse to a dict")
@@ -344,6 +342,9 @@ class Environment:
     TILELANG_DISABLE_CACHE = EnvVar(
         "TILELANG_DISABLE_CACHE", "0"
     )  # disable kernel cache, usually for unit testing / debugging, high priority
+    TILELANG_KERNEL_CACHE_USE_LIB_STAMP = EnvVar(
+        "TILELANG_KERNEL_CACHE_USE_LIB_STAMP", "0"
+    )  # include native TileLang library content hash in kernel cache keys
     TILELANG_CLEANUP_TEMP_FILES = EnvVar(
         "TILELANG_CLEANUP_TEMP_FILES", "1"
     )  # cleanup temporary compiler files/dirs after compilation (set to 0 to keep for debugging)
@@ -396,6 +397,9 @@ class Environment:
 
     def is_cache_globally_disabled(self) -> bool:
         return self.TILELANG_DISABLE_CACHE.lower() in ("1", "true", "yes", "on")
+
+    def should_use_kernel_cache_lib_stamp(self) -> bool:
+        return str(self.TILELANG_KERNEL_CACHE_USE_LIB_STAMP).lower() in ("1", "true", "yes", "on")
 
     def is_autotune_cache_disabled(self) -> bool:
         return self.TILELANG_AUTO_TUNING_DISABLE_CACHE.lower() in ("1", "true", "yes", "on")
