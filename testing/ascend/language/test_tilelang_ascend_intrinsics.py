@@ -163,6 +163,11 @@ def test_ascend_simd_3510_intrinsics_codegen():
                 b = T.simd.vpack(a)
                 T.simd.vsts(h_ub[64], b, half, dist="PK_B32")
                 T.simd.vsstb(a, c_ub[0], T.int32(1), pred)
+                T.simd.vscatter(a, c_ub[0], T.simd.vci(T.uint32(0), "uint32"), pred)
+                acc = T.simd.alloc_local(1, "float32")
+                acc[0] = a
+                T.simd.vaxpy(acc[0], a, T.float32(2), pred)
+                a = T.simd.vadd(a, acc[0], pred)
                 T.simd.mem_bar("VST_VLD")
 
                 a = T.simd.vld(i_ub[0])

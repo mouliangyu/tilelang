@@ -283,6 +283,20 @@ def vmadd(dst, src0, src1, mask=None, mode="MODE_ZEROING"):
     return tirx.call_intrin("void", _Op("tl.simd.vmadd"), dst, src0, src1, mask, mode)
 
 
+def vaxpy(dst, src, scalar, mask=None, mode="MODE_ZEROING"):
+    """Fused scalar multiply-add: dst = src * scalar + dst."""
+    if mask is None:
+        mask = _default_mask(dst.dtype)
+    if not isinstance(dst, BufferLoad):
+        raise ValueError(
+            "vaxpy: `dst` must be a buffer access (e.g. c[0]) allocated with "
+            "T.simd.alloc_local()/alloc_var(), not an immutable register value. "
+            f"Got {type(dst).__name__} {dst}."
+        )
+    dst = access_ptr(dst, "rw")
+    return tirx.call_intrin("void", _Op("tl.simd.vaxpy"), dst, src, scalar, mask, mode)
+
+
 def vdiv(src0, src1, mask=None, mode="MODE_ZEROING"):
     if mask is None:
         mask = _default_mask(src0.dtype)
@@ -557,6 +571,19 @@ def vgather2(base, index, mask=None):
         index,
         mask,
     )
+
+
+def vscatter(src, base, index, mask=None):
+    """Scatter-store: base[index[lane]] = src[lane].
+
+    Write-side counterpart to vgatherb/vgather2. ``index`` is a vector register of
+    per-lane element offsets (uint32 for 32-bit elements, uint16 for 8/16-bit).
+    """
+    if mask is None:
+        mask = _default_mask(src.dtype)
+    if isinstance(base, BufferLoad):
+        base = access_ptr(base, "w", extent=_vreg_lanes(base.buffer.dtype))
+    return tirx.call_intrin("void", _Op("tl.simd.vscatter"), src, base, index, mask)
 
 
 # -- Type conversion --------------------------------------------------------------

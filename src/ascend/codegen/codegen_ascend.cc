@@ -1513,6 +1513,20 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     os << ", " << Downcast<StringImm>(op->args[4])->value; // mode
     os << ")";
   }
+  // --- SimdVF scalar FMA: (dst, src, scalar, mask, mode) ---
+  else if (op->op.same_as(tl::simd_vaxpy())) {
+    ICHECK_EQ(op->args.size(), 5);
+    os << "simd_inst::vaxpy(";
+    PrintExpr(op->args[0], os); // dst
+    os << ", ";
+    PrintExpr(op->args[1], os); // src
+    os << ", ";
+    PrintExpr(op->args[2], os); // scalar
+    os << ", ";
+    PrintExpr(op->args[3], os);                            // mask
+    os << ", " << Downcast<StringImm>(op->args[4])->value; // mode
+    os << ")";
+  }
   // --- SimdVF binary ops: (src0, src1, mask, mode) ---
   else if (op->op.same_as(tl::simd_vadd()) || op->op.same_as(tl::simd_vsub()) ||
            op->op.same_as(tl::simd_vmul()) || op->op.same_as(tl::simd_vdiv()) ||
@@ -1829,6 +1843,21 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     PrintExpr(op->args[1], this->stream); // base
     this->stream << ", ";
     PrintExpr(op->args[2], this->stream); // stride
+    this->stream << ", ";
+    PrintExpr(op->args[3], this->stream); // mask
+    this->stream << ");\n";
+  }
+  // --- SimdVF scatter-store: (src, base, index, mask) ---
+  else if (op->op.same_as(tl::simd_vscatter())) {
+    ICHECK_EQ(op->args.size(), 4);
+    DataType dtype = op->args[0].dtype().element_of();
+    this->PrintIndent();
+    this->stream << "simd_inst::vscatter(";
+    PrintExpr(op->args[0], this->stream); // src (data reg)
+    this->stream << ", (__ubuf__ " << CCEUBufType(dtype) << "*)";
+    PrintExpr(op->args[1], this->stream); // base
+    this->stream << ", ";
+    PrintExpr(op->args[2], this->stream); // index reg
     this->stream << ", ";
     PrintExpr(op->args[3], this->stream); // mask
     this->stream << ");\n";

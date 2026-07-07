@@ -552,6 +552,9 @@ TIR_DEFINE_TL_SIMD_BUILTIN(vmula).set_num_inputs(5).set_attr<TCallEffectKind>(
 TIR_DEFINE_TL_SIMD_BUILTIN(vmadd).set_num_inputs(5).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_SIMD_BUILTIN(vaxpy).set_num_inputs(5).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_SIMD_BUILTIN(vdiv).set_num_inputs(-1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
@@ -637,6 +640,11 @@ TIR_DEFINE_TL_SIMD_BUILTIN(vgatherb)
 
 TIR_DEFINE_TL_SIMD_BUILTIN(vgather2)
     .set_num_inputs(3)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_SIMD_BUILTIN(vscatter)
+    .set_num_inputs(4)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
