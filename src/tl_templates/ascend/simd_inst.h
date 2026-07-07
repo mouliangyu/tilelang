@@ -624,6 +624,14 @@ __simd_callee__ inline SrcVec vexpdif(SrcVec src_0, SrcVec src_1,
   return dst;
 }
 
+template <typename SrcVec, typename Mode>
+__simd_callee__ inline SrcVec vabsdif(SrcVec src_0, SrcVec src_1,
+                                      vector_bool mask, Mode mode) {
+  SrcVec dst;
+  ::vabsdif(dst, src_0, src_1, mask, mode);
+  return dst;
+}
+
 template <typename U, typename SrcVec, typename Part>
 __simd_callee__ inline vec_t<U> vpack(SrcVec src, Part part) {
   vec_t<U> dst;

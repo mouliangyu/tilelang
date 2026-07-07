@@ -1474,7 +1474,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   // --- SimdVF binary ops: (src0, src1, mask, mode) ---
   else if (op->op.same_as(tl::simd_vadd()) || op->op.same_as(tl::simd_vsub()) ||
            op->op.same_as(tl::simd_vmul()) || op->op.same_as(tl::simd_vdiv()) ||
-           op->op.same_as(tl::simd_vmax()) || op->op.same_as(tl::simd_vmin())) {
+           op->op.same_as(tl::simd_vmax()) || op->op.same_as(tl::simd_vmin()) ||
+           op->op.same_as(tl::simd_vabsdif())) {
     ICHECK_EQ(op->args.size(), 4);
     const char *name = nullptr;
     if (op->op.same_as(tl::simd_vadd()))
@@ -1483,6 +1484,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       name = "vsub";
     else if (op->op.same_as(tl::simd_vmul()))
       name = "vmul";
+    else if (op->op.same_as(tl::simd_vabsdif()))
+      name = "vabsdif";
     else if (op->op.same_as(tl::simd_vmax()))
       name = "vmax";
     else if (op->op.same_as(tl::simd_vmin()))

@@ -566,10 +566,22 @@ def vexpdif(src0, src1, mask=None, part=0):
     """Fused exp-sub: dst = vexpdif(src0, src1, mask, PART_X).
 
     Computes dst = exp(src0 - src1). part: 0=EVEN, 1=ODD.
+    Supported types: float32, float16.
     """
     if mask is None:
         mask = _default_mask(src0.dtype)
     return tirx.call_intrin(str(src0.dtype), _Op("tl.simd.vexpdif"), src0, src1, mask, part)
+
+
+def vabsdif(src0, src1, mask=None, mode="MODE_ZEROING"):
+    """Fused abs-sub: dst = vabsdif(src0, src1, mask, mode).
+
+    Computes dst = abs(src0 - src1) in a single instruction.
+    Supported types: float32, float16.
+    """
+    if mask is None:
+        mask = _default_mask(src0.dtype)
+    return tirx.call_intrin(str(src0.dtype), _Op("tl.simd.vabsdif"), src0, src1, mask, mode)
 
 
 def vcvt(

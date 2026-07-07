@@ -900,6 +900,7 @@ TVM_DLL const Op &simd_vshls();
 TVM_DLL const Op &simd_vshrs();
 TVM_DLL const Op &simd_mem_bar();
 TVM_DLL const Op &simd_vexpdif();
+TVM_DLL const Op &simd_vabsdif();
 
 /*!
  * \brief Ascend SetFlag intrinsic for pipeline synchronization.
