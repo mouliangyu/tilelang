@@ -1107,13 +1107,18 @@ struct EventInstance {
   PrimExpr event_id_expr;
   int mode_id = 0;
   int wg_id = -1;
-  // Id of the innermost pipelined (multi-iteration) loop this instance lives
-  // in, or -1 if the instance is at top level / in a single-iteration loop.
-  // Two buffers that are both accessed inside the *same* pipelined loop are
-  // rolling / double-buffered and continuously live for the whole loop, so
-  // they must never reuse each other's storage regardless of the stage-offset
-  // separation the software pipeliner introduces between their accesses.
-  int loop_id = -1;
+  // Ids of *all* enclosing pipelined (multi-iteration) loops this instance
+  // lives in, innermost last. Empty if the instance is at top level / only in
+  // single-iteration loops. Two buffers that are both accessed inside the
+  // *same* pipelined loop are rolling / double-buffered and continuously live
+  // for that loop, so they must never reuse each other's storage regardless of
+  // the stage-offset separation the software pipeliner introduces between their
+  // accesses. The full ancestor chain (not just the innermost id) is recorded
+  // so that a buffer touched only inside a nested inner loop still shares the
+  // enclosing pipelined loop id with sibling buffers touched in other inner
+  // loops of the same outer pipeline (e.g. C1's K-tile L0 and C2's V-tile L0,
+  // which are concurrent stages of one outer software pipeline).
+  std::vector<int> loop_ids;
 };
 
 // Recursively build unrolled event instances and the per-loop unroll plan.
@@ -1125,7 +1130,8 @@ static void BuildEventInstancesRecursive(
     const std::vector<LinearEvent> &events, int scope_begin, int scope_end,
     const std::vector<int> &outer_unrolled_iters,
     const std::vector<PrimExpr> &outer_loop_vals, int outer_physical_base,
-    std::vector<EventInstance> &instances, int cur_loop_id, int *next_loop_id,
+    std::vector<EventInstance> &instances, const std::vector<int> &cur_loop_ids,
+    int *next_loop_id,
     const std::unordered_map<int, std::vector<int>> *event_active_iters =
         nullptr) {
 
@@ -1173,12 +1179,16 @@ static void BuildEventInstancesRecursive(
       // Recurse into the loop body (between kForBegin+1 and kForEnd).
       // A loop that materializes more than one iteration, or a conservative
       // fallback for a multi-iteration pipelined loop, gets a fresh loop id so
-      // buffers accessed inside it are recognized as continuously live.
-      int body_loop_id = cur_loop_id;
+      // buffers accessed inside it are recognized as continuously live. The id
+      // is *appended* to the enclosing chain (rather than replacing it) so that
+      // accesses nested inside this loop still carry every ancestor pipelined
+      // loop id — a buffer touched only in an inner loop must still share the
+      // outer pipeline's id with sibling buffers in other inner loops.
+      std::vector<int> body_loop_ids = cur_loop_ids;
       if (plan.phys_for_unrolled.size() > 1 || plan.force_loop_live)
-        body_loop_id = (*next_loop_id)++;
+        body_loop_ids.push_back((*next_loop_id)++);
       BuildEventInstancesRecursive(events, i + 1, for_end - 1, local_unrolled,
-                                   local_loop_vals, 0, instances, body_loop_id,
+                                   local_loop_vals, 0, instances, body_loop_ids,
                                    next_loop_id, &plan.event_unrolled_iters);
       i = for_end + 1;
     } else {
@@ -1205,7 +1215,7 @@ static void BuildEventInstancesRecursive(
       inst.event_id_expr = ev.event_id_expr;
       inst.mode_id = ev.mode_id;
       inst.wg_id = ev.wg_id;
-      inst.loop_id = cur_loop_id;
+      inst.loop_ids = cur_loop_ids;
       instances.push_back(inst);
     }
   } else {
@@ -1238,7 +1248,7 @@ static void BuildEventInstancesRecursive(
         inst.event_id_expr = ev.event_id_expr;
         inst.mode_id = ev.mode_id;
         inst.wg_id = ev.wg_id;
-        inst.loop_id = cur_loop_id;
+        inst.loop_ids = cur_loop_ids;
         instances.push_back(inst);
       }
     }
@@ -1262,9 +1272,9 @@ struct HappensBeforeGraph {
   void Build(const std::vector<LinearEvent> &events) {
     instances.clear();
     int next_loop_id = 0;
-    BuildEventInstancesRecursive(events, 0, static_cast<int>(events.size()) - 1,
-                                 {}, {}, 0, instances, /*cur_loop_id=*/-1,
-                                 &next_loop_id);
+    BuildEventInstancesRecursive(
+        events, 0, static_cast<int>(events.size()) - 1, {}, {}, 0, instances,
+        /*cur_loop_ids=*/std::vector<int>{}, &next_loop_id);
     N = static_cast<int>(instances.size());
     if (N == 0)
       return;
@@ -1845,8 +1855,9 @@ public:
     std::vector<std::unordered_set<int>> buf_loops(num_buffers);
     for (int i = 0; i < num_buffers; ++i) {
       for (int na : all_nodes[i]) {
-        if (na < hb.N && hb.instances[na].loop_id >= 0)
-          buf_loops[i].insert(hb.instances[na].loop_id);
+        if (na < hb.N)
+          for (int lid : hb.instances[na].loop_ids)
+            buf_loops[i].insert(lid);
       }
     }
     auto share_pipelined_loop = [&](int a, int b) {
