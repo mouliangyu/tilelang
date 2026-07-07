@@ -953,6 +953,18 @@ TVM_DLL const Op &ascend_cross_core_wait_flag();
 TVM_DLL const Op &ascend_copy_gm_to_ubuf();
 
 /*!
+ * \brief Ascend set padding fill value for subsequent padded MTE copies.
+ *
+ * ascend_set_copy_pad_value(value)
+ *
+ * The single argument is a typed scalar PrimExpr; its dtype selects the
+ * AscendC::SetPadValue<T> template instantiation. Configures stateful hardware
+ * pad value consumed by a following padded GM -> UB/L1 copy.
+ *
+ */
+TVM_DLL const Op &ascend_set_copy_pad_value();
+
+/*!
  * \brief Ascend DMA copy from UBuf to GM.
  *
  * ascend_copy_ubuf_to_gm(dst, src, sid, burst_num, burst_len, l2_cache_ctl,

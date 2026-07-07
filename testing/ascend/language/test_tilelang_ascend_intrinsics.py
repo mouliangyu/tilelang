@@ -1,4 +1,5 @@
 import tilelang.language as T
+import tilelang.testing
 from tilelang.engine.lower import lower
 
 
@@ -189,11 +190,26 @@ def test_ascend_simd_3510_intrinsics_codegen():
     print(source)
 
 
+def test_copy_pad_value_gm_to_ub():
+    # 30 float32 = 120B per row (not 32B-aligned); dst UB is over-allocated to
+    # 32 cols so each row can be right-padded up to 128B.
+    @T.prim_func
+    def func(A: T.Buffer((4, 30), "float32"), B: T.Buffer((4, 32), "float32")):
+        with T.Kernel(1) as _:
+            a_ub = T.alloc_shared((4, 32), "float32")
+            T.copy(A[:, :], a_ub[:, :30], pad_value=0.0)
+            T.copy(a_ub[:, :], B[:, :])
+
+    source = lower(func, target="ascend").kernel_source
+    print(source)
+    pad_idx = source.find("set_mov_pad_val")
+    copy_idx = source.find("copy_gm_to_ubuf_align_v2")
+    assert pad_idx != -1 and copy_idx != -1
+    # The pad-register write must precede the padded copy.
+    assert pad_idx < copy_idx
+    # Padded copy: rightPadding=2 (128B-120B)/4, dataSelect=1, dst_stride=128.
+    assert "0, 4, 120, 0, 2, 1," in source
+
+
 if __name__ == "__main__":
-    test_ascend_pipe_barrier()
-    test_ascend_set_wait_flag()
-    test_ascend_threadfence()
-    test_ascend_cross_core_set_flag()
-    test_ascend_cross_core_wait_flag()
-    test_ascend_simd_3510_intrinsics_codegen()
-    print("[ok] All ascend intrinsic tests passed.")
+    tilelang.testing.main()

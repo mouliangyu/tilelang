@@ -139,6 +139,8 @@ def copy(
     unit_flag_ctrl: int = 0,
     sub_blockid: int = 0,
     scale: BufferLikeType | None = None,
+    pad_value: int | float | tirx.PrimExpr | None = None,
+    data_select: bool = False,
 ) -> tirx.PrimExpr | tirx.Stmt:
     """Copy data between memory regions.
 
@@ -177,6 +179,23 @@ def copy(
             auto-derived from the data slice (1 SF pair = 64 K-elements); the
             NZ stride is taken from the scale buffer's second-to-last dimension.
             Ascend L1→L0 only; ignored on other paths/backends. Defaults to None.
+        pad_value (Optional[int | float | PrimExpr], keyword-only): Ascend GM→UB
+            padding fill value. When set, an unaligned copy row is right-padded
+            up to the next 32B boundary and the pad lanes are filled with this
+            value. Emits a leading ``T.ascend_set_copy_pad_value(value)`` (so
+            AutoSchedule syncs the pad-register write before the copy) and pads
+            the copy via ``data_select``. The fill dtype is the destination
+            element dtype. Opt-in: without it, an unaligned multi-row copy still
+            errors as before. Ascend GM→UB (global→shared) only; ignored on
+            other paths/backends. Defaults to None.
+        data_select (bool, keyword-only): Ascend GM→UB. Same right-pad behavior
+            as ``pad_value`` (dataSelect=1 + rightPadding to the 32B boundary),
+            but the fill value is NOT set by this copy — it uses whatever the
+            hardware pad register currently holds, which the caller must have
+            set via ``T.ascend_set_copy_pad_value(...)`` beforehand. Use this to
+            reuse one pad value across several copies without re-setting it.
+            Mutually exclusive with ``pad_value`` (passing both raises
+            ValueError). Ascend GM→UB only. Defaults to False.
 
     Raises:
         TypeError: If copy extents cannot be deduced from arguments
@@ -242,6 +261,34 @@ def copy(
         ann["unit_flag_ctrl"] = unit_flag_ctrl
     if sub_blockid and "sub_blockid" not in ann:
         ann["sub_blockid"] = sub_blockid
+    if pad_value is not None and data_select:
+        raise ValueError(
+            "T.copy: pad_value and data_select are mutually exclusive. Pass "
+            "pad_value to set the fill value on this copy, or data_select to "
+            "reuse a pad value already set via T.ascend_set_copy_pad_value()."
+        )
+    if pad_value is not None:
+        import tvm.script.ir_builder.tir as tb_tir
+        from tilelang.ascend.lang.ascend import ascend_set_copy_pad_value
+
+        # Emit SetPadValue as a leading TIR statement (not folded into the copy
+        # lowering) so it exists in the IR before AutoSchedule, which then
+        # inserts the PIPE_S -> PIPE_MTE2 sync between the scalar pad-register
+        # write and the MTE2 copy that reads it. Folding it in at LowerTileOp
+        # (which runs after AutoSchedule) would leave the two unsynchronized and
+        # the copy would read a stale pad register. The copy itself then just
+        # reuses the register via data_select. dst_orig is a
+        # Buffer/BufferRegion/BufferLoad; all but a raw Buffer expose .buffer.
+        if not isinstance(dst_orig, (tirx.Buffer, tirx.BufferRegion, tirx.BufferLoad)):
+            raise TypeError(
+                "T.copy: pad_value requires dst to be a Buffer, BufferRegion, or "
+                f"BufferLoad so the pad fill dtype can be derived, got {type(dst_orig)}."
+            )
+        dst_buf = dst_orig.buffer if isinstance(dst_orig, (tirx.BufferRegion, tirx.BufferLoad)) else dst_orig
+        tb_tir.evaluate(ascend_set_copy_pad_value(pad_value, dtype=str(dst_buf.dtype)))
+        ann["data_select"] = tirx.IntImm("int32", 1)
+    if data_select and "data_select" not in ann:
+        ann["data_select"] = tirx.IntImm("int32", 1)
     if "l2_cache_ctrl" in ann:
         ann["l2_cache_ctrl"] = _normalize_l2_cache_ctrl(ann["l2_cache_ctrl"])
 

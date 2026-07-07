@@ -1061,9 +1061,30 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     ICHECK_EQ(op->args.size(), 11)
         << "tl.ascend_copy_gm_to_ubuf expects exactly 11 arguments";
     this->PrintIndent();
-    this->stream << "copy_gm_to_ubuf_align_v2((__ubuf__ uint8_t*)(";
+    // Unit convention of copy_gm_to_ubuf_align_v2
+    // burstLen / stride in bytes and right_pad_elems as an element count of the
+    // buffer dtype
+    std::string ptr_ty = "uint8_t";
+    const auto *right_pad = op->args[6].as<IntImmNode>();
+    if (right_pad && right_pad->value != 0) {
+      DataType elem = op->args[0].dtype();
+      if (elem.is_handle()) {
+        // access_ptr: recover the element dtype from the type annotation.
+        if (const auto *call = op->args[0].as<CallNode>()) {
+          if (!call->args.empty()) {
+            elem = call->args[0].dtype();
+          }
+        }
+      }
+      int bits = elem.bits();
+      ICHECK(bits == 8 || bits == 16 || bits == 32)
+          << "Ascend padded GM->UB copy supports 8/16/32-bit elements, got "
+          << bits;
+      ptr_ty = "uint" + std::to_string(bits) + "_t";
+    }
+    this->stream << "copy_gm_to_ubuf_align_v2((__ubuf__ " << ptr_ty << "*)(";
     this->PrintExpr(op->args[0], this->stream);
-    this->stream << "), (__gm__ uint8_t*)(";
+    this->stream << "), (__gm__ " << ptr_ty << "*)(";
     this->PrintExpr(op->args[1], this->stream);
     this->stream << ")";
     for (size_t i = 2; i < op->args.size(); ++i) {
@@ -1071,6 +1092,15 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->PrintExpr(op->args[i], this->stream);
     }
     this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_set_copy_pad_value())) {
+    ICHECK_EQ(op->args.size(), 1)
+        << "tl.ascend_set_copy_pad_value expects exactly 1 argument";
+    this->PrintIndent();
+    this->stream << "set_mov_pad_val(AscendC::GetScalarBitcodeValue<";
+    this->PrintType(op->args[0].dtype(), this->stream);
+    this->stream << ">(";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << "));\n";
   } else if (op->op.same_as(tl::ascend_copy_ubuf_to_gm())) {
     ICHECK_EQ(op->args.size(), 8)
         << "tl.ascend_copy_ubuf_to_gm expects exactly 8 arguments";

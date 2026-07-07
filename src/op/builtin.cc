@@ -720,6 +720,11 @@ TIR_DEFINE_TL_BUILTIN(ascend_copy_gm_to_ubuf)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(ascend_set_copy_pad_value)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(ascend_copy_ubuf_to_gm)
     .set_num_inputs(8)
     .set_attr<TCallEffectKind>("TCallEffectKind",

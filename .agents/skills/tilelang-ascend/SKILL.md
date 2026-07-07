@@ -277,6 +277,36 @@ T.copy(src, dst, transpose=True)                   # transposed DMA
 **L2 cache control values:** `"NORMAL_FV"` (default), `"NOTALLOC_KEEP"`,
 `"NOTALLOC_PW"`, `"NOTALLOC_CLEAN"`, etc.
 
+**Padded GM→UB copy (`pad_value=` / `data_select=`).** An Ascend MTE GM→UB
+copy requires each row to be a multiple of 32B. When a copied row is not
+32B-aligned, a multi-row copy normally errors. Opt in to right-pad the row
+tail up to the next 32B boundary and fill the pad lanes with a chosen value.
+The destination UB buffer must be over-allocated to (at least) the 32B-aligned
+row width so padded rows don't overlap. Two mutually-exclusive modes:
+
+```python
+# Mode 1: pad_value=v — this copy sets the fill value AND pads.
+# 30 fp32 cols = 120B (not 32B-aligned) -> padded to 128B; tail lanes = -1.0.
+a_ub = T.alloc_shared((M, 32), T.float32)      # over-allocated to 128B rows
+T.copy(A[:, :], a_ub[:, :30], pad_value=-1.0)
+
+# Mode 2: data_select=True — pad, but reuse the pad register set beforehand.
+# Set once, reuse across several copies without re-setting.
+T.ascend_set_copy_pad_value(-1.0, dtype="float32")
+T.copy(A[:, :], a_ub[:, :30], data_select=True)
+```
+
+- `pad_value` emits a leading `T.ascend_set_copy_pad_value(v)` so AutoSchedule
+  inserts the PIPE_S→PIPE_MTE2 sync between the scalar pad-register write and
+  the MTE2 copy that reads it. The fill dtype is the destination element dtype.
+- `data_select=True` pads but does NOT set the fill value — it uses whatever
+  the hardware pad register currently holds, which you must set once via
+  `T.ascend_set_copy_pad_value(v, dtype=...)` beforehand.
+- Passing both `pad_value` and `data_select` raises `ValueError`.
+- Ascend GM→UB only; supported dtypes are 8/16/32-bit (int8/uint8/int16/
+  uint16/float16/bfloat16/int32/uint32/float32). Ignored on other paths/backends.
+- Example: `examples/ascend/example_copy_pad_value.py` (+ `test_copy_pad_value.py`).
+
 ### 6.2 T.dual_copy (Ascend-Only)
 
 Splits L0C data across 2 AIV sub-cores. The split direction is inferred
@@ -726,6 +756,7 @@ All examples are in `examples/ascend/`. Key files organized by category:
 ### Misc
 | File | Description |
 |---|---|
+| `example_copy_pad_value.py` | Padded GM→UB copy (`T.copy(pad_value=)` / `data_select=`) for non-32B-aligned rows |
 | `example_buffer_version_annotation.py` | Buffer version annotation for pipelining |
 | `example_ascend_postproc_callback.py` | Post-processing codegen callback |
 

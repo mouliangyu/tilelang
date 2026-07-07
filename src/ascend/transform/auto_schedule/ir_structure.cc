@@ -91,6 +91,8 @@ std::shared_ptr<IRStructure> TaskNode::Clone() const {
   // Copy resource pipe mask
   new_task->SetPipeMask(GetPipeMask());
   new_task->SetHbmMask(GetHbmMask());
+  new_task->SetSpecialWriteMask(GetSpecialWriteMask());
+  new_task->SetReadsPadValue(ReadsPadValueRegister());
   // Copy memory access regions
   new_task->SetReadRegions(GetReadRegions());
   new_task->SetWriteRegions(GetWriteRegions());
@@ -110,56 +112,8 @@ std::shared_ptr<IRStructure> TaskNode::Clone() const {
   }
   // Copy warpgroup id
   new_task->SetWarpgroupId(GetWarpgroupId());
-  // Copy loop_break cache
-  new_task->contains_loop_break_cache_ = contains_loop_break_cache_;
-  // Copy hf32_mode cache
-  new_task->contains_hf32_mode_cache_ = contains_hf32_mode_cache_;
   new_task->CopyBaseMetadataFrom(*this);
   return new_task;
-}
-
-bool TaskNode::ContainsLoopBreak() const {
-  // Return cached result if available
-  if (contains_loop_break_cache_.has_value()) {
-    return contains_loop_break_cache_.value();
-  }
-
-  // Check if this task's statement contains a loop_break call
-  bool found_loop_break = false;
-  PostOrderVisit(stmt, [&found_loop_break](const ObjectRef &node) {
-    if (found_loop_break)
-      return;
-    if (const auto *call = node.as<CallNode>()) {
-      if (call->op.same_as(tl::loop_break())) {
-        found_loop_break = true;
-      }
-    }
-  });
-
-  contains_loop_break_cache_ = found_loop_break;
-  return found_loop_break;
-}
-
-bool TaskNode::ContainsHf32Mode() const {
-  // Return cached result if available
-  if (contains_hf32_mode_cache_.has_value()) {
-    return contains_hf32_mode_cache_.value();
-  }
-
-  // Check if this task's statement contains a set_hf32_mode call
-  bool found_hf32_mode = false;
-  PostOrderVisit(stmt, [&found_hf32_mode](const ObjectRef &node) {
-    if (found_hf32_mode)
-      return;
-    if (const auto *call = node.as<CallNode>()) {
-      if (call->op.same_as(tl::ascend_set_hf32_mode())) {
-        found_hf32_mode = true;
-      }
-    }
-  });
-
-  contains_hf32_mode_cache_ = found_hf32_mode;
-  return found_hf32_mode;
 }
 
 std::shared_ptr<IRStructure> ControlNode::Clone() const {

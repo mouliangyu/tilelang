@@ -359,6 +359,16 @@ protected:
     auto task_node = std::make_shared<TaskNode>();
     task_node->stmt = GetRef<Stmt>(op);
 
+    if (const auto *call = op->value.as<CallNode>()) {
+      if (call->op.same_as(tl::loop_break())) {
+        task_node->AddSpecialWrite(SpecialRegister::kLoopControl);
+      } else if (call->op.same_as(tl::ascend_set_hf32_mode())) {
+        task_node->AddSpecialWrite(SpecialRegister::kHf32Mode);
+      } else if (call->op.same_as(tl::ascend_set_copy_pad_value())) {
+        task_node->AddSpecialWrite(SpecialRegister::kPadValue);
+      }
+    }
+
     // Analyze the expression for resource usage
     AnalyzeResourceUsage(GetRef<Stmt>(op), task_node.get());
     StampCtx(task_node.get());
@@ -515,6 +525,8 @@ private:
       TaskNode *task_node;
       uint16_t pipe_mask{0};
       uint16_t hbm_mask{0};
+      // A padded GM->UB copy (data_select / pad_value) reads the pad register.
+      bool reads_pad_value{false};
 
       // Tensor Core shape information (multiple shapes possible)
       struct TensorCoreShape {
@@ -607,6 +619,12 @@ private:
           uint16_t copy_pipe = GetCopyPipeMask(copy->src, copy->dst);
           pipe_mask |= copy_pipe;
           hbm_mask |= GetHbmPortBit(copy->src, copy->dst);
+          // A GM->UB copy with data_select (from pad_value= or an explicit
+          // data_select) reads the pad-value register set by a preceding
+          // ascend_set_copy_pad_value. Only these copies need to be ordered
+          // against that scalar write — not every MTE2 copy.
+          if (copy_obj->GetDataSelect() != 0)
+            reads_pad_value = true;
           copy_infos.emplace_back(copy->src.scope(), copy->dst.scope(),
                                   DataType(copy->dst->dtype),
                                   CalculateCopyBytes(copy), copy_pipe);
@@ -685,6 +703,8 @@ private:
       // Set task node pipe mask.
       task_node->SetPipeMask(resolve_pipe(analyzer.pipe_mask));
       task_node->SetHbmMask(analyzer.hbm_mask);
+      if (analyzer.reads_pad_value)
+        task_node->SetReadsPadValue(true);
       // Set Tensor Core shape information if available
       for (const auto &shape : analyzer.tensor_core_shapes) {
         if (shape.m > 0 && shape.n > 0 && shape.k > 0) {
@@ -1167,9 +1187,12 @@ static ScheduledKernelResult ScheduleSingleKernel(
           }
         }
         t->SetWarpgroupId(to_l1 ? 1 : 0);
-      } else if (t->ContainsHf32Mode()) {
-        // HF32 mode configures the Cube (AIC) unit
+      } else if (t->WritesSpecialRegister(SpecialRegister::kHf32Mode)) {
+        // HF32 mode configures the Cube (AIC) unit.
         t->SetWarpgroupId(1);
+      } else if (t->WritesSpecialRegister(SpecialRegister::kPadValue)) {
+        // set_copy_pad_value runs on the vector core (AIV).
+        t->SetWarpgroupId(0);
       } else if (t->UsesPipe(ResourcePipe::kScalar) || m == 0) {
         t->SetWarpgroupId(kWarpgroupBroadcast);
       }

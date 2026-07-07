@@ -116,6 +116,16 @@ public:
     return default_value;
   }
 
+  // Ascend GM->UB padding fill value.
+  int GetDataSelect() const {
+    if (auto val = annotations.Get("data_select")) {
+      if (auto int_val = val->as<IntImmNode>()) {
+        return int_val->value;
+      }
+    }
+    return 0;
+  }
+
   /*!
    * \brief Lower the copy operator to a TIR statement.
    * \param lower_args Arguments for lowering.

@@ -164,6 +164,31 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
         make_access_ptr(op.dst, plan.dst_offset, plan_total_elems, 2);
     PrimExpr plan_total_bytes = plan.row_bytes * plan.n_rows;
 
+    // Ascend GM->UB padding (data_select): an unaligned row is right-padded up
+    // to the next 32B boundary and the pad lanes are filled from the pad-value
+    // register. The register must have been set by a leading
+    // ascend_set_copy_pad_value op.
+    auto as_int_plan = [](PrimExpr e) -> int64_t {
+      if (auto *imm = e.as<IntImmNode>()) {
+        return imm->value;
+      }
+      return -1;
+    };
+    int64_t rb_plan = as_int_plan(plan.row_bytes);
+    bool data_select = dma_path == 0 && op.GetDataSelect() != 0;
+    // Padding right-pads each row up to the next 32B boundary, so it needs a
+    // statically-known row byte length to compute the pad count. A symbolic
+    // row extent would silently skip padding and read garbage tail lanes.
+    ICHECK(!data_select || rb_plan > 0)
+        << "Ascend padded GM->UB copy (pad_value / data_select) requires a "
+           "statically-known row byte length, got a symbolic row extent.";
+    int64_t right_pad_elems = 0;
+    if (data_select && rb_plan > 0 && (rb_plan % 32) != 0) {
+      int64_t aligned_bytes = (rb_plan + 31) / 32 * 32;
+      right_pad_elems = (aligned_bytes - rb_plan) / elem_bytes;
+    }
+    bool do_pad = right_pad_elems > 0;
+
     // Collapse into a single contiguous burst only when the region is truly
     // contiguous on both sides: one row, or each side's inter-row stride equals
     // the row byte length (consecutive rows back-to-back). A small row
@@ -177,6 +202,19 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
          analyzer->CanProveEqual(plan.dst_stride_bytes, plan.row_bytes));
 
     if (dma_path == 0) {
+      if (do_pad) {
+        // Padded copy: rightPadding fills the row tail from the pad-value
+        // register (set_mov_pad_val). The destination stride is the physical
+        // UB row stride (plan.dst_stride_bytes), NOT the padded row width: the
+        // dst buffer may be over-allocated wider than align32(row), and rows
+        // must land at their real stride to avoid clobbering each other.
+        PrimExpr copy_call =
+            Call(DataType::Void(), ascend_copy_gm_to_ubuf(),
+                 {plan_dst_ptr, plan_src_ptr, sid, plan.n_rows, plan.row_bytes,
+                  zero, I(right_pad_elems), I(1), l2_cache_ctrl,
+                  plan.src_stride_bytes, plan.dst_stride_bytes});
+        return Evaluate(copy_call);
+      }
       if (plan_single_row) {
         call = Call(DataType::Void(), ascend_copy_gm_to_ubuf(),
                     {plan_dst_ptr, plan_src_ptr, sid, I(1), plan_total_bytes,

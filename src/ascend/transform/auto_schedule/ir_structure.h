@@ -53,6 +53,15 @@ enum class HbmPort : uint16_t {
   kAic = 1 << 1, // AIC HBM port: GM->L1 / L0C->GM
 };
 
+// Special scalar "registers" written by config/control intrinsics and read by
+// their consumers.
+enum class SpecialRegister : uint8_t {
+  kNone = 0,
+  kHf32Mode = 1 << 0,    // set_hf32_mode      <- read by Cube (MAD) ops
+  kPadValue = 1 << 1,    // set_copy_pad_value <- read by padded MTE2 copies
+  kLoopControl = 1 << 2, // loop_break         <- read by every sibling (fence)
+};
+
 // Structure to represent a specific access to a buffer (used for ordering
 // accesses). `path` records the chain of IRStructure nodes traversed from the
 // queried subtree's root down to (and including) the task — only real IR-tree
@@ -267,11 +276,37 @@ public:
 
   virtual bool containWarpgroupId(int id) const = 0;
 
-  // Check if this node (or any descendant) contains a loop_break call
-  virtual bool ContainsLoopBreak() const = 0;
+  // Special scalar registers this node *writes* (bitmask of SpecialRegister).
+  // Only leaf config/control intrinsics write; everything else returns 0.
+  virtual uint8_t GetSpecialWriteMask() const { return 0; }
 
-  // Check if this node (or any descendant) contains a set_hf32_mode call
-  virtual bool ContainsHf32Mode() const { return false; }
+  // Special scalar registers this node *reads*:
+  //   Cube (MAD)     reads the HF32-mode register (derived from the Cube pipe)
+  //   padded GM->UB copies read the pad-value register (only copies that carry
+  //     data_select / pad_value)
+  //   loop_break is a fence: every node implicitly reads the loop-control
+  //     register, so any loop_break write orders against all siblings.
+  uint8_t GetSpecialReadMask() const {
+    uint8_t mask = static_cast<uint8_t>(SpecialRegister::kLoopControl);
+    if (UsesPipe(ResourcePipe::kCube))
+      mask |= static_cast<uint8_t>(SpecialRegister::kHf32Mode);
+    if (ReadsPadValueRegister())
+      mask |= static_cast<uint8_t>(SpecialRegister::kPadValue);
+    return mask;
+  }
+
+  // Whether this node contains a padded GM->UB copy.
+  virtual bool ReadsPadValueRegister() const { return false; }
+
+  bool WritesSpecialRegister(SpecialRegister reg) const {
+    return (GetSpecialWriteMask() & static_cast<uint8_t>(reg)) != 0;
+  }
+
+  // Whether this node is the loop_break marker (writes the loop-control
+  // register). Used by warpgroup broadcast + sequence scans.
+  bool ContainsLoopBreak() const {
+    return WritesSpecialRegister(SpecialRegister::kLoopControl);
+  }
 
 private:
   std::vector<Guard> guards_;
@@ -299,6 +334,13 @@ public:
   // Resource pipe mask
   uint16_t GetPipeMask() const override { return pipe_mask_; }
   uint16_t GetHbmMask() const override { return hbm_mask_; }
+
+  // Special scalar registers written by this leaf (config/control intrinsics).
+  uint8_t GetSpecialWriteMask() const override { return special_write_mask_; }
+
+  // A padded GM->UB copy (data_select / pad_value) in this leaf reads the
+  // pad-value register.
+  bool ReadsPadValueRegister() const override { return reads_pad_value_; }
 
   // Memory access regions (collected during analysis)
   std::vector<BufferRegion> GetReadRegions() const override {
@@ -329,6 +371,11 @@ public:
   // Setters
   void SetPipeMask(uint16_t mask) { pipe_mask_ = mask; }
   void SetHbmMask(uint16_t mask) { hbm_mask_ = mask; }
+  void SetSpecialWriteMask(uint8_t mask) { special_write_mask_ = mask; }
+  void SetReadsPadValue(bool v) { reads_pad_value_ = v; }
+  void AddSpecialWrite(SpecialRegister reg) {
+    special_write_mask_ |= static_cast<uint8_t>(reg);
+  }
   void SetReadRegions(const std::vector<BufferRegion> &regions) {
     read_regions_ = regions;
   }
@@ -505,16 +552,14 @@ public:
            warpgroup_id_ == id;
   }
 
-  // Check if this task contains loop_break call
-  bool ContainsLoopBreak() const override;
-
-  // Check if this task contains a set_hf32_mode call
-  bool ContainsHf32Mode() const override;
-
 private:
   // Resource pipe mask (bitmask of ResourcePipe values)
   uint16_t pipe_mask_{0};
   uint16_t hbm_mask_{0};
+  // Special scalar registers written by this leaf (bitmask of SpecialRegister).
+  uint8_t special_write_mask_{0};
+  // Whether a padded GM->UB copy in this leaf reads the pad-value register.
+  bool reads_pad_value_{false};
 
   // Memory access regions (collected during analysis)
   std::vector<BufferRegion> read_regions_;
@@ -544,12 +589,6 @@ private:
 
   // Selected tensor core instruction key for this task.
   std::vector<CopyInfo> copy_infos_;
-
-  // Cached flag for loop_break detection
-  mutable std::optional<bool> contains_loop_break_cache_;
-
-  // Cached flag for set_hf32_mode detection
-  mutable std::optional<bool> contains_hf32_mode_cache_;
 };
 
 // Control node: contains a For operation and an ordered list of child
@@ -579,6 +618,16 @@ public:
         mask |= child->GetHbmMask();
     }
     return mask;
+  }
+
+  // A loop reads the pad-value register if any child (or its own task) contains
+  // a padded GM->UB copy.
+  bool ReadsPadValueRegister() const override {
+    for (const auto &child : children) {
+      if (child && child->ReadsPadValueRegister())
+        return true;
+    }
+    return task && task->ReadsPadValueRegister();
   }
 
   // Memory access regions (aggregate from children & task)
@@ -716,10 +765,6 @@ public:
         return true;
     }
     return false;
-  }
-
-  bool ContainsLoopBreak() const override {
-    return false; // Loop does not contain loop break
   }
 
   int64_t GetTripCount() const {

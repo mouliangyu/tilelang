@@ -110,32 +110,21 @@ public:
         }
       }
 
-      // Loop-break control dependencies
+      // Special-register ordering: a node writing register R must be ordered
+      // against every node reading R (RAW forward, WAR backward), preserving
+      // program order. loop_break writes kLoopControl, which every node reads,
+      // so it fences against all siblings; hf32/pad match only their consumers.
       for (size_t i = 0; i < n; ++i) {
-        if (!nodes[i]->ContainsLoopBreak())
+        uint8_t wmask = nodes[i]->GetSpecialWriteMask();
+        if (wmask == 0)
           continue;
         for (size_t j = 0; j < n; ++j) {
+          if (j == i || (wmask & nodes[j]->GetSpecialReadMask()) == 0)
+            continue;
           if (i < j) {
             data_deps.emplace_back(i, j, latencies[i]);
-          } else if (i > j) {
+          } else {
             data_deps.emplace_back(j, i, 0);
-          }
-        }
-      }
-
-      // HF32 mode must be set before Cube op runs.
-      for (size_t i = 0; i < n; ++i) {
-        if (!nodes[i]->ContainsHf32Mode())
-          continue;
-        for (size_t j = 0; j < n; ++j) {
-          if (j == i)
-            continue;
-          if (nodes[j]->UsesPipe(ResourcePipe::kCube)) {
-            if (i < j) {
-              data_deps.emplace_back(i, j, latencies[i]);
-            } else if (i > j) {
-              data_deps.emplace_back(j, i, 0);
-            }
           }
         }
       }
@@ -447,36 +436,24 @@ public:
       }
     }
 
-    // Loop-break control dependencies
+    // Special-register ordering: a node writing register R must be ordered
+    // against every node reading R (RAW forward, WAR backward), preserving
+    // program order. loop_break writes kLoopControl, which every node reads,
+    // so it fences against all siblings; hf32/pad match only their consumers.
+    // The distance bit encodes intra-iter (0) vs next-iter (1) direction.
     for (size_t i = 0; i < n; ++i) {
-      if (!nodes[i]->ContainsLoopBreak())
+      uint8_t wmask = nodes[i]->GetSpecialWriteMask();
+      if (wmask == 0)
         continue;
       for (size_t j = 0; j < n; ++j) {
+        if (j == i || (wmask & nodes[j]->GetSpecialReadMask()) == 0)
+          continue;
         if (i < j) {
           data_deps.emplace_back(i, j, 0, latencies[i]);
           data_deps.emplace_back(j, i, 1, 0);
-        } else if (i > j) {
+        } else {
           data_deps.emplace_back(i, j, 1, latencies[i]);
           data_deps.emplace_back(j, i, 0, 0);
-        }
-      }
-    }
-
-    // HF32 mode must be set before Cube op runs.
-    for (size_t i = 0; i < n; ++i) {
-      if (!nodes[i]->ContainsHf32Mode())
-        continue;
-      for (size_t j = 0; j < n; ++j) {
-        if (j == i)
-          continue;
-        if (nodes[j]->UsesPipe(ResourcePipe::kCube)) {
-          if (i < j) {
-            data_deps.emplace_back(i, j, 0, latencies[i]);
-            data_deps.emplace_back(j, i, 1, 0);
-          } else if (i > j) {
-            data_deps.emplace_back(i, j, 1, latencies[i]);
-            data_deps.emplace_back(j, i, 0, 0);
-          }
         }
       }
     }

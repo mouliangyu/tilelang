@@ -1,12 +1,24 @@
 """pytest test for example_simdvf_topk_gate.py — TopK-gate via SimdVF selection loop."""
 
+import pytest
 import torch
 import tilelang
+import tilelang.testing
 
 from example_simdvf_topk_gate import topk_gate, ref_program
 
 
-def _run(num_experts: int, num_topk: int, num_tokens: int = 4096):
+@pytest.mark.parametrize(
+    ("num_experts", "num_topk"),
+    [
+        (256, 8),
+        (128, 6),
+        # num_experts=161 -> row is 644B, not 32B-aligned: exercises the GM->UB
+        # T.copy(..., pad_value=-inf) right-pad path in the kernel.
+        (161, 8),
+    ],
+)
+def test_topk_gate(num_experts, num_topk, num_tokens=4096):
     kernel = tilelang.compile(topk_gate(num_experts, num_topk), out_idx=-1)
     device = torch.device("npu")
     torch.manual_seed(42)
@@ -21,20 +33,5 @@ def _run(num_experts: int, num_topk: int, num_tokens: int = 4096):
     )
 
 
-def test_topk_gate_256_8():
-    _run(256, 8)
-
-
-def test_topk_gate_128_6():
-    _run(128, 6)
-
-
-def test_topk_gate_160_8():
-    _run(160, 8)
-
-
 if __name__ == "__main__":
-    test_topk_gate_256_8()
-    test_topk_gate_128_6()
-    test_topk_gate_160_8()
-    print("PASS: test_simdvf_topk_gate")
+    tilelang.testing.main()
