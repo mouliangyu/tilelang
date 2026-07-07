@@ -68,6 +68,7 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     if allow_autoschedule(pass_ctx=pass_ctx):
         mod = ascend_transform.AnnotateMultiBufferEligible()(mod)
         mod = ascend_transform.IfConditionExtract()(mod)
+        mod = ascend_transform.NormalizeNoConflictHints()(mod)
         mod = ascend_transform.AutoSchedule()(mod)
         mod = ascend_transform.NormalizeMixedKernelSid()(mod)
         mod = tilelang.transform.Simplify()(mod)

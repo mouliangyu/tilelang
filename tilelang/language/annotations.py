@@ -3,10 +3,10 @@
 from collections.abc import Callable
 
 from tilelang.layout import Fragment, Layout
-from tilelang.utils.language import is_fragment
+from tilelang.utils.language import is_fragment, to_buffer_region
+from tvm.tirx import Buffer, FloatImm, IntImm, StringImm, tvm_tuple
 from tvm.tirx.script.parser import attr
 from tvm.tirx.script.builder.ir import sblock_attr
-from tvm.tirx import FloatImm, tvm_tuple
 
 _VALID_MEMORY_SCOPES = ("shared", "shared.l1", "shared.l0c", "shared.l0a", "shared.l0b")
 
@@ -19,6 +19,7 @@ __all__ = [
     "annotate_min_blocks_per_sm",
     "annotate_buffer_versions",
     "annotate_unlimit_memory",
+    "assume_no_conflict",
 ]
 
 
@@ -167,3 +168,80 @@ def annotate_unlimit_memory(*scopes: str):
         if scope not in valid:
             raise ValueError(f"Invalid memory scope {scope!r}, must be one of {valid}")
     return sblock_attr({"tl.unlimit_memory_scopes": list(scopes)})
+
+
+def assume_no_conflict(a, b=None, *, level=None, cross=None, group=None):
+    """Assert that two buffer regions do not conflict, suppressing a false
+    dependency the auto-scheduler would otherwise conservatively insert.
+
+    The auto-scheduler's dependency analysis cannot prove that dynamically
+    indexed accesses (e.g. a permutation ``state_cache[perm[idx], ...]``) are
+    disjoint across loop iterations, so it inserts redundant synchronization.
+    This hint lets the user declare that the regions do not overlap. It is
+    consumed by the ``NormalizeNoConflictHints`` pass before auto-scheduling; at
+    runtime it is a no-op.
+
+    Args:
+        a: first region -- ``buffer[indices...]`` or a bare ``buffer`` (the
+            whole buffer). A region must cover the same footprint as the actual
+            access it refers to: use slices for the accessed extents (e.g.
+            ``buf[i, 0:M, 0:N]``), since a fully scalar-indexed ``buf[i, 0, 0]``
+            denotes only a 1-element region and will not match a wider copy.
+        b: second region; defaults to ``a`` (a self-dependency).
+        level: which enclosing loop the non-overlap is asserted at, counted from
+            the outermost enclosing loop (``0`` = outermost, ``1`` = next inner,
+            ...). ``None`` (default) asserts it at each enclosing loop
+            independently. For a ``group``, ``level`` indexes the loops enclosing
+            both halves (their common ancestors), still counted from the
+            outermost.
+        cross: ``None`` = both same- and cross-iteration are conflict-free
+            (default); ``True`` = only cross-iteration; ``False`` = only
+            same-iteration.
+        group: string tag pairing two separately-written half-declarations whose
+            regions live in different scopes (so they cannot be written in one
+            call). Must appear exactly twice; the combined hint is attached to
+            the loops enclosing both. Rarely needed.
+
+    Example:
+        >>> # self-dependency across iterations: A[perm[i]] written each
+        >>> # iteration lands in a disjoint slot (perm is a permutation), so
+        >>> # there is no cross-iteration conflict
+        >>> T.assume_no_conflict(A[perm[i], 0:N], level=0, cross=True)
+        >>> # two distinct regions that never overlap -- both within the same
+        >>> # iteration and across iterations (cross=None, the default)
+        >>> T.assume_no_conflict(A[lo, 0:N], A[hi, 0:N], level=0)
+        >>> # whole buffer: drop every dependency involving B at every loop
+        >>> # enclosing this statement (level=None broadcasts to all of them)
+        >>> T.assume_no_conflict(B)
+        >>> # group: pair two regions written in separate (sibling) scopes
+        >>> T.assume_no_conflict(A[wperm[i], 0:N], group="perm")   # in one loop
+        >>> T.assume_no_conflict(A[rperm[j], 0:N], group="perm")   # in another
+    """
+    if cross is True:
+        cross_code = 1
+    elif cross is False:
+        cross_code = 0
+    elif cross is None:
+        cross_code = -1
+    else:
+        raise ValueError(f"cross must be None/True/False, got {cross!r}")
+    if level is not None and (not isinstance(level, int) or level < 0):
+        raise ValueError(f"level must be None or a non-negative int, got {level!r}")
+    if group is not None and b is not None:
+        raise ValueError(
+            "assume_no_conflict: a group's two half-declarations each carry one region, so `b` must be None when `group` is set"
+        )
+
+    # A bare Buffer (no indexing) declares non-conflict for the whole buffer; it
+    # is carried as the Buffer object and matched by storage key. Everything else
+    # is a concrete region.
+    def operand(x):
+        return x if isinstance(x, Buffer) else to_buffer_region(x)
+
+    a_op = operand(a)
+    b_op = operand(b) if b is not None else a_op
+    # level None (all enclosing loops) is encoded as -1. All fields live in the
+    # node list; the attr value is only a human-readable label (like T.assume).
+    level_imm = IntImm("int32", level if level is not None else -1)
+    node = [a_op, b_op, level_imm, StringImm(group or ""), IntImm("int32", cross_code)]
+    return attr(node, "tl.assume_no_conflict", StringImm("no_conflict"))

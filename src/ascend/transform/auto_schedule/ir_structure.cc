@@ -308,6 +308,45 @@ std::set<BufferAccessPoint> CollectAccessPoints(const IRStructure *node,
 // Dependency analysis implementation
 // ============================================================================
 
+// Check user `T.assume_no_conflict` hints carried on the current (innermost)
+// loop's `tl.no_conflict` annotation. Each entry is a triple
+// [a, b, IntImm(cross_code)] with cross_code -1=any / 1=cross / 0=same, where a
+// and b are each a Buffer (whole buffer, matched by storage key) or a concrete
+// BufferRegion (matched by region equality). A hint matches when its two
+// operands match the two queried regions (order-insensitive, since non-overlap
+// is symmetric) and the cross mode agrees.
+static bool DeclaredNoConflict(const BufferRegion &a_region,
+                               const BufferRegion &b_region,
+                               const std::vector<For> &loop_stack, bool cross) {
+  if (loop_stack.empty())
+    return false;
+  auto ann = loop_stack.back()->annotations.Get("tl.no_conflict");
+  if (!ann.has_value())
+    return false;
+
+  // A hint operand matches a queried region: a bare Buffer matches any region
+  // of the same storage; a BufferRegion must match the same buffer and region.
+  auto operand_matches = [](const Any &hint, const BufferRegion &q) {
+    if (auto buf = hint.as<Buffer>())
+      return StorageKey(buf.value()) == StorageKey(q->buffer);
+    auto hr = Downcast<BufferRegion>(hint);
+    return hr->buffer.same_as(q->buffer) && RegionsEqual(hr->region, q->region);
+  };
+
+  for (const auto &entry : Downcast<Array<Any>>(ann.value())) {
+    auto triple = Downcast<Array<Any>>(entry);
+    const Any &ha = triple[0];
+    const Any &hb = triple[1];
+    int64_t cross_code = Downcast<IntImm>(triple[2])->value;
+    if (cross_code != -1 && (cross_code == 1) != cross)
+      continue;
+    if ((operand_matches(ha, a_region) && operand_matches(hb, b_region)) ||
+        (operand_matches(ha, b_region) && operand_matches(hb, a_region)))
+      return true;
+  }
+  return false;
+}
+
 bool RegionsMayConflict(const TaskNode *a_task, const BufferRegion &a_region,
                         const TaskNode *b_task, const BufferRegion &b_region,
                         const std::vector<For> &loop_stack, bool cross) {
@@ -320,6 +359,10 @@ bool RegionsMayConflict(const TaskNode *a_task, const BufferRegion &a_region,
   bool same_logical_buffer = a_region->buffer.same_as(b_region->buffer);
   if (!same_logical_buffer)
     return true;
+
+  // User-declared disjointness (T.assume_no_conflict) overrides analysis.
+  if (DeclaredNoConflict(a_region, b_region, loop_stack, cross))
+    return false;
 
   const Array<Range> &a_rng = a_region->region;
   const Array<Range> &b_rng = b_region->region;

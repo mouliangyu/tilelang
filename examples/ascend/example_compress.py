@@ -93,6 +93,15 @@ def _compress_and_update_state_decode_tl_ascend(
                         }
                     )
 
+                    # state_idx is a permutation of the state slots, so
+                    # different `idx` iterations write disjoint state_cache
+                    # regions -- there is no cross-iteration WAW (cross=True).
+                    # RegionsMayConflict cannot prove this (state_idx is a
+                    # dynamic load), so declare it explicitly. The regions must
+                    # match the store copies' footprint below.
+                    T.assume_no_conflict(state_cache[state_idx, cache_pos, 0, 0:OVERLAP_RATIO, 0:DIM], level=0, cross=True)
+                    T.assume_no_conflict(state_cache[state_idx, cache_pos, 1, 0:OVERLAP_RATIO, 0:DIM], level=0, cross=True)
+
                     if HAS_APE:
                         T.assume(0 <= position_load < COMPRESS_RATIO)
                         T.copy(ape[position_load, 0, 0], ape_ub)

@@ -181,6 +181,7 @@ from .annotations import (  # noqa: F401
     annotate_min_blocks_per_sm,
     annotate_buffer_versions,
     annotate_unlimit_memory,
+    assume_no_conflict,
 )
 
 from .random import (

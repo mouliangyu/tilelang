@@ -18,6 +18,11 @@ def AnnotateMultiBufferEligible():
     return _ffi_api.AnnotateMultiBufferEligible()  # type: ignore
 
 
+def NormalizeNoConflictHints():
+    """Consume ``T.assume_no_conflict`` markers into ``tl.no_conflict`` For annotations."""
+    return _ffi_api.NormalizeNoConflictHints()  # type: ignore
+
+
 def AutoSchedule():
     """Auto schedule for high-level operations"""
     return _ffi_api.AutoSchedule()  # type: ignore
@@ -61,4 +66,5 @@ __all__ = [
     "MarkScalarDcacheBypass",
     "MergeUBAllocations",
     "NormalizeMixedKernelSid",
+    "NormalizeNoConflictHints",
 ]
