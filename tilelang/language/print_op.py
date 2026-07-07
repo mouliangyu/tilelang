@@ -8,6 +8,7 @@ from typing import Any
 from tilelang.language.kernel import get_thread_bindings
 from tilelang.language import copy, macro, serial, alloc_shared
 from tilelang.language.utils import index_to_coordinates
+from tilelang.language.eager.builder import Builder
 
 
 def _check_ascend_availability() -> bool:
@@ -19,7 +20,23 @@ def _check_ascend_availability() -> bool:
         return False
 
 
+def check_cuda_availability() -> bool:
+    """
+    Check if CUDA is available on the system by locating the CUDA path.
+    Returns:
+        bool: True if CUDA is available, False otherwise.
+    """
+    try:
+        from tilelang.contrib import nvcc
+
+        nvcc.find_cuda_path()
+        return True
+    except Exception:
+        return False
+
+
 _IS_ASCEND_AVAILABLE = _check_ascend_availability()
+_IS_CUDA_AVAILABLE = check_cuda_availability()
 
 
 @macro
@@ -133,10 +150,30 @@ def print_local_buffer_with_condition(condition: tirx.PrimExpr, buffer: tirx.Buf
             tirx.call_extern("handle", "debug_print_buffer_value", msg, buffer.name, i, buffer[coords])
 
 
-def device_assert(condition: tirx.PrimExpr, msg: str = "", no_stack_info=False):
-    from tilelang.cuda.debug import device_assert as cuda_device_assert
+def get_stack_str(msg, stacklevel=1):
+    stack = Builder.current().get_fileline_stack(stacklevel)
+    msg = msg + "\n"
+    for fileline, lineno, macro_name in stack:
+        msg += f"  at {fileline}:{lineno} in {macro_name}\n"
+    return msg
 
-    return cuda_device_assert(condition, msg, no_stack_info)
+
+@macro
+def device_assert(condition: tirx.PrimExpr, msg: str = "", no_stack_info=False):
+    """
+    Device-side assert emulation.
+    """
+    if _IS_ASCEND_AVAILABLE or _IS_CUDA_AVAILABLE:
+        if no_stack_info:
+            if msg == "":
+                tirx.call_intrin("void", tirx.op.Op.get("tl.device_assert"), condition)
+            else:
+                import warnings
+
+                warnings.warn("Non-empty msg may slightly slow down the kernel", stacklevel=2)
+                tirx.call_intrin("void", tirx.op.Op.get("tl.device_assert_with_msg"), condition, msg)
+        else:
+            tirx.call_intrin("void", tirx.op.Op.get("tl.device_assert_with_msg"), condition, get_stack_str(msg, stacklevel=2))
 
 
 # NOTE(chaofan): T.print is implemented as a macro, so no return

@@ -965,7 +965,19 @@ void CodeGenTileLangAscend::VisitExpr_(const BroadcastNode *op,
 }
 
 void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
-  if (op->op.same_as(tl::ascend_pipe_barrier())) {
+  if (op->op.same_as(tl::device_assert())) {
+    ICHECK_EQ(op->args.size(), 1)
+        << "tl.device_assert expects exactly 1 argument (condition)";
+    this->PrintIndent();
+    this->stream << "device_assert(" << PrintExpr(op->args[0]) << ");\n";
+  } else if (op->op.same_as(tl::device_assert_with_msg())) {
+    ICHECK_EQ(op->args.size(), 2)
+        << "tl.device_assert_with_msg expects exactly 2 arguments "
+           "(condition, msg)";
+    this->PrintIndent();
+    this->stream << "device_assert_with_msg(" << PrintExpr(op->args[0]) << ", "
+                 << PrintExpr(op->args[1]) << ");\n";
+  } else if (op->op.same_as(tl::ascend_pipe_barrier())) {
     ICHECK_EQ(op->args.size(), 1) << "tl.ascend_pipe_barrier expects exactly "
                                      "1 argument (pipe_t string)";
     std::string pipe_t_str = Downcast<StringImm>(op->args[0])->value;

@@ -270,6 +270,15 @@
                                                                                \
   ATTR inline void debug_print_msg(__gm__ const char *msg) {                   \
     printf("msg='%s' BlockIdx=%d\n", msg, blockIdx.x);                         \
+  }                                                                            \
+                                                                               \
+  ATTR inline void device_assert(bool cond) { assert(cond); }                  \
+                                                                               \
+  ATTR inline void device_assert_with_msg(bool cond, __gm__ const char *msg) { \
+    if (!cond) {                                                               \
+      printf("Device assert failed: %s BlockIdx=%d\n", msg, blockIdx.x);       \
+      assert(false);                                                           \
+    }                                                                          \
   }
 
 namespace __asc_aicore {
