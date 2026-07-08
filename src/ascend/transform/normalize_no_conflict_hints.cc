@@ -1,30 +1,38 @@
 /*!
  * \file normalize_no_conflict_hints.cc
- * \brief Consume `T.assume_no_conflict` AttrStmt markers into For annotations.
+ * \brief Consume `T.assume_no_conflict` markers into For annotations.
  *
- * The frontend emits `AttrStmt(node=[a, b, level, group, cross],
- * "tl.assume_no_conflict", value=<label>)` inside a loop body, where `a`/`b`
- * are each a `BufferRegion` (a concrete region) or a bare `Buffer` (the whole
- * buffer, matched by storage key), `level` is an IntImm loop index counted from
- * the outermost enclosing loop (`0` = outermost) or `-1` for "all enclosing
- * loops", and `cross` is an IntImm (-1=any / 1=cross-iter / 0=same-iter). The
- * attr value is only a human-readable label (like `tl.assume`). This pass runs
- * before AutoSchedule and:
- *   - removes each marker (replacing it with its body),
+ * The frontend emits a statement-form marker
+ *   Evaluate(Call(tl.assume_no_conflict, a, b, level, cross, group))
+ * inside a loop body, where `a`/`b` are each a `tl.region` Call (a concrete
+ * region) or a bare buffer's data Var (the whole buffer, matched by storage
+ * key), `level` is an IntImm loop index counted from the outermost enclosing
+ * loop (`0` = outermost) or `-1` for "all enclosing loops", `cross` is an
+ * IntImm (-1=any / 1=cross-iter / 0=same-iter), and `group` is a StringImm tag
+ * ("" = none).
+ *
+ * The statement form (rather than an AttrStmt) is deliberate: its region Call
+ * args are simplified/inlined by Simplify in lockstep with the real T.copy
+ * accesses (an AttrStmt's `node` array is NOT descended into by Simplify, which
+ * froze the region's symbolic vars and broke region matching).
+ *
+ * This pass runs before AutoSchedule and:
+ *   - removes each marker (drops the Evaluate from its SeqStmt),
  *   - attaches each hint to the enclosing For(s) selected by `level` (for a
  *     `group`, `level` indexes the loops enclosing BOTH sites -- the common
  *     ancestor prefix -- where the cross-scope dependency is analyzed),
  *   - pairs the two half-declarations sharing a `group` tag (must appear
  *     exactly twice),
  *   - normalizes each hint into an `[a, b, IntImm(cross_code)]` triple appended
- *     to those Fors' `annotations["tl.no_conflict"]` (operands kept as-is:
- *     Buffer or BufferRegion).
+ *     to those Fors' `annotations["no_conflict"]` (operands kept as Buffer or
+ *     BufferRegion).
  *
  * AutoSchedule's RegionsMayConflict reads the annotation off
  * `loop_stack.back()` and short-circuits matching dependencies to "disjoint".
  */
 
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/ir/op.h>
 #include <tvm/tirx/analysis.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
@@ -35,6 +43,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "op/utils.h"
 #include "support/check.h"
 
 namespace tvm {
@@ -43,8 +52,9 @@ namespace tl {
 using namespace tirx;
 using namespace ffi;
 
-static constexpr const char *kHintAttrKey = "tl.assume_no_conflict";
-static constexpr const char *kForAnnotKey = "tl.no_conflict";
+// Op registered in src/op/schedule_hint.cc.
+static constexpr const char *kHintOpName = "tl.assume_no_conflict";
+static constexpr const char *kForAnnotKey = "no_conflict";
 
 class NoConflictHintNormalizer : public StmtExprMutator {
 public:
@@ -86,6 +96,15 @@ private:
     return t;
   }
 
+  // Decode a marker operand: a bare buffer arrives as its data Var (a handle)
+  // and is kept as a Var (matched by storage key downstream); a tl.region Call
+  // is reconstructed into its (Simplify'd) BufferRegion.
+  static Any DecodeOperand(const PrimExpr &arg) {
+    if (arg.as<VarNode>())
+      return arg;
+    return NormalizeToBufferRegion(arg);
+  }
+
   // Length of the longest common (outermost) prefix of two loop chains.
   static int CommonPrefix(const std::vector<const ForNode *> &x,
                           const std::vector<const ForNode *> &y) {
@@ -111,53 +130,82 @@ private:
     stack_[level].push_back(Triple(a, b, cross));
   }
 
-  Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key != kHintAttrKey)
-      return StmtExprMutator::VisitStmt_(op);
-
-    auto fields = Downcast<Array<Any>>(op->node);
-    Any a = fields[0];
-    Any b = fields[1];
-    int level = static_cast<int>(Downcast<IntImm>(fields[2])->value);
-    std::string group = Downcast<StringImm>(fields[3])->value;
-    int cross = static_cast<int>(Downcast<IntImm>(fields[4])->value);
+  // Consume one marker Call. Returns nothing; drops the statement.
+  void ConsumeMarker(const CallNode *call) {
+    const auto &args = call->args;
+    ICHECK_EQ(args.size(), 5u) << "assume_no_conflict marker expects 5 args";
+    Any a = DecodeOperand(args[0]);
+    Any b = DecodeOperand(args[1]);
+    int level = static_cast<int>(Downcast<IntImm>(args[2])->value);
+    int cross = static_cast<int>(Downcast<IntImm>(args[3])->value);
+    std::string group = Downcast<StringImm>(args[4])->value;
     int depth = static_cast<int>(stack_.size());
 
     ICHECK(depth > 0) << "assume_no_conflict must appear inside a loop body";
 
     if (group.empty()) {
       Attach(level, depth, a, b, cross);
+      return;
+    }
+    // group pairing: a tag must appear exactly twice, symmetrically (which half
+    // is seen first is irrelevant). Both must carry the same `level` and
+    // `cross`. The first records its region, level, cross and enclosing loop
+    // chain; the second attaches the combined hint, bounding `level` to the LCA
+    // (longest common prefix of the two chains). A third occurrence is an
+    // error.
+    ICHECK(!completed_group_.count(group))
+        << "assume_no_conflict group '" << group
+        << "' appears more than twice; each group must appear exactly twice";
+    auto it = pending_group_.find(group);
+    if (it == pending_group_.end()) {
+      pending_group_.emplace(group, PendingHalf{a, level, cross, loop_chain_});
     } else {
-      // group pairing: a tag must appear exactly twice, symmetrically (which
-      // half is seen first is irrelevant). Both must carry the same `level` and
-      // `cross`. The first records its region, level, cross and enclosing loop
-      // chain; the second attaches the combined hint, bounding `level` to the
-      // LCA (longest common prefix of the two chains). A third occurrence is an
-      // error.
-      ICHECK(!completed_group_.count(group))
+      ICHECK(it->second.level == level)
           << "assume_no_conflict group '" << group
-          << "' appears more than twice; each group must appear exactly twice";
-      auto it = pending_group_.find(group);
-      if (it == pending_group_.end()) {
-        pending_group_.emplace(group,
-                               PendingHalf{a, level, cross, loop_chain_});
-      } else {
-        ICHECK(it->second.level == level)
-            << "assume_no_conflict group '" << group
-            << "' has mismatched level between its two half-declarations ("
-            << it->second.level << " vs " << level << ")";
-        ICHECK(it->second.cross == cross)
-            << "assume_no_conflict group '" << group
-            << "' has mismatched cross between its two half-declarations ("
-            << it->second.cross << " vs " << cross << ")";
-        int lca = CommonPrefix(it->second.chain, loop_chain_);
-        Attach(level, lca, it->second.operand, a, cross);
-        pending_group_.erase(it);
-        completed_group_.insert(group);
+          << "' has mismatched level between its two half-declarations ("
+          << it->second.level << " vs " << level << ")";
+      ICHECK(it->second.cross == cross)
+          << "assume_no_conflict group '" << group
+          << "' has mismatched cross between its two half-declarations ("
+          << it->second.cross << " vs " << cross << ")";
+      int lca = CommonPrefix(it->second.chain, loop_chain_);
+      Attach(level, lca, it->second.operand, a, cross);
+      pending_group_.erase(it);
+      completed_group_.insert(group);
+    }
+  }
+
+  static bool IsZeroEvaluate(const Stmt &s) {
+    if (const auto *eval = s.as<EvaluateNode>())
+      if (auto imm = eval->value.as<IntImmNode>())
+        return imm->value == 0;
+    return false;
+  }
+
+  Stmt VisitStmt_(const EvaluateNode *op) final {
+    if (const auto *call = op->value.as<CallNode>()) {
+      if (call->op.same_as(Op::Get(kHintOpName))) {
+        ConsumeMarker(call);
+        return Evaluate(0); // drop; SeqStmt visitor flattens no-ops away
       }
     }
-    // Consume the marker: replace it with its (visited) body.
-    return VisitStmt(op->body);
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
+  Stmt VisitStmt_(const SeqStmtNode *op) final {
+    Array<Stmt> seq;
+    for (const auto &stmt : op->seq) {
+      Stmt s = VisitStmt(stmt);
+      // Drop consumed markers (rewritten to Evaluate(0)).
+      if (IsZeroEvaluate(s))
+        continue;
+      seq.push_back(s);
+    }
+    if (seq.empty())
+      return Evaluate(0);
+    if (seq.size() == 1)
+      return seq[0];
+    return SeqStmt(std::move(seq));
   }
 
   Stmt VisitStmt_(const ForNode *op) final {

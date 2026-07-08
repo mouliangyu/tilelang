@@ -263,26 +263,27 @@ std::set<BufferAccessPoint> CollectAccessPoints(const IRStructure *node,
 // ============================================================================
 
 // Check user `T.assume_no_conflict` hints carried on the current (innermost)
-// loop's `tl.no_conflict` annotation. Each entry is a triple
+// loop's `no_conflict` annotation. Each entry is a triple
 // [a, b, IntImm(cross_code)] with cross_code -1=any / 1=cross / 0=same, where a
-// and b are each a Buffer (whole buffer, matched by storage key) or a concrete
-// BufferRegion (matched by region equality). A hint matches when its two
-// operands match the two queried regions (order-insensitive, since non-overlap
-// is symmetric) and the cross mode agrees.
+// and b are each a bare buffer's data Var (whole buffer, matched by storage
+// key) or a concrete BufferRegion (matched by region equality). A hint matches
+// when its two operands match the two queried regions (order-insensitive, since
+// non-overlap is symmetric) and the cross mode agrees.
 static bool DeclaredNoConflict(const BufferRegion &a_region,
                                const BufferRegion &b_region,
                                const std::vector<For> &loop_stack, bool cross) {
   if (loop_stack.empty())
     return false;
-  auto ann = loop_stack.back()->annotations.Get("tl.no_conflict");
+  auto ann = loop_stack.back()->annotations.Get("no_conflict");
   if (!ann.has_value())
     return false;
 
-  // A hint operand matches a queried region: a bare Buffer matches any region
-  // of the same storage; a BufferRegion must match the same buffer and region.
+  // A hint operand matches a queried region: a bare buffer's data Var matches
+  // any region of the same storage; a BufferRegion must match the same buffer
+  // and region.
   auto operand_matches = [](const Any &hint, const BufferRegion &q) {
-    if (auto buf = hint.as<Buffer>())
-      return StorageKey(buf.value()) == StorageKey(q->buffer);
+    if (auto var = hint.as<Var>())
+      return var.value().get() == StorageKey(q->buffer);
     auto hr = Downcast<BufferRegion>(hint);
     return hr->buffer.same_as(q->buffer) && RegionsEqual(hr->region, q->region);
   };
@@ -325,6 +326,7 @@ bool RegionsMayConflict(const TaskNode *a_task, const BufferRegion &a_region,
   const size_t ndim = a_rng.size();
 
   arith::Analyzer ana;
+  ana.z3_prover.SetRLimit(100000);
   Map<Var, PrimExpr> a_sub, b_sub;
   ConstrSet loop_ctx;
   // Only the innermost loop (loop_stack.back()) is treated as cross-iteration:

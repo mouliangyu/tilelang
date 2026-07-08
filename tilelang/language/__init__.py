@@ -181,8 +181,9 @@ from .annotations import (  # noqa: F401
     annotate_min_blocks_per_sm,
     annotate_buffer_versions,
     annotate_unlimit_memory,
-    assume_no_conflict,
 )
+
+from .schedule_hint import assume_no_conflict  # noqa: F401
 
 from .random import (
     rng_init,  # noqa: F401

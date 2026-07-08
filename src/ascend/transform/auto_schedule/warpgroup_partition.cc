@@ -795,6 +795,7 @@ static Stmt ConvertIRStructureToStmtInner(IRStructure *structure, Var sid,
       Map<String, Any> filtered_annotations = ctrl->control->annotations;
       filtered_annotations.erase("num_stages");
       filtered_annotations.erase("multi_buffer_eligible");
+      filtered_annotations.erase("no_conflict");
       return For(loop_var, loop_start, loop_extent, ctrl->control->kind, body,
                  ctrl->control->thread_binding, filtered_annotations);
     }
@@ -861,6 +862,7 @@ static Stmt ConvertIRStructureToStmtInner(IRStructure *structure, Var sid,
     Map<String, Any> filtered_annotations = ctrl->control->annotations;
     filtered_annotations.erase("num_stages");
     filtered_annotations.erase("multi_buffer_eligible");
+    filtered_annotations.erase("no_conflict");
     Map<Var, PrimExpr> sub_var;
     sub_var.Set(loop_var, new_var);
     For for_op =
