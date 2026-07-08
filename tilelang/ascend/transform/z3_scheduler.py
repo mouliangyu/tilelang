@@ -100,7 +100,7 @@ def z3_schedule_python(
 
     # Create Z3 solver
     solver = z3.Optimize()
-    solver.set("timeout", 10000)
+    solver.set("rlimit", 1000000)
 
     # Create start time variables
     start_vars = [z3.Int(f"start_{i}") for i in range(n)]
@@ -229,7 +229,7 @@ def z3_schedule_loop_python(
     recalculate_buffer_versions: bool = True,
     enable_offset: bool = False,
     verbose: bool = False,
-    seed: int | None = None,
+    seed: int | None = 42,
 ) -> tuple[list[int], list[int], int]:
     """Z3-based scheduler for loops with distance-aware dependencies.
 
@@ -319,7 +319,7 @@ def z3_schedule_loop_python(
         if seed is not None:
             solver.set("random_seed", seed)
             solver.set("smt.random_seed", seed)
-        solver.set("timeout", 10000)
+        solver.set("rlimit", 1000000)
 
         k_vars = [z3.Int(f"k_{i}") for i in range(n)]
         r_vars = [z3.Int(f"r_{i}") for i in range(n)]
@@ -419,37 +419,48 @@ def z3_schedule_loop_python(
             ii_lower = ii_mid + 1
 
     if best_model is None:
-        raise RuntimeError("Z3 loop scheduling failed: no feasible II found")
-
-    if verbose:
-        print(f"[Python Z3 Loop] Minimal feasible II = {best_ii}")
-
-    # Extract start times from best model. Normalize by the smallest k so the
-    # earliest iteration starts at 0.
-    start_times = []
-    k_vars = [best_model.eval(best_k_vars[i]).as_long() for i in range(n)]
-    offset = min(k_vars)
-    for i in range(n):
-        start_time = best_model.eval(best_start_vars[i]).as_long() - offset * best_ii
-        start_times.append(start_time)
-
-    # Extract buffer versions from best model
-    if recalculate_buffer_versions:
-        # if recalculation is true, we recalculate based on the schedule and dependencies
-        buffer_versions = len(buffer_sizes) * [1]
-        for u, v, distance, latency in data_deps:
-            if distance < 0:
-                buffer_var_id = -distance - 1
-                from math import ceil
-
-                buffer_versions[buffer_var_id] = max(
-                    buffer_versions[buffer_var_id], ceil((latency + start_times[u] - start_times[v]) / best_ii)
-                )
+        # No feasible II found. Fall back to a trivial sequential (non-pipelined)
+        # schedule: each task starts right after the previous one finishes, in
+        # index order. II = sum(latencies) makes successive loop iterations
+        # non-overlapping. best_ii is clamped to >= 1 to avoid downstream
+        # division by zero.
+        if verbose:
+            print("[Python Z3 Loop] No feasible II found; falling back to sequential schedule")
+        start_times = [0] * n
+        for i in range(1, n):
+            start_times[i] = start_times[i - 1] + latencies[i - 1]
+        best_ii = max(sum(latencies), 1)
+        buffer_versions = [1] * len(buffer_sizes)
     else:
-        buffer_versions = []
-        for i in range(len(buffer_sizes)):
-            buffer_var = best_model.eval(best_buffer_vars[i]).as_long()
-            buffer_versions.append(buffer_var)
+        if verbose:
+            print(f"[Python Z3 Loop] Minimal feasible II = {best_ii}")
+
+        # Extract start times from best model. Normalize by the smallest k so the
+        # earliest iteration starts at 0.
+        start_times = []
+        k_vars = [best_model.eval(best_k_vars[i]).as_long() for i in range(n)]
+        offset = min(k_vars)
+        for i in range(n):
+            start_time = best_model.eval(best_start_vars[i]).as_long() - offset * best_ii
+            start_times.append(start_time)
+
+        # Extract buffer versions from best model
+        if recalculate_buffer_versions:
+            # if recalculation is true, we recalculate based on the schedule and dependencies
+            buffer_versions = len(buffer_sizes) * [1]
+            for u, v, distance, latency in data_deps:
+                if distance < 0:
+                    buffer_var_id = -distance - 1
+                    from math import ceil
+
+                    buffer_versions[buffer_var_id] = max(
+                        buffer_versions[buffer_var_id], ceil((latency + start_times[u] - start_times[v]) / best_ii)
+                    )
+        else:
+            buffer_versions = []
+            for i in range(len(buffer_sizes)):
+                buffer_var = best_model.eval(best_buffer_vars[i]).as_long()
+                buffer_versions.append(buffer_var)
 
     # Sort tasks by start time (and by index as tie-breaker)
     task_indices = list(range(n))

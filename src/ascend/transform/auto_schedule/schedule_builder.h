@@ -34,7 +34,8 @@ bool HasVarDependency(const IRStructure *a, const IRStructure *b);
 
 // Check if two IRStructures have resource dependency (use same hardware
 // resource)
-bool HasResourceDependency(const IRStructure *a, const IRStructure *b);
+bool HasResourceDependency(const IRStructure *a, const IRStructure *b,
+                           uint16_t mask = UINT16_MAX);
 
 // Builder that schedules TaskNode/ControlNode children in IRStructure
 class ScheduleBuilder {
@@ -493,7 +494,8 @@ public:
     // Collect resource dependencies
     for (size_t i = 0; i < n; ++i) {
       for (size_t j = i + 1; j < n; ++j) {
-        if (HasResourceDependency(nodes[i], nodes[j])) {
+        if (HasResourceDependency(nodes[i], nodes[j],
+                                  ~((uint16_t)ResourcePipe::kScalar))) {
           resource_deps.emplace_back(i, j);
         }
       }

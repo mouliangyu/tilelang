@@ -84,8 +84,9 @@ bool HasVarDependency(const IRStructure *a, const IRStructure *b) {
   return false;
 }
 
-bool HasResourceDependency(const IRStructure *a, const IRStructure *b) {
-  if ((a->GetPipeMask() & b->GetPipeMask()) != 0)
+bool HasResourceDependency(const IRStructure *a, const IRStructure *b,
+                           uint16_t mask) {
+  if (((a->GetPipeMask() & b->GetPipeMask()) & mask) != 0)
     return true;
   return (a->GetHbmMask() & b->GetHbmMask()) != 0;
 }
