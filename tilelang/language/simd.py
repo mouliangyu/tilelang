@@ -838,7 +838,18 @@ def vsel(src0, src1, mask):
 
 def vselr(src, index):
     """Select lanes from src using per-lane indices."""
-    return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vselr"), src, index)
+    src_dtype = str(src.dtype)
+    index_dtype = str(index.dtype)
+    # The index must be an unsigned integer vector.
+    if index_dtype.startswith("int"):
+        index = tirx.reinterpret("u" + index_dtype, index)
+    # vselr supports f16/bf16 natively but not f32: reinterpret f32 to the same-width unsigned integer, select, then reinterpret back.
+    if src_dtype.startswith("float32"):
+        uint_dtype = src_dtype.replace("float", "uint")
+        src = tirx.reinterpret(uint_dtype, src)
+        res = tirx.call_intrin(uint_dtype, _Op("tl.simd.vselr"), src, index)
+        return tirx.reinterpret(src_dtype, res)
+    return tirx.call_intrin(src_dtype, _Op("tl.simd.vselr"), src, index)
 
 
 def vmaxs(src, scalar, mask=None, mode="MODE_ZEROING"):
