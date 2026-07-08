@@ -1814,19 +1814,16 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     } else if (n == 4 && !op->args[3].as<StringImmNode>()) {
       off_idx = 3;
     }
+    // Capture operands first so SSA temporaries (e.g. from reinterpret) are
+    // emitted on their own lines before the call statement.
+    std::string src = this->PrintExpr(op->args[1]);
+    std::string addr = this->PrintExpr(op->args[0]);
+    std::string mask = this->PrintExpr(op->args[2]);
+    std::string off = (off_idx >= 0) ? this->PrintExpr(op->args[off_idx]) : "0";
     this->PrintIndent();
-    this->stream << "simd_inst::vsts(";
-    PrintExpr(op->args[1], this->stream); // src
-    this->stream << ", (__ubuf__ " << CCEUBufType(dtype) << "*)";
-    PrintExpr(op->args[0], this->stream); // addr
-    if (off_idx >= 0) {
-      this->stream << ", ";
-      PrintExpr(op->args[off_idx], this->stream);
-    } else {
-      this->stream << ", 0";
-    }
-    this->stream << ", " << dist << ", ";
-    PrintExpr(op->args[2], this->stream); // mask
+    this->stream << "simd_inst::vsts(" << src << ", (__ubuf__ "
+                 << CCEUBufType(dtype) << "*)" << addr << ", " << off << ", "
+                 << dist << ", " << mask;
     if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
       this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
     this->stream << ");\n";
@@ -1836,31 +1833,31 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   else if (op->op.same_as(tl::simd_vsstb())) {
     ICHECK_EQ(op->args.size(), 4);
     DataType dtype = op->args[0].dtype().element_of();
+    // Capture operands first so SSA temporaries (e.g. from reinterpret) are
+    // emitted on their own lines before the call statement.
+    std::string src = this->PrintExpr(op->args[0]);
+    std::string base = this->PrintExpr(op->args[1]);
+    std::string stride = this->PrintExpr(op->args[2]);
+    std::string mask = this->PrintExpr(op->args[3]);
     this->PrintIndent();
-    this->stream << "simd_inst::vsstb(";
-    PrintExpr(op->args[0], this->stream); // src
-    this->stream << ", (__ubuf__ " << CCEUBufType(dtype) << "*)";
-    PrintExpr(op->args[1], this->stream); // base
-    this->stream << ", ";
-    PrintExpr(op->args[2], this->stream); // stride
-    this->stream << ", ";
-    PrintExpr(op->args[3], this->stream); // mask
-    this->stream << ");\n";
+    this->stream << "simd_inst::vsstb(" << src << ", (__ubuf__ "
+                 << CCEUBufType(dtype) << "*)" << base << ", " << stride << ", "
+                 << mask << ");\n";
   }
   // --- SimdVF scatter-store: (src, base, index, mask) ---
   else if (op->op.same_as(tl::simd_vscatter())) {
     ICHECK_EQ(op->args.size(), 4);
     DataType dtype = op->args[0].dtype().element_of();
+    // Capture operands first so SSA temporaries (e.g. from reinterpret) are
+    // emitted on their own lines before the call statement.
+    std::string src = this->PrintExpr(op->args[0]);
+    std::string base = this->PrintExpr(op->args[1]);
+    std::string index = this->PrintExpr(op->args[2]);
+    std::string mask = this->PrintExpr(op->args[3]);
     this->PrintIndent();
-    this->stream << "simd_inst::vscatter(";
-    PrintExpr(op->args[0], this->stream); // src (data reg)
-    this->stream << ", (__ubuf__ " << CCEUBufType(dtype) << "*)";
-    PrintExpr(op->args[1], this->stream); // base
-    this->stream << ", ";
-    PrintExpr(op->args[2], this->stream); // index reg
-    this->stream << ", ";
-    PrintExpr(op->args[3], this->stream); // mask
-    this->stream << ");\n";
+    this->stream << "simd_inst::vscatter(" << src << ", (__ubuf__ "
+                 << CCEUBufType(dtype) << "*)" << base << ", " << index << ", "
+                 << mask << ");\n";
   }
   // --- SimdVF scalar-vector ops: (src, scalar, mask, mode) ---
   else if (op->op.same_as(tl::simd_vadds()) ||
