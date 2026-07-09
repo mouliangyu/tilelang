@@ -284,17 +284,32 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
   if (node->IsTask()) {
     auto task = static_cast<TaskNode *>(node);
 
-    // LetDecl tasks are always included in every warp group clone.
-    // Create a fresh variable copy so the two warp groups use different names.
     if (IsLetDeclTask(task)) {
       const auto *bind = task->stmt.as<BindNode>();
-      auto new_var = bind->var.copy_with_suffix("");
-      // Substitute previously renamed variables in the value expression.
+      // A LetDecl marked broadcast is replicated onto every warpgroup; give
+      // each clone a fresh variable so the two cores use independent names.
+      if (IsWarpgroupBroadcast(task->GetWarpgroupId())) {
+        auto new_var = bind->var.copy_with_suffix("");
+        // Substitute previously renamed variables in the value expression.
+        PrimExpr new_value = var_remap.empty()
+                                 ? bind->value
+                                 : Substitute(bind->value, var_remap);
+        var_remap.Set(bind->var, new_var);
+        auto new_task = std::make_shared<TaskNode>();
+        new_task->stmt = Bind(new_var, new_value);
+        CloneSchedulingMetadata(task, new_task.get(), warpgroup_id, var_remap);
+        return new_task;
+      }
+      // A LetDecl assigned a concrete warpgroup only lives on that core (the
+      // demand-lattice pass proved all its consumers are there), so filter it
+      // like a normal task and keep its original variable name — downstream
+      // consumers on this core reference that name and get no remap for it.
+      if (!node->containWarpgroupId(warpgroup_id))
+        return nullptr;
       PrimExpr new_value =
           var_remap.empty() ? bind->value : Substitute(bind->value, var_remap);
-      var_remap.Set(bind->var, new_var);
       auto new_task = std::make_shared<TaskNode>();
-      new_task->stmt = Bind(new_var, new_value);
+      new_task->stmt = Bind(bind->var, new_value);
       CloneSchedulingMetadata(task, new_task.get(), warpgroup_id, var_remap);
       return new_task;
     }

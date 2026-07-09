@@ -2263,6 +2263,20 @@ void CodeGenTileLangAscend::VisitStmt_(const ForNode *op) {
   CodeGenC::VisitStmt_(op);
 }
 
+void CodeGenTileLangAscend::VisitStmt_(const WhileNode *op) {
+  if (is_one(op->condition)) {
+    PrintIndent();
+    stream << "while (1) {\n";
+    int while_scope = BeginScope();
+    PrintStmt(op->body);
+    this->EndScope(while_scope);
+    PrintIndent();
+    stream << "}\n";
+    return;
+  }
+  CodeGenC::VisitStmt_(op);
+}
+
 void CodeGenTileLangAscend::VisitStmt_(const AttrStmtNode *op) {
   // Push tl.assume facts (e.g. `stride % N == 0`) into analyzer
   if (op->attr_key == tirx::attr::tilelang_assume) {

@@ -781,267 +781,164 @@ HasWarpgroupId(const std::vector<std::shared_ptr<IRStructure>> &nodes,
   return false;
 }
 
-// Collect register buffers read by all broadcast tasks in the IR tree.
-static void CollectBroadcastRegisterReads(
-    IRStructure *node, std::unordered_set<const BufferNode *> &reg_bufs) {
-  if (!node)
-    return;
-  auto collect_from_leaf_task = [&](const TaskNode *task) {
-    if (!task)
-      return;
-    int wg_id = task->GetWarpgroupId();
-    if (!IsWarpgroupBroadcast(wg_id) && wg_id != kWarpgroupUnassigned)
-      return;
-    for (const auto &region : task->GetReadRegions()) {
-      if (IsRegisterRegion(region)) {
-        reg_bufs.insert(region->buffer.get());
-      }
-    }
-  };
-  auto collect_from_structural_task = [&](const TaskNode *task) {
-    if (!task)
-      return;
-    for (const auto &region : task->GetReadRegions()) {
-      if (IsRegisterRegion(region)) {
-        reg_bufs.insert(region->buffer.get());
-      }
-    }
-  };
+// Per-value warpgroup demand bitmask: bit0 = needed on wg0 (AIV), bit1 = needed
+// on wg1 (AIC). A scalar/register value's demand is the union of the warpgroups
+// of everything that consumes it (directly, or transitively through scalar Let
+// chains and loop bounds / guard conditions).
+static constexpr uint8_t kDemandWg0 = 0b01;
+static constexpr uint8_t kDemandWg1 = 0b10;
+static constexpr uint8_t kDemandBoth = 0b11;
 
-  if (node->IsTask()) {
-    collect_from_leaf_task(static_cast<TaskNode *>(node));
-  } else if (node->IsControl()) {
-    auto ctrl = static_cast<ControlNode *>(node);
-    if (ctrl->task)
-      collect_from_structural_task(ctrl->task.get());
-    for (auto &child : ctrl->children) {
-      CollectBroadcastRegisterReads(child.get(), reg_bufs);
-    }
-  }
-}
-
-static void CollectBroadcastRegisterReads(
-    const std::vector<std::shared_ptr<IRStructure>> &nodes,
-    std::unordered_set<const BufferNode *> &reg_bufs) {
-  for (const auto &n : nodes) {
-    CollectBroadcastRegisterReads(n.get(), reg_bufs);
-  }
-}
-
-// Propagate broadcast: if a broadcast task reads a register buffer,
-// any leaf task that writes that register buffer must also be broadcast
-// (because each wg needs its own initialized copy).
-static void PropagateBroadcastWarpgroupId(
+// Assign every currently-broadcast scalar / LetDecl task to the warpgroup(s)
+// that actually consume its output.
+static void AssignScalarWarpgroupByDemand(
     const std::vector<std::shared_ptr<IRStructure>> &root) {
   std::vector<TaskNodeWithContext> all_tasks;
   CollectAllTaskNodesWithContext(root, all_tasks);
 
+  std::unordered_map<const VarNode *, uint8_t> var_demand;
+  std::unordered_map<const BufferNode *, uint8_t> buf_demand;
+
+  auto add_reads_demand = [&](const TaskNode *t, uint8_t mask) -> bool {
+    if (!mask)
+      return false;
+    bool grew = false;
+    for (const auto &v : t->GetReadVars()) {
+      uint8_t &d = var_demand[v.get()];
+      if ((d | mask) != d) {
+        d |= mask;
+        grew = true;
+      }
+    }
+    for (const auto &r : t->GetReadRegions()) {
+      if (!IsRegisterRegion(r))
+        continue;
+      uint8_t &d = buf_demand[r->buffer.get()];
+      if ((d | mask) != d) {
+        d |= mask;
+        grew = true;
+      }
+    }
+    return grew;
+  };
+  auto add_guard_demand = [&](const IRStructure *node, uint8_t mask) {
+    if (!mask)
+      return;
+    for (const auto &g : node->GetGuards()) {
+      if (g.is_assume)
+        continue;
+      for (const Var &v : UndefinedVars(g.expr))
+        var_demand[v.get()] |= mask;
+    }
+  };
+  // The warpgroup(s) a subtree's compute actually lands on: the union over its
+  // concretely-assigned (wg 0/1) descendant tasks. Unassigned / broadcast
+  // scalars are ignored here so they don't pollute the coverage (a broadcast
+  // node's containWarpgroupId is true for every id). A loop whose body has
+  // compute on both cores is replicated to both; a single-core loop only to
+  // one.
+  auto loop_body_coverage = [&](const IRStructure *node) -> uint8_t {
+    uint8_t mask = 0;
+    std::function<void(const IRStructure *)> walk = [&](const IRStructure *n) {
+      if (!n)
+        return;
+      if (n->IsTask()) {
+        int wg = static_cast<const TaskNode *>(n)->GetWarpgroupId();
+        if (wg == 0)
+          mask |= kDemandWg0;
+        else if (wg == 1)
+          mask |= kDemandWg1;
+      } else if (n->IsControl()) {
+        auto *c = static_cast<const ControlNode *>(n);
+        for (const auto &child : c->children)
+          walk(child.get());
+      }
+    };
+    walk(node);
+    return mask;
+  };
+
+  // Seed phase: each concretely-assigned compute/MTE task demands its reads on
+  // its own warpgroup; a still-broadcast task (true serves-both scalar, or an
+  // `m==0` task) demands on both. Loop headers and guards demand on whichever
+  // cores the enclosing structure runs.
+  std::function<void(const IRStructure *, uint8_t)> seed =
+      [&](const IRStructure *node, uint8_t enclosing) {
+        if (!node)
+          return;
+        if (node->IsTask()) {
+          const auto *t = static_cast<const TaskNode *>(node);
+          int wg = t->GetWarpgroupId();
+          uint8_t mask = (wg == 0)   ? kDemandWg0
+                         : (wg == 1) ? kDemandWg1
+                                     : enclosing; // broadcast / unassigned
+          // The task's guard runs on exactly the cores the task runs on.
+          add_guard_demand(t, mask);
+          add_reads_demand(t, mask);
+        } else if (node->IsControl()) {
+          auto *c = static_cast<const ControlNode *>(node);
+          uint8_t cover = loop_body_coverage(node);
+          // The loop's guard and header (bound: min/extent/step) are replicated
+          // to exactly the cores the body runs on.
+          add_guard_demand(c, cover);
+          if (c->task)
+            add_reads_demand(c->task.get(), cover);
+          for (const auto &child : c->children)
+            seed(child.get(), cover);
+        }
+      };
+  for (const auto &node : root)
+    seed(node.get(), kDemandBoth);
+
+  // Backward fixpoint: a scalar / LetDecl producer whose output is demanded on
+  // some cores demands its own (direct) reads on those same cores. Iterating to
+  // a fixpoint closes the demand over the whole producer chain
+  // (guard/extent <- advance <- init) and through scalar Let chains, so no
+  // precomputed indirect-read closure is needed here.
+  auto write_demand = [&](const TaskNode *t) -> uint8_t {
+    uint8_t mask = 0;
+    for (const auto &v : t->GetWriteVars()) {
+      auto it = var_demand.find(v.get());
+      if (it != var_demand.end())
+        mask |= it->second;
+    }
+    for (const auto &r : t->GetWriteRegions()) {
+      if (!IsRegisterRegion(r))
+        continue;
+      auto it = buf_demand.find(r->buffer.get());
+      if (it != buf_demand.end())
+        mask |= it->second;
+    }
+    return mask;
+  };
   bool changed = true;
   while (changed) {
     changed = false;
-    // 1. Collect register buffers read by all current broadcast tasks
-    std::unordered_set<const BufferNode *> broadcast_reg_reads;
-    CollectBroadcastRegisterReads(root, broadcast_reg_reads);
-    // Also collect from leaf broadcast tasks
     for (auto &task_ctx : all_tasks) {
-      TaskNode *task = task_ctx.task;
-      if (!IsWarpgroupBroadcast(task->GetWarpgroupId()))
+      TaskNode *t = task_ctx.task;
+      if (!t->UsesPipe(ResourcePipe::kScalar) && !IsLetDeclTask(t))
         continue;
-      for (const auto &region : task->GetReadRegions()) {
-        if (IsRegisterRegion(region)) {
-          broadcast_reg_reads.insert(region->buffer.get());
-        }
-      }
-    }
-    // 2. Mark leaf tasks that write these register buffers as broadcast
-    if (!broadcast_reg_reads.empty()) {
-      for (auto &task_ctx : all_tasks) {
-        TaskNode *task = task_ctx.task;
-        if (IsWarpgroupBroadcast(task->GetWarpgroupId()))
-          continue;
-        for (const auto &region : task->GetWriteRegions()) {
-          if (IsRegisterRegion(region) &&
-              broadcast_reg_reads.count(region->buffer.get())) {
-            task->SetWarpgroupId(kWarpgroupBroadcast);
-            changed = true;
-            break;
-          }
-        }
-      }
-    }
-
-    // 3. Detect cross-warpgroup register buffer / scalar-var accesses
-    constexpr int kReaderAnyWg = std::numeric_limits<int>::min();
-    std::unordered_map<const BufferNode *, std::unordered_set<int>>
-        buffer_reader_wgs;
-    std::unordered_map<const BufferNode *, std::unordered_set<int>>
-        buffer_writer_wgs;
-    std::unordered_map<const VarNode *, std::unordered_set<int>> var_reader_wgs;
-    std::unordered_map<const VarNode *, std::unordered_set<int>> var_writer_wgs;
-
-    auto add_accesses = [&](const TaskNode *task, int reader_key, int wg_id) {
-      for (const auto &region : task->GetReadRegions()) {
-        if (IsRegisterRegion(region)) {
-          buffer_reader_wgs[region->buffer.get()].insert(reader_key);
-        }
-      }
-      if (wg_id >= 0) {
-        for (const auto &region : task->GetWriteRegions()) {
-          if (IsRegisterRegion(region)) {
-            buffer_writer_wgs[region->buffer.get()].insert(wg_id);
-          }
-        }
-      }
-      for (const auto &v : task->GetReadVars()) {
-        var_reader_wgs[v.get()].insert(reader_key);
-      }
-      if (wg_id >= 0) {
-        for (const auto &v : task->GetWriteVars()) {
-          var_writer_wgs[v.get()].insert(wg_id);
-        }
-      }
-    };
-
-    for (auto &task_ctx : all_tasks) {
-      TaskNode *task = task_ctx.task;
-      int wg_id = task->GetWarpgroupId();
-      int reader_key = (wg_id >= 0) ? wg_id : kReaderAnyWg;
-      add_accesses(task, reader_key, wg_id);
-    }
-    // Also include structural tasks
-    std::function<void(IRStructure *)> walk_structural =
-        [&](IRStructure *node) {
-          if (!node)
-            return;
-          auto add_struct = [&](const TaskNode *t) {
-            if (!t)
-              return;
-            int wg = t->GetWarpgroupId();
-            int key = (wg >= 0) ? wg : kReaderAnyWg;
-            if (IsWarpgroupBroadcast(wg))
-              key = kReaderAnyWg;
-            add_accesses(t, key, -1);
-          };
-          if (node->IsControl()) {
-            auto *c = static_cast<ControlNode *>(node);
-            add_struct(c->task.get());
-            for (auto &child : c->children)
-              walk_structural(child.get());
-          }
-        };
-    for (const auto &node : root)
-      walk_structural(node.get());
-
-    std::unordered_set<const BufferNode *> cross_wg_buffers;
-    for (const auto &kv : buffer_reader_wgs) {
-      const auto *buf = kv.first;
-      const auto &reader_wgs = kv.second;
-      const auto &writer_wgs = buffer_writer_wgs[buf];
-      for (int rwg : reader_wgs) {
-        if (writer_wgs.find(rwg) == writer_wgs.end()) {
-          cross_wg_buffers.insert(buf);
-          break;
-        }
-      }
-    }
-
-    std::unordered_set<const VarNode *> cross_wg_vars;
-    for (const auto &kv : var_reader_wgs) {
-      const auto *v = kv.first;
-      const auto &reader_wgs = kv.second;
-      auto it_w = var_writer_wgs.find(v);
-      if (it_w == var_writer_wgs.end())
-        continue;
-      const auto &writer_wgs = it_w->second;
-      for (int rwg : reader_wgs) {
-        if (writer_wgs.find(rwg) == writer_wgs.end()) {
-          cross_wg_vars.insert(v);
-          break;
-        }
-      }
-    }
-
-    if (!cross_wg_buffers.empty() || !cross_wg_vars.empty()) {
-      for (auto &task_ctx : all_tasks) {
-        TaskNode *task = task_ctx.task;
-        if (IsWarpgroupBroadcast(task->GetWarpgroupId()))
-          continue;
-        bool should_broadcast = false;
-        for (const auto &region : task->GetWriteRegions()) {
-          if (IsRegisterRegion(region) &&
-              cross_wg_buffers.count(region->buffer.get())) {
-            should_broadcast = true;
-            break;
-          }
-        }
-        if (!should_broadcast) {
-          for (const auto &v : task->GetWriteVars()) {
-            if (cross_wg_vars.count(v.get())) {
-              should_broadcast = true;
-              break;
-            }
-          }
-        }
-        if (should_broadcast) {
-          task->SetWarpgroupId(kWarpgroupBroadcast);
-          changed = true;
-        }
-      }
+      uint8_t mask = write_demand(t);
+      if (add_reads_demand(t, mask))
+        changed = true;
     }
   }
-}
 
-// Resolve scalar tasks to a concrete warpgroup just before barrier insertion.
-static void ResolveScalarWarpgroupId(
-    const std::vector<std::shared_ptr<IRStructure>> &root) {
-  std::vector<TaskNodeWithContext> all_tasks;
-  CollectAllTaskNodesWithContext(root, all_tasks);
-
-  // Collect buffers touched by each side's non-broadcast tasks.
-  std::unordered_set<const BufferNode *> cube_bufs, vec_bufs;
-  for (auto &task_ctx : all_tasks) {
-    TaskNode *t = task_ctx.task;
-    int wg = t->GetWarpgroupId();
-    if (IsWarpgroupBroadcast(wg) || wg == kWarpgroupUnassigned)
-      continue;
-    auto &dst = (wg == 1) ? cube_bufs : vec_bufs;
-    for (auto &r : t->GetIndirectReadRegions())
-      dst.insert(r->buffer.get());
-    for (auto &r : t->GetWriteRegions())
-      dst.insert(r->buffer.get());
-  }
-
+  // Write-back phase: place each broadcast scalar / LetDecl into its consumer
+  // warpgroup union. A value with no consumer keeps broadcast (harmless: a dead
+  // LetDecl is DCE'd per warpgroup, a dead store is a no-op on both).
   for (auto &task_ctx : all_tasks) {
     TaskNode *t = task_ctx.task;
     if (!IsWarpgroupBroadcast(t->GetWarpgroupId()))
       continue;
-    if (!t->UsesPipe(ResourcePipe::kScalar))
+    if (!t->UsesPipe(ResourcePipe::kScalar) && !IsLetDeclTask(t))
       continue;
-
-    bool serves_cube = false, serves_aiv = false;
-    auto check = [&](const std::vector<BufferRegion> &regions) {
-      for (auto &r : regions) {
-        if (cube_bufs.count(r->buffer.get()))
-          serves_cube = true;
-        if (vec_bufs.count(r->buffer.get()))
-          serves_aiv = true;
-        if (IsL1Buffer(r->buffer) || IsL0ABuffer(r->buffer) ||
-            IsL0BBuffer(r->buffer) || IsL0CBuffer(r->buffer))
-          serves_cube = true;
-        if (IsSharedBuffer(r->buffer))
-          serves_aiv = true;
-      }
-    };
-    check(t->GetIndirectReadRegions());
-    check(t->GetWriteRegions());
-
-    if (serves_cube && serves_aiv) {
-      // Cross-core scalar: leave as broadcast (both sides need a copy).
-    } else if (serves_cube) {
-      t->SetWarpgroupId(1);
-    } else {
+    uint8_t mask = write_demand(t);
+    if (mask == kDemandWg0)
       t->SetWarpgroupId(0);
-    }
+    else if (mask == kDemandWg1)
+      t->SetWarpgroupId(1);
+    // kDemandBoth or 0: leave broadcast.
   }
 }
 
@@ -1194,15 +1091,52 @@ static ScheduledKernelResult ScheduleSingleKernel(
         // set_copy_pad_value runs on the vector core (AIV).
         t->SetWarpgroupId(0);
       } else if (t->UsesPipe(ResourcePipe::kScalar) || m == 0) {
-        t->SetWarpgroupId(kWarpgroupBroadcast);
+        // A scalar / mask-0 task issues on the S pipe, but its warpgroup is
+        // still fixed by the on-chip memory it touches: UB is AIV-side (wg0),
+        // L1/L0A/L0B/L0C are AIC-side (wg1).
+        bool touches_ub = false, touches_cube = false;
+        auto scan = [&](const Array<BufferRegion> &regions) {
+          for (auto &r : regions) {
+            if (IsSharedBuffer(r->buffer))
+              touches_ub = true;
+            else if (IsL1Buffer(r->buffer) || IsL0ABuffer(r->buffer) ||
+                     IsL0BBuffer(r->buffer) || IsL0CBuffer(r->buffer))
+              touches_cube = true;
+          }
+        };
+        scan(t->GetReadRegions());
+        scan(t->GetWriteRegions());
+        if (touches_ub && !touches_cube) {
+          t->SetWarpgroupId(0);
+        } else if (touches_cube && !touches_ub) {
+          t->SetWarpgroupId(1);
+        } else {
+          t->SetWarpgroupId(kWarpgroupBroadcast);
+        }
+      }
+    }
+
+    // A scalar-only kernel (no task landed on a concrete Cube/Vector/MTE
+    // warpgroup) has no AIC side.
+    bool has_concrete_wg = false;
+    for (auto &task_ctx : all_tasks) {
+      int wg = task_ctx.task->GetWarpgroupId();
+      if (wg == 0 || wg == 1) {
+        has_concrete_wg = true;
+        break;
+      }
+    }
+    if (!has_concrete_wg) {
+      for (auto &task_ctx : all_tasks) {
+        task_ctx.task->SetWarpgroupId(0);
       }
     }
   }
 
-  // Propagate broadcast warpgroup IDs for register buffers accessed
-  // across warp groups.
-  PropagateBroadcastWarpgroupId(ir_structure);
-  ResolveScalarWarpgroupId(ir_structure);
+  // Assign each broadcast scalar / LetDecl to the warpgroup(s) that consume its
+  // output (a {0}/{1}/{0,1} demand lattice); values needed on both cores stay
+  // broadcast, one-sided values are demoted to their single consumer core.
+  AssignScalarWarpgroupByDemand(ir_structure);
 
   EventIdMap event_id_map;
   FlagInfoList flag_infos;

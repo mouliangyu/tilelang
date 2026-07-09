@@ -282,7 +282,7 @@ public:
     }
 
     // Multi-buffer eligible set from AnnotateMultiBufferEligible pass.
-    // The pass runs before IfConditionExtract and records on the For loop
+    // The pass runs before AutoSchedule and records on the For loop
     // which on-chip buffers are safe to multi-buffer (written before any
     // read inside the loop, not referenced outside).
     std::set<const VarNode *> eligible_storage_set;

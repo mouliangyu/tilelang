@@ -218,6 +218,11 @@ from .meta import (
 from .tile_schedule import (
     BaseTileScheduler,  # noqa: F401
     PersistentTileScheduler,  # noqa: F401
+    AscendBaseTileScheduler,  # noqa: F401
+    AscendTileScheduler,  # noqa: F401
+    AscendBatchedTileScheduler,  # noqa: F401
+    AscendMGroupedTileScheduler,  # noqa: F401
+    AscendKGroupedTileScheduler,  # noqa: F401
 )
 
 

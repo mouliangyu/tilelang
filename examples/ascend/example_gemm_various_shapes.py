@@ -165,61 +165,12 @@ def gemm(M_DIM, N_DIM, K_DIM):
     M_TILES = M_DIM // TILE_M
     N_TILES = N_DIM // TILE_N
     K_TILES = K_DIM // TILE_K
-    OUT_TILES = M_TILES * N_TILES
     TILE_N_HALF = TILE_N // 2
 
     # DeepGEMM l2_ctrl strategy
     l2_ctrl_a = "NOTALLOC_KEEP" if N_TILES <= 2 and M_TILES > N_TILES else "NORMAL_FV"
     l2_ctrl_b = "NOTALLOC_KEEP" if M_TILES <= 2 and N_TILES > M_TILES else "NORMAL_FV"
     l2_ctrl_d = "NOTALLOC_CLEAN"
-
-    # DeepGEMM scheduler constants
-    GROUP_M = 4
-    GROUP_N = 32 // GROUP_M
-    N_GROUPS = N_TILES // GROUP_N
-    TILES_PER_SUPERROW = GROUP_M * N_TILES
-    FULL_TILES = N_GROUPS * 32
-    TAIL_M_START = M_TILES - (M_TILES % GROUP_M) if M_TILES >= GROUP_M else 0
-    TAIL_START = TAIL_M_START * N_TILES
-    XOR_N = True
-    SNAKE = True
-
-    @T.macro
-    def aswt_swizzle(tile_idx):
-        """Map tile index to (m_tile, n_tile) matching DeepGEMM scheduler."""
-        m_tile = T.alloc_var("int32")
-        n_tile = T.alloc_var("int32")
-        if M_TILES < GROUP_M:
-            m_tile = tile_idx // N_TILES
-            n_tile = tile_idx % N_TILES
-        else:
-            if tile_idx >= TAIL_START:
-                tail = tile_idx - TAIL_START
-                m_tile = TAIL_M_START + tail // N_TILES
-                n_tile = tail % N_TILES
-            else:
-                superrow = tile_idx // TILES_PER_SUPERROW
-                within = tile_idx - superrow * TILES_PER_SUPERROW
-                if within < FULL_TILES:
-                    grp = within // 32
-                    local = within - grp * 32
-                    m_local = local % GROUP_M
-                    n_local = local // GROUP_M ^ (m_local if XOR_N else 0)
-                    if SNAKE:
-                        if superrow % 2 == 1:
-                            m_tile = superrow * GROUP_M + m_local
-                            n_tile = (N_GROUPS - 1 - grp) * GROUP_N + n_local
-                        else:
-                            m_tile = superrow * GROUP_M + m_local
-                            n_tile = grp * GROUP_N + n_local
-                    else:
-                        m_tile = superrow * GROUP_M + m_local
-                        n_tile = grp * GROUP_N + n_local
-                else:
-                    rem_within = within - FULL_TILES
-                    m_tile = superrow * GROUP_M + (rem_within % GROUP_M)
-                    n_tile = N_GROUPS * GROUP_N + (rem_within // GROUP_M)
-        return m_tile, n_tile
 
     @T.prim_func
     def main(
@@ -239,8 +190,10 @@ def gemm(M_DIM, N_DIM, K_DIM):
                 temp1 = T.alloc_shared((TILE_M // 2, TILE_N_HALF), "float32")
                 T.annotate_buffer_versions({a: NUM_STAGES, b0: NUM_STAGES, b1: NUM_STAGES})
 
-                for tile_idx in T.Persistent([OUT_TILES], NUM_BLOCKS, bx):
-                    m_tile, n_tile = aswt_swizzle(tile_idx)
+                sched = T.AscendTileScheduler("sched", block_m=TILE_M, block_n=TILE_N, num_cores=NUM_BLOCKS, shape_m=M_DIM, shape_n=N_DIM)
+                sched.init(bx)
+                while sched.valid():
+                    m_tile, n_tile = sched.m_idx[0], sched.n_idx[0]
                     for kt in T.Pipelined(K_TILES, num_stages=NUM_STAGES):
                         T.copy(A[m_tile * TILE_M : (m_tile + 1) * TILE_M, kt * TILE_K : (kt + 1) * TILE_K], a, l2_cache_ctrl=l2_ctrl_a)
                         T.copy(
@@ -265,6 +218,7 @@ def gemm(M_DIM, N_DIM, K_DIM):
                         D[m_tile * TILE_M : (m_tile + 1) * TILE_M, n_tile * TILE_N + TILE_N_HALF : (n_tile + 1) * TILE_N],
                         l2_cache_ctrl=l2_ctrl_d,
                     )
+                    sched.next_block()
             else:
                 # Full-N kernel: single W tile, single L0C accumulator
                 b = T.alloc_l1((TILE_N, TILE_K), "bfloat16")
@@ -272,8 +226,10 @@ def gemm(M_DIM, N_DIM, K_DIM):
                 temp = T.alloc_shared((TILE_M // 2, TILE_N), "float32")
                 T.annotate_buffer_versions({a: NUM_STAGES, b: NUM_STAGES})
 
-                for tile_idx in T.Persistent([OUT_TILES], NUM_BLOCKS, bx):
-                    m_tile, n_tile = aswt_swizzle(tile_idx)
+                sched = T.AscendTileScheduler("sched", block_m=TILE_M, block_n=TILE_N, num_cores=NUM_BLOCKS, shape_m=M_DIM, shape_n=N_DIM)
+                sched.init(bx)
+                while sched.valid():
+                    m_tile, n_tile = sched.m_idx[0], sched.n_idx[0]
                     for kt in T.Pipelined(K_TILES, num_stages=NUM_STAGES):
                         T.copy(A[m_tile * TILE_M : (m_tile + 1) * TILE_M, kt * TILE_K : (kt + 1) * TILE_K], a, l2_cache_ctrl=l2_ctrl_a)
                         T.copy(B[n_tile * TILE_N : (n_tile + 1) * TILE_N, kt * TILE_K : (kt + 1) * TILE_K], b, l2_cache_ctrl=l2_ctrl_b)
@@ -282,6 +238,7 @@ def gemm(M_DIM, N_DIM, K_DIM):
                     T.dual_copy(
                         temp, D[m_tile * TILE_M : (m_tile + 1) * TILE_M, n_tile * TILE_N : (n_tile + 1) * TILE_N], l2_cache_ctrl=l2_ctrl_d
                     )
+                    sched.next_block()
 
     return main
 

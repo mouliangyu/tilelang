@@ -4,10 +4,11 @@
  *        buffers can be multi-buffered and record the set on the For's
  *        annotations under "multi_buffer_eligible".
  *
- *  Runs before IfConditionExtract. IfConditionExtract only extracts complex
- *  if conditions into Bind variables; it keeps the if-then-else intact, so the
- *  ordering is not strictly required for correctness, but we keep this pass
- *  first to operate on the untouched frontend structure.
+ *  Runs after NormalizeControlFlowForSchedule (which rewrites `while` loops
+ *  into bounded serial for loops and hoists complex if conditions into Bind
+ *  variables). Operating after that rewrite lets this pass mark buffers inside
+ * a former while body as multi-buffer eligible; the hoisted Bind conditions
+ * keep the if-then-else intact so the write-first analysis is unaffected.
  *
  *  A buffer is eligible inside For L iff
  *    1) it lives in on-chip memory (shared / shared.l1 / shared.l0c, including

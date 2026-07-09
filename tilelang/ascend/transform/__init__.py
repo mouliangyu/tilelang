@@ -8,9 +8,20 @@ from .hoist_simd_pairs import HoistSimdPairs  # noqa: F401
 from .normalize_mixed_kernel_sid import NormalizeMixedKernelSid  # noqa: F401
 
 
-def IfConditionExtract():
-    """Extract if condition to LetStmt variables."""
-    return _ffi_api.IfConditionExtract()  # type: ignore
+def NormalizeControlFlowForSchedule():
+    """Normalize control flow ahead of AutoSchedule.
+
+    Rewrites each ``while cond: BODY`` into a bounded serial ``for`` loop
+    (tagged ``synthetic_while``) so AutoSchedule can pipeline the body, then
+    extracts complex ``if`` conditions into temporary ``Bind`` variables.
+    :func:`RestoreWhileLoops` undoes the while-rewrite after scheduling.
+    """
+    return _ffi_api.NormalizeControlFlowForSchedule()  # type: ignore
+
+
+def RestoreWhileLoops():
+    """Rewrite ``synthetic_while``-tagged for loops back into ``while(true)``."""
+    return _ffi_api.RestoreWhileLoops()  # type: ignore
 
 
 def AnnotateMultiBufferEligible():
@@ -62,9 +73,10 @@ __all__ = [
     "AscendSimdVFLowerParallel",
     "AutoSchedule",
     "HoistSimdPairs",
-    "IfConditionExtract",
     "MarkScalarDcacheBypass",
     "MergeUBAllocations",
+    "NormalizeControlFlowForSchedule",
     "NormalizeMixedKernelSid",
     "NormalizeNoConflictHints",
+    "RestoreWhileLoops",
 ]

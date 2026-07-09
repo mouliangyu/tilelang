@@ -17,6 +17,7 @@ public:
   void PrintCCEVectorSuffix(DataType t, std::ostream &os);
   void VisitStmt_(const SBlockNode *op) final;
   void VisitStmt_(const ForNode *op) final;
+  void VisitStmt_(const WhileNode *op) final;
   void VisitStmt_(const AttrStmtNode *op) final;
   void VisitStmt_(const AllocBufferNode *op) final;
   void VisitStmt_(const BindNode *op) final;
