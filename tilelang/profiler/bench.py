@@ -391,7 +391,7 @@ def _bench_with_msprof(
     def _nop_trace_ready(_prof):
         pass
 
-    def _parse_ffts_profile(prof_path: Path):
+    def _parse_ffts_profile(prof_path: Path, n_repeat: int):
         hash_to_name: dict[int, str] = {}
         for f in prof_path.rglob("*hash_dic.slice_*"):
             if f.name.endswith(".done"):
@@ -459,15 +459,15 @@ def _bench_with_msprof(
             n_aic = len(aic_list) or 1
             n_aiv = len(aiv_list) or 1
             profiles[name] = KernelProfile(
-                dur_ns=sum(m["dur_ns"] for m in dur_list) / len(dur_list),
-                aic_total_cycles=int(sum(m["total_cycles"] for m in aic_list) / n_aic),
+                dur_ns=sum(m["dur_ns"] for m in dur_list) / n_repeat,
+                aic_total_cycles=int(sum(m["total_cycles"] for m in aic_list) / n_repeat),
                 aic_mad=sum(m["mad"] for m in aic_list) / n_aic,
                 aic_scalar=sum(m["scalar"] for m in aic_list) / n_aic,
                 aic_mte1=sum(m["mte1"] for m in aic_list) / n_aic,
                 aic_mte2=sum(m["mte2"] for m in aic_list) / n_aic,
                 aic_mte3=sum(m["mte3"] for m in aic_list) / n_aic,
                 aic_fixpipe=sum(m["fixpipe"] for m in aic_list) / n_aic,
-                aiv_total_cycles=int(sum(m["total_cycles"] for m in aiv_list) / n_aiv),
+                aiv_total_cycles=int(sum(m["total_cycles"] for m in aiv_list) / n_repeat),
                 aiv_vec=sum(m["vec"] for m in aiv_list) / n_aiv,
                 aiv_scalar=sum(m["scalar"] for m in aiv_list) / n_aiv,
                 aiv_mte2=sum(m["mte2"] for m in aiv_list) / n_aiv,
@@ -504,7 +504,7 @@ def _bench_with_msprof(
             torch.npu.synchronize()
             prof.step()
 
-        kernel_profiles = _parse_ffts_profile(Path(prof.prof_if.prof_path))
+        kernel_profiles = _parse_ffts_profile(Path(prof.prof_if.prof_path), n_repeat)
 
     kernel_profiles = {name: profile for name, profile in kernel_profiles.items() if "_tilelang_profiler_cache_flush_kernel" not in name}
     if not kernel_profiles:
