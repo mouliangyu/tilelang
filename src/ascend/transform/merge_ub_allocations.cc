@@ -447,6 +447,7 @@ private:
       ICHECK_GE(call->args.size(), 1U);
       if (auto *str_imm = call->args[0].as<StringImmNode>())
         e.hard_event = str_imm->value; // store pipe name in hard_event
+      e.wg_id = current_wg_;
       linear_events.push_back(e);
       return true;
     }
@@ -486,6 +487,46 @@ private:
   std::vector<const Object *> scope_stack_; // generic scope tracking
   std::vector<const ForNode *> loop_stack_; // active For loops
 };
+
+// Coalesce runs of consecutive buffer-access events into fewer events to keep
+// the happens-before instance count (and the unroll budget) small.
+static std::vector<LinearEvent>
+CoalesceBufferAccessRuns(const std::vector<LinearEvent> &events) {
+  std::vector<LinearEvent> out;
+  out.reserve(events.size());
+  // Within the current run: buffer var → index in `out` of its access node.
+  std::unordered_map<const VarNode *, int> run_nodes;
+  int run_wg = -2; // sentinel distinct from any real wg_id (incl. -1)
+  auto reset_run = [&]() {
+    run_nodes.clear();
+    run_wg = -2;
+  };
+  for (const LinearEvent &ev : events) {
+    if (ev.kind != EventKind::kBufferAccess) {
+      // Any non-access event (sync / barrier / scope marker) ends the run.
+      reset_run();
+      out.push_back(ev);
+      continue;
+    }
+    if (ev.wg_id != run_wg)
+      reset_run();
+    run_wg = ev.wg_id;
+    // Each access event touches exactly one buffer (see SyncAwareLinearizer).
+    ICHECK_EQ(ev.touched.size(), 1U);
+    const VarNode *buf = ev.touched[0];
+    bool w = !ev.is_write.empty() && ev.is_write[0];
+    auto it = run_nodes.find(buf);
+    if (it == run_nodes.end()) {
+      run_nodes[buf] = static_cast<int>(out.size());
+      out.push_back(ev);
+    } else if (w) {
+      LinearEvent &dst = out[it->second];
+      if (!dst.is_write.empty())
+        dst.is_write[0] = true;
+    }
+  }
+  return out;
+}
 
 // Pipeline Unroller
 
@@ -1405,6 +1446,16 @@ private:
              k == EventKind::kPipeBarrier || k == EventKind::kCrossCoreSet ||
              k == EventKind::kCrossCoreWait;
     };
+    auto is_release = [&](int idx) {
+      EventKind k = instances[idx].kind;
+      return k == EventKind::kSetFlag || k == EventKind::kCrossCoreSet ||
+             k == EventKind::kPipeBarrier;
+    };
+    auto is_acquire = [&](int idx) {
+      EventKind k = instances[idx].kind;
+      return k == EventKind::kWaitFlag || k == EventKind::kCrossCoreWait ||
+             k == EventKind::kPipeBarrier;
+    };
 
     // Group by (unrolled_iter, wg_id) so wiring never crosses the AIC/AIV
     // boundary. std::map keeps a deterministic group iteration order.
@@ -1429,23 +1480,27 @@ private:
         prev_sync = idx;
       }
 
-      // 2) Each access ← nearest preceding sync (within this core).
+      // 2) Each access ← nearest preceding *acquire* sync (within this core).
+      // A wait/barrier acquires: accesses after it happen-after the paired set.
       prev_sync = -1;
       for (int idx : nodes) {
-        if (is_sync(idx)) {
+        if (is_acquire(idx)) {
           prev_sync = idx;
-        } else if (prev_sync != -1) {
+        } else if (!is_sync(idx) && prev_sync != -1) {
           AddEdge(prev_sync, idx);
         }
       }
 
-      // 3) Each access → nearest following sync (within this core).
+      // 3) Each access → nearest following *release* sync (within this core).
+      // A set/barrier releases: accesses before it happen-before the paired
+      // wait. A wait_flag does NOT release, so an access does not become
+      // ordered merely because a wait follows it.
       int next_sync = -1;
       for (auto it = nodes.rbegin(); it != nodes.rend(); ++it) {
         int idx = *it;
-        if (is_sync(idx)) {
+        if (is_release(idx)) {
           next_sync = idx;
-        } else if (next_sync != -1) {
+        } else if (!is_sync(idx) && next_sync != -1) {
           AddEdge(idx, next_sync);
         }
       }
@@ -1551,10 +1606,29 @@ private:
     for (auto &kv : buckets) {
       const SyncKey &key = kv.first;
       auto &eps = kv.second;
-      std::sort(
-          eps.begin(), eps.end(), [this](const Endpoint &a, const Endpoint &b) {
-            return instances[a.idx].linear_idx < instances[b.idx].linear_idx;
-          });
+      // Order endpoints by (unrolled_iter, linear_idx, node_id). unrolled_iter
+      // MUST be the primary key: positional pairing below wires the k-th set on
+      // a track to the k-th wait, so both tracks have to enumerate iterations
+      // in lockstep. linear_idx alone is NOT enough — it is the source
+      // LinearEvent index and is identical across every unrolled iteration of
+      // the same event, so a loop-invariant (constant) cross-core flag id
+      // issued inside a software-pipelined loop drops every iteration's
+      // set/wait into this one bucket with equal linear_idx. std::sort is not
+      // stable, so without the unrolled_iter key different iterations'
+      // instances interleave nondeterministically and pair_across can wire
+      // iteration 2's set to iteration 0's wait, fabricating a cross-core
+      // happens-before the hardware never guarantees. node_id is the final
+      // tiebreak for full determinism.
+      std::sort(eps.begin(), eps.end(),
+                [this](const Endpoint &a, const Endpoint &b) {
+                  const EventInstance &ia = instances[a.idx];
+                  const EventInstance &ib = instances[b.idx];
+                  if (ia.unrolled_iter != ib.unrolled_iter)
+                    return ia.unrolled_iter < ib.unrolled_iter;
+                  if (ia.linear_idx != ib.linear_idx)
+                    return ia.linear_idx < ib.linear_idx;
+                  return ia.node_id < ib.node_id;
+                });
 
       if (key.is_cross_core) {
         auto collect = [&](int wg, bool is_set) {
@@ -1615,27 +1689,36 @@ private:
         barriers_by_iter[instances[i].unrolled_iter].push_back(i);
     }
 
+    // A pipe_barrier is a PER-CORE pipe fence: it orders only the instruction
+    // stream of the core that issued it. On a Mix kernel the AIC (wg=1) and AIV
+    // (wg=0) streams execute concurrently, so a barrier on one core must NOT be
+    // wired to the other core's nodes (that would fabricate an intra-core
+    // happens-before across the AIC/AIV boundary). We therefore only connect a
+    // barrier to instances sharing its wg_id. A wg_id == -1 barrier
+    // (single-core / non-Mix kernel, where the core is undetermined) connects
+    // all wg_id == -1 nodes, reproducing the previous behavior.
     for (auto &kv : barriers_by_iter) {
       int u = kv.first;
       for (int b_node : kv.second) {
         int b_linear = instances[b_node].linear_idx;
+        int b_wg = instances[b_node].wg_id;
 
-        // All nodes before the barrier in this iteration → barrier.
+        // All nodes before the barrier in this iteration (same core) → barrier.
         for (int i = 0; i < N; ++i) {
-          if (instances[i].unrolled_iter == u &&
+          if (instances[i].wg_id == b_wg && instances[i].unrolled_iter == u &&
               instances[i].linear_idx < b_linear)
             AddEdge(i, b_node);
         }
-        // Barrier → all nodes after the barrier in this iteration.
+        // Barrier → all nodes after the barrier in this iteration (same core).
         for (int i = 0; i < N; ++i) {
-          if (instances[i].unrolled_iter == u &&
+          if (instances[i].wg_id == b_wg && instances[i].unrolled_iter == u &&
               instances[i].linear_idx > b_linear)
             AddEdge(b_node, i);
         }
 
-        // Barrier → all nodes in the next unrolled iteration.
+        // Barrier → all nodes in the next unrolled iteration (same core).
         for (int i = 0; i < N; ++i) {
-          if (instances[i].unrolled_iter == u + 1)
+          if (instances[i].wg_id == b_wg && instances[i].unrolled_iter == u + 1)
             AddEdge(b_node, i);
         }
       }
@@ -1655,28 +1738,45 @@ private:
     // used only in head iterations look disjoint from one used only in tail
     // iterations — and thus falsely reusable — even though both are live
     // across the whole loop (e.g. double-buffered K/V in flash-attention).
-    std::unordered_map<int, std::vector<int>> nodes_by_iter;
-    for (int i = 0; i < N; ++i)
-      nodes_by_iter[instances[i].unrolled_iter].push_back(i);
+    //
+    // Loop-carried ordering is PER CORE. On a Mix kernel the AIC (wg=1) and AIV
+    // (wg=0) loops are independent parallel sequences that each number their
+    // iterations 0,1,2,… in the same unrolled_iter space. Wiring "iter u → iter
+    // u+1" across all wg_ids would fabricate a cross-core happens-before (AIC's
+    // iteration k appearing to precede AIV's iteration k+1) that the hardware
+    // never guarantees — the only legitimate AIC↔AIV ordering is a CrossCore
+    // set→wait pair (added in AddSyncEdges). So we group by (wg_id,
+    // unrolled_iter) and add iteration edges only within a single core. wg_id
+    // == -1 (single-core / non-Mix) keeps its own group, reproducing prior
+    // behavior.
+    std::unordered_map<int, std::map<int, std::vector<int>>> nodes_by_core_iter;
+    std::unordered_map<int, std::map<int, int>> phys_by_core_iter;
+    for (int i = 0; i < N; ++i) {
+      int wg = instances[i].wg_id;
+      int u = instances[i].unrolled_iter;
+      nodes_by_core_iter[wg][u].push_back(i);
+      phys_by_core_iter[wg][u] = instances[i].physical_iter;
+    }
 
-    // Determine the physical iteration for each unrolled iteration.
-    std::unordered_map<int, int> phys_for_unrolled;
-    for (int i = 0; i < N; ++i)
-      phys_for_unrolled[instances[i].unrolled_iter] =
-          instances[i].physical_iter;
-
-    for (int u = 0; u < static_cast<int>(nodes_by_iter.size()); ++u) {
-      if (!nodes_by_iter.count(u) || !nodes_by_iter.count(u + 1))
-        continue;
-      int phys_u = phys_for_unrolled[u];
-      int phys_next = phys_for_unrolled[u + 1];
-      // Add the edge whenever the later unrolled iteration is a later physical
-      // iteration (monotonic progression through the loop).
-      if (phys_next <= phys_u)
-        continue;
-      for (int a : nodes_by_iter[u])
-        for (int b : nodes_by_iter[u + 1])
-          AddEdge(a, b);
+    for (auto &core_kv : nodes_by_core_iter) {
+      int wg = core_kv.first;
+      auto &nodes_by_iter = core_kv.second;
+      auto &phys_for_unrolled = phys_by_core_iter[wg];
+      for (const auto &it_kv : nodes_by_iter) {
+        int u = it_kv.first;
+        auto next = nodes_by_iter.find(u + 1);
+        if (next == nodes_by_iter.end())
+          continue;
+        int phys_u = phys_for_unrolled[u];
+        int phys_next = phys_for_unrolled[u + 1];
+        // Add the edge whenever the later unrolled iteration is a later
+        // physical iteration (monotonic progression through the loop).
+        if (phys_next <= phys_u)
+          continue;
+        for (int a : it_kv.second)
+          for (int b : next->second)
+            AddEdge(a, b);
+      }
     }
   }
 
@@ -1826,21 +1926,14 @@ public:
     // (i.e. a reaches b).  If any pair is unordered, A and B have
     // overlapping lifetimes and must share an SCC instead.
     //
-    // Cross-core caveat: on a Mix kernel the happens-before closure mixes
-    // per-core program order, intra-core sync, loop-carried edges, and
-    // CrossCore set→wait pairings. Loop-carried transitive closure can
-    // manufacture a *false* one-way separation between two buffers whose
-    // live ranges actually overlap when the witnessing ordering hops across
-    // the AIC/AIV boundary (observed: a loop-invariant AIC buffer read every
-    // iteration appearing to strictly precede a per-iteration buffer written
-    // on AIV). We therefore only trust a reuse edge whose lifetime separation
-    // is witnessed *without* relying on a cross-core hop — i.e. every access
-    // pair must be ordered AND the ordering must not require crossing cores.
-    // Buffers whose separation is only cross-core fall back to the same SCC
-    // (no reuse), which is the safe answer. This is the robust form of
-    // "reuse only within a proven CrossCore set→wait range": a same-core
-    // ordering is directly provable, whereas a cross-core one laundered
-    // through loop-carried closure is not.
+    // Cross-core ordering is trustworthy here: all *structural* edges
+    // (program order, pipe_barrier, loop-carried) are built strictly per-core
+    // (see AddProgramOrderEdges / AddPipeBarrierEdges / AddLoopCarriedEdges),
+    // so the only way reachability crosses the AIC/AIV boundary is through a
+    // genuine CrossCore set→wait pairing (AddSyncEdges). A cross-core-witnessed
+    // separation therefore reflects a real hardware handshake — e.g. the
+    // serialized dual_copy staging buffers in a Cube+Vector kernel, where AIV
+    // signals "buf_a consumed" before AIC writes buf_b — and is honored.
     adj.assign(num_buffers, std::vector<bool>(num_buffers, false));
 
     // For each buffer, collect the set of pipelined (multi-iteration) loop ids
@@ -1880,22 +1973,17 @@ public:
         if (share_pipelined_loop(a, b))
           continue;
         bool edge = true;
-        bool any_cross = false;
         for (int na : all_nodes[a]) {
           for (int nb : all_nodes[b]) {
             if (na >= hb.N || nb >= hb.N || !hb.reachable[na][nb]) {
               edge = false;
               break;
             }
-            int wa = hb.instances[na].wg_id;
-            int wb = hb.instances[nb].wg_id;
-            if (wa != -1 && wb != -1 && wa != wb)
-              any_cross = true;
           }
           if (!edge)
             break;
         }
-        if (edge && !any_cross)
+        if (edge)
           adj[a][b] = true;
       }
     }
@@ -2192,9 +2280,14 @@ public:
     SyncAwareLinearizer linearizer(target_scope_);
     linearizer(stmt);
 
+    // Step 1b: Coalesce sync-free runs of buffer accesses into single events to
+    // keep the happens-before instance count (and the unroll budget) small.
+    std::vector<LinearEvent> events =
+        CoalesceBufferAccessRuns(linearizer.linear_events);
+
     // Step 2: Build happens-before graph.
     HappensBeforeGraph hb;
-    hb.Build(linearizer.linear_events);
+    hb.Build(events);
 
     // Step 3: Build buffer DAG and compute SCCs.
     BufferDAG buf_dag;
