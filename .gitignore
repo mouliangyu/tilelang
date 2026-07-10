@@ -136,3 +136,5 @@ uv.lock
 
 # cann-sim
 .cannsim_work/
+
+measure_vf_latency.py

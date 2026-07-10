@@ -55,6 +55,7 @@
 #include <utility>
 #include <vector>
 
+#include "ascend/transform/auto_schedule/ir_structure.h"
 #include "auto_schedule.h"
 #include "backend/common/target_utils.h"
 #include "op/builtin.h"
@@ -938,7 +939,9 @@ static void AssignScalarWarpgroupByDemand(
       t->SetWarpgroupId(0);
     else if (mask == kDemandWg1)
       t->SetWarpgroupId(1);
-    // kDemandBoth or 0: leave broadcast.
+    else if (mask == 0)
+      t->SetWarpgroupId(kWarpgroupUnassigned);
+    // kDemandBoth: leave broadcast.
   }
 }
 
@@ -1115,28 +1118,31 @@ static ScheduledKernelResult ScheduleSingleKernel(
         }
       }
     }
-
-    // A scalar-only kernel (no task landed on a concrete Cube/Vector/MTE
-    // warpgroup) has no AIC side.
-    bool has_concrete_wg = false;
-    for (auto &task_ctx : all_tasks) {
-      int wg = task_ctx.task->GetWarpgroupId();
-      if (wg == 0 || wg == 1) {
-        has_concrete_wg = true;
-        break;
-      }
-    }
-    if (!has_concrete_wg) {
-      for (auto &task_ctx : all_tasks) {
-        task_ctx.task->SetWarpgroupId(0);
-      }
-    }
   }
 
   // Assign each broadcast scalar / LetDecl to the warpgroup(s) that consume its
   // output (a {0}/{1}/{0,1} demand lattice); values needed on both cores stay
   // broadcast, one-sided values are demoted to their single consumer core.
   AssignScalarWarpgroupByDemand(ir_structure);
+
+  // Fallback: pin every unresolved task to a single core: AIC if the kernel has
+  // any concrete Cube-side (wg1) work, otherwise AIV.
+  {
+    std::vector<TaskNodeWithContext> all_tasks;
+    CollectAllTaskNodesWithContext(ir_structure, all_tasks);
+    std::vector<TaskNode *> unresolved;
+    bool has_cube_wg = false;
+    for (auto &task_ctx : all_tasks) {
+      int wg = task_ctx.task->GetWarpgroupId();
+      if (wg == 1)
+        has_cube_wg = true;
+      else if (wg == kWarpgroupUnassigned)
+        unresolved.push_back(task_ctx.task);
+    }
+    int fallback_wg = has_cube_wg ? 1 : 0;
+    for (auto *t : unresolved)
+      t->SetWarpgroupId(fallback_wg);
+  }
 
   EventIdMap event_id_map;
   FlagInfoList flag_infos;
