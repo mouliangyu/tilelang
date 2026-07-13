@@ -75,7 +75,7 @@ struct ascend_nd2nz_scatter_impl<
       __ubuf__ T *dstPtr = dst_nz_ub + pass * (ROWS + 1) * VL_T;
       __ubuf__ T *srcBase = src_ub + pass * VL_T;
       for (int r = 0; r < ROWS; ++r) {
-        auto reg = V::vld(srcBase + r * COLS, NORM);
+        auto reg = V::vlds(srcBase + r * COLS, 0, NORM);
         V::vsstb(reg, dstPtr, STRIDE, mask, POST_UPDATE);
       }
       ++pass;
@@ -103,7 +103,7 @@ struct ascend_nd2nz_scatter_impl<ROWS, COLS, float, bfloat16_t,
       __ubuf__ bfloat16_t *dstPtr = dst_nz_ub + pass * (ROWS + 1) * 64;
       __ubuf__ float *srcBase = src_ub + pass * 64;
       for (int r = 0; r < ROWS; ++r) {
-        auto srcReg = V::vld(srcBase + r * COLS, NORM);
+        auto srcReg = V::vlds(srcBase + r * COLS, 0, NORM);
         auto castReg = V::vcvt<bfloat16_t>(srcReg, f32Mask, ROUND_R, RS_DISABLE,
                                            PART_EVEN, MODE_ZEROING);
         auto packReg = V::vpack<uint16_t>((V::vec_t<uint32_t> &)castReg, LOWER);
@@ -147,7 +147,7 @@ struct ascend_nd2nz_scatter_impl<ROWS, COLS, bfloat16_t, float,
       __ubuf__ float *dstPtr1 = dstPtr0 + (ROWS + 1) * 64;
 
       for (int r = 0; r < ROWS; ++r) {
-        auto src = V::vld(src_ub + r * COLS + pass * 128, NORM);
+        auto src = V::vlds(src_ub + r * COLS + pass * 128, 0, NORM);
         auto dst_lo = V::vcvt<float>(src, bf16Mask, PART_EVEN, MODE_ZEROING);
         auto dst_hi = V::vcvt<float>(src, bf16Mask, PART_ODD, MODE_ZEROING);
         auto [dst_half0, dst_half1] = V::vintlv(dst_lo, dst_hi);

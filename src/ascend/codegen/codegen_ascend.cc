@@ -1787,8 +1787,10 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     DataType elem = op->dtype.element_of();
     std::string dist = Downcast<StringImm>(op->args[1])->value;
     bool has_off = (op->args.size() == 3);
-    os << "simd_inst::vld<" << CCEUBufType(elem) << ">((" << "__ubuf__"
-       << " " << CCEUBufType(elem) << "*)";
+    // Prefer vlds with a zero scalar offset to support
+    // E2B_B32/UNPK_B32/UNPK4_B8
+    os << "simd_inst::vlds<" << CCEUBufType(elem) << ">((" << "__ubuf__" << " "
+       << CCEUBufType(elem) << "*)";
     PrintExpr(op->args[0], os); // addr
     os << ", ";
     if (has_off) {
@@ -1796,7 +1798,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       PrintExpr(op->args[2], os);
       os << "), " << dist;
     } else {
-      os << dist;
+      os << "0, " << dist;
     }
     os << ")";
   }

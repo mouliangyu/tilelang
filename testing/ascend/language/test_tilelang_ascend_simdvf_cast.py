@@ -85,18 +85,18 @@ def cast_kernel(n: int, in_dtype: T.dtype, out_dtype: T.dtype):
                     mask_b16 = T.simd.pset(16)
                     if out_dtype == BF16:
                         for i in range(n // 64):
-                            x = T.simd.vld(x_ub[i * 64], dist="UNPK4_B8", off=0)
+                            x = T.simd.vld(x_ub[i * 64], dist="UNPK4_B8")
                             y = T.simd.vcvt(x, out_dtype, mask_b16)
                             T.simd.vsts(y_ub[i * 64], y, mask_b16, dist="PK_B32")
                 elif is_fp8_in:
                     if out_dtype == F32:
                         for i in range(n // 64):
-                            x = T.simd.vld(x_ub[i * 64], dist="UNPK4_B8", off=0)
+                            x = T.simd.vld(x_ub[i * 64], dist="UNPK4_B8")
                             y = T.simd.vcvt(x, "float32", mask_f32)
                             T.simd.vsts(y_ub[i * 64], y, mask_f32)
                     elif out_dtype in F16_TYPES:
                         for i in range(n // 64):
-                            x = T.simd.vld(x_ub[i * 64], dist="UNPK4_B8", off=0)
+                            x = T.simd.vld(x_ub[i * 64], dist="UNPK4_B8")
                             y_f32 = T.simd.vcvt(x, "float32", mask_f32)
                             y = T.simd.vcvt(y_f32, out_dtype, mask_f32)
                             T.simd.vsts(y_ub[i * 64], y, mask_f32, dist="PK_B32")
@@ -125,7 +125,7 @@ def cast_kernel(n: int, in_dtype: T.dtype, out_dtype: T.dtype):
                             T.simd.vsts(y_ub[i * 64], y, mask_b16, dist="PK4_B32")
                 elif in_dtype == INT8 and out_dtype == INT16:
                     for i in range(n // 64):
-                        x = T.simd.vld(x_ub[i * 64], dist="UNPK4_B8", off=0)
+                        x = T.simd.vld(x_ub[i * 64], dist="UNPK4_B8")
                         y = T.simd.vcvt(x, "int16", mask_f32)
                         T.simd.vsts(y_ub[i * 64], y, mask_f32, dist="PK_B32")
 

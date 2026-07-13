@@ -100,17 +100,11 @@ template <> struct widen_vec<vector_u16> {
 
 template <typename SrcVec> using widen_vec_t = typename widen_vec<SrcVec>::type;
 
-template <typename T, typename Dist>
-__simd_callee__ inline vec_t<T> vld(__ubuf__ T *src, Dist dist) {
-  vec_t<T> dst;
-  ::vld(dst, src, dist);
-  return dst;
-}
-
 template <typename T, typename Offset, typename Dist>
-__simd_callee__ inline vec_t<T> vld(__ubuf__ T *src, Offset offset, Dist dist) {
+__simd_callee__ inline vec_t<T> vlds(__ubuf__ T *src, Offset offset,
+                                     Dist dist) {
   vec_t<T> dst;
-  ::vld(dst, src, offset, dist);
+  ::vlds(dst, src, offset, dist);
   return dst;
 }
 
