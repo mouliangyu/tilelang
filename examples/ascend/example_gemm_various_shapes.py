@@ -193,7 +193,7 @@ def gemm(M_DIM, N_DIM, K_DIM):
                 sched = T.AscendTileScheduler("sched", block_m=TILE_M, block_n=TILE_N, num_cores=NUM_BLOCKS, shape_m=M_DIM, shape_n=N_DIM)
                 sched.init(bx)
                 while sched.valid():
-                    m_tile, n_tile = sched.m_idx[0], sched.n_idx[0]
+                    m_tile, n_tile = sched.m_idx, sched.n_idx
                     for kt in T.Pipelined(K_TILES, num_stages=NUM_STAGES):
                         T.copy(A[m_tile * TILE_M : (m_tile + 1) * TILE_M, kt * TILE_K : (kt + 1) * TILE_K], a, l2_cache_ctrl=l2_ctrl_a)
                         T.copy(
@@ -229,7 +229,7 @@ def gemm(M_DIM, N_DIM, K_DIM):
                 sched = T.AscendTileScheduler("sched", block_m=TILE_M, block_n=TILE_N, num_cores=NUM_BLOCKS, shape_m=M_DIM, shape_n=N_DIM)
                 sched.init(bx)
                 while sched.valid():
-                    m_tile, n_tile = sched.m_idx[0], sched.n_idx[0]
+                    m_tile, n_tile = sched.m_idx, sched.n_idx
                     for kt in T.Pipelined(K_TILES, num_stages=NUM_STAGES):
                         T.copy(A[m_tile * TILE_M : (m_tile + 1) * TILE_M, kt * TILE_K : (kt + 1) * TILE_K], a, l2_cache_ctrl=l2_ctrl_a)
                         T.copy(B[n_tile * TILE_N : (n_tile + 1) * TILE_N, kt * TILE_K : (kt + 1) * TILE_K], b, l2_cache_ctrl=l2_ctrl_b)

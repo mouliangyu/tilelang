@@ -11,6 +11,7 @@
 #include <tvm/s_tir/stmt.h>
 #include <tvm/tirx/index_map.h>
 #include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
 
 #include <cmath>
 #include <cstdint>
@@ -701,7 +702,15 @@ void CodeGenTileLangCUDA::VisitStmt_(const tirx::ForNode *op) {
   stream << ' ' << vid << " = " << start << "; " << vid << " < " << extent
          << "; ++" << vid << ") {\n";
   int for_scope = BeginScope();
-  PrintStmt(op->body);
+  // A lexical_alloc_scope spanning the entire loop body is redundant with
+  // the loop's own braces; unwrap it to avoid emitting `{ {`.
+  Stmt body = op->body;
+  while (const auto *attr = body.as<AttrStmtNode>()) {
+    if (attr->attr_key != tl::attr::kLexicalAllocScope)
+      break;
+    body = attr->body;
+  }
+  PrintStmt(body);
   this->EndScope(for_scope);
   PrintIndent();
   stream << "}\n";
@@ -1535,6 +1544,47 @@ void CodeGenTileLangCUDA::VisitExpr_(const CastNode *op, std::ostream &os) {
   std::string cast_round = get_str_anno("round");
   bool cast_sat = get_bool_anno("sat", true);
   Optional<PrimExpr> cast_rbits = get_expr_anno("rbits");
+
+  // Scalar fp8 <-> half via the __tl_cvt helpers; the default cast detours
+  // through fp32.
+  if (from_ty.is_scalar() && cast_round.empty() && target_ty.is_float16() &&
+      tl::IsCudaVectorizableFP8(from_ty)) {
+    bool is_e4m3 = from_ty.is_float8_e4m3() || from_ty.is_float8_e4m3fn();
+    std::string interp = is_e4m3 ? "__NV_E4M3" : "__NV_E5M2";
+    os << "half_t(__tl_cvt_fp8_to_half((" << PrintExpr(op->value) << ").raw(), "
+       << interp << "))";
+    return;
+  }
+
+  if (from_ty.is_scalar() && cast_round.empty() && from_ty.is_float16() &&
+      tl::IsCudaVectorizableFP8(target_ty)) {
+    bool is_e4m3 = target_ty.is_float8_e4m3() || target_ty.is_float8_e4m3fn();
+    std::string interp = is_e4m3 ? "__NV_E4M3" : "__NV_E5M2";
+    this->PrintType(target_ty, os);
+    os << "::bitcast(__tl_cvt_half_to_fp8((" << PrintExpr(op->value)
+       << ").to_half(), " << interp << "))";
+    return;
+  }
+
+  // Scalar fp8 <-> bfloat16: same idea, via the native/PTX helpers.
+  if (from_ty.is_scalar() && cast_round.empty() && target_ty.is_bfloat16() &&
+      tl::IsCudaVectorizableFP8(from_ty)) {
+    bool is_e4m3 = from_ty.is_float8_e4m3() || from_ty.is_float8_e4m3fn();
+    std::string interp = is_e4m3 ? "__NV_E4M3" : "__NV_E5M2";
+    os << "bfloat16_t(__tl_cvt_fp8_to_bfloat16((" << PrintExpr(op->value)
+       << ").raw(), " << interp << "))";
+    return;
+  }
+
+  if (from_ty.is_scalar() && cast_round.empty() && from_ty.is_bfloat16() &&
+      tl::IsCudaVectorizableFP8(target_ty)) {
+    bool is_e4m3 = target_ty.is_float8_e4m3() || target_ty.is_float8_e4m3fn();
+    std::string interp = is_e4m3 ? "__NV_E4M3" : "__NV_E5M2";
+    this->PrintType(target_ty, os);
+    os << "::bitcast(__tl_cvt_bfloat16_to_fp8((" << PrintExpr(op->value)
+       << ").to_nv_bfloat16(), " << interp << "))";
+    return;
+  }
 
   // Emit simple C-style type conversion for scalar casts without custom
   // rounding.
@@ -4503,18 +4553,19 @@ bool CodeGenTileLangCUDA::HandleLateIntrinsicCall(const CallNode *op,
     return true;
   } else if (op->op.same_as(tl::rng_init())) {
     this->need_curand_kernel_h_ = true;
-    this->curand_random_generator_state =
-        name_supply_->FreshName("__random_generator_state");
+    auto it = rng_state_name_map_.find(op);
+    ICHECK(it != rng_state_name_map_.end())
+        << "tl.rng_init call was not registered by the AddFunction pre-scan";
+    this->curand_random_generator_state = it->second;
     this->curand_random_generator_state_type =
         op->args[3].as<StringImmNode>()->value;
-    this->PrintIndent();
-    this->stream << op->args[3].as<StringImmNode>()->value << " "
-                 << this->curand_random_generator_state << ";\n";
     this->PrintIndent();
     this->stream << "curand_init(" << PrintExpr(op->args[0]) << ", "
                  << PrintExpr(op->args[1]) << ", " << PrintExpr(op->args[2])
                  << ", &" << this->curand_random_generator_state << ");\n";
-    // State var is used later by rng_rand / rng_rand_float.
+    // The state var is declared at function scope (see AddFunction) so it
+    // stays visible to rng_rand / rng_rand_float even when passes split the
+    // enclosing block across __syncthreads() barriers.
     return true;
   } else if (op->op.same_as(tl::rng_rand())) {
     this->need_curand_kernel_h_ = true;
@@ -5829,6 +5880,22 @@ void CodeGenTileLangCUDA::AddFunction(const GlobalVar &gvar,
     stream << ' ' << vid;
   }
   stream << ") {\n";
+  // Declare curand states for all tl.rng_init calls at function scope.
+  // Sync-insertion passes may split the block containing rng_init across
+  // __syncthreads(), so a declaration emitted at the call site can go out
+  // of scope before later rng_rand / rng_rand_float uses.
+  rng_state_name_map_.clear();
+  tirx::PostOrderVisit(f->body, [this](const ObjectRef &n) {
+    const auto *call = n.as<CallNode>();
+    if (call == nullptr || !call->op.same_as(tl::rng_init())) {
+      return;
+    }
+    this->need_curand_kernel_h_ = true;
+    std::string name = name_supply_->FreshName("__random_generator_state");
+    this->stream << "  " << call->args[3].as<StringImmNode>()->value << " "
+                 << name << ";\n";
+    rng_state_name_map_.emplace(call, std::move(name));
+  });
   this->PreFunctionBody(f);
   int func_scope = this->BeginScope();
   this->PrintStmt(f->body);

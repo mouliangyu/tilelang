@@ -97,6 +97,7 @@ def do_bench(
     backend: Literal["event", "cupti", "cudagraph", "msprof", "msprof_detail"] = "event",
     return_mode: Literal["min", "max", "mean", "median"] = "mean",
     device: int | torch.device | None = None,
+    cache_size: int = 256,
 ) -> float | list[float]:
     """Benchmark the runtime of a PyTorch function with L2 cache management.
 
@@ -116,6 +117,9 @@ def do_bench(
         fast_flush: Use faster L2 cache flush with int32 vs int8 (default: True)
         backend: Profiler backend - "event", "cupti", "cudagraph", or "msprof" (default: "event")
         return_mode: Result aggregation method - "mean", "median", "min", or "max"
+        device: Optional device to benchmark on (ignored on the Ascend NPU path,
+            which uses the current device).
+        cache_size: L2 cache flush buffer size in MB (default: 256)
 
     Returns:
         Runtime in milliseconds (float) or list of quantile values if quantiles specified
@@ -128,11 +132,12 @@ def do_bench(
     fn()
     device_synchronize()
 
-    # Create L2 cache flush buffer (256 MB)
+    # Create L2 cache flush buffer (`cache_size` MB)
     # Fast flush uses int32 (4 bytes), regular uses int8 (1 byte)
-    cache_size = int(256e6 // 4) if fast_flush else int(256e6)
+    cache_bytes = cache_size * 1024 * 1024
+    cache_numel = cache_bytes // 4 if fast_flush else cache_bytes
     cache_dtype = torch.int if fast_flush else torch.int8
-    cache = torch.empty(cache_size, dtype=cache_dtype, device=device)
+    cache = torch.empty(cache_numel, dtype=cache_dtype, device=device)
 
     # Estimate kernel runtime with 5 iterations
     start_event = Event(enable_timing=True)
