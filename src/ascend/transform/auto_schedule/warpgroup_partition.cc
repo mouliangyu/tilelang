@@ -53,7 +53,6 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -363,122 +362,12 @@ CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
   return nullptr;
 }
 
-// Dead LetDecl elimination on a single warpgroup subtree
-
-namespace {
-
-bool IsRemovableScalarDecl(const IRStructure *node, Var *defined_var) {
-  if (!node->IsTask())
-    return false;
-  const auto *task = static_cast<const TaskNode *>(node);
-  // Flat LetDecl: removable iff its value has no write side effect
-  if (const auto *bind = task->stmt.as<BindNode>()) {
-    if (SideEffect(bind->value) >= CallEffectKind::kUpdateState)
-      return false;
-    *defined_var = bind->var;
-    return true;
-  }
-  // Guard-lowered scalar: BufferStore into a local.var buffer.
-  if (const auto *store = task->stmt.as<BufferStoreNode>()) {
-    if (store->buffer.scope() != "local.var")
-      return false;
-    if (SideEffect(store->value) >= CallEffectKind::kUpdateState)
-      return false;
-    *defined_var = store->buffer->data;
-    return true;
-  }
-  return false;
-}
-
-// Collect every variable a node reads
-void CollectNodeReads(const IRStructure *node,
-                      std::unordered_set<const VarNode *> *reads) {
-  if (node->IsTask()) {
-    const auto *task = static_cast<const TaskNode *>(node);
-    if (task->stmt.defined()) {
-      for (const Var &v : UndefinedVars(task->stmt, {}))
-        reads->insert(v.get());
-    }
-  }
-  for (const Guard &g : node->GetGuards()) {
-    for (const Var &v : UndefinedVars(g.expr))
-      reads->insert(v.get());
-  }
-}
-
-// Recursively gather (node, defined_var) for every removable scalar decl, and
-// seed `live` with the reads of every non-removable (root) node.
-void GatherDeclsAndSeeds(const std::vector<std::shared_ptr<IRStructure>> &nodes,
-                         std::vector<std::pair<IRStructure *, Var>> *decls,
-                         std::unordered_set<const VarNode *> *live) {
-  for (const auto &child : nodes) {
-    IRStructure *node = child.get();
-    Var def;
-    if (IsRemovableScalarDecl(node, &def)) {
-      decls->emplace_back(node, def);
-      // A removable decl's own reads are added only once it is proven live.
-    } else {
-      CollectNodeReads(node, live);
-    }
-    if (node->IsControl()) {
-      // The loop var / bounds and guards of the control node are roots.
-      auto *ctrl = static_cast<ControlNode *>(node);
-      if (ctrl->task)
-        CollectNodeReads(ctrl->task.get(), live);
-      GatherDeclsAndSeeds(ctrl->children, decls, live);
-    }
-  }
-}
-
-// Drop removable decls whose defined var is not in `live`.
-void DropDeadDecls(std::vector<std::shared_ptr<IRStructure>> *nodes,
-                   const std::unordered_set<const VarNode *> &live) {
-  std::vector<std::shared_ptr<IRStructure>> kept;
-  for (auto &child : *nodes) {
-    IRStructure *node = child.get();
-    Var def;
-    if (IsRemovableScalarDecl(node, &def) && !live.count(def.get())) {
-      continue; // dead: drop
-    }
-    if (node->IsControl()) {
-      auto *ctrl = static_cast<ControlNode *>(node);
-      DropDeadDecls(&ctrl->children, live);
-    }
-    kept.push_back(std::move(child));
-  }
-  *nodes = std::move(kept);
-}
-
-} // namespace
-
-// Eliminate dead LetDecl / local.var-store nodes from a warpgroup subtree.
-void PruneDeadLetDecls(std::vector<std::shared_ptr<IRStructure>> &nodes) {
-  std::vector<std::pair<IRStructure *, Var>> decls;
-  std::unordered_set<const VarNode *> live;
-  GatherDeclsAndSeeds(nodes, &decls, &live);
-
-  // Fixpoint: a decl proven live contributes its own reads, which may keep
-  // another decl alive.
-  bool changed = true;
-  while (changed) {
-    size_t before = live.size();
-    for (auto &[node, def] : decls) {
-      if (live.count(def.get()))
-        CollectNodeReads(node, &live);
-    }
-    changed = live.size() != before;
-  }
-
-  DropDeadDecls(&nodes, live);
-}
-
 // Entry point overload — creates a fresh var_remap and filters the root list.
 std::vector<std::shared_ptr<IRStructure>> CloneIRStructureWithWarpgroupFilter(
     const std::vector<std::shared_ptr<IRStructure>> &root, int warpgroup_id) {
   Map<Var, PrimExpr> var_remap;
   auto cloned =
       CloneIRStructureListWithWarpgroupFilter(root, warpgroup_id, var_remap);
-  PruneDeadLetDecls(cloned);
   return cloned;
 }
 
