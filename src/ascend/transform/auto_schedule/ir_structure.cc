@@ -24,6 +24,7 @@
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/container/array.h>
+#include <tvm/ffi/extra/structural_hash.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
@@ -326,77 +327,44 @@ bool RegionsMayConflict(const TaskNode *a_task, const BufferRegion &a_region,
   const size_t ndim = a_rng.size();
 
   arith::Analyzer ana;
-  ana.z3_prover.SetRLimit(100000);
+  ana.z3_prover.SetRLimit(50000);
   Map<Var, PrimExpr> a_sub, b_sub;
+  ConstrSet a_ctx = a_task ? a_task->outer_ctx : ConstrSet();
+  ConstrSet b_ctx = b_task ? b_task->outer_ctx : ConstrSet();
   ConstrSet loop_ctx;
-  // Only the innermost loop (loop_stack.back()) is treated as cross-iteration:
-  // the consumer runs a later iteration of that loop while all outer loops are
-  // held fixed (shared var). Outer-loop reuse is analyzed at those outer
-  // levels.
-  const size_t last = loop_stack.empty() ? 0 : loop_stack.size() - 1;
-  for (size_t k = 0; k < loop_stack.size(); ++k) {
-    const ForNode *fn = loop_stack[k].get();
-    Var lv = fn->loop_var;
-    // A loop that never executes carries no dependency, so we may assume its
-    // body runs (extent > 0).
-    loop_ctx.AddConstr(fn->extent > make_const(fn->extent.dtype(), 0));
-    if (!cross || k < last) {
-      Var lv_s(lv->name_hint + "_s", lv.dtype());
-      loop_ctx.AddConstr(lv_s, Range::FromMinExtent(fn->min, fn->extent));
-      a_sub.Set(lv, lv_s);
-      b_sub.Set(lv, lv_s);
-    } else {
-      // Loop back-edge: consumer runs d>=1 iterations after the producer.
-      Var lv_p(lv->name_hint + "_p", lv.dtype());
-      Var lv_c(lv->name_hint + "_c", lv.dtype());
-      loop_ctx.AddConstr(lv_p, Range::FromMinExtent(fn->min, fn->extent));
-      loop_ctx.AddConstr(lv_c, Range::FromMinExtent(fn->min, fn->extent));
-      loop_ctx.AddConstr(lv_c > lv_p);
-      a_sub.Set(lv, lv_p);
-      b_sub.Set(lv, lv_c);
-    }
+  if (cross && !loop_stack.empty()) {
+    Var inner_lv = loop_stack.back()->loop_var;
+    a_ctx = a_ctx.RenameFrom("_p", a_sub, inner_lv);
+    b_ctx = b_ctx.RenameFrom("_c", b_sub, inner_lv);
+    if (a_sub.count(inner_lv) && b_sub.count(inner_lv))
+      loop_ctx.AddConstr(b_sub[inner_lv] > a_sub[inner_lv]);
   }
-  loop_ctx.Populate(ana);
-  auto rename_bindings = [](const TaskNode *task, const char *suffix,
-                            Map<Var, PrimExpr> &sub) {
-    if (!task)
-      return;
-    for (const auto &c : task->outer_ctx.constrs_) {
-      if (c.kind == Constr::kBindValue || c.kind == Constr::kBindRange) {
-        const Var &v = c.var;
-        if (!sub.count(v)) {
-          sub.Set(v, Var(v->name_hint + suffix, v.dtype()));
-        }
-      }
-    }
-  };
-  rename_bindings(a_task, "_p", a_sub);
-  rename_bindings(b_task, "_c", b_sub);
-  if (a_task) {
-    a_task->outer_ctx.Substitute(a_sub).Populate(ana);
-  }
-  if (b_task) {
-    b_task->outer_ctx.Substitute(b_sub).Populate(ana);
-  }
+  loop_ctx.Merge(a_ctx).Merge(b_ctx).Populate(ana);
 
+  // Freshen mutable reads (BufferLoads etc.) that appear INLINE in the region
+  // bounds, per side: a read written verbatim in both bounds is not provably
+  // equal across the two access points (a store may sit between them), so it
+  // must become an independent unknown on each side.
+  FreshenMutableReads freshen_a, freshen_b;
+
+  PrimExpr any_dim_disjoint = Bool(false);
   for (size_t i = 0; i < ndim; ++i) {
-    PrimExpr a_min = Substitute(a_rng[i]->min, a_sub);
-    PrimExpr a_max = Substitute(a_rng[i]->min + a_rng[i]->extent - 1, a_sub);
-    PrimExpr b_min = Substitute(b_rng[i]->min, b_sub);
-    PrimExpr b_max = Substitute(b_rng[i]->min + b_rng[i]->extent - 1, b_sub);
-    try {
-      a_min = ana.Simplify(a_min);
-      a_max = ana.Simplify(a_max);
-      b_min = ana.Simplify(b_min);
-      b_max = ana.Simplify(b_max);
-      if (ana.CanProve(a_max < b_min || b_max < a_min)) {
-        return false; // disjoint on this dim ⇒ regions disjoint
-      }
-    } catch (...) {
-      // conservative — treat this dim as non-disjoint
-    }
+    PrimExpr a_min = freshen_a(Substitute(a_rng[i]->min, a_sub));
+    PrimExpr a_max =
+        freshen_a(Substitute(a_rng[i]->min + a_rng[i]->extent - 1, a_sub));
+    PrimExpr b_min = freshen_b(Substitute(b_rng[i]->min, b_sub));
+    PrimExpr b_max =
+        freshen_b(Substitute(b_rng[i]->min + b_rng[i]->extent - 1, b_sub));
+    any_dim_disjoint = any_dim_disjoint || (a_max < b_min) || (b_max < a_min);
   }
-  return true; // no dim proved disjoint ⇒ conservatively overlap
+  any_dim_disjoint = ana.Simplify(any_dim_disjoint);
+  // Raw Z3 as a fallback catches the infeasible-context case that Analyzer's
+  // constant-fold short-circuit misses.
+  if (ana.CanProve(any_dim_disjoint) ||
+      ana.z3_prover.CanProve(any_dim_disjoint)) {
+    return false;
+  }
+  return true;
 }
 
 std::vector<DepInfo>

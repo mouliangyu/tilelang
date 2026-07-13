@@ -1455,21 +1455,26 @@ private:
     PrimExpr lhs_max = analyzer.Simplify(lhs.touched[0].max());
     PrimExpr rhs_min = analyzer.Simplify(rhs.touched[0].min());
     PrimExpr rhs_max = analyzer.Simplify(rhs.touched[0].max());
+    Map<Var, PrimExpr> prev_sub, curr_sub;
     for (unsigned idx = 0; idx != 3; ++idx) {
       auto &info = thread_vars[idx];
       Var old_prev_var = lhs.threads[lhs.threads.size() + idx - 3]->var;
       Var old_curr_var = rhs.threads[rhs.threads.size() + idx - 3]->var;
-      Var prev_var(info.name_prev, old_prev_var.dtype());
-      Var curr_var(info.name_curr, old_curr_var.dtype());
-      lhs_min = Substitute(lhs_min, {{old_prev_var, prev_var}});
-      lhs_max = Substitute(lhs_max, {{old_prev_var, prev_var}});
-      prev_cset = prev_cset.Substitute({{old_prev_var, prev_var}});
-      rhs_min = Substitute(rhs_min, {{old_curr_var, curr_var}});
-      rhs_max = Substitute(rhs_max, {{old_curr_var, curr_var}});
-      curr_cset = curr_cset.Substitute({{old_curr_var, curr_var}});
+      prev_sub.Set(old_prev_var, Var(info.name_prev, old_prev_var.dtype()));
+      curr_sub.Set(old_curr_var, Var(info.name_curr, old_curr_var.dtype()));
     }
-    prev_cset.Populate(analyzer);
-    curr_cset.Populate(analyzer);
+    lhs_min = Substitute(lhs_min, prev_sub);
+    lhs_max = Substitute(lhs_max, prev_sub);
+    rhs_min = Substitute(rhs_min, curr_sub);
+    rhs_max = Substitute(rhs_max, curr_sub);
+    // Lower both sides' constraints to predicates (ToConstraints) before
+    // merging: the two access points may bind the same let var to different
+    // per-side values, and binding predicates (rather than analyzer Binds)
+    // lets those coexist without a conflicting re-bind. Populate once.
+    prev_cset.Substitute(prev_sub)
+        .ToConstraints()
+        .Merge(curr_cset.Substitute(curr_sub).ToConstraints())
+        .Populate(analyzer);
 
     if (analyzer.CanProve(lhs_max < rhs_min,
                           arith::ProofStrength::kSymbolicBound)) {
@@ -1773,8 +1778,15 @@ private:
       if (!same_access_type) {
         analyzer.EnterConstraint(thread_condition);
       }
-      prev_cset.Substitute(prev_sub).Populate(analyzer);
-      curr_cset.Substitute(curr_sub).Populate(analyzer);
+      // Lower to predicates before merging: the analyzer already Binds the loop
+      // var to an adjusted range above, and each cset also carries the loop var
+      // (full range) plus possibly-shared per-side let binds; predicates
+      // coexist with that external Bind without a conflicting re-bind. Populate
+      // once.
+      prev_cset.Substitute(prev_sub)
+          .ToConstraints()
+          .Merge(curr_cset.Substitute(curr_sub).ToConstraints())
+          .Populate(analyzer);
       bool provably_disjoint = false;
 
       prev_indice_bytes =

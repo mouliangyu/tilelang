@@ -304,12 +304,6 @@ protected:
   // tilelang_assume, branch guards) the region was written under.
   void StampCtx(TaskNode *task) { task->outer_ctx = GetConstrSet(); }
 
-  void VisitStmt_(const SeqStmtNode *op) override {
-    for (size_t i = 0; i < op->seq.size(); i++) {
-      VisitStmt(op->seq[i]);
-    }
-  }
-
   void VisitStmt_(const ForNode *op) override {
     // Determine if this is a sequential or parallel for
     if (op->kind == ForKind::kSerial) {
@@ -331,8 +325,9 @@ protected:
 
       // Process the loop body inside the loop scope (push loop_var range).
       {
-        auto guard =
+        auto guard_1 =
             MakeGuard(op->loop_var, Range::FromMinExtent(op->min, op->extent));
+        auto guard_2 = MakeGuard(op->extent > 0);
         control_node->children = BuildList(op->body);
       }
 

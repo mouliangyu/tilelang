@@ -42,14 +42,16 @@ struct ParallelLoopVerifier : public ConstrVisitor {
       return;
     }
     ConstrSet cset{constr_stack_};
-    std::vector<Var> other_thread_vars_;
     Map<Var, PrimExpr> subs;
-    for (const auto &var : parallel_loop_vars_) {
-      Var v_other_thread(var->name_hint + "<OTHER>", var->dtype);
-      other_thread_vars_.push_back(v_other_thread);
-      subs.Set(var, v_other_thread);
-    }
-    cset.Extend(cset.Substitute(subs));
+    // Rename the other thread's binds starting from the OUTERMOST parallel loop
+    // var (RenameFrom pivot): binds defined before it are outside all thread
+    // parallelism → thread-invariant → stay shared; binds inside the parallel
+    // region (the parallel loop vars themselves, and any let in the body) may
+    // differ per thread and are renamed. `subs` is filled with those renames,
+    // so the index/value substitutions below see the other thread's vars.
+    if (!parallel_loop_vars_.empty())
+      cset = cset.Merge(
+          cset.RenameFrom("<OTHER>", subs, parallel_loop_vars_.front()));
     for (const auto &idx : op->indices) {
       cset.AddConstr(idx == tirx::Substitute(idx, subs));
     }
