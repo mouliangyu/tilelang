@@ -125,18 +125,18 @@ ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
  * \tparam N           Tile N dimension
  * \tparam TILE_K_SUB  Sub-K chunk size that fits in L0A/L0B
  * \tparam TRANS_B     Whether B is transposed
- * \tparam SF_LOAD_INTERVAL  Multi-load factor for SF tiles per K chunk
+ * \tparam SF_NZ_STRIDE  NZ stride in SF L1 buffer (int16 element count in
  * \tparam InT         Input element type (float8_e4m3_t, etc.)
  * \tparam SFT         Scale factor L1 storage type (int16_t: 2× float8_e8m0
  *                     packed per element, one pair per 64 K-elements)
  * \tparam AccumT      Accumulator element type (deduced from cc_ptr)
  */
-template <int M, int K, int N, int TILE_K_SUB, bool TRANS_B,
-          int SF_LOAD_INTERVAL, typename InT, typename SFT, typename AccumT>
+template <int M, int K, int N, int TILE_K_SUB, bool TRANS_B, int SF_NZ_STRIDE,
+          typename InT, typename SFT, typename AccumT>
 __aicore__ inline void ascend_blockscaled_gemm_l1(
     __cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr, __cbuf__ InT *cbuf_b_ptr,
     __cbuf__ SFT *cbuf_sfa_ptr, __cbuf__ SFT *cbuf_sfb_ptr, int clear_accum,
-    int buf_offset = 0, int sf_k_within_chunk = 0, int unit_flag_ctrl = 0) {
+    int buf_offset = 0, int sf_k_offset = 0, int unit_flag_ctrl = 0) {
   constexpr int C0 = 32 / sizeof(InT);
   constexpr int FRAC_N = 16;
 
@@ -160,8 +160,6 @@ __aicore__ inline void ascend_blockscaled_gemm_l1(
   static constexpr int kSFAddrDiv = 16;
 
   static constexpr int kSFPairsPerInner = TILE_K_SUB / kSFDivisor;
-  static constexpr int kSFValuesPerKBlock = K / kSFDivisor;
-  static constexpr int kSFNZStride = SF_LOAD_INTERVAL * K / kSFDivisor;
 
   __ca__ InT *l0a = (__ca__ InT *)0;
   __cb__ InT *l0b = (__cb__ InT *)0;
@@ -189,15 +187,14 @@ __aicore__ inline void ascend_blockscaled_gemm_l1(
           (uint64_t)(uintptr_t)((__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE))) /
           kSFAddrDiv;
 
-      uint16_t sf_y =
-          sf_k_within_chunk * kSFValuesPerKBlock + sk * kSFPairsPerInner;
+      uint16_t sf_y = sf_k_offset + sk * kSFPairsPerInner;
 
       load_cbuf_to_ca_mx(dst_a, (__cbuf__ fp8_e4_t *)cbuf_sfa_ptr, 0, sf_y,
-                         mStepA, kSFPairsPerInner, kSFNZStride,
+                         mStepA, kSFPairsPerInner, SF_NZ_STRIDE,
                          kSFPairsPerInner);
 
       load_cbuf_to_cb_mx(dst_b, (__cbuf__ fp8_e4_t *)cbuf_sfb_ptr, 0, sf_y,
-                         mStepB, kSFPairsPerInner, kSFNZStride,
+                         mStepB, kSFPairsPerInner, SF_NZ_STRIDE,
                          kSFPairsPerInner);
     }
 

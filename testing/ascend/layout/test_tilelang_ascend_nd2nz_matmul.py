@@ -12,6 +12,7 @@ import pytest
 import torch
 import tilelang
 import tilelang.language as T
+import tilelang.testing
 
 
 def nd2nz_matmul(
@@ -45,10 +46,10 @@ def nd2nz_matmul(
                 if num_aiv == 1:
                     if sid == 0:
                         T.copy(X_gm, x_ub)
-                        T.copy(x_ub, x_l1, nd2nz=True)
+                        T.copy(x_ub, x_l1)
                 else:
                     T.dual_copy(X_gm, x_ub)
-                    T.dual_copy(x_ub, x_l1, nd2nz=True)
+                    T.dual_copy(x_ub, x_l1)
                 T.copy(I_gm, i_l1)
                 T.gemm(x_l1, i_l1, o_l0c, transpose_B=True, clear_accum=True)
                 T.copy(o_l0c, O_gm)
@@ -101,15 +102,4 @@ def test_nd2nz_matmul(M, N, src_dtype, mul_dtype, num_aiv):
 
 
 if __name__ == "__main__":
-    for m in [16, 32, 64, 128]:
-        for n in [64, 128]:
-            test_nd2nz_matmul(m, n, "float", "bfloat16", num_aiv=1)
-            print(f"PASS: test_nd2nz_matmul M={m} N={n} float bfloat16 num_aiv=1")
-    for m in [16, 32, 64, 128]:
-        for n in [64, 128]:
-            test_nd2nz_matmul(m, n, "float", "float", num_aiv=1)
-            print(f"PASS: test_nd2nz_matmul M={m} N={n} float float num_aiv=1")
-    for m in [16, 32, 64, 128]:
-        for n in [128, 256]:
-            test_nd2nz_matmul(m, n, "bfloat16", "float", num_aiv=1)
-            print(f"PASS: test_nd2nz_matmul M={m} N={n} bfloat16 float num_aiv=1")
+    tilelang.testing.main()

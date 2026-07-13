@@ -3,7 +3,7 @@ import tilelang.language as T
 from tilelang.profiler import do_bench
 
 
-def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", MIXED=None, hf32=None):
+def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", MIXED=None, hf32=None, scale_dtype="uint16", scale_packed=True):
     """Auto-scheduled GEMM.
 
     dtype: 'bfloat16' or 'float32'.
@@ -18,7 +18,7 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", MIXED=None, hf32=
     TILE_N = 256
     TILE_K = 128 if is_fp32 else 256  # fp32: L1 512KB, 2*(256+256)*128*4=512KB fits
 
-    SF_DIV = 64  # one SF pair (int16) covers 64 K-elements
+    SF_DIV = 64 if scale_dtype == "uint16" else 32  # one SF pair (int16) covers 64 K-elements
     SF_K = K_DIM // SF_DIV  # SF pairs over the full K
     TILE_SF_K = TILE_K // SF_DIV  # SF pairs per K-tile (L1 SF tile width)
     SF_LOAD_CHUNK_SIZE = 1  # load one SF pair per 1 K-tiles; adjust as needed for better performance
@@ -52,8 +52,8 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", MIXED=None, hf32=
     def main(
         X: T.Buffer((M_DIM, K_DIM), dtype),
         W: T.Buffer((N_DIM, K_DIM), dtype),
-        SFX: T.Buffer((SF_K, M_DIM), "uint16"),
-        SFW: T.Buffer((SF_K, N_DIM), "uint16"),
+        SFX: T.Buffer((SF_K, M_DIM) if scale_packed else (M_DIM, SF_K), scale_dtype),
+        SFW: T.Buffer((SF_K, N_DIM) if scale_packed else (N_DIM, SF_K), scale_dtype),
         C: T.Buffer((M_DIM, N_DIM), "float32"),
     ):
         with T.Kernel(NUM_BLOCKS) as bx:
@@ -62,8 +62,8 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", MIXED=None, hf32=
             res = T.alloc_l0c((TILE_M, TILE_N), "float32")
             x_l1 = T.alloc_l1((TILE_M, TILE_K), dtype)
             w_l1 = T.alloc_l1((TILE_N, TILE_K), dtype)
-            xsf_l1 = T.alloc_l1((SF_LOAD_CHUNK_SIZE * TILE_SF_K, TILE_M), "uint16")
-            wsf_l1 = T.alloc_l1((SF_LOAD_CHUNK_SIZE * TILE_SF_K, TILE_N), "uint16")
+            xsf_l1 = T.alloc_l1((TILE_M, SF_LOAD_CHUNK_SIZE * TILE_SF_K), scale_dtype)
+            wsf_l1 = T.alloc_l1((TILE_N, SF_LOAD_CHUNK_SIZE * TILE_SF_K), scale_dtype)
             temp = T.alloc_shared((TILE_M // 2, TILE_N), "float32")
             sf_int = SF_LOAD_CHUNK_SIZE
 
@@ -74,16 +74,27 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", MIXED=None, hf32=
                     T.copy(W[n_tile * TILE_N : (n_tile + 1) * TILE_N, kt * TILE_K : (kt + 1) * TILE_K], w_l1)
 
                     if kt % sf_int == 0:
-                        T.copy(SFX[kt * TILE_SF_K : (kt + sf_int) * TILE_SF_K, m_tile * TILE_M : (m_tile + 1) * TILE_M], xsf_l1)
-                        T.copy(SFW[kt * TILE_SF_K : (kt + sf_int) * TILE_SF_K, n_tile * TILE_N : (n_tile + 1) * TILE_N], wsf_l1)
+                        if scale_packed:
+                            T.copy(
+                                SFX[kt * TILE_SF_K : (kt + sf_int) * TILE_SF_K, m_tile * TILE_M : (m_tile + 1) * TILE_M],
+                                xsf_l1,
+                                transpose=True,
+                            )
+                            T.copy(
+                                SFW[kt * TILE_SF_K : (kt + sf_int) * TILE_SF_K, n_tile * TILE_N : (n_tile + 1) * TILE_N],
+                                wsf_l1,
+                                transpose=True,
+                            )
+                        else:
+                            T.copy(SFX[m_tile * TILE_M : (m_tile + 1) * TILE_M, kt * TILE_SF_K : (kt + sf_int) * TILE_SF_K], xsf_l1)
+                            T.copy(SFW[n_tile * TILE_N : (n_tile + 1) * TILE_N, kt * TILE_SF_K : (kt + sf_int) * TILE_SF_K], wsf_l1)
 
                     T.blockscaled_gemm(
                         x_l1,
                         w_l1,
                         res,
-                        sfa=xsf_l1,
-                        sfb=wsf_l1,
-                        sf_k_within_chunk=(kt % sf_int),
+                        sfa=xsf_l1[:, (kt % sf_int) * TILE_SF_K : (kt % sf_int + 1) * TILE_SF_K],
+                        sfb=wsf_l1[:, (kt % sf_int) * TILE_SF_K : (kt % sf_int + 1) * TILE_SF_K],
                         transpose_B=True,
                         clear_accum=(kt == 0),
                         unit_flag_ctrl=T.Select(kt == K_TILES - 1, 3, 2),
@@ -153,9 +164,14 @@ if __name__ == "__main__":
     device = torch.device("npu")
     M, K, N = 8192, 8192, 8192
 
+    scale_dtype = "uint16"  # or "uint8"
+    scale_packed = True  # or False
+
+    assert scale_dtype != "uint8" or not scale_packed, "uint8 scale must be packed"
+
     for dt, thresh in [("float8_e4m3fn", 1e-1)]:
         print(f"\n=== {dt} GEMM ===")
-        program = gemm(M, K, N, dtype=dt)
+        program = gemm(M, K, N, dtype=dt, scale_dtype=scale_dtype, scale_packed=scale_packed)
         kernel = tilelang.compile(program, out_idx=-1)
 
         print(kernel.get_kernel_source())
@@ -168,10 +184,14 @@ if __name__ == "__main__":
         sfx_e8m0 = torch.randint(120, 135, (M, sf_k_e8m0), dtype=torch.uint8, device=device)
         sfw_e8m0 = torch.randint(120, 135, (N, sf_k_e8m0), dtype=torch.uint8, device=device)
 
-        sfx_pairs = sfx_e8m0.view(torch.uint16)  # [M, K/64]
-        sfw_pairs = sfw_e8m0.view(torch.uint16)  # [N, K/64]
-        sfx = sfx_pairs.T.contiguous()  # [K/64, M]  (MN-major)
-        sfw = sfw_pairs.T.contiguous()  # [K/64, N]
+        if scale_packed:
+            sfx_pairs = sfx_e8m0.view(torch.uint16)  # [M, K/64]
+            sfw_pairs = sfw_e8m0.view(torch.uint16)  # [N, K/64]
+            sfx = sfx_pairs.T.contiguous()  # [K/64, M]  (MN-major)
+            sfw = sfw_pairs.T.contiguous()  # [K/64, N]
+        else:
+            sfx = sfx_e8m0.view(getattr(torch, scale_dtype))
+            sfw = sfw_e8m0.view(getattr(torch, scale_dtype))
 
         c = kernel(x, w, sfx, sfw)
         torch.npu.synchronize()

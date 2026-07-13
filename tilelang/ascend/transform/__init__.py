@@ -5,6 +5,7 @@ from tilelang.transform import _ffi_api
 
 from . import z3_scheduler  # noqa: F401
 from .hoist_simd_pairs import HoistSimdPairs  # noqa: F401
+from .insert_nd2nz import InsertNd2Nz  # noqa: F401
 from .normalize_mixed_kernel_sid import NormalizeMixedKernelSid  # noqa: F401
 
 
@@ -73,6 +74,8 @@ __all__ = [
     "AscendSimdVFLowerParallel",
     "AutoSchedule",
     "HoistSimdPairs",
+    "IfConditionExtract",
+    "InsertNd2Nz",
     "MarkScalarDcacheBypass",
     "MergeUBAllocations",
     "NormalizeControlFlowForSchedule",

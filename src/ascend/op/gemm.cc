@@ -43,7 +43,7 @@ struct Gemm {
 
   static bool ReuseExistingSharedLayout(String gemm_inst) {
     (void)gemm_inst;
-    return false;
+    return true;
   }
 };
 

@@ -320,8 +320,8 @@ from the shape mismatch:
 # L0C → UB (M-split for 2 AIVs)
 T.dual_copy(res_l0c, temp_ub)
 
-# UB → L1 with ND-to-NZ format conversion
-T.dual_copy(p_ub, p_l1, nd2nz=True)
+# UB → L1 (ND-to-NZ conversion is automatic via InsertNd2Nz pass)
+T.dual_copy(p_ub, p_l1)
 
 # UB → GM (M-split write)
 T.dual_copy(o_ub, O[row_start:row_end, 0:D])

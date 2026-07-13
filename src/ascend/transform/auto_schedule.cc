@@ -58,6 +58,7 @@
 #include "ascend/transform/auto_schedule/ir_structure.h"
 #include "auto_schedule.h"
 #include "backend/common/target_utils.h"
+#include "layout/layout.h"
 #include "op/builtin.h"
 #include "op/copy.h"
 #include "op/gemm.h"
@@ -1474,6 +1475,53 @@ Stmt ReNestLetStmts(const Stmt &stmt) {
   return nester(flat);
 }
 
+Layout ExpandLayoutToBuffer(const Buffer &layout_buffer,
+                            const Buffer &target_buffer, const Layout &layout) {
+  if (!layout.defined() ||
+      target_buffer->shape.size() < layout_buffer->shape.size()) {
+    return Layout();
+  }
+  size_t leading_ndim =
+      target_buffer->shape.size() - layout_buffer->shape.size();
+  if (leading_ndim == 0) {
+    return layout;
+  }
+  Array<PrimExpr> leading_shape;
+  for (size_t i = 0; i < leading_ndim; ++i) {
+    leading_shape.push_back(target_buffer->shape[i]);
+  }
+  return layout->Expand(leading_shape);
+}
+
+Layout FindLayoutForBuffer(const Map<Buffer, Layout> &layout_map,
+                           const Buffer &buffer) {
+  if (layout_map.count(buffer)) {
+    return layout_map[buffer];
+  }
+  for (const auto &[layout_buffer, layout] : layout_map) {
+    if (layout_buffer->data.same_as(buffer->data) ||
+        layout_buffer->name == buffer->name) {
+      Layout expanded = ExpandLayoutToBuffer(layout_buffer, buffer, layout);
+      if (expanded.defined()) {
+        return expanded;
+      }
+    }
+  }
+  return Layout();
+}
+
+bool AddLayoutForBuffer(Map<Buffer, Layout> *layout_map, const Buffer &buffer) {
+  if (!layout_map || layout_map->count(buffer)) {
+    return false;
+  }
+  Layout layout = FindLayoutForBuffer(*layout_map, buffer);
+  if (!layout.defined()) {
+    return false;
+  }
+  layout_map->Set(buffer, layout);
+  return true;
+}
+
 // StmtMutator to rewrite alloc_buffers in SBlock nodes for double buffering
 class AllocBufferRewriter : public StmtMutator {
 public:
@@ -1489,7 +1537,17 @@ private:
     Stmt new_body = this->VisitStmt(op->body);
 
     bool needs_update = false;
+    bool layout_update = false;
     Array<Buffer> new_alloc_buffers;
+    Map<String, Any> new_annotations = op->annotations;
+    bool has_layout_map = false;
+    Map<Buffer, Layout> layout_map;
+    if (auto layout_map_ref = op->annotations.Get(attr::kLayoutMap)) {
+      if (auto map = layout_map_ref.value().as<Map<Buffer, Layout>>()) {
+        layout_map = map.value();
+        has_layout_map = true;
+      }
+    }
     for (auto buffer : op->alloc_buffers) {
       auto it = buffer_remap_.find(buffer);
       if (it != buffer_remap_.end()) {
@@ -1499,11 +1557,22 @@ private:
         new_alloc_buffers.push_back(buffer);
       }
     }
+    if (has_layout_map) {
+      for (const auto &buffer : new_alloc_buffers) {
+        layout_update |= AddLayoutForBuffer(&layout_map, buffer);
+      }
+    }
+    if (layout_update) {
+      new_annotations.Set(attr::kLayoutMap, layout_map);
+    }
 
     auto new_block = CopyOnWrite(op);
     new_block->body = new_body;
     if (needs_update) {
       new_block->alloc_buffers = new_alloc_buffers;
+    }
+    if (layout_update) {
+      new_block->annotations = new_annotations;
     }
     return Stmt(new_block);
   }

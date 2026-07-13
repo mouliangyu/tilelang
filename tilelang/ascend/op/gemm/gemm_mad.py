@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from tilelang.tileop.gemm.gemm_base import GemmBase
 from tilelang import language as T
+from tilelang.layout import make_ascend_major_k_layout, make_ascend_sf_layout, try_extract_fractal_layout
 from tilelang.transform.simplify import _Simplify
 from tvm import DataType, tirx
 from tvm.ir import Range
@@ -55,6 +56,22 @@ def _make_access_ptr(buf, region, rw_mask):
     )
 
 
+def _find_layout(layout_map, buf):
+    if layout_map is None:
+        return None
+    for key in (buf.data if hasattr(buf, "data") else None, buf):
+        if key is not None:
+            layout = layout_map.get(key)
+            if layout is not None:
+                return layout
+    for key, layout in layout_map.items():
+        if hasattr(key, "data") and hasattr(buf, "data") and key.data.same_as(buf.data):
+            return layout
+        if hasattr(key, "name") and getattr(key, "name", None) == getattr(buf, "name", None):
+            return layout
+    return None
+
+
 _ASCEND_DTYPE_MAP = {
     "bfloat16": "bfloat16_t",
     "float16": "half",
@@ -69,7 +86,15 @@ _ASCEND_DTYPE_MAP = {
 
 class GemmMAD(GemmBase):
     def infer_layout(self, target: Target, thread_nums: int):
-        return {}
+        layouts = {}
+        if self._is_l1_input():
+            layouts[self.A] = make_ascend_major_k_layout(self.A)
+            layouts[self.B] = make_ascend_major_k_layout(self.B)
+        if self.SFARegion is not None:
+            layouts[self.SFARegion.buffer] = make_ascend_sf_layout(self.SFARegion.buffer)
+        if self.SFBRegion is not None:
+            layouts[self.SFBRegion.buffer] = make_ascend_sf_layout(self.SFBRegion.buffer)
+        return layouts
 
     def lower(
         self,
@@ -79,10 +104,32 @@ class GemmMAD(GemmBase):
         thread_var: tirx.Var,
         mbar_phase_expr: tirx.PrimExpr | None = None,
     ):
+        self._layout_map = layout_map
         assert not self.trans_A, f"Ascend Cube requires transpose_A=False, got {self.trans_A}"
         assert self.trans_B, f"Ascend Cube requires transpose_B=True, got {self.trans_B}"
+
+        # Validate fractal layouts on A/B/C.  mad requires A and B to be
+        # MajorK (reduce axis = C0-axis) and C to be L0C accumulator.
+        for name, buf in [("A", self.A), ("B", self.B)]:
+            if buf is None:
+                continue
+            layout = _find_layout(layout_map, buf)
+            if layout is not None:
+                info = try_extract_fractal_layout(layout, buf)
+                assert info is not None, f"GEMM {name} buffer {buf.name} must carry an Ascend fractal layout"
+                assert info.c0_axis == 1, f"GEMM {name} buffer {buf.name}: reduce axis must be C0-axis (col), got c0_axis={info.c0_axis}"
+
+        if self.C is not None:
+            layout = _find_layout(layout_map, self.C)
+            if layout is not None:
+                info = try_extract_fractal_layout(layout, self.C)
+                assert info is not None, f"GEMM C buffer {self.C.name} must carry an Ascend fractal layout"
+
         if self._is_l1_input():
             if self.is_blockscaled:
+                assert self.SFARegion is not None and self.SFBRegion is not None, (
+                    "blockscaled_gemm with L1 A/B inputs requires sfa and sfb buffers"
+                )
                 return self._lower_l1_blockscaled()
             return self._lower_l1()
         if self.is_blockscaled:
@@ -262,6 +309,12 @@ class GemmMAD(GemmBase):
 
         def _sf_dtype_str(dtype) -> str:
             dtype_str = str(dtype)
+            if "uint8" in dtype_str:
+                return "uint8_t"
+            if "int8" in dtype_str:
+                return "int8_t"
+            if "uint16" in dtype_str:
+                return "uint16_t"
             if "int16" in dtype_str:
                 return "int16_t"
             if "float8_e4m3" in dtype_str:
@@ -269,7 +322,12 @@ class GemmMAD(GemmBase):
             return dtype_str
 
         sf_dtype_str = _sf_dtype_str(sfa_buf.dtype)
-        sf_load_chunk_size = int(sfa_buf.shape[-2]) // (self.K // 64)
+        sfa_layout = _find_layout(getattr(self, "_layout_map", {}), sfa_buf)
+        sfa_info = try_extract_fractal_layout(sfa_layout, sfa_buf) if sfa_layout is not None else None
+        assert sfa_info is not None and sfa_info.kind == 2, f"blockscaled_gemm sfa buffer {sfa_buf.name} must carry an Ascend SF_K layout"
+        assert sfa_info.c0_axis == 1, f"blockscaled_gemm sfa buffer {sfa_buf.name}: SF K axis must be col, got c0_axis={sfa_info.c0_axis}"
+        sf_nz_stride = sfa_info.outer1
+        sf_k_offset = _to_int32(sfa_region.region[-1].min // sfa_info.c0)
 
         call = tirx.call_intrin(
             "void",
@@ -289,8 +347,8 @@ class GemmMAD(GemmBase):
             tirx.StringImm(sf_dtype_str),
             tirx.StringImm("float"),
             _to_int32(0),  # buf_offset
-            _to_int32(self.sf_k_within_chunk),
-            _to_int32(sf_load_chunk_size),
+            sf_k_offset,  # sf_k_offset (auto from region slice)
+            _to_int32(sf_nz_stride),
             _to_int32(self.unit_flag_ctrl),
         )
 

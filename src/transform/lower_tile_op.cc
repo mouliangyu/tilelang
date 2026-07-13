@@ -687,6 +687,17 @@ private:
         remaining_offset =
             analyzer_->Simplify(floordiv(remaining_offset, old_shape[i]));
       }
+      // Layout input placeholders are int32. The access-ptr offset can be
+      // int64 here (e.g. Ascend pipelines offsets in int64 before
+      // NarrowDataType runs), so coerce the derived indices to the placeholder
+      // dtype; otherwise Layout::Forward's Substitute fails its strict dtype
+      // check. Tile-local indices are small, so the narrowing is safe.
+      for (size_t i = 0; i < multi_dim_indices.size(); ++i) {
+        if (multi_dim_indices[i].dtype() != DataType::Int(32)) {
+          multi_dim_indices.Set(i,
+                                cast(DataType::Int(32), multi_dim_indices[i]));
+        }
+      }
       // Apply layout transformation
       auto forward_indices = layout->Forward(multi_dim_indices);
       PrimExpr new_offset = 0;

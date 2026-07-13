@@ -59,11 +59,19 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.VerifyParallelLoop()(mod)
     mod = tilelang.transform.InjectAssumes()(mod)
     mod = tilelang.transform.Simplify()(mod)
-    tilelang.ascend.analysis.VFChecker()(mod)
 
     mod = tilelang.transform.LayoutReducer()(mod)
     mod = tilelang.transform.LayoutInference()(mod)
     LayoutVisual(mod)
+
+    # Rewrite UB->L1 copies into NZ buffers as scatter+post_copy, using the NZ
+    # layouts just inferred. Must run before AutoSchedule so it can schedule the
+    # emitted ops.
+    mod = ascend_transform.InsertNd2Nz()(mod)
+
+    # Run VFChecker after InsertNd2Nz: the UB->L1 copies it would otherwise
+    # reject (e.g. casting copies) are by now rewritten into a SIMD_VF scatter.
+    tilelang.ascend.analysis.VFChecker()(mod)
 
     if allow_autoschedule(pass_ctx=pass_ctx):
         mod = ascend_transform.NormalizeControlFlowForSchedule()(mod)

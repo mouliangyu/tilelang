@@ -626,10 +626,18 @@ void CodeGenTileLangPTO::EnsurePTOGemmHelper(const CallNode *op) {
 }
 
 void CodeGenTileLangPTO::EmitAscendCopyGmToCbuf(const CallNode *op) {
-  ICHECK_EQ(op->args.size(), 11U)
-      << "tl.ascend_copy_gm_to_cbuf expects exactly 11 arguments";
+  ICHECK_EQ(op->args.size(), 12U)
+      << "tl.ascend_copy_gm_to_cbuf expects exactly 12 arguments";
   CheckConstZero(op->args[2], "sid");
   CheckConstZero(op->args[7], "loop4_src_stride");
+
+  // arg[10] dst_n_value and arg[11] physical_dtype are consumed by the AscendC
+  // codegen (MTE2 NZ-para / packed-SF pointer cast). The PTO fractal copy
+  // derives layout from shape/stride, so it only needs the standard path;
+  // reject the packed-SF variant (non-empty physical_dtype) which PTO cannot
+  // emit yet.
+  ICHECK(Downcast<StringImm>(op->args[11])->value.empty())
+      << "PTO GM-to-L1 copy does not support packed scale-factor layouts";
 
   int64_t transpose = 0;
   ICHECK(TryGetConstInt(op->args[9], &transpose))

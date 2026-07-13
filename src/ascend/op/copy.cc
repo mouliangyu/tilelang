@@ -5,13 +5,16 @@
 
 #include "op/copy.h"
 
+#include "ascend/layout/ascend_layouts.h"
 #include "ascend_mte_plan.h"
 #include "backend/common/target_utils.h"
+#include "layout/layout.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 #include "transform/common/loop_fusion_utils.h"
 #include "transform/loop_partition.h"
 
+#include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/tirx/stmt_functor.h>
 
 #include <string>
@@ -91,6 +94,22 @@ PrimExpr ComputeFlatOffset(const Buffer &buf, const Array<Range> &range) {
   return offset;
 }
 
+// Row-major element strides of an ND (GM/UB) buffer, derived from its ND
+// (identity) affine layout's output shape: strides[k] = product(shape[k+1..]).
+// Keeps copy parameters layout-driven for the ND side as well.
+Array<PrimExpr> AscendNDStrides(const Buffer &buf) {
+  Array<PrimExpr> shape = makeAscendNDLayout(buf)->OutputShape();
+  int n = static_cast<int>(shape.size());
+  Array<PrimExpr> strides(static_cast<size_t>(n),
+                          make_const(DataType::Int(32), 1));
+  PrimExpr cur = make_const(DataType::Int(32), 1);
+  for (int i = n - 1; i >= 0; --i) {
+    strides.Set(i, cur);
+    cur = cur * shape[i];
+  }
+  return strides;
+}
+
 // Map float32 source (L0C) + destination dtype → quant_pre hardware mode.
 static int GetCCQuantPre(DataType src_dtype, DataType dst_dtype) {
   if (src_dtype.is_float() && src_dtype.bits() == 32) {
@@ -112,7 +131,6 @@ static int GetCCQuantPre(DataType src_dtype, DataType dst_dtype) {
 
 Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
                   arith::Analyzer *analyzer, int dma_path) {
-  (void)T;
   auto I = [](int64_t v) { return make_const(DataType::Int(32), v); };
   auto I64 = [](int64_t v) { return make_const(DataType::Int(64), v); };
   int elem_bytes = op.src->dtype.bytes();
@@ -126,10 +144,9 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
 
   PrimExpr row_bytes = inner_elems * I(elem_bytes);
 
-  PrimExpr src_row_stride_bytes = I(elem_bytes);
-  for (size_t j = 1; j < op.src->shape.size(); ++j) {
-    src_row_stride_bytes = src_row_stride_bytes * op.src->shape[j];
-  }
+  // GM/UB row stride from the ND (identity) layout's row-major strides: the
+  // outermost stride is the bytes between consecutive rows.
+  PrimExpr src_row_stride_bytes = AscendNDStrides(op.src)[0] * I(elem_bytes);
 
   auto make_access_ptr = [&](const Buffer &buf, PrimExpr offset,
                              PrimExpr extent, int rw_mask) -> PrimExpr {
@@ -137,7 +154,6 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
         DataType::Handle(), builtin::tvm_access_ptr(),
         {TypeAnnotation(buf->dtype), buf->data, offset, extent, I(rw_mask)});
   };
-
   PrimExpr total_elems = inner_elems * n_rows;
   PrimExpr src_offset = ComputeFlatOffset(op.src, op.src_range);
   PrimExpr dst_offset = ComputeFlatOffset(op.dst, op.dst_range);
@@ -242,20 +258,46 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
       }
     }
   } else if (dma_path == 2) {
-    PrimExpr transpose_flag = I(op.GetTranspose());
-    size_t dst_ndim = op.dst_range.size();
-    PrimExpr dst_n_rows = I(1);
-    for (size_t i = 0; i + 1 < dst_ndim; ++i) {
-      dst_n_rows = dst_n_rows * op.dst_range[i]->extent;
+    AscendFractalLayoutInfo dst_layout;
+    bool has_dst_layout = false;
+    if (T.layout_map.count(op.dst)) {
+      has_dst_layout = TryExtractAscendFractalLayout(T.layout_map[op.dst],
+                                                     op.dst, &dst_layout);
+      ICHECK(has_dst_layout)
+          << "GM->L1 copy expects an Ascend fractal layout on the L1 dst "
+          << op.dst->name;
     }
+    bool needs_transpose = op.GetTranspose();
+    PrimExpr dst_n_value;
+    if (has_dst_layout) {
+      if (dst_layout.kind == AscendFractalKind::kSF) {
+        needs_transpose = !needs_transpose;
+        dst_n_value = dst_layout.outer1;
+      } else {
+        dst_n_value = dst_layout.outer1 * dst_layout.row_frac;
+      }
+    } else {
+      size_t dst_ndim = op.dst_range.size();
+      dst_n_value = I(1);
+      for (size_t i = 0; i + 1 < dst_ndim; ++i) {
+        dst_n_value = dst_n_value * op.dst_range[i]->extent;
+      }
+    }
+    PrimExpr transpose_flag = I(needs_transpose ? 1 : 0);
     // For dn2nz (transpose), SDK expects nValue=width(cols) and
     // dValue=height(rows), which is the reverse of nd2nz.
-    PrimExpr n_value = op.GetTranspose() ? inner_elems : n_rows;
-    PrimExpr d_value = op.GetTranspose() ? n_rows : inner_elems;
-    PrimExpr dst_n_value = dst_n_rows;
+    PrimExpr n_value = needs_transpose ? inner_elems : n_rows;
+    PrimExpr d_value = needs_transpose ? n_rows : inner_elems;
+    std::string physical_dtype;
+    if (has_dst_layout && dst_layout.kind == AscendFractalKind::kSF &&
+        op.src->dtype.bits() == 8 && op.dst->dtype.bits() == 8) {
+      physical_dtype = "uint16_t";
+      n_value = n_value / I(2);
+    }
     call = Call(DataType::Void(), ascend_copy_gm_to_cbuf(),
                 {dst_ptr, src_ptr, sid, src_row_stride_bytes, l2_cache_ctrl,
-                 n_value, d_value, zero, zero, transpose_flag, dst_n_value});
+                 n_value, d_value, zero, zero, transpose_flag, dst_n_value,
+                 StringImm(physical_dtype)});
   } else if (dma_path == 3 || dma_path == 4) {
     // M/K positions go through intrinsic args; leading dims (e.g. version)
     // through the pointer offset.  MakeAccessPtrFromRegion splits offset/extent
@@ -263,60 +305,116 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
     PrimExpr src_base_ptr =
         MakeAccessPtrFromRegion(BufferRegion(op.src, op.src_range), 1, false);
 
-    // M-direction fractal is always 16 rows; K-direction fractal C0 depends on
-    // the element size: C0 = 32 / elem_bytes (16 for bf16/fp16, 32 for fp8,
-    // 8 for fp32).
-    PrimExpr c0 = I(16);
-    PrimExpr c0_k = I(32 / elem_bytes);
-    size_t src_range_ndim = op.src_range.size();
-    size_t src_shape_ndim = op.src->shape.size();
-    PrimExpr m_dim =
-        src_range_ndim >= 2 ? op.src_range[src_range_ndim - 2]->extent : I(1);
-    PrimExpr k_dim =
-        src_range_ndim >= 2 ? op.src_range[src_range_ndim - 1]->extent : I(1);
-    PrimExpr m_start =
-        src_range_ndim >= 2 ? op.src_range[src_range_ndim - 2]->min / c0 : I(0);
-    PrimExpr k_start = src_range_ndim >= 2
-                           ? op.src_range[src_range_ndim - 1]->min / c0_k
-                           : I(0);
-    PrimExpr src_m_dim =
-        src_shape_ndim >= 2 ? op.src->shape[src_shape_ndim - 2] : I(1);
-    PrimExpr m_step = m_dim / c0;
-    PrimExpr k_step = k_dim / c0_k;
-    PrimExpr src_stride = src_m_dim / c0;
-    PrimExpr dst_stride = m_dim / c0;
+    AscendFractalLayoutInfo src_info;
+    AscendFractalLayoutInfo dst_info;
+    bool have_src_layout =
+        T.layout_map.count(op.src) &&
+        TryExtractAscendFractalLayout(T.layout_map[op.src], op.src, &src_info);
+    bool have_dst_layout =
+        T.layout_map.count(op.dst) &&
+        TryExtractAscendFractalLayout(T.layout_map[op.dst], op.dst, &dst_info);
+
+    PrimExpr m_start, k_start, m_step, k_step, src_stride, dst_stride;
+
+    if (have_src_layout && have_dst_layout) {
+      AscendFractalRegionInfo src_region;
+      ICHECK(TryExtractAscendFractalRegion(T.layout_map[op.src], op.src_range,
+                                           &src_region))
+          << "Failed to map L1->L0 source region through layout for buffer "
+          << op.src->name;
+      m_start = src_region.outer1->min;
+      k_start = src_region.outer0->min;
+      m_step = src_region.outer1->extent;
+      k_step = src_region.outer0->extent;
+      src_stride = src_info.outer1;
+      dst_stride = dst_info.outer1;
+    } else {
+      // Fallback: derive fractal params from logical shape (legacy path)
+      PrimExpr c0 = I(16);
+      PrimExpr c0_k = I(AscendC0(elem_bytes * 8));
+      size_t src_range_ndim = op.src_range.size();
+      PrimExpr m_dim =
+          src_range_ndim >= 2 ? op.src_range[src_range_ndim - 2]->extent : I(1);
+      PrimExpr k_dim =
+          src_range_ndim >= 2 ? op.src_range[src_range_ndim - 1]->extent : I(1);
+      m_start = src_range_ndim >= 2 ? op.src_range[src_range_ndim - 2]->min / c0
+                                    : I(0);
+      k_start = src_range_ndim >= 2
+                    ? op.src_range[src_range_ndim - 1]->min / c0_k
+                    : I(0);
+      m_step = m_dim / c0;
+      k_step = k_dim / c0_k;
+      // src/dst stride from logical shape
+      size_t sn = op.src->shape.size();
+      size_t dn = op.dst->shape.size();
+      src_stride = sn >= 2 ? op.src->shape[sn - 2] / c0 : I(1);
+      dst_stride = dn >= 2 ? op.dst->shape[dn - 2] / c0 : I(1);
+    }
+
+    // Transpose is explicitly specified by the user via T.copy(...,
+    // transpose=True). Auto-derivation from shape relationship is not safe
+    // (fails on square matrices).
+    bool needs_transpose = op.GetTranspose();
 
     auto intrinsic =
         dma_path == 3 ? ascend_load_cbuf_to_ca() : ascend_load_cbuf_to_cb();
-    Array<PrimExpr> ld_args = {dst_ptr,    src_base_ptr, m_start,
-                               k_start,    m_step,       k_step,
-                               src_stride, dst_stride,   zero};
+    Array<PrimExpr> ld_args = {
+        dst_ptr,    src_base_ptr, m_start,
+        k_start,    m_step,       k_step,
+        src_stride, dst_stride,   I(needs_transpose ? 1 : 0)};
 
     if (op.sf.defined()) {
       const Buffer &sf_buf = op.sf.value();
-      const int sf_range_ndim = static_cast<int>(op.sf_range.size());
-      const int sf_shape_ndim = static_cast<int>(sf_buf->shape.size());
-      // SF buffer layout is (..., K-pairs, M): K-pairs is the second-to-last
-      // dim, M is the last. All positions are derived from the SF region itself
-      // (independent of the data copy), and the M/K start positions flow
-      // through the load_cbuf_to_ca_mx intrinsic parameters rather than the
-      // pointer.
-      const int sf_k_dim = sf_range_ndim >= 2 ? sf_range_ndim - 2 : -1;
-      const int sf_m_dim = sf_range_ndim - 1;
-
-      // SF pointer: M/K positions go through intrinsic args; leading dims
-      // (e.g. pipeline version) go through the pointer offset.
       PrimExpr sf_ptr =
           MakeAccessPtrFromRegion(BufferRegion(sf_buf, op.sf_range), 1, false);
-      PrimExpr sf_m_start = op.sf_range[sf_m_dim]->min / c0;
-      PrimExpr sf_m_step = op.sf_range[sf_m_dim]->extent / c0;
-      PrimExpr sf_k_start = sf_k_dim >= 0 ? op.sf_range[sf_k_dim]->min : I(0);
-      PrimExpr sf_k_step = sf_k_dim >= 0 ? op.sf_range[sf_k_dim]->extent : I(1);
-      PrimExpr sf_src_stride =
-          sf_shape_ndim >= 2 ? sf_buf->shape[sf_shape_ndim - 2] : I(1);
-      PrimExpr sf_dst_stride =
-          sf_k_dim >= 0 ? op.sf_range[sf_k_dim]->extent : I(1);
 
+      AscendFractalLayoutInfo sf_info;
+      bool have_sf_layout = T.layout_map.count(sf_buf) &&
+                            TryExtractAscendFractalLayout(T.layout_map[sf_buf],
+                                                          sf_buf, &sf_info) &&
+                            sf_info.kind == AscendFractalKind::kSF;
+
+      PrimExpr sf_m_start, sf_m_step, sf_k_start, sf_k_step, sf_src_stride,
+          sf_dst_stride;
+
+      if (have_sf_layout) {
+        AscendFractalRegionInfo sf_region;
+        ICHECK(TryExtractAscendFractalRegion(T.layout_map[sf_buf], op.sf_range,
+                                             &sf_region))
+            << "Failed to map L1->L0 SF region through layout for buffer "
+            << sf_buf->name;
+        // SF_K layout maps trailing [M, K-pairs] to physical
+        // [M/16, K-pairs/pack, M%16, K-pairs%pack].  The MX load intrinsic
+        // expects x=M/16 and y=K-pair/pack positions.
+        sf_m_start = sf_region.outer0->min;
+        sf_k_start = sf_region.outer1->min;
+        sf_m_step = sf_region.outer0->extent;
+        sf_k_step = sf_region.outer1->extent;
+        sf_src_stride = sf_info.outer1;
+        sf_dst_stride = sf_region.outer1->extent;
+      } else {
+        const int sf_range_ndim = static_cast<int>(op.sf_range.size());
+        const int sf_shape_ndim = static_cast<int>(sf_buf->shape.size());
+        // SF buffer layout is (..., K-pairs, M): K-pairs is the second-to-last
+        // dim, M is the last. All positions are derived from the SF region
+        // itself (independent of the data copy), and the M/K start positions
+        // flow through the load_cbuf_to_ca_mx intrinsic parameters rather than
+        // the pointer.
+        const int sf_k_dim = sf_range_ndim >= 2 ? sf_range_ndim - 2 : -1;
+        const int sf_m_dim = sf_range_ndim - 1;
+
+        // SF pointer: M/K positions go through intrinsic args; leading dims
+        // (e.g. pipeline version) go through the pointer offset.
+        sf_ptr = MakeAccessPtrFromRegion(BufferRegion(sf_buf, op.sf_range), 1,
+                                         false);
+        sf_m_start = op.sf_range[sf_m_dim]->min / I(16);
+        sf_m_step = op.sf_range[sf_m_dim]->extent / I(16);
+        sf_k_start = sf_k_dim >= 0 ? op.sf_range[sf_k_dim]->min : I(0);
+        sf_k_step = sf_k_dim >= 0 ? op.sf_range[sf_k_dim]->extent : I(1);
+        sf_src_stride =
+            sf_shape_ndim >= 2 ? sf_buf->shape[sf_shape_ndim - 2] : I(1);
+        sf_dst_stride = sf_k_dim >= 0 ? op.sf_range[sf_k_dim]->extent : I(1);
+      }
       ld_args.push_back(sf_ptr);        // [9]  sf_ptr
       ld_args.push_back(sf_m_start);    // [10] sf_x_start
       ld_args.push_back(sf_k_start);    // [11] sf_y_start
@@ -327,6 +425,16 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
     }
     call = Call(DataType::Void(), intrinsic, ld_args);
   } else if (dma_path == 5) {
+    AscendFractalLayoutInfo info;
+    PrimExpr loop_src_stride = n_rows;
+
+    if (T.layout_map.count(op.src)) {
+      ICHECK(TryExtractAscendFractalLayout(T.layout_map[op.src], op.src, &info))
+          << "L0C->UB copy expects an Ascend fractal layout on the L0C src "
+          << op.src->name;
+      loop_src_stride = info.outer1 * info.row_frac;
+    }
+
     PrimExpr dual_dst_ctl_val = I(op.GetDualDstCtl());
     PrimExpr unit_flag_ctl_val = I(op.GetUnitFlagCtl());
     call = Call(DataType::Void(), ascend_copy_matrix_cc_to_ub(),
@@ -336,7 +444,7 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
                  inner_elems,
                  n_rows,
                  inner_elems,
-                 n_rows,
+                 loop_src_stride,
                  dual_dst_ctl_val,
                  I(op.GetSubBlockId()), // sub_blockid
                  zero,                  // clip_relu_pre
@@ -366,7 +474,18 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
     call = Call(DataType::Void(), ascend_copy_ubuf_to_cbuf(),
                 {dst_ptr, src_ptr, zero, n_burst_val, I(1), zero, zero});
   } else if (dma_path == 7) {
-    PrimExpr dst_last_dim = op.dst->shape[op.dst->shape.size() - 1];
+    AscendFractalLayoutInfo info;
+    PrimExpr loop_src_stride = n_rows;
+
+    if (T.layout_map.count(op.src)) {
+      ICHECK(TryExtractAscendFractalLayout(T.layout_map[op.src], op.src, &info))
+          << "L0C->GM copy expects an Ascend fractal layout on the L0C src "
+          << op.src->name;
+      loop_src_stride = info.outer1 * info.row_frac;
+    }
+    // GM dst last-dim from its ND (identity) layout output shape.
+    Array<PrimExpr> dst_nd_shape = makeAscendNDLayout(op.dst)->OutputShape();
+    PrimExpr dst_last_dim = dst_nd_shape[dst_nd_shape.size() - 1];
     call =
         Call(DataType::Void(), ascend_copy_matrix_cc_to_gm(),
              {dst_ptr,
@@ -375,7 +494,7 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
               inner_elems,
               n_rows,
               dst_last_dim,
-              n_rows,
+              loop_src_stride,
               I(op.GetL2CacheCtrl()), // [7] l2_cache_ctl
               zero,                   // [8] clip_relu_pre
               I(op.GetUnitFlagCtl()), // [9] unit_flag_ctl
@@ -447,6 +566,23 @@ struct Copy {
         CollectFragmentLayouts(range->extent, T.bind_var_to_expr, T.layout_map,
                                thread_extent, T.thread_bounds, result_map);
       }
+
+      if (op.sf.defined()) {
+        const Buffer &sf_buf = op.sf.value();
+        result_map.Set(sf_buf, MakeAscendSFLayout(sf_buf));
+      }
+
+      int dma_path = GetDMAPath(op.src, op.dst);
+      if ((dma_path == 3 || dma_path == 4) && !T.layout_map.count(op.src)) {
+        result_map.Set(op.src, MakeAscendMajorKLayout(op.src));
+      }
+
+      // Layout constraints for Ascend Cube-side data buffers are now attached
+      // at allocation / explicit annotation sites (e.g. alloc_l1(...,
+      // major=...), alloc_l0a/b default MajorK, and GemmMAD for L0C).  Copy
+      // inference should not guess or overwrite those data layouts based solely
+      // on DMA path. It only contributes fragment layouts discovered in index
+      // expressions above, plus SF_K layout for explicit MX scale operands.
       return result_map;
     }
 

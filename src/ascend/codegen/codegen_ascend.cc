@@ -1137,8 +1137,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->stream << ", " << Downcast<StringImm>(op->args[3])->value;
     this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_copy_gm_to_cbuf())) {
-    ICHECK_EQ(op->args.size(), 11)
-        << "tl.ascend_copy_gm_to_cbuf expects exactly 11 arguments";
+    ICHECK_EQ(op->args.size(), 12)
+        << "tl.ascend_copy_gm_to_cbuf expects exactly 12 arguments";
     // arg[9] is the transpose flag: 0 → nd2nz, nonzero → dn2nz
     const IntImmNode *transpose_node = op->args[9].as<IntImmNode>();
     bool use_dn2nz = transpose_node && transpose_node->value != 0;
@@ -1160,9 +1160,19 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintIndent();
     this->stream << (use_dn2nz ? "copy_gm_to_cbuf_multi_dn2nz("
                                : "copy_gm_to_cbuf_multi_nd2nz(");
-    this->PrintExpr(op->args[0], this->stream);
-    this->stream << ", ";
-    this->PrintExpr(op->args[1], this->stream);
+    std::string physical_dtype = Downcast<StringImm>(op->args[11])->value;
+    if (!physical_dtype.empty()) {
+      this->stream << "(__cbuf__ " << physical_dtype << "*)(";
+      this->PrintExpr(op->args[0], this->stream);
+      this->stream << "), ";
+      this->stream << "(__gm__ " << physical_dtype << "*)(";
+      this->PrintExpr(op->args[1], this->stream);
+      this->stream << ")";
+    } else {
+      this->PrintExpr(op->args[0], this->stream);
+      this->stream << ", ";
+      this->PrintExpr(op->args[1], this->stream);
+    }
     this->stream << ", ";
     for (int i = 2; i < 9; ++i) {
       if (i > 2)
@@ -1302,10 +1312,9 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     //                        dst_dtype_str)
     // 2D copy_ubuf_to_cbuf from NZ tmp to L1.
     //
-    // Sid correction: warpgroup_partition gives dst_ptr an ND offset
-    //   (sid * rows * cols elements).  The true NZ offset is
-    //   sid * rows * elems_perC0 (elems_perC0 = 32 / sizeof(elem)).
-    // We subtract the difference inline — sid is a runtime variable.
+    // The dst_l1 access_ptr already carries the correct physical NZ offset
+    // (computed by HandleAccessPtrAndOffset through the fractal layout).
+    // No sid correction is needed.
     //
     // 2D copy model: each D-group = one "row".
     //   burst_num = cols / elems_perC0    (D-groups)
@@ -1322,17 +1331,15 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     int elem_bytes = (dst_dtype == "float") ? 4 : 2;
     int elems_perC0 = 32 / elem_bytes; // 16 (half) or 8 (float)
 
-    int burst_num = cols / elems_perC0;           // D-groups
-    int burst_len = rows;                         // 32B blocks per D-group
-    int src_gap = 1;                              // pad in tmp between D-groups
-    int dst_gap = full_rows - rows;               // other AIV rows in L1
-    int correction = rows * (cols - elems_perC0); // ND→NZ ptr delta
+    int burst_num = cols / elems_perC0; // D-groups
+    int burst_len = rows;               // 32B blocks per D-group
+    int src_gap = 1;                    // pad in tmp between D-groups
+    int dst_gap = full_rows - rows;     // other AIV rows in L1
 
     this->PrintIndent();
-    this->stream << "copy_ubuf_to_cbuf((__cbuf__ void*)((__cbuf__ " << dst_dtype
-                 << "*)(";
+    this->stream << "copy_ubuf_to_cbuf((__cbuf__ void*)(";
     this->PrintExpr(op->args[0], this->stream);
-    this->stream << ") - sid * " << correction << "), (__ubuf__ void*)(";
+    this->stream << "), (__ubuf__ void*)(";
     this->PrintExpr(op->args[1], this->stream);
     this->stream << "), 0, " << burst_num << ", " << burst_len << ", "
                  << src_gap << ", " << dst_gap << ");\n";
@@ -1397,7 +1404,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     int N = op->args[7].as<IntImmNode>()->value;
     int tile_k_sub = op->args[8].as<IntImmNode>()->value;
     int trans_b = op->args[9].as<IntImmNode>()->value;
-    int sf_load_chunk_size = op->args[16].as<IntImmNode>()->value;
+    int sf_nz_stride = op->args[16].as<IntImmNode>()->value;
     std::string in_dtype_str = op->args[11].as<StringImmNode>()->value;
     std::string sf_dtype_str = op->args[12].as<StringImmNode>()->value;
     std::string accum_dtype_str = op->args[13].as<StringImmNode>()->value;
@@ -1405,7 +1412,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintIndent();
     this->stream << "ascend_blockscaled_gemm_l1<" << M << ", " << K << ", " << N
                  << ", " << tile_k_sub << ", " << (trans_b ? "true" : "false")
-                 << ", " << sf_load_chunk_size << ", " << in_dtype_str << ", "
+                 << ", " << sf_nz_stride << ", " << in_dtype_str << ", "
                  << sf_dtype_str << ", " << accum_dtype_str << ">(";
     this->PrintExpr(op->args[0], this->stream);
     this->stream << ", ";

@@ -519,17 +519,20 @@ def blockscaled_gemm(
     A: BufferLikeType,
     B: BufferLikeType,
     C: BufferLikeType,
-    sfa: BufferLikeType,
-    sfb: BufferLikeType,
+    sfa: BufferLikeType | None = None,
+    sfb: BufferLikeType | None = None,
     transpose_A: bool = False,
     transpose_B: bool = False,
     clear_accum: bool = False,
-    sf_k_within_chunk: int | tirx.PrimExpr = 0,
     unit_flag_ctrl: int = 0,
 ) -> tirx.PrimExpr:
-    """Ascend block-scaled MXFP8 GEMM with L1 data and scale-factor tiles."""
+    """Ascend block-scaled MXFP8 GEMM.
 
-    ann = {"unit_flag_ctrl": unit_flag_ctrl}
+    Scale buffers are required for L1 A/B inputs. For L0 A/B inputs the scales
+    are expected to have been loaded by the preceding ``T.copy(..., scale=...)``.
+    """
+
+    ann = {"unit_flag_ctrl": unit_flag_ctrl, "blockscaled": 1}
     return _gemm_impl(
         "tl.tileop.gemm",
         A,
@@ -544,6 +547,5 @@ def blockscaled_gemm(
         mbar=None,
         sfa=sfa,
         sfb=sfb,
-        sf_k_start=sf_k_within_chunk,
         annotations=ann,
     )

@@ -31,6 +31,25 @@ from .eager.builder import OutTensor
 from .proxy import Tensor, ptr as _ptr_sentinel
 
 
+def _annotate_ascend_major_layout(buf: Buffer, major: Literal["K", "MN", "SF_K"] | None) -> None:
+    """Attach an Ascend fractal layout annotation for Cube-side buffers."""
+    if major is None:
+        return
+    if len(buf.shape) < 2:
+        return
+    from tilelang.layout import make_ascend_major_k_layout, make_ascend_major_mn_layout, make_ascend_sf_layout
+
+    if major == "K":
+        layout = make_ascend_major_k_layout(buf)
+    elif major == "MN":
+        layout = make_ascend_major_mn_layout(buf)
+    elif major == "SF_K":
+        layout = make_ascend_sf_layout(buf)
+    else:
+        raise ValueError(f"major must be 'K', 'MN', 'SF_K', or None, got {major!r}")
+    sblock_attr({"layout_map": {buf.data: layout}})
+
+
 def alloc_shared(shape: ShapeType, dtype: DType, scope="shared.dyn") -> Buffer:
     """Allocate a shared memory buffer for inter-thread communication.
 
@@ -88,37 +107,56 @@ def alloc_l1(shape: ShapeType, dtype: DType, scope="shared.l1") -> Buffer:
     return T.sblock_alloc_buffer(shape, dtype, scope=scope)
 
 
-def alloc_l0a(shape: ShapeType, dtype: DType, scope="shared.l0a") -> Buffer:
+def alloc_l0a(shape: ShapeType, dtype: DType, scope="shared.l0a", major: Literal["K"] | None = "K") -> Buffer:
     """Allocate an L0A buffer (__ca__) on Ascend NPU.
 
     Args:
         shape: Buffer shape
         dtype: Data type
         scope: Memory scope. Defaults to "shared.l0a"
+        major: Ascend Cube semantic major. L0A is a mad input and must be
+            canonical K-major; use ``None`` only for low-level/manual code.
     """
-    return T.sblock_alloc_buffer(shape, dtype, scope=scope)
+    if major not in ("K", None):
+        raise ValueError(f"L0A only supports major='K' or None, got {major!r}")
+    buf = T.sblock_alloc_buffer(shape, dtype, scope=scope)
+    _annotate_ascend_major_layout(buf, major)
+    return buf
 
 
-def alloc_l0b(shape: ShapeType, dtype: DType, scope="shared.l0b") -> Buffer:
+def alloc_l0b(shape: ShapeType, dtype: DType, scope="shared.l0b", major: Literal["K"] | None = "K") -> Buffer:
     """Allocate an L0B buffer (__cb__) on Ascend NPU.
 
     Args:
         shape: Buffer shape
         dtype: Data type
         scope: Memory scope. Defaults to "shared.l0b"
+        major: Ascend Cube semantic major. L0B is a mad input and must be
+            canonical K-major; use ``None`` only for low-level/manual code.
     """
-    return T.sblock_alloc_buffer(shape, dtype, scope=scope)
+    if major not in ("K", None):
+        raise ValueError(f"L0B only supports major='K' or None, got {major!r}")
+    buf = T.sblock_alloc_buffer(shape, dtype, scope=scope)
+    _annotate_ascend_major_layout(buf, major)
+    return buf
 
 
-def alloc_l0c(shape: ShapeType, dtype: DType, scope="shared.l0c") -> Buffer:
+def alloc_l0c(shape: ShapeType, dtype: DType, scope="shared.l0c", layout: bool = True) -> Buffer:
     """Allocate an L0C buffer (__cc__) on Ascend NPU.
 
     Args:
         shape: Buffer shape
         dtype: Data type
         scope: Memory scope. Defaults to "shared.l0c"
+        layout: Whether to annotate the fixed Ascend L0C accumulator layout.
     """
-    return T.sblock_alloc_buffer(shape, dtype, scope=scope)
+    buf = T.sblock_alloc_buffer(shape, dtype, scope=scope)
+    if layout:
+        from tilelang.layout import make_ascend_l0c_layout
+
+        if len(buf.shape) >= 2:
+            sblock_attr({"layout_map": {buf.data: make_ascend_l0c_layout(buf)}})
+    return buf
 
 
 @overload

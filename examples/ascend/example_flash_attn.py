@@ -131,7 +131,7 @@ def flash_attention(D=128, SEQ_LEN=4096):
                         outReg = vadd(outReg, sum1, one)
                         vsts(l_ub[r + 1], outReg, one, "ONEPT_B32")
 
-                T.dual_copy(P_ub, P_shared, nd2nz=True)
+                T.dual_copy(P_ub, P_shared)
                 T.gemm(P_shared, V_shared, acc_o, transpose_B=True, clear_accum=True)
                 T.dual_copy(acc_o, O_tmp_ub)
 
