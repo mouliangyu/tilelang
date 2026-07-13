@@ -307,7 +307,7 @@ protected:
 
   void VisitStmt_(const ForNode *op) override {
     // Determine if this is a sequential or parallel for
-    if (op->kind == ForKind::kSerial) {
+    if (op->kind == ForKind::kSerial || op->kind == ForKind::kUnrolled) {
       // Sequential For -> ControlNode
       auto control_node = std::make_shared<ControlNode>();
       control_node->control = GetRef<For>(op);
