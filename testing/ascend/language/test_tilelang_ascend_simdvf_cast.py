@@ -28,6 +28,12 @@ FP4_E2M1_VALUES = torch.tensor(
 )
 
 
+def _gm_storage(dt: T.dtype) -> T.dtype:
+    # Ascend stores fp4 1 code/byte; declare it int8 so the tvm_ffi packed-ABI
+    # check and the DMA byte count agree with a 1-byte-per-code tensor.
+    return INT8 if dt == FP4_E2M1 else dt
+
+
 @tilelang.jit(out_idx=[1])
 def cast_kernel(n: int, in_dtype: T.dtype, out_dtype: T.dtype):
     is_fp8_in = in_dtype in FP8_TYPES
@@ -35,12 +41,12 @@ def cast_kernel(n: int, in_dtype: T.dtype, out_dtype: T.dtype):
 
     @T.prim_func
     def main(
-        X: T.Tensor((n,), in_dtype),
-        Y: T.Tensor((n,), out_dtype),
+        X: T.Tensor((n,), _gm_storage(in_dtype)),
+        Y: T.Tensor((n,), _gm_storage(out_dtype)),
     ):
         with T.Kernel(1):
-            x_ub = T.alloc_shared((n,), in_dtype)
-            y_ub = T.alloc_shared((n,), out_dtype)
+            x_ub = T.alloc_shared((n,), _gm_storage(in_dtype))
+            y_ub = T.alloc_shared((n,), _gm_storage(out_dtype))
 
             T.copy(X, x_ub)
 
@@ -72,10 +78,13 @@ def cast_kernel(n: int, in_dtype: T.dtype, out_dtype: T.dtype):
                             y = T.simd.vcvt(x_f32, out_dtype, mask_f32)
                             T.simd.vsts(y_ub[i * 64], y, mask_f32, dist="PK4_B32")
                     elif in_dtype == BF16 and out_dtype == FP4_E2M1:
+                        # Ascend stores fp4 1 code/byte; view the int8 UBuf as
+                        # fp4 so vsts packs the codes correctly.
+                        y_fp4 = T.view(y_ub, (2 * n,), FP4_E2M1)
                         for i in range(n // 64):
                             x = T.simd.vld(x_ub[i * 64], dist="UNPK_B16")
                             y = T.simd.vcvt(x, out_dtype, mask_b16)
-                            T.simd.vsts(y_ub[i * 64], y, mask_b16, dist="PK4_B32")
+                            T.simd.vsts(y_fp4[i * 64], y, mask_b16, dist="PK4_B32")
                     elif in_dtype == F16 and out_dtype == F32:
                         for i in range(n // 64):
                             x = T.simd.vld(x_ub[i * 64], dist="UNPK_B16")
@@ -84,8 +93,11 @@ def cast_kernel(n: int, in_dtype: T.dtype, out_dtype: T.dtype):
                 elif in_dtype == FP4_E2M1:
                     mask_b16 = T.simd.pset(16)
                     if out_dtype == BF16:
+                        # Ascend stores fp4 1 code/byte; view the int8 UBuf as
+                        # fp4 so vld/vcvt decode the codes correctly.
+                        x_fp4 = T.view(x_ub, (2 * n,), FP4_E2M1)
                         for i in range(n // 64):
-                            x = T.simd.vld(x_ub[i * 64], dist="UNPK4_B8")
+                            x = T.simd.vld(x_fp4[i * 64], dist="UNPK4_B8")
                             y = T.simd.vcvt(x, out_dtype, mask_b16)
                             T.simd.vsts(y_ub[i * 64], y, mask_b16, dist="PK_B32")
                 elif is_fp8_in:
@@ -141,8 +153,8 @@ CASES = (
     ("e4m3->half", FP8_E4M3, F16, torch.float8_e4m3fn, torch.float16, "e4m3"),
     ("bf16->e4m3", BF16, FP8_E4M3, torch.bfloat16, torch.float8_e4m3fn, "e4m3"),
     ("e4m3->bf16", FP8_E4M3, BF16, torch.float8_e4m3fn, torch.bfloat16, "e4m3"),
-    ("bf16->e2m1x2", BF16, FP4_E2M1, torch.bfloat16, torch.float4_e2m1fn_x2, "e2m1"),
-    ("e2m1x2->bf16", FP4_E2M1, BF16, torch.float4_e2m1fn_x2, torch.bfloat16, "e2m1"),
+    ("bf16->e2m1x2", BF16, FP4_E2M1, torch.bfloat16, torch.int8, "e2m1"),
+    ("e2m1x2->bf16", FP4_E2M1, BF16, torch.int8, torch.bfloat16, "e2m1"),
     ("fp32->half", F32, F16, torch.float32, torch.float16, "int"),
     ("half->fp32", F16, F32, torch.float16, torch.float32, "int"),
     ("s32->f32", INT32, F32, torch.int32, torch.float32, "int"),
@@ -165,8 +177,8 @@ def make_input(n: int, torch_dtype: torch.dtype, value_kind: str) -> torch.Tenso
     elif value_kind == "e5m2":
         x = torch.linspace(-57344.0, 57344.0, n, device="npu", dtype=torch.float32)
     elif value_kind == "e2m1":
-        if torch_dtype == torch.float4_e2m1fn_x2:
-            return fp4_e2m1_codes(n).view(torch_dtype)
+        if torch_dtype == torch.int8:
+            return fp4_e2m1_codes(n).view(torch.int8)
         idx = torch.arange(n, dtype=torch.long, device=FP4_E2M1_VALUES.device) % FP4_E2M1_VALUES.numel()
         x = FP4_E2M1_VALUES[idx].to(device="npu")
     elif value_kind == "uint":
@@ -200,6 +212,7 @@ def test_simdvf_cast(case):
 
     kernel = cast_kernel(N, in_tl_dtype, out_tl_dtype)
     x = make_input(N, in_torch_dtype, value_kind)
+
     y = kernel(x)
     torch.npu.synchronize()
 

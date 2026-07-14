@@ -101,6 +101,10 @@ def resolve_execution_backend_spec(requested: str | None, target: Target) -> Exe
     if requested_name in (None, "auto"):
         if not allowed_available_specs:
             raise ValueError(f"No available execution backend for target '{target.kind.name}'. Allowed: {_format_options(allowed_all)}.")
+        if "ascend" in target.keys:
+            for spec in allowed_available_specs:
+                if spec.name == "tvm_ffi":
+                    return spec
         return allowed_available_specs[0]
 
     if requested_name not in allowed_all:

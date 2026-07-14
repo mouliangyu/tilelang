@@ -266,6 +266,9 @@ def compress_and_update_state_decode_ref(
 
 def _check(actual, ref, name, rtol=2e-2, atol=2e-2):
     """Compare NPU output against CPU reference; print a diagnostic and assert."""
+    # Kernels launch asynchronously on the NPU stream; block until they finish
+    # so the D2H copy below observes the completed results (not a partial write).
+    torch.npu.synchronize()
     a = actual.detach().float().cpu()
     r = ref.detach().float().cpu()
     diff = (a - r).abs()

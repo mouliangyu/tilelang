@@ -472,20 +472,22 @@ void CodeGenTileLangAscend::PrintKernelLauncher(
   // `void*` at that address; scalar params hold the scalar value.
   //
   // grid (flattened blockIdx extent) and smem (dynamic shared-memory bytes) are
-  // baked here from the PrimFunc's static `thread_extent` /
-  // `dyn_shared_memory_buf` attrs, mirroring the cython host wrapper. We
-  // deliberately do NOT use the grid/smem passed by the runtime: the upstream
-  // LaunchParamConfig folds Ascend-specific launch tags such as
-  // `cthread`/`vthread` into the grid dims, which would corrupt the launch
-  // grid. The stream is taken from the caller.
-  int64_t grid = 1;
+  // baked here from the PrimFunc's `thread_extent` / `dyn_shared_memory_buf`
+  // attrs, mirroring the cython host wrapper. We deliberately do NOT use the
+  // grid/smem passed by the runtime: the upstream LaunchParamConfig folds
+  // Ascend-specific launch tags such as `cthread`/`vthread` into the grid dims,
+  // which would corrupt the launch grid. The stream is taken from the caller.
+  //
+  // The grid is rendered as a C++ expression (not just a static literal) so
+  // that dynamic launch bounds such as `blockIdx.x = ceildiv(num_tokens, ...)`
+  // resolve at runtime against the scalar params, matching the cython path.
+  ffi::Optional<PrimExpr> grid_expr;
   if (auto opt = f->GetAttr<ffi::Map<ffi::String, PrimExpr>>("thread_extent")) {
     for (const auto &kv : opt.value()) {
       const std::string tag = kv.first;
       if (tag.compare(0, 9, "blockIdx.") == 0) {
-        if (const auto *imm = kv.second.as<IntImmNode>()) {
-          grid *= imm->value;
-        }
+        grid_expr =
+            grid_expr.defined() ? (grid_expr.value() * kv.second) : kv.second;
       }
     }
   }
@@ -502,11 +504,11 @@ void CodeGenTileLangAscend::PrintKernelLauncher(
      << "(void** void_args, uint32_t grid, uint32_t smem, void* stream) {\n";
 
   // Build the unpacked argument list, casting each void_args[i] to the
-  // corresponding kernel parameter type.
+  // corresponding kernel parameter type. Scalar params are bound to named
+  // locals first so the grid expression (which may reference them) resolves.
   std::vector<std::string> call_args;
   for (size_t i = 0; i < f->params.size(); ++i) {
     const tirx::Var &v = f->params[i];
-    std::ostringstream arg;
     if (v.dtype().is_handle()) {
       // Pointer parameter: emit the fully-qualified pointer type (storage
       // scope + element type) and load the pointer value from void_args[i].
@@ -520,14 +522,20 @@ void CodeGenTileLangAscend::PrintKernelLauncher(
       } else {
         ty << "void";
       }
+      std::ostringstream arg;
       arg << "(*reinterpret_cast<" << ty.str() << "**>(void_args[" << i
           << "]))";
+      call_args.push_back(arg.str());
     } else {
+      // Scalar parameter: bind to a named local so a dynamic grid expression
+      // can reference it by name (via GetVarID / PrintExpr).
       std::ostringstream ty;
       CodeGenC::PrintType(v.dtype(), ty);
-      arg << "(*reinterpret_cast<" << ty.str() << "*>(void_args[" << i << "]))";
+      std::string vid = GetVarID(v.get());
+      os << "  " << ty.str() << " " << vid << " = (*reinterpret_cast<"
+         << ty.str() << "*>(void_args[" << i << "]));\n";
+      call_args.push_back(vid);
     }
-    call_args.push_back(arg.str());
   }
 
   std::string joined;
@@ -537,10 +545,18 @@ void CodeGenTileLangAscend::PrintKernelLauncher(
     joined += call_args[i];
   }
 
+  std::string grid_str;
+  if (grid_expr.defined()) {
+    arith::Analyzer analyzer;
+    grid_str = PrintExpr(analyzer.Simplify(grid_expr.value()));
+  } else {
+    grid_str = "1";
+  }
+
   // Suppress unused-parameter warnings for the runtime-supplied grid/smem.
   os << "  (void)grid; (void)smem;\n";
-  os << "  " << global_symbol << "<<<" << grid << ", " << smem << ", stream>>>("
-     << joined << ");\n";
+  os << "  " << global_symbol << "<<<" << grid_str << ", " << smem
+     << ", stream>>>(" << joined << ");\n";
   os << "}\n\n";
   this->stream << os.str();
 }
