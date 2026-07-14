@@ -67,6 +67,9 @@ private:
   bool has_simd_inst_included_{false};
   bool has_gm_bypass_dcache_{false};
   bool has_gm_bypass_dcache_included_{false};
+  bool has_philox_rng_{false};
+  bool has_philox_rng_included_{false};
+  std::string ascend_rng_state_var_;
 
   ffi::Array<Var> CollectVFCaptures(const SBlockNode *op) const;
   void EmitVFFunction(const SBlockNode *op, const ffi::Array<Var> &captures,

@@ -353,6 +353,9 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
           call->op.same_as(tl::ascend_write_gm_bypass_dcache())) {
         has_gm_bypass_dcache_ = true;
       }
+      if (call->op.same_as(tl::rng_init())) {
+        has_philox_rng_ = true;
+      }
     }
   });
 
@@ -373,6 +376,12 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   if (has_gm_bypass_dcache_ && !has_gm_bypass_dcache_included_) {
     decl_stream << "#include <tl_templates/ascend/dcache_bypass.h>\n";
     has_gm_bypass_dcache_included_ = true;
+  }
+
+  // Conditionally include philox_rng.h when tl.rng_init is used
+  if (has_philox_rng_ && !has_philox_rng_included_) {
+    decl_stream << "#include <tl_templates/ascend/philox_rng.h>\n";
+    has_philox_rng_included_ = true;
   }
 
   if (has_cube && has_vector) {
@@ -2015,6 +2024,28 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       emit_ptr_and_val(this->stream);
       this->stream << ";\n";
     }
+  } else if (op->op.same_as(tl::rng_init())) {
+    // Ascend SIMT Philox RNG. Must be used inside a T.SimtVF(...) block so it
+    // compiles into a __simt_vf__ helper. args: seed, seq, off, generator.
+    ICHECK(inside_simtvf_body_)
+        << "tl.rng_init on Ascend must be used inside a T.SimtVF(...) block";
+    ascend_rng_state_var_ = name_supply_->FreshName("__asc_rng_state");
+    this->PrintIndent();
+    this->stream << "tl::AscendPhiloxState " << ascend_rng_state_var_ << ";\n";
+    this->PrintIndent();
+    this->stream << "tl::philox_init(&" << ascend_rng_state_var_ << ", "
+                 << PrintExpr(op->args[0]) << ", " << PrintExpr(op->args[1])
+                 << ", " << PrintExpr(op->args[2]) << ");\n";
+    // args[3] (curand generator string) is ignored on Ascend.
+  } else if (op->op.same_as(tl::rng_rand())) {
+    os << "tl::philox_rand(&" << ascend_rng_state_var_ << ")";
+  } else if (op->op.same_as(tl::rng_rand_float())) {
+    ICHECK_NE(op->dtype.bits(), 64)
+        << "float64 RNG (tl.rng_rand_float bit=64) is not supported on Ascend";
+    const std::string dist = op->args[0].as<StringImmNode>()->value;
+    ICHECK(dist == "uniform" || dist == "normal")
+        << "Unsupported RNG distribution on Ascend: " << dist;
+    os << "tl::philox_rand_" << dist << "(&" << ascend_rng_state_var_ << ")";
   } else {
     CodeGenC::VisitExpr_(op, os);
   }
