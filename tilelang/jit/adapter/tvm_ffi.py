@@ -1,9 +1,8 @@
-"""Utilities to adapt TVM FFI kernels to Torch tensors.
+"""Utilities to adapt TVM-FFI kernels to Torch tensors.
 
-This adapter intentionally captures PyTorch's current CUDA stream and device
-via light-weight callables so that, when the wrapped function is invoked,
-the execution observes the same stream context as the active Torch code.
-On non-CUDA builds, the stream/device fall back to 0/CPU semantics.
+TVM-FFI obtains the active work stream through Torch's DLPack Exchange API.
+The Ascend adapter installs TileLang's Torch NPU callback before the first
+tensor reaches an executable.
 """
 
 from __future__ import annotations
@@ -23,6 +22,7 @@ from tilelang.jit.adapter.base import BaseKernelAdapter, CachedTextSource
 from tilelang.utils.language import retrieve_func_from_module
 from tilelang.engine.param import KernelParam
 from tilelang.language.dtypes import dtype
+from tilelang.jit.adapter.utils import is_ascend_target
 
 
 COMPILE_ARGS = {}
@@ -37,16 +37,24 @@ elif sys.platform == "win32":
     COMPILE_ARGS["fcompile"] = _msvc_create_shared
 
 
+def _install_torch_stream_exchange(target: Target) -> None:
+    if not is_ascend_target(target):
+        return
+
+    from tilelang.ascend.torch_exchange import (
+        install_torch_npu_stream_exchange,
+    )
+
+    install_torch_npu_stream_exchange()
+
+
 class TVMFFIKernelAdapter(BaseKernelAdapter):
     """Adapter that runs a TVM runtime.Executable with Torch tensors.
 
     Notes
-    - We capture the "current" PyTorch CUDA stream/device as thunks (callables)
-      rather than materializing them at construction time. This ensures the
-      actual stream/device is read just-in-time when the function runs, matching
-      the user's current Torch context (e.g., after a stream guard/switch).
-    - The stream pointer returned is a raw CUDA stream handle compatible with
-      TVM's device API; on CPU or when CUDA is unavailable, we return 0.
+    - Torch tensors use TVM-FFI's zero-copy DLPack Exchange API conversion.
+    - Ascend execution installs a Cython callback that reads Torch's current
+      NPU stream for every invocation.
     """
 
     # Class attributes to store compiled kernel information
@@ -67,6 +75,10 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
     rt_mod: tvm.runtime.Module | None = None
     # Maps symbolic variables to their corresponding buffer and shape indices
     dynamic_symbolic_map: dict[tirx.Var, tuple[int, int, int]] | None = None
+
+    def _post_init(self) -> None:
+        _install_torch_stream_exchange(self.target)
+        super()._post_init()
 
     # Stream/device functors are inherited from BaseKernelAdapter
     def __init__(
