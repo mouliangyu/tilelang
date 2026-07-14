@@ -1972,20 +1972,6 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
              op->op.same_as(tl::atomic_max_ret_elem_op()) ||
              op->op.same_as(tl::atomic_min_ret_elem_op())) {
     ICHECK_GE(op->args.size(), 2);
-    const auto *addr = op->args[0].as<CallNode>();
-    ICHECK(addr && addr->op.same_as(tirx::builtin::address_of()));
-    const auto *load = addr->args[0].as<BufferLoadNode>();
-    ICHECK(load);
-    const auto *buf_var = load->buffer->data.get();
-    std::string scope;
-    auto scope_it = alloc_storage_scope_.find(buf_var);
-    if (scope_it != alloc_storage_scope_.end()) {
-      scope = scope_it->second;
-    } else {
-      scope = GetPtrStorageScope(load->buffer->data);
-    }
-    std::string qual =
-        (scope == "global") ? "__gm__" : GetAscendScopeQualifier(scope);
     const char *fn = nullptr;
     bool is_ret = false;
     if (op->op.same_as(tl::atomic_add_elem_op()) ||
@@ -2000,17 +1986,9 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
              op->op.same_as(tl::atomic_max_ret_elem_op()) ||
              op->op.same_as(tl::atomic_min_ret_elem_op());
     auto emit_ptr_and_val = [&](std::ostream &out) {
-      out << "asc_atomic_" << fn << "((" << qual << " ";
-      PrintType(load->dtype, out);
-      out << "*)(" << GetVarID(buf_var);
-      if (load->indices.size() == 1) {
-        PrimExpr idx = load->indices[0];
-        if (!is_zero(idx)) {
-          out << " + ";
-          PrintExpr(idx, out);
-        }
-      }
-      out << "), ";
+      // args[0] is address_of(BufferLoad); its codegen already emits a
+      // correctly scoped, element-typed, offset pointer.
+      out << "asc_atomic_" << fn << "(" << PrintExpr(op->args[0]) << ", ";
       PrintExpr(op->args[1], out);
       if (op->args.size() > 2) {
         out << ", " << PrintExpr(op->args[2]);
