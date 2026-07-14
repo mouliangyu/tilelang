@@ -2,6 +2,7 @@
 
 import torch
 import tilelang
+import pytest
 from example_gemm import gemm, ref_program
 
 
@@ -44,6 +45,7 @@ def test_gemm_auto_bf16():
     _test("bfloat16", 1e-2, "bfloat16")
 
 
+@pytest.mark.pto
 def test_gemm_auto_bf16_pto():
     _test_pto("bfloat16", 1e-2)
 

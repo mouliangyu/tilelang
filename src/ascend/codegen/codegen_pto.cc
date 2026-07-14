@@ -4,17 +4,26 @@
  */
 #include "ascend/codegen/codegen_pto.h"
 
-#include <tvm/arith/analyzer.h>
-#include <tvm/tirx/builtin.h>
-#include <tvm/tirx/stmt_functor.h>
-
-#include <cstdint>
-#include <sstream>
-#include <string>
-
 #include "backend/common/codegen/codegen_utils.h"
 #include "op/builtin.h"
 #include "support/check.h"
+
+#include <tvm/arith/analyzer.h>
+#include <tvm/ffi/extra/structural_equal.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/expr_functor.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+
+#include <cstdint>
+#include <cstdio>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace tvm {
 namespace codegen {
@@ -27,22 +36,22 @@ std::string PtoTypeName(DataType t) {
   ICHECK(t.is_scalar()) << "PTO scalar type expected, got " << t;
   if (t.is_float()) {
     if (t.bits() == 32)
-      return "pto.float32";
+      return "pto.f32";
     if (t.bits() == 16)
       return "pto.float16";
   } else if (t.is_bfloat16()) {
     return "pto.bf16";
   } else if (t.is_int() || t.is_uint()) {
     if (t.bits() == 64)
-      return "pto.int64";
+      return "pto.i64";
     if (t.bits() == 32)
-      return "pto.int32";
+      return "pto.i32";
     if (t.bits() == 16)
-      return "pto.int16";
+      return "pto.i16";
     if (t.bits() == 8)
-      return "pto.int8";
+      return "pto.i8";
     if (t.bits() == 1)
-      return "pto.int1";
+      return "pto.i1";
   }
   LOG(FATAL) << "Unsupported PTO type: " << t;
   return "";
@@ -88,6 +97,28 @@ bool StartsWith(const std::string &value, const std::string &prefix) {
   return value.rfind(prefix, 0) == 0;
 }
 
+bool IsFloat32(DataType t) {
+  return t.is_float() && t.bits() == 32 && t.lanes() == 1;
+}
+
+void CheckContiguousRampStride(const PrimExpr &index, const char *access_kind) {
+  if (const auto *ramp = index.as<RampNode>()) {
+    PrimExpr stride_expr = arith::Analyzer().Simplify(ramp->stride);
+    int64_t stride = 0;
+    ICHECK(TryGetConstInt(stride_expr, &stride) && stride == 1)
+        << "PTO SIMT vector " << access_kind
+        << " emits a contiguous vector access, so Ramp stride must be 1, got "
+        << ramp->stride;
+  }
+}
+
+void CheckConstZero(const PrimExpr &expr, const char *name) {
+  int64_t value = 0;
+  ICHECK(TryGetConstInt(expr, &value) && value == 0)
+      << "PTO codegen currently only supports " << name
+      << " == 0 for tl.ascend_copy_gm_to_ubuf, got " << expr;
+}
+
 bool IsOpName(const ObjectRef &op, const std::string &name) {
   if (auto opt_call_op = op.as<Op>()) {
     return opt_call_op.value()->name == name;
@@ -105,13 +136,6 @@ int64_t ConstShapeDim(const PrimExpr &expr, const char *name) {
 int64_t ConstArgDim(const CallNode *call, size_t index, const char *name) {
   ICHECK_GT(call->args.size(), index) << name << " argument is missing";
   return ConstShapeDim(call->args[index], name);
-}
-
-void CheckConstZero(const PrimExpr &expr, const char *name) {
-  int64_t value = 0;
-  ICHECK(TryGetConstInt(expr, &value) && value == 0)
-      << "PTO codegen currently only supports " << name
-      << " == 0 for tl.ascend_copy_gm_to_ubuf, got " << expr;
 }
 
 void CheckPTOLocalVarBuffer(const BufferNode *buffer) {
@@ -298,13 +322,13 @@ void CodeGenTileLangPTO::PrintFunctionSignature_(
     std::ostream &os) { // NOLINT(*)
   os << "def " << function_name << "(";
   for (size_t i = 0; i < func->params.size(); ++i) {
-    tirx::Var v = func->params[i];
+    Var v = func->params[i];
     if (i > 0) {
       os << ", ";
     }
     os << AllocVarID(v.get());
     if (func->buffer_map.count(v)) {
-      tirx::Buffer buffer = func->buffer_map[v];
+      Buffer buffer = func->buffer_map[v];
       os << ": " << PtoPtrType(buffer->dtype, "gm");
     } else if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
       if (auto *prim = ptr->element_type.as<PrimTypeNode>()) {
@@ -364,6 +388,218 @@ bool CodeGenTileLangPTO::HasAscendGemmL1(const PrimFunc &func) const {
   return found;
 }
 
+std::string CodeGenTileLangPTO::ResolveVarName(const Var &v) const {
+  auto it = var_idmap_.find(v.get());
+  if (it != var_idmap_.end()) {
+    return it->second;
+  }
+  return v->name_hint;
+}
+
+std::string CodeGenTileLangPTO::ScopeOfBuffer(const BufferNode *buffer) const {
+  std::string scope;
+  auto it = alloc_storage_scope_.find(buffer->data.get());
+  if (it != alloc_storage_scope_.end()) {
+    scope = it->second;
+  }
+  if (scope.empty()) {
+    scope = GetPtrStorageScope(buffer->data);
+  }
+  return scope;
+}
+
+ffi::Array<Var>
+CodeGenTileLangPTO::CollectVFCaptures(const SBlockNode *op) const {
+  ffi::Array<Var> predefined;
+  for (const Buffer &buf : op->alloc_buffers) {
+    predefined.push_back(buf->data);
+  }
+
+  ffi::Array<Var> undefined = UndefinedVars(op->body, predefined);
+  ffi::Array<Var> captures;
+  std::unordered_set<const VarNode *> seen;
+  for (const Var &var : undefined) {
+    if (seen.count(var.get())) {
+      continue;
+    }
+    // Kernel blockIdx.x is mapped directly to the PTODSL builtin in
+    // VisitStmt_(AttrStmtNode), so SIMT helpers can reference it without a
+    // scalar capture parameter.
+    auto it = var_idmap_.find(var.get());
+    if (it != var_idmap_.end() && it->second == "pto.get_block_idx()") {
+      continue;
+    }
+    seen.insert(var.get());
+
+    const DataType dtype = var->dtype;
+    ICHECK(dtype.lanes() == 1 &&
+           (dtype.is_int() || dtype.is_uint() || dtype.is_float() ||
+            dtype.is_handle() || dtype.is_bool()))
+        << op->name_hint << " capture variable `" << var
+        << "` has unsupported dtype `" << dtype
+        << "`. Only scalar int/uint/float/bool/handle captures are supported.";
+    captures.push_back(var);
+  }
+  return captures;
+}
+
+void CodeGenTileLangPTO::ExtractSimtThreadExtents(const SBlockNode *op,
+                                                  int64_t *thread_x,
+                                                  int64_t *thread_y,
+                                                  int64_t *thread_z) const {
+  *thread_x = 1;
+  *thread_y = 1;
+  *thread_z = 1;
+
+  tirx::PostOrderVisit(op->body, [&](const ffi::ObjectRef &node) {
+    const auto *attr = node.as<AttrStmtNode>();
+    if (attr == nullptr || attr->attr_key != tirx::attr::thread_extent) {
+      return;
+    }
+    const auto *iv = attr->node.as<IterVarNode>();
+    if (!iv) {
+      return;
+    }
+    int64_t value = 1;
+    if (TryGetConstInt(attr->value, &value)) {
+      if (iv->thread_tag == "threadIdx.x") {
+        *thread_x = value;
+      } else if (iv->thread_tag == "threadIdx.y") {
+        *thread_y = value;
+      } else if (iv->thread_tag == "threadIdx.z") {
+        *thread_z = value;
+      }
+    }
+  });
+}
+
+void CodeGenTileLangPTO::EmitSimtVFFunction(const SBlockNode *op,
+                                            const ffi::Array<Var> &captures,
+                                            const std::string &helper_name,
+                                            int64_t thread_x, int64_t thread_y,
+                                            int64_t thread_z) {
+  std::unordered_map<const VarNode *, std::string> capture_scope;
+  for (const Var &v : captures) {
+    if (v->type_annotation.as<PointerTypeNode>()) {
+      alloc_storage_scope_[v.get()] = GetPtrStorageScope(v);
+    }
+    auto it = alloc_storage_scope_.find(v.get());
+    if (it != alloc_storage_scope_.end()) {
+      capture_scope[v.get()] = it->second;
+    }
+  }
+
+  std::unordered_map<const VarNode *, std::string> saved_var_idmap;
+  saved_var_idmap.swap(var_idmap_);
+  NameSupply saved_name_supply = name_supply_;
+  name_supply_ = NameSupply();
+  ReserveKeywordsAsUnique_();
+  for (const auto &kv : saved_var_idmap) {
+    var_idmap_[kv.first] = kv.second;
+  }
+  for (const Var &v : captures) {
+    if (!var_idmap_.count(v.get())) {
+      AllocVarID(v.get());
+    }
+    name_supply_->ReserveName(ResolveVarName(v), false);
+  }
+
+  std::vector<std::string> capture_names;
+  capture_names.reserve(captures.size());
+  for (const Var &v : captures) {
+    capture_names.push_back(ResolveVarName(v));
+  }
+
+  CodeGenTileLangPTO body_codegen;
+  body_codegen.var_idmap_ = var_idmap_;
+  body_codegen.name_supply_ = name_supply_;
+  body_codegen.alloc_storage_scope_ = alloc_storage_scope_;
+  body_codegen.inside_simtvf_body_ = true;
+  for (const Var &v : captures) {
+    if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
+      if (auto *prim = ptr->element_type.as<PrimTypeNode>()) {
+        body_codegen.RegisterHandleType_(v.get(), prim->dtype);
+      }
+    }
+  }
+  int helper_scope = body_codegen.BeginScope();
+  for (const Buffer &buf : op->alloc_buffers) {
+    body_codegen.EmitPtoBufferAllocation(buf);
+  }
+  body_codegen.VisitStmt(op->body);
+  body_codegen.EndScope(helper_scope);
+  std::string helper_body = body_codegen.stream.str();
+
+  var_idmap_.swap(saved_var_idmap);
+  name_supply_ = saved_name_supply;
+
+  const int64_t total_threads = thread_x * thread_y * thread_z;
+  decl_stream << "@pto.simt(name=\"" << helper_name << "\"";
+  if (total_threads > 0) {
+    decl_stream << ", max_threads=" << total_threads;
+  }
+  decl_stream << ", max_regs=64)\n";
+  decl_stream << "def " << helper_name << "(";
+  for (size_t i = 0; i < captures.size(); ++i) {
+    if (i != 0) {
+      decl_stream << ", ";
+    }
+    const Var &v = captures[i];
+    std::string vname = capture_names[i];
+    decl_stream << vname << ": ";
+    if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
+      if (auto *prim = ptr->element_type.as<PrimTypeNode>()) {
+        std::string scope =
+            ptr->storage_scope.empty() ? "gm" : ptr->storage_scope;
+        auto scope_it = capture_scope.find(v.get());
+        if (scope_it != capture_scope.end() &&
+            (scope_it->second == "shared" ||
+             scope_it->second == "shared.dyn")) {
+          decl_stream << PtoPtrType(prim->dtype, "ub");
+          RegisterHandleType_(v.get(), prim->dtype);
+          continue;
+        }
+        if (scope == "global") {
+          scope = "gm";
+        } else if (scope == "shared" || scope == "shared.dyn") {
+          scope = "ub";
+        }
+        decl_stream << PtoPtrType(prim->dtype, scope);
+        RegisterHandleType_(v.get(), prim->dtype);
+      } else {
+        decl_stream << PtoScalarType(v->dtype);
+      }
+    } else {
+      decl_stream << PtoScalarType(v->dtype);
+    }
+  }
+  decl_stream << "):\n";
+  if (helper_body.empty()) {
+    decl_stream << "  return\n";
+  } else {
+    decl_stream << helper_body;
+  }
+  decl_stream << "\n";
+}
+
+void CodeGenTileLangPTO::EmitSimtVFLaunch(const ffi::Array<Var> &captures,
+                                          const std::string &helper_name,
+                                          int64_t thread_x, int64_t thread_y,
+                                          int64_t thread_z) {
+  PrintIndent();
+  stream << helper_name << "[" << thread_x << ", " << thread_y << ", "
+         << thread_z << "](";
+  for (size_t i = 0; i < captures.size(); ++i) {
+    if (i != 0) {
+      stream << ", ";
+    }
+    const Var &v = captures[i];
+    std::string arg = ResolveVarName(v);
+    stream << arg;
+  }
+  stream << ")\n";
+}
+
 std::string CodeGenTileLangPTO::GetPtoPointerExpr(const VarNode *buffer_var,
                                                   DataType elem_dtype,
                                                   const PrimExpr &index) {
@@ -374,7 +610,10 @@ std::string CodeGenTileLangPTO::GetPtoPointerExpr(const VarNode *buffer_var,
 
   std::string base = GetVarID(buffer_var);
   if (scope == "shared" || scope == "shared.dyn") {
-    base = "pto.castptr(" + base + ", " + PtoPtrType(elem_dtype, "ub") + ")";
+    if (HandleTypeMatch_(buffer_var, DataType::Int(8)) ||
+        !HandleTypeMatch_(buffer_var, elem_dtype)) {
+      base = "pto.castptr(" + base + ", " + PtoPtrType(elem_dtype, "ub") + ")";
+    }
   }
 
   if (is_zero(index)) {
@@ -384,7 +623,7 @@ std::string CodeGenTileLangPTO::GetPtoPointerExpr(const VarNode *buffer_var,
   std::string index_str;
   int64_t const_index = 0;
   if (TryGetConstInt(index, &const_index)) {
-    index_str = "pto.const(" + std::to_string(const_index) + ")";
+    index_str = std::to_string(const_index);
   } else {
     index_str = RemoveOutermostParentheses(PrintExpr_(index));
   }
@@ -403,6 +642,133 @@ std::string CodeGenTileLangPTO::GetPtoPointerExpr(const BufferNode *buffer,
   return GetPtoPointerExpr(buffer->data.get(), buffer->dtype, index);
 }
 
+std::string CodeGenTileLangPTO::PtoScalarLoad(const BufferNode *buffer,
+                                              const PrimExpr &index) {
+  std::string scope = ScopeOfBuffer(buffer);
+  if (scope == "local.var") {
+    return GetVarID(buffer->data.get());
+  }
+
+  std::string index_str = RemoveOutermostParentheses(PrintExpr_(index));
+  if (inside_simtvf_body_ && (scope == "local.fragment" || scope == "local")) {
+    ICHECK(IsFloat32(buffer->dtype))
+        << "PTO SIMT local scalar load currently supports float32 only, got "
+        << buffer->dtype;
+    return "scalar.load(" + GetVarID(buffer->data.get()) + ", " + index_str +
+           ")";
+  }
+
+  if (scope == "shared" || scope == "shared.dyn" || scope == "global" ||
+      scope.empty()) {
+    const VarNode *buffer_var = buffer->data.get();
+    std::string base = GetVarID(buffer_var);
+    std::string pto_space =
+        (scope == "shared" || scope == "shared.dyn") ? "ub" : "gm";
+    if (scope == "shared" || scope == "shared.dyn") {
+      const bool need_cast = HandleTypeMatch_(buffer_var, DataType::Int(8)) ||
+                             !HandleTypeMatch_(buffer_var, buffer->dtype);
+      if (need_cast) {
+        base = "pto.castptr(" + base + ", " +
+               PtoPtrType(buffer->dtype, pto_space) + ")";
+      }
+    }
+    return "scalar.load(" + base + ", " + index_str + ")";
+  }
+
+  if (scope == "local.fragment" || scope == "local") {
+    return GetVarID(buffer->data.get()) + "[" + index_str + "]";
+  }
+
+  LOG(FATAL) << "Unsupported PTO scalar load scope: " << scope;
+  return "";
+}
+
+void CodeGenTileLangPTO::EmitPtoScalarStore(const BufferNode *buffer,
+                                            const std::string &value,
+                                            const PrimExpr &index) {
+  std::string scope = ScopeOfBuffer(buffer);
+  std::string index_str = RemoveOutermostParentheses(PrintExpr_(index));
+
+  if (scope == "local.var") {
+    stream << GetVarID(buffer->data.get()) << " = " << value << "\n";
+    return;
+  }
+
+  if (scope == "local.fragment" || scope == "local") {
+    if (inside_simtvf_body_) {
+      ICHECK(IsFloat32(buffer->dtype))
+          << "PTO SIMT local scalar store currently supports float32 only, got "
+          << buffer->dtype;
+      stream << "scalar.store(" << value << ", " << GetVarID(buffer->data.get())
+             << ", " << index_str << ")\n";
+      return;
+    }
+    stream << GetVarID(buffer->data.get()) << "[" << index_str
+           << "] = " << value << "\n";
+    return;
+  }
+
+  if (scope == "shared" || scope == "shared.dyn" || scope == "global" ||
+      scope.empty()) {
+    const VarNode *buffer_var = buffer->data.get();
+    std::string base = GetVarID(buffer_var);
+    std::string pto_space =
+        (scope == "shared" || scope == "shared.dyn") ? "ub" : "gm";
+    if (scope == "shared" || scope == "shared.dyn") {
+      const bool need_cast = HandleTypeMatch_(buffer_var, DataType::Int(8)) ||
+                             !HandleTypeMatch_(buffer_var, buffer->dtype);
+      if (need_cast) {
+        base = "pto.castptr(" + base + ", " +
+               PtoPtrType(buffer->dtype, pto_space) + ")";
+      }
+    }
+    stream << "scalar.store(" << value << ", " << base << ", " << index_str
+           << ")\n";
+    return;
+  }
+
+  LOG(FATAL) << "Unsupported PTO scalar store scope: " << scope;
+}
+
+void CodeGenTileLangPTO::EmitPtoBufferAllocation(const Buffer &buffer) {
+  std::string scope = GetPtrStorageScope(buffer->data);
+  alloc_storage_scope_[buffer->data.get()] = scope;
+
+  if (scope == "shared" || scope == "shared.dyn") {
+    PrintIndent();
+    std::string vid = AllocVarID(buffer->data.get());
+    auto alloc = AllocBuffer(buffer);
+    auto opt_size = alloc.ConstantAllocationSize();
+    ICHECK(opt_size.has_value())
+        << "PTO shared allocation currently requires constant allocation size";
+    stream << vid << " = pto.castptr(pto.const(0, dtype=pto.i64), "
+           << PtoPtrType(buffer->dtype, "ub") << ")\n";
+    RegisterHandleType_(buffer->data.get(), buffer->dtype);
+    return;
+  } else if (scope == "local.fragment" || scope == "local") {
+    std::string vid = AllocVarID(buffer->data.get());
+    auto alloc = AllocBuffer(buffer);
+    auto opt_size = alloc.ConstantAllocationSize();
+    ICHECK(opt_size.has_value())
+        << "PTO local.fragment currently requires constant allocation size";
+    PrintIndent();
+    if (inside_simtvf_body_) {
+      ICHECK(IsFloat32(buffer->dtype))
+          << "PTO SIMT local allocation currently supports float32 only, got "
+          << buffer->dtype;
+      stream << vid << " = pto.alloc_buffer((" << opt_size.value()
+             << ",), pto.f32)\n";
+    } else {
+      stream << vid << " = [None] * " << opt_size.value() << "\n";
+    }
+  } else if (scope == "local.var") {
+    PrintIndent();
+    stream << AllocVarID(buffer->data.get()) << " = 0\n";
+  }
+
+  RegisterHandleType_(buffer->data.get(), buffer->dtype);
+}
+
 std::string CodeGenTileLangPTO::GetAddressOfExpr_(const CallNode *op) {
   ICHECK_EQ(op->args.size(), 1U);
   const auto *load = op->args[0].as<BufferLoadNode>();
@@ -417,7 +783,7 @@ std::string CodeGenTileLangPTO::GetAccessPtrExpr_(const CallNode *op) {
   auto buffer_var = Downcast<Var>(op->args[1]);
   DataType elem_dtype = DataType::Float(32);
 
-  if (auto *type_call = op->args[0].as<CallNode>()) {
+  if (const auto *type_call = op->args[0].as<CallNode>()) {
     if (!type_call->args.empty()) {
       if (const auto *dtype_name = type_call->args[0].as<StringImmNode>()) {
         elem_dtype = ParsePTODtype(dtype_name->value);
@@ -715,6 +1081,51 @@ void CodeGenTileLangPTO::EmitAscendCopyMatrixCcToGm(const CallNode *op) {
   stream << ", layout=\"nz2nd\")\n";
 }
 
+std::string
+CodeGenTileLangPTO::EmitPTOAllReduceExpr_(const std::string &func_name,
+                                          const CallNode *op) {
+  ICHECK_GE(op->args.size(), 2U)
+      << "tl::AscendAllReduce call expects a value argument";
+
+  const size_t begin = func_name.find("tl::AscendAllReduce");
+  ICHECK_NE(begin, std::string::npos)
+      << "Cannot parse AscendAllReduce template arguments from: " << func_name;
+  ICHECK_NE(func_name.find("tl::AscendAllReduce<tl::SumOp", begin),
+            std::string::npos)
+      << "PTO codegen currently maps only sum reductions to "
+         "pto.simt_allreduce_sum";
+
+  long long parsed_threads = 0;       // NOLINT(runtime/int)
+  long long parsed_scale = 1;         // NOLINT(runtime/int)
+  long long parsed_thread_offset = 0; // NOLINT(runtime/int)
+  const char *pattern = "tl::AscendAllReduce<tl::SumOp, %lld, %lld, %lld";
+  const int parsed =
+      std::sscanf(func_name.c_str() + begin, pattern, &parsed_threads,
+                  &parsed_scale, &parsed_thread_offset);
+  ICHECK_GE(parsed, 1)
+      << "AscendAllReduce expects at least a threads template parameter: "
+      << func_name;
+
+  const int64_t threads = parsed_threads;
+  const int64_t scale = parsed >= 2 ? parsed_scale : 1;
+  const int64_t thread_offset = parsed >= 3 ? parsed_thread_offset : 0;
+
+  std::string value = RemoveOutermostParentheses(PrintExpr_(op->args[1]));
+  std::string scratch = "None";
+  if (op->args.size() >= 3U) {
+    scratch = RemoveOutermostParentheses(PrintExpr_(op->args[2]));
+  } else {
+    ICHECK_LE(threads, scale)
+        << "AscendAllReduce with threads > scale requires a scratch pointer";
+  }
+
+  std::ostringstream os;
+  os << "pto.simt_allreduce_sum(" << value << ", threads=" << threads
+     << ", scale=" << scale << ", thread_offset=" << thread_offset
+     << ", scratch=" << scratch << ")";
+  return os.str();
+}
+
 void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
                                     std::ostream &os) { // NOLINT(*)
   if (op->op.same_as(builtin::bitwise_and())) {
@@ -748,6 +1159,46 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
     PrintBinaryExpr_("//", op->dtype, op->args[0],
                      IntImm(op->args[0].dtype(), 1LL << shift), os);
     return;
+  }
+
+  if (op->op.same_as(builtin_call_extern_) ||
+      op->op.same_as(builtin_call_pure_extern_)) {
+    ICHECK_GE(op->args.size(), 1U);
+    std::string func_name = Downcast<StringImm>(op->args[0])->value;
+    if ((func_name == "sqrt" || func_name == "sqrtf") &&
+        op->args.size() == 2U) {
+      std::string value = PrintExpr_(op->args[1]);
+      os << (inside_simtvf_body_ ? "pto.sqrt(" : "scalar.sqrt(") << value
+         << ")";
+      return;
+    }
+    if ((func_name == "rsqrt" || func_name == "rsqrtf") &&
+        op->args.size() == 2U) {
+      std::string value = PrintExpr_(op->args[1]);
+      os << "(1.0 / " << (inside_simtvf_body_ ? "pto.sqrt(" : "scalar.sqrt(")
+         << value << "))";
+      return;
+    }
+    if (func_name.find("tl::AscendAllReduce") != std::string::npos) {
+      os << EmitPTOAllReduceExpr_(func_name, op);
+      return;
+    }
+  }
+
+  if (op->op.same_as(builtin::tvm_storage_sync())) {
+    ICHECK_GE(op->args.size(), 1U)
+        << "tvm_storage_sync expects at least the storage scope argument";
+    std::string sync_scope = Downcast<StringImm>(op->args[0])->value;
+    if (sync_scope == "warp") {
+      return;
+    }
+    if (sync_scope == "shared" || sync_scope == "shared.dyn") {
+      PrintIndent();
+      stream << (inside_simtvf_body_ ? "pto.syncthreads()\n"
+                                     : "pto.pipe_barrier(pto.Pipe.ALL)\n");
+      return;
+    }
+    LOG(FATAL) << "Unsupported PTO storage sync scope: " << sync_scope;
   }
 
   if (op->op.same_as(tl::ascend_copy_gm_to_ubuf())) {
@@ -885,29 +1336,25 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
   if (auto opt_call_op = op->op.as<Op>()) {
     const auto &call_op = opt_call_op.value();
     std::string op_name = call_op->name;
+    if ((op_name == "tir.rsqrt" || op_name == "tirx.rsqrt") &&
+        op->args.size() == 1U) {
+      std::string value = PrintExpr_(op->args[0]);
+      os << "(1.0 / " << (inside_simtvf_body_ ? "pto.sqrt(" : "scalar.sqrt(")
+         << value << "))";
+      return;
+    }
+    if ((op_name == "tir.sqrt" || op_name == "tirx.sqrt") &&
+        op->args.size() == 1U) {
+      std::string value = PrintExpr_(op->args[0]);
+      os << (inside_simtvf_body_ ? "pto.sqrt(" : "scalar.sqrt(") << value
+         << ")";
+      return;
+    }
     if (StartsWith(op_name, "tl.")) {
       LOG(FATAL) << "PTO codegen does not support TileLang op `" << op_name
-                 << "`. Please add a handler in CodeGenTileLangPTO or "
-                    "lower it before PTO codegen.";
+                 << "`. Please add a handler in CodeGenTileLangPTO or lower "
+                    "it before PTO codegen.";
     }
-  }
-
-  CodeGenTileLangPY::VisitExpr_(op, os);
-}
-
-void CodeGenTileLangPTO::VisitExpr_(const BufferLoadNode *op,
-                                    std::ostream &os) { // NOLINT(*)
-  if (IsLocalVarBuffer(op->buffer->data.get())) {
-    // T.alloc_var lowers to local.var[0]. Read it back as the scalar surface
-    // value used by GEMM tile mapping, not as a general PTO buffer load.
-    CheckPTOLocalVarBuffer(op->buffer.get());
-    ICHECK_EQ(op->indices.size(), 1U)
-        << "PTO local.var load expects a scalar buffer";
-    int64_t index = 0;
-    ICHECK(TryGetConstInt(op->indices[0], &index) && index == 0)
-        << "PTO local.var load expects index 0";
-    os << LocalVarID(op->buffer->data.get());
-    return;
   }
 
   CodeGenTileLangPY::VisitExpr_(op, os);
@@ -959,30 +1406,34 @@ void CodeGenTileLangPTO::VisitExpr_(const SelectNode *op,
   os << ")";
 }
 
-void CodeGenTileLangPTO::VisitStmt_(const DeclBufferNode *op) {
-  // DeclBuffer is a leaf statement in tirx. The surrounding SeqStmt owns order.
-}
-
-void CodeGenTileLangPTO::VisitStmt_(const BufferStoreNode *op) {
-  if (IsLocalVarBuffer(op->buffer->data.get())) {
-    // T.alloc_var lowers to local.var[0]. Store it as a scalar surface value
-    // for GEMM tile mapping, not as a general PTO buffer store.
-    CheckPTOLocalVarBuffer(op->buffer.get());
-    ICHECK_EQ(op->indices.size(), 1U)
-        << "PTO local.var store expects a scalar buffer";
-    int64_t index = 0;
-    ICHECK(TryGetConstInt(op->indices[0], &index) && index == 0)
-        << "PTO local.var store expects index 0";
-    PrintIndent();
-    stream << LocalVarID(op->buffer->data.get()) << " = "
-           << "_tl_wrap_surface_value(_tl_coerce_i64("
-           << RemoveOutermostParentheses(PrintExpr_(op->value))
-           << ", context=\"PTO local.var store\"))\n";
+void CodeGenTileLangPTO::PrintBinaryExpr_(const std::string &opstr,
+                                          DataType dtype, PrimExpr lhs,
+                                          PrimExpr rhs,
+                                          std::ostream &os) { // NOLINT(*)
+  if (dtype.is_scalar()) {
+    CodeGenTileLangPY::PrintBinaryExpr_(opstr, dtype, lhs, rhs, os);
     return;
   }
 
-  CodeGenTileLangPY::VisitStmt_(op);
+  ICHECK(inside_simtvf_body_)
+      << "PTO vector binary expressions are only supported inside SIMT bodies";
+  if (opstr != "+" && opstr != "-" && opstr != "*" && opstr != "/") {
+    LOG(FATAL) << "Unsupported PTO SIMT vector binary op: " << opstr;
+  }
+  os << "(" << PrintExpr_(lhs) << " " << opstr << " " << PrintExpr_(rhs) << ")";
 }
+
+void CodeGenTileLangPTO::VisitExpr_(const BroadcastNode *op,
+                                    std::ostream &os) { // NOLINT(*)
+  DataType elem_dtype = op->value.dtype();
+  ICHECK(IsFloat32(elem_dtype))
+      << "PTO vector broadcast currently supports float32 only, got "
+      << elem_dtype;
+  std::string value = PrintExpr_(op->value);
+  os << "pto.Vec(pto.f32, " << op->dtype.lanes() << ", init=" << value << ")";
+}
+
+void CodeGenTileLangPTO::VisitStmt_(const DeclBufferNode *op) { (void)op; }
 
 void CodeGenTileLangPTO::VisitStmt_(const BindNode *op) {
   if (const auto *call = op->value.as<CallNode>()) {
@@ -1005,6 +1456,11 @@ void CodeGenTileLangPTO::VisitStmt_(const BindNode *op) {
 }
 
 void CodeGenTileLangPTO::VisitStmt_(const AllocBufferNode *op) {
+  if (!current_function_has_gemm_) {
+    EmitPtoBufferAllocation(op->buffer);
+    return;
+  }
+
   const Var &buffer_var = op->buffer->data;
   std::string scope = GetPtrStorageScope(buffer_var);
   alloc_storage_scope_[buffer_var.get()] = scope;
@@ -1039,11 +1495,15 @@ void CodeGenTileLangPTO::VisitStmt_(const AllocBufferNode *op) {
 void CodeGenTileLangPTO::VisitStmt_(const AttrStmtNode *op) {
   if (op->attr_key == tirx::attr::thread_extent) {
     IterVar iv = Downcast<IterVar>(op->node);
+    if (iv->thread_tag == "blockIdx.x") {
+      var_idmap_[iv->var.get()] = "pto.get_block_idx()";
+      VisitStmt(op->body);
+      return;
+    }
+
     std::string vid = AllocVarID(iv->var.get());
     std::string thread_value;
-    if (iv->thread_tag == "blockIdx.x") {
-      thread_value = "pto.get_block_idx()";
-    } else if (iv->thread_tag == "cthread") {
+    if (iv->thread_tag == "cthread") {
       thread_value = "pto.get_subblock_idx()";
     } else if (iv->thread_tag == "threadIdx.x") {
       thread_value = "pto.get_tid_x()";
@@ -1065,12 +1525,28 @@ void CodeGenTileLangPTO::VisitStmt_(const AttrStmtNode *op) {
     return;
   }
 
+  if (op->attr_key == "tl.simtvf_scope") {
+    VisitStmt(op->body);
+    return;
+  }
+
   VisitStmt(op->body);
 }
 
 void CodeGenTileLangPTO::VisitStmt_(const ForNode *op) {
   if (!current_function_has_gemm_) {
-    CodeGenTileLangPY::VisitStmt_(op);
+    PrintIndent();
+    std::string vid = AllocVarID(op->loop_var.get());
+    std::string begin = RemoveOutermostParentheses(PrintExpr_(op->min));
+    PrimExpr upper_bound = arith::Analyzer().Simplify(op->extent + op->min);
+    std::string end = RemoveOutermostParentheses(PrintExpr_(upper_bound));
+    std::string range_fn =
+        op->kind == tirx::ForKind::kUnrolled ? "pto.static_range" : "range";
+    stream << "for " << vid << " in " << range_fn << "(" << begin << ", " << end
+           << "):\n";
+    int for_scope = BeginScope();
+    PrintStmt_(op->body);
+    EndScope(for_scope);
     return;
   }
 
@@ -1086,6 +1562,26 @@ void CodeGenTileLangPTO::VisitStmt_(const ForNode *op) {
 }
 
 void CodeGenTileLangPTO::VisitStmt_(const SBlockNode *op) {
+  if (op->name_hint == "SIMT_VF") {
+    int64_t thread_x = 1;
+    int64_t thread_y = 1;
+    int64_t thread_z = 1;
+    ExtractSimtThreadExtents(op, &thread_x, &thread_y, &thread_z);
+
+    auto captures = CollectVFCaptures(op);
+    int64_t vf_idx = simtvf_helper_counter_++;
+    auto it = op->annotations.find("tl.vf_source_index");
+    if (it != op->annotations.end()) {
+      if (auto *imm = (*it).second.as<IntImmNode>()) {
+        vf_idx = imm->value;
+      }
+    }
+    std::string helper_name = "simt_vf_" + std::to_string(vf_idx);
+    EmitSimtVFFunction(op, captures, helper_name, thread_x, thread_y, thread_z);
+    EmitSimtVFLaunch(captures, helper_name, thread_x, thread_y, thread_z);
+    return;
+  }
+
   if (op->init.defined()) {
     PrintStmt_(op->init.value());
   }
@@ -1093,14 +1589,14 @@ void CodeGenTileLangPTO::VisitStmt_(const SBlockNode *op) {
 }
 
 void CodeGenTileLangPTO::VisitStmt_(const IfThenElseNode *op) {
+  std::string cond = RemoveOutermostParentheses(PrintExpr_(op->condition));
   PrintIndent();
-  stream << "if " << RemoveOutermostParentheses(PrintExpr_(op->condition))
-         << ":\n";
+  stream << "if " << cond << ":\n";
   int if_scope = BeginScope();
   PrintStmt_(op->then_case);
   EndScope(if_scope);
 
-  if (op->else_case.defined()) {
+  if (op->else_case) {
     PrintIndent();
     stream << "else:\n";
     int else_scope = BeginScope();
@@ -1117,6 +1613,158 @@ void CodeGenTileLangPTO::VisitStmt_(const EvaluateNode *op) {
     PrintIndent();
     stream << emitted << "\n";
   }
+}
+
+void CodeGenTileLangPTO::VisitExpr_(const BufferLoadNode *op,
+                                    std::ostream &os) { // NOLINT(*)
+  if (IsLocalVarBuffer(op->buffer->data.get())) {
+    // T.alloc_var lowers to local.var[0]. Read it back as the scalar surface
+    // value used by GEMM tile mapping, not as a general PTO buffer load.
+    CheckPTOLocalVarBuffer(op->buffer.get());
+    ICHECK_EQ(op->indices.size(), 1U)
+        << "PTO local.var load expects a scalar buffer";
+    int64_t index = 0;
+    ICHECK(TryGetConstInt(op->indices[0], &index) && index == 0)
+        << "PTO local.var load expects index 0";
+    os << LocalVarID(op->buffer->data.get());
+    return;
+  }
+
+  ICHECK_EQ(op->indices.size(), 1)
+      << "CodeGenTileLangPTO only supports flat buffer loads";
+  ICHECK(!op->predicate.defined())
+      << "CodeGenTileLangPTO does not support predicated loads yet";
+
+  DataType value_dtype = op->dtype;
+  DataType element_dtype = op->buffer->dtype;
+  if (value_dtype.lanes() > 1) {
+    EmitScalarizedLoad(op, os);
+    return;
+  }
+
+  ICHECK_EQ(value_dtype, element_dtype)
+      << "PTO scalar BufferLoad expects value dtype to match buffer element "
+         "dtype, got "
+      << value_dtype << " vs " << element_dtype;
+
+  os << PtoScalarLoad(op->buffer.get(), op->indices[0]);
+}
+
+void CodeGenTileLangPTO::EmitScalarizedLoad(const BufferLoadNode *op,
+                                            std::ostream &os) {
+  DataType value_dtype = op->dtype;
+  DataType element_dtype = op->buffer->dtype;
+  ICHECK_EQ(element_dtype.lanes(), 1)
+      << "PTO vector BufferLoad scalarization currently expects scalar "
+         "buffer elements, got "
+      << element_dtype;
+
+  if (inside_simtvf_body_) {
+    ICHECK(IsFloat32(element_dtype))
+        << "PTO SIMT vector BufferLoad currently supports float32 only, got "
+        << element_dtype;
+    std::string scope = ScopeOfBuffer(op->buffer.get());
+    const int lanes = value_dtype.lanes();
+    std::string index_str =
+        RemoveOutermostParentheses(PrintExpr_(op->indices[0]));
+    if (const auto *ramp = op->indices[0].as<RampNode>()) {
+      CheckContiguousRampStride(op->indices[0], "load");
+      index_str = RemoveOutermostParentheses(PrintExpr_(ramp->base));
+    }
+    if (scope == "local.fragment" || scope == "local") {
+      os << "scalar.load(" << GetVarID(op->buffer->data.get()) << ", "
+         << index_str << ", contiguous=" << lanes << ")";
+      return;
+    }
+    if (scope == "shared" || scope == "shared.dyn") {
+      std::string base = GetVarID(op->buffer->data.get());
+      if (HandleTypeMatch_(op->buffer->data.get(), DataType::Int(8)) ||
+          !HandleTypeMatch_(op->buffer->data.get(), element_dtype)) {
+        base = "pto.castptr(" + base + ", " + PtoPtrType(element_dtype, "ub") +
+               ")";
+      }
+      os << "scalar.load(" << base << ", " << index_str
+         << ", contiguous=" << lanes << ")";
+      return;
+    }
+    LOG(FATAL) << "Unsupported PTO SIMT vector load scope: " << scope;
+  }
+
+  LOG(FATAL) << "PTO non-SIMT vector BufferLoad is not supported yet";
+}
+
+void CodeGenTileLangPTO::VisitStmt_(const BufferStoreNode *op) {
+  if (IsLocalVarBuffer(op->buffer->data.get())) {
+    // T.alloc_var lowers to local.var[0]. Store it as a scalar surface value
+    // for GEMM tile mapping, not as a general PTO buffer store.
+    CheckPTOLocalVarBuffer(op->buffer.get());
+    ICHECK_EQ(op->indices.size(), 1U)
+        << "PTO local.var store expects a scalar buffer";
+    int64_t index = 0;
+    ICHECK(TryGetConstInt(op->indices[0], &index) && index == 0)
+        << "PTO local.var store expects index 0";
+    PrintIndent();
+    stream << LocalVarID(op->buffer->data.get()) << " = "
+           << "_tl_wrap_surface_value(_tl_coerce_i64("
+           << RemoveOutermostParentheses(PrintExpr_(op->value))
+           << ", context=\"PTO local.var store\"))\n";
+    return;
+  }
+
+  ICHECK_EQ(op->indices.size(), 1)
+      << "CodeGenTileLangPTO only supports flat buffer stores";
+  ICHECK(!op->predicate.defined())
+      << "CodeGenTileLangPTO does not support predicated stores yet";
+
+  if (op->value.dtype().lanes() > 1) {
+    EmitScalarizedStore(op);
+    return;
+  }
+
+  std::string value = RemoveOutermostParentheses(PrintExpr_(op->value));
+  PrintIndent();
+  EmitPtoScalarStore(op->buffer.get(), value, op->indices[0]);
+}
+
+void CodeGenTileLangPTO::EmitScalarizedStore(const BufferStoreNode *op) {
+  ICHECK_EQ(op->buffer->dtype.lanes(), 1)
+      << "PTO vector BufferStore scalarization currently expects scalar "
+         "buffer elements, got "
+      << op->buffer->dtype;
+
+  if (inside_simtvf_body_) {
+    ICHECK(IsFloat32(op->buffer->dtype))
+        << "PTO SIMT vector BufferStore currently supports float32 only, got "
+        << op->buffer->dtype;
+    std::string scope = ScopeOfBuffer(op->buffer.get());
+    std::string value = RemoveOutermostParentheses(PrintExpr_(op->value));
+    std::string index_str =
+        RemoveOutermostParentheses(PrintExpr_(op->indices[0]));
+    if (const auto *ramp = op->indices[0].as<RampNode>()) {
+      CheckContiguousRampStride(op->indices[0], "store");
+      index_str = RemoveOutermostParentheses(PrintExpr_(ramp->base));
+    }
+    PrintIndent();
+    if (scope == "local.fragment" || scope == "local") {
+      stream << "scalar.store(" << value << ", "
+             << GetVarID(op->buffer->data.get()) << ", " << index_str << ")\n";
+      return;
+    }
+    if (scope == "shared" || scope == "shared.dyn") {
+      std::string base = GetVarID(op->buffer->data.get());
+      if (HandleTypeMatch_(op->buffer->data.get(), DataType::Int(8)) ||
+          !HandleTypeMatch_(op->buffer->data.get(), op->buffer->dtype)) {
+        base = "pto.castptr(" + base + ", " +
+               PtoPtrType(op->buffer->dtype, "ub") + ")";
+      }
+      stream << "scalar.store(" << value << ", " << base << ", " << index_str
+             << ")\n";
+      return;
+    }
+    LOG(FATAL) << "Unsupported PTO SIMT vector store scope: " << scope;
+  }
+
+  LOG(FATAL) << "PTO non-SIMT vector BufferStore is not supported yet";
 }
 
 } // namespace codegen

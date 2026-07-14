@@ -1,7 +1,4 @@
-"""pytest test for example_rmsnorm_auto.py — Pipelined-loop RMSNorm.
-
-Mirrors the example's __main__ which sweeps d ∈ {4096, 5120, 7168} at batch=4096.
-"""
+"""pytest tests for example_rmsnorm.py through AscendC and PTO backends."""
 
 import pytest
 import torch
@@ -10,10 +7,12 @@ import tilelang
 from example_rmsnorm import ref_program, rms_norm_fwd
 
 
-@pytest.mark.parametrize("d", [4096, 5120, 7168])
-def test_rmsnorm_auto(d):
+DS = [4096, 5120, 7168]
+
+
+def _run_rmsnorm(d, target):
     batch = 4096
-    kernel = tilelang.compile(rms_norm_fwd(batch, d, "float32"), out_idx=[1, 3])
+    kernel = tilelang.compile(rms_norm_fwd(batch, d, "float32"), target=target, out_idx=[1, 3])
     device = torch.device("npu")
     x = torch.randn(batch, d, dtype=torch.float32, device=device)
     weight = torch.randn(d, dtype=torch.float32, device=device)
@@ -28,7 +27,22 @@ def test_rmsnorm_auto(d):
     assert max_diff < 1e-3, f"max_diff={max_diff:.2e}"
 
 
+@pytest.mark.parametrize("d", DS)
+def test_rmsnorm_auto(d):
+    _run_rmsnorm(d, "ascend")
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("d", DS)
+def test_rmsnorm_pto(d):
+    _run_rmsnorm(d, "pto")
+
+
 if __name__ == "__main__":
-    for d in [4096, 5120, 7168]:
+    for d in DS:
         test_rmsnorm_auto(d)
         print(f"PASS: test_rmsnorm_auto d={d}")
+
+    for d in DS:
+        test_rmsnorm_pto(d)
+        print(f"PASS: test_rmsnorm_pto d={d}")

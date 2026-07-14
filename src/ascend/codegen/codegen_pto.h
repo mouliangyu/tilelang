@@ -35,6 +35,8 @@ protected:
   void VisitStmt_(const IfThenElseNode *op) override;
   void VisitStmt_(const EvaluateNode *op) override;
 
+  void VisitExpr_(const BroadcastNode *op,
+                  std::ostream &os) override; // NOLINT(*)
   void VisitExpr_(const BufferLoadNode *op,
                   std::ostream &os) override;                     // NOLINT(*)
   void VisitExpr_(const CastNode *op, std::ostream &os) override; // NOLINT(*)
@@ -73,14 +75,38 @@ private:
   std::string GetAddressOfExpr_(const CallNode *op);
   std::string GetAscendCopyGmUbExpr_(const CallNode *op);
   std::string GetAscendCopyUbGmExpr_(const CallNode *op);
+  std::string EmitPTOAllReduceExpr_(const std::string &func_name,
+                                    const CallNode *op);
+  ffi::Array<Var> CollectVFCaptures(const SBlockNode *op) const;
+  void EmitSimtVFFunction(const SBlockNode *op, const ffi::Array<Var> &captures,
+                          const std::string &helper_name, int64_t thread_x,
+                          int64_t thread_y, int64_t thread_z);
+  void ExtractSimtThreadExtents(const SBlockNode *op, int64_t *thread_x,
+                                int64_t *thread_y, int64_t *thread_z) const;
+  void EmitSimtVFLaunch(const ffi::Array<Var> &captures,
+                        const std::string &helper_name, int64_t thread_x,
+                        int64_t thread_y, int64_t thread_z);
+  std::string ResolveVarName(const Var &v) const;
+  std::string PtoScalarLoad(const BufferNode *buffer, const PrimExpr &index);
+  void EmitPtoScalarStore(const BufferNode *buffer, const std::string &value,
+                          const PrimExpr &index);
+  void EmitPtoBufferAllocation(const Buffer &buffer);
+  void EmitScalarizedLoad(const BufferLoadNode *op, std::ostream &os);
+  void EmitScalarizedStore(const BufferStoreNode *op);
+  std::string ScopeOfBuffer(const BufferNode *buffer) const;
+  void PrintBinaryExpr_(const std::string &opstr, DataType dtype, PrimExpr lhs,
+                        PrimExpr rhs,
+                        std::ostream &os) override; // NOLINT(*)
+
+  std::string current_function_name_;
+  int simtvf_helper_counter_{0};
+  bool inside_simtvf_body_{false};
   std::string GetPtoLocalPtrExpr(const PrimExpr &expr, const std::string &space,
                                  DataType fallback_dtype);
   std::string GetPtoLocalByteAddrExpr(const PrimExpr &index,
                                       DataType elem_dtype,
                                       const std::string &context);
   std::string GetPtoAccPtrExpr(const PrimExpr &expr, DataType dtype);
-  std::pair<std::string, std::string>
-  ParseHardEventPair(const std::string &hard_event) const;
   void EnsurePTOGemmHelper(const CallNode *op);
   void EmitAscendCopyGmToCbuf(const CallNode *op);
   void EmitAscendGemmL1(const CallNode *op);
@@ -92,12 +118,13 @@ private:
   bool IsLocalVarBuffer(const VarNode *var) const;
   bool HasAscendGemmL1(const PrimFunc &func) const;
 
-  std::string current_function_name_;
   bool current_function_has_gemm_{false};
   bool has_gemm_l1_{false};
   std::unordered_map<const VarNode *, FragmentInfo> fragment_info_;
   std::unordered_set<const VarNode *> local_var_buffers_;
   PTOGemmEmitContext gemm_emit_ctx_;
+  std::pair<std::string, std::string>
+  ParseHardEventPair(const std::string &hard_event) const;
 };
 
 } // namespace codegen

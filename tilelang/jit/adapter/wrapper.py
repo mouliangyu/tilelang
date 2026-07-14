@@ -1087,8 +1087,10 @@ class TLPTOSourceWrapper:
         self.pass_configs = pass_configs
         self.pto_kernel_source = source.strip()
         self.pto_kernel_name = self._primary_kernel_name()
-        self.grid_dim = self._extract_grid_dim(self._primary_device_func())
-        self.lib_code = self._generate_host_source(self.prim_func, self.pto_kernel_name, self.grid_dim)
+        device_func = self._primary_device_func()
+        self.grid_dim = self._extract_grid_dim(device_func)
+        self.dynamic_smem = self._extract_dynamic_smem(device_func)
+        self.lib_code = self._generate_host_source(self.prim_func, self.pto_kernel_name, self.grid_dim, self.dynamic_smem)
 
     def _primary_kernel_name(self) -> str:
         if self.device_mod is None:
@@ -1152,6 +1154,12 @@ class TLPTOSourceWrapper:
                 elif "blockIdx.z" in var_name:
                     grid_extents[2] = extent
         return f"({self._pythonic_expr(grid_extents[0])} * {self._pythonic_expr(grid_extents[1])} * {self._pythonic_expr(grid_extents[2])})"
+
+    def _extract_dynamic_smem(self, func: tvm.tirx.PrimFunc) -> str:
+        attrs = func.attrs
+        if "dyn_shared_memory_buf" not in attrs:
+            return "0"
+        return str(int(attrs["dyn_shared_memory_buf"]))
 
     def _lookup_type(self, dtype: str | Any) -> str:
         key = dtype if isinstance(dtype, str) else str(dtype)
@@ -1222,7 +1230,7 @@ class TLPTOSourceWrapper:
 
         return host_args, arg_by_name
 
-    def _generate_host_source(self, func, kernel_name: str, grid_dim: str) -> str:
+    def _generate_host_source(self, func, kernel_name: str, grid_dim: str, dynamic_smem: str) -> str:
         host_args, host_arg_by_name = self._host_argument_infos(func)
         device_arg_names = self._parse_ptodsl_kernel_args(kernel_name)
         if len(device_arg_names) != len(host_args):
@@ -1250,7 +1258,7 @@ class TLPTOSourceWrapper:
         call_arg_list = ", ".join(call_args)
         launch_stub = (
             f'extern "C" TL_EXPORT int call({", ".join(launch_params)}) {{\n'
-            f"  {kernel_name}<<<{grid_dim}, nullptr, stream>>>({call_arg_list});\n"
+            f"  {kernel_name}<<<{grid_dim}, {dynamic_smem}, stream>>>({call_arg_list});\n"
             "  return 0;\n"
             "}\n"
         )
