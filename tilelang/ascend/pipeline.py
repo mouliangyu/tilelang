@@ -48,7 +48,6 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     # materialization (lower_thread_binding=True) reproduces the previous
     # LaunchThread(blockIdx.x) behavior.
     mod = tilelang.transform.MaterializeKernelLaunch()(mod)
-    mod = ascend_transform.HoistSimdPairs()(mod)
     pass_ctx = tilelang.transform.get_pass_context()
 
     if should_force_let_inline(pass_ctx=pass_ctx):

@@ -151,7 +151,6 @@ class KernelCache:
             "ascend/analysis/vf_checker.py",
             "ascend/pipeline.py",
             "ascend/target.py",
-            "ascend/transform/hoist_simd_pairs.py",
             "ascend/transform/z3_scheduler.py",
             "cpu/pipeline.py",
             "cuda/pipeline.py",

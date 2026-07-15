@@ -17,11 +17,10 @@ _Op = tirx.op.Op.get
 class SimdPair:
     """Wraps a vintlv/vdintlv/vld2 result, supports unpacking: a, b = vintlv(x, y).
 
-    ``a, b = ...`` always emits two ``pair_get`` calls. For pure register
-    permutations (``vintlv`` / ``vdintlv``) the Ascend ``HoistSimdPairs`` pass
-    CSE's the duplicated pair expression. For opaque memory loads (``vld2``),
-    the frontend binds the pair once at the call site so hoist never
-    CSE/code-motions a load.
+    ``a, b = ...`` emits two ``pair_get`` calls against the pair. The pair-
+    producing op (``vintlv`` / ``vdintlv`` / ``vld2``) is bound once at its call
+    site by the frontend, so both ``pair_get`` calls reference a single bound
+    variable rather than inlining the pair expression twice.
     """
 
     def __init__(self, pair):
@@ -219,10 +218,10 @@ def vld2(addr, dist="DINTLV_B16", off=None):
       - ``DINTLV_B8``: load 512×u8/fp8 → two 256-lane regs (even/odd bytes)
       - ``DINTLV_B16``: load 256×bf16/u16 → two 128-lane regs
 
-    The access_ptr footprint is always 2× the single-vector width. Unlike
-    ``vintlv``/``vdintlv``, this is an opaque memory load: the pair is bound
-    once at this program point so ``HoistSimdPairs`` does not CSE or
-    code-motion it.
+    The access_ptr footprint is always 2× the single-vector width. This is an
+    opaque memory load: the pair is bound once at this program point so the two
+    ``pair_get`` calls from the unpack share a single load rather than issuing
+    two independent loads.
     """
     if isinstance(dist, str) and dist not in _VLD2_DISTS:
         raise ValueError(f"vld2 only supports dist in {_VLD2_DISTS}, got {dist!r}")
@@ -550,18 +549,30 @@ def vintlv(src0, src1):
     """Interleave two vector registers.
 
     Unpack: a, b = vintlv(x, y)
+
+    The pair is bound once at the call site so the unpack's two ``pair_get``
+    calls share a single permutation instruction instead of inlining the pair
+    expression twice.
     """
     pair = tirx.call_intrin(str(src0.dtype), _Op("tl.simd.vintlv"), src0, src1)
-    return SimdPair(pair)
+    if not IRBuilder.is_in_scope():
+        raise RuntimeError("vintlv requires an active IRBuilder to bind the pair")
+    return SimdPair(_bind(pair))
 
 
 def vdintlv(src0, src1):
     """De-interleave two vector registers.
 
     Unpack: a, b = vdintlv(x, y)
+
+    The pair is bound once at the call site so the unpack's two ``pair_get``
+    calls share a single permutation instruction instead of inlining the pair
+    expression twice.
     """
     pair = tirx.call_intrin(str(src0.dtype), _Op("tl.simd.vdintlv"), src0, src1)
-    return SimdPair(pair)
+    if not IRBuilder.is_in_scope():
+        raise RuntimeError("vdintlv requires an active IRBuilder to bind the pair")
+    return SimdPair(_bind(pair))
 
 
 def pair_get(pair, index):

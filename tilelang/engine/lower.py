@@ -285,12 +285,6 @@ def _prepare_device_codegen_mod(device_mod: tvm.IRModule, target: Target) -> tvm
     device_mod = tilelang.transform.LowerIntrin()(device_mod)
     device_mod = tirx.transform.Simplify()(device_mod)
 
-    is_ascend = target.kind.name == "ascend" or "ascend" in target.keys
-    if is_ascend:
-        from tilelang.ascend import transform as ascend_transform
-
-        device_mod = ascend_transform.HoistSimdPairs()(device_mod)
-
     device_mod = tilelang.transform.HoistBroadcastValues()(device_mod)
     return device_mod
 
