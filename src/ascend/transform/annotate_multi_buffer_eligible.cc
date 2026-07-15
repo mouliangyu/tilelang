@@ -34,6 +34,7 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
+#include <set>
 #include <unordered_set>
 #include <vector>
 
@@ -451,10 +452,16 @@ public:
 // ---------------------------------------------------------------------------
 class MultiBufferAnnotator : public StmtMutator {
 public:
-  Stmt Run(Stmt body) { return VisitStmt(body); }
+  explicit MultiBufferAnnotator(std::set<const VarNode *> manual = {})
+      : manual_buffers_(std::move(manual)) {}
 
 private:
   BufferSet used_buffers_;
+  // Data Vars of buffers the user manually multi-buffered (from
+  // `tl.manual_multi_buffer`). These are excluded from eligibility: the pass
+  // must not add a version dim / rewrite them; the barrier pass handles their
+  // synchronization directly.
+  std::set<const VarNode *> manual_buffers_;
 
   static bool IsOnChipMultiBufferScope(const Buffer &b) {
     return IsSharedBuffer(b) || IsL1Buffer(b) || IsL0CBuffer(b) ||
@@ -545,6 +552,9 @@ private:
     for (const auto &buf : touched) {
       if (already.count(buf))
         continue;
+      // Manually multi-buffered buffers are never pass-versioned.
+      if (manual_buffers_.count(buf->data.get()))
+        continue;
       if (!IsOnChipMultiBufferScope(buf))
         continue;
       if (parent_used.count(buf))
@@ -590,10 +600,32 @@ private:
 
 using namespace tirx::transform;
 
+// Collect the data Vars named in the `tl.manual_multi_buffer` annotation on any
+// SBlock in the function body.
+static std::set<const VarNode *> CollectManualMultiBuffers(const Stmt &body) {
+  struct Visitor : public StmtVisitor {
+    std::set<const VarNode *> vars;
+    void VisitStmt_(const SBlockNode *op) final {
+      if (auto ann = op->annotations.Get("tl.manual_multi_buffer")) {
+        if (auto *map_obj = ann.value().as<ffi::MapObj>()) {
+          for (const auto &it : *map_obj) {
+            if (auto *var = it.first.as<VarNode>())
+              vars.insert(var);
+          }
+        }
+      }
+      StmtVisitor::VisitStmt_(op);
+    }
+  } v;
+  v(body);
+  return std::move(v.vars);
+}
+
 tvm::transform::Pass AnnotateMultiBufferEligible() {
   auto pass_func = [=](PrimFunc f, const IRModule &, const PassContext &) {
     auto *n = f.CopyOnWrite();
-    n->body = MultiBufferAnnotator().Run(std::move(n->body));
+    auto manual = CollectManualMultiBuffers(n->body);
+    n->body = MultiBufferAnnotator(std::move(manual))(std::move(n->body));
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.AnnotateMultiBufferEligible", {});

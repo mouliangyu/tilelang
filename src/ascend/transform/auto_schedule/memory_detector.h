@@ -159,8 +159,7 @@ private:
       int_sets.reserve(region.size());
       for (const auto &range : region) {
         // Create IntSet for range [min, min + extent)
-        int_sets.push_back(arith::IntSet::FromRange(
-            Range::FromMinExtent(range->min, range->extent)));
+        int_sets.push_back(RelaxAccessIndex(range->min, range->extent));
       }
       if (is_read) {
         Update(&read_buffers_, &read_regions_, buffer, int_sets);
@@ -232,15 +231,33 @@ private:
     return result;
   }
 
-  /*! \brief Helper function to relax the buffer indices */
-  arith::IntSet RelaxAccessIndex(const PrimExpr &index) {
-    PrimExpr current = index;
+  /*! \brief Resolve Let bindings in an expression to a fixpoint. */
+  PrimExpr ResolveLets(const PrimExpr &e) {
+    PrimExpr current = e;
     PrimExpr remapped = Substitute(current, let_bindings_);
     while (!remapped.same_as(current)) {
       current = remapped;
       remapped = Substitute(current, let_bindings_);
     }
-    return arith::EvalSet(arith::IntSet::Vector(current), dom_map_);
+    return current;
+  }
+
+  /*! \brief Relax the half-open range [base, base + extent) over the loop
+   * domain, resolving Let bindings first. The default extent of 1 gives the
+   * single-point relaxation of one index. */
+  arith::IntSet RelaxAccessIndex(const PrimExpr &index,
+                                 PrimExpr extent = IntImm(DataType::Int(32),
+                                                          1)) {
+    PrimExpr base = ResolveLets(index);
+    arith::IntSet lo_set =
+        arith::EvalSet(arith::IntSet::Vector(base), dom_map_);
+    const auto *ext_imm = extent.as<IntImmNode>();
+    if (ext_imm && ext_imm->value <= 1) {
+      return lo_set;
+    }
+    PrimExpr hi = base + ResolveLets(extent) - make_const(base.dtype(), 1);
+    arith::IntSet hi_set = arith::EvalSet(arith::IntSet::Vector(hi), dom_map_);
+    return arith::IntSet::Interval(lo_set.min(), hi_set.max());
   }
 
   void VisitStmt_(const ForNode *op) override {
@@ -366,8 +383,7 @@ private:
               PrimExpr extent = op->args[2 + i];
 
               // Create IntSet for range [min, min + extent)
-              relaxed_region.push_back(
-                  arith::IntSet::FromRange(Range::FromMinExtent(min, extent)));
+              relaxed_region.push_back(RelaxAccessIndex(min, extent));
             }
           } else {
             // No extents provided: each dimension is a single point at the
@@ -425,6 +441,10 @@ private:
     }
 
     // Handle TileLang `tl.access_ptr(BufferLoad(buf, mins), extent, rw_mask)`.
+    // The access is a contiguous run of `extent` elements in row-major layout
+    // starting at the base index `mins`. Reconstruct the per-dimension region
+    // by distributing the flat extent across dimensions from innermost outward,
+    // rather than conservatively taking the whole buffer for every dimension.
     if (op->op.same_as(tl_access_ptr_op)) {
       if (op->args.size() >= 3) {
         const auto *buffer_load = op->args[0].as<BufferLoadNode>();
@@ -432,17 +452,54 @@ private:
         if (buffer_load && mask_int) {
           Buffer buffer = buffer_load->buffer;
           int rw_mask = mask_int->value;
-          std::vector<arith::IntSet> full_region;
-          full_region.reserve(buffer->shape.size());
-          for (const PrimExpr &dim : buffer->shape) {
-            full_region.push_back(
-                arith::IntSet::FromRange(Range::FromMinExtent(0, dim)));
+          size_t ndim = buffer->shape.size();
+          std::vector<arith::IntSet> region(ndim);
+
+          const auto *ext_imm = op->args[1].as<IntImmNode>();
+          if (ext_imm && buffer_load->indices.size() == ndim) {
+            // Distribute a known flat extent (in elements) across dims,
+            // innermost-first. `rem` is the number of elements still to be
+            // covered at the current dimension; each dim consumes as many of
+            // its `shape[i]` indices as the run spans, carrying the rounded-up
+            // remainder to the next (outer) dim.
+            int64_t rem = ext_imm->value;
+            for (size_t k = ndim; k-- > 0;) {
+              PrimExpr base = buffer_load->indices[k];
+              const auto *dim_imm = buffer->shape[k].as<IntImmNode>();
+              if (rem <= 1) {
+                region[k] = RelaxAccessIndex(base);
+              } else if (dim_imm) {
+                int64_t d = dim_imm->value;
+                if (rem >= d) {
+                  // Run spills past this dim: cover it whole and carry up.
+                  region[k] = arith::IntSet::FromRange(
+                      Range::FromMinExtent(0, buffer->shape[k]));
+                  rem = (rem + d - 1) / d;
+                } else {
+                  region[k] = RelaxAccessIndex(base, IntImm(base.dtype(), rem));
+                  rem = 1;
+                }
+              } else {
+                // Non-constant dim size: be conservative for this and any
+                // remaining outer dims.
+                region[k] = arith::IntSet::FromRange(
+                    Range::FromMinExtent(0, buffer->shape[k]));
+                rem = 1;
+              }
+            }
+          } else {
+            // Non-constant extent or arity mismatch: fall back to whole buffer.
+            for (size_t k = 0; k < ndim; ++k) {
+              region[k] = arith::IntSet::FromRange(
+                  Range::FromMinExtent(0, buffer->shape[k]));
+            }
           }
+
           if (rw_mask & 1) {
-            Update(&read_buffers_, &read_regions_, buffer, full_region);
+            Update(&read_buffers_, &read_regions_, buffer, region);
           }
           if (rw_mask & 2) {
-            Update(&write_buffers_, &write_regions_, buffer, full_region);
+            Update(&write_buffers_, &write_regions_, buffer, region);
           }
           for (const PrimExpr &index : buffer_load->indices) {
             VisitExpr(index);

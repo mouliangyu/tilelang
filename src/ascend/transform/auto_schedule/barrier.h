@@ -50,7 +50,8 @@ void AnalyzeAndInsertBarriers(std::vector<std::shared_ptr<IRStructure>> &root,
                               EventIdMap &event_id_map,
                               FlagInfoList &flag_infos,
                               std::vector<MultiVersionBufferInfo> &buffer_infos,
-                              MultiVersionBufferMap &buffer_info_map);
+                              MultiVersionBufferMap &buffer_info_map,
+                              const ManualMultiBufferTable &manual = {});
 
 inline Stmt MakeAscendSetFlag(const std::string &hard_event,
                               PrimExpr event_id) {

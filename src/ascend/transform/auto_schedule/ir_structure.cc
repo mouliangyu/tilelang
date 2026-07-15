@@ -42,6 +42,8 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <queue>
@@ -159,6 +161,10 @@ void CollectAllTaskNodesWithContext(IRStructure *node,
   }
 }
 
+// ============================================================================
+// Dependency analysis implementation
+// ============================================================================
+
 inline bool WarpgroupMatches(const TaskNode *task, int wg_id) {
   int task_wg = task->GetWarpgroupId();
   return IsWarpgroupBroadcast(wg_id) || IsWarpgroupBroadcast(task_wg) ||
@@ -259,10 +265,6 @@ std::set<BufferAccessPoint> CollectAccessPoints(const IRStructure *node,
   return result;
 }
 
-// ============================================================================
-// Dependency analysis implementation
-// ============================================================================
-
 // Check user `T.assume_no_conflict` hints carried on the current (innermost)
 // loop's `no_conflict` annotation. Each entry is a triple
 // [a, b, IntImm(cross_code)] with cross_code -1=any / 1=cross / 0=same, where a
@@ -303,20 +305,28 @@ static bool DeclaredNoConflict(const BufferRegion &a_region,
   return false;
 }
 
-bool RegionsMayConflict(const TaskNode *a_task, const BufferRegion &a_region,
-                        const TaskNode *b_task, const BufferRegion &b_region,
-                        const std::vector<For> &loop_stack, bool cross) {
+// Check whether a_region and b_region are provably disjoint under their
+// per-side outer contexts, with an optional constraint relating the innermost
+// loop var across the two sides. `offset`: <0 renames sides and constrains
+// consumer > producer (any later iteration); ==0 same iteration (no rename); >0
+// constrains consumer == producer + offset (exactly that many iterations
+// later).
+static bool RegionsMayConflict(const TaskNode *a_task,
+                               const BufferRegion &a_region,
+                               const TaskNode *b_task,
+                               const BufferRegion &b_region,
+                               const std::vector<For> &loop_stack, int offset) {
   if (!a_region->buffer->data.same_as(b_region->buffer->data))
     return false;
 
-  // Same data Var but different logical Buffer, e.g. T.view/T.reshape.  Their
-  // regions may have different ranks/dtypes/strides, so do not compare them
-  // dimension-by-dimension.  Conservatively keep the dependency.
-  bool same_logical_buffer = a_region->buffer.same_as(b_region->buffer);
-  if (!same_logical_buffer)
+  // Same storage but different logical buffer (T.view/T.reshape): regions may
+  // differ in rank/dtype/strides, so keep the dependency conservatively.
+  if (!a_region->buffer.same_as(b_region->buffer))
     return true;
 
-  // User-declared disjointness (T.assume_no_conflict) overrides analysis.
+  const bool cross = offset != 0;
+  if (cross && loop_stack.empty())
+    return false;
   if (DeclaredNoConflict(a_region, b_region, loop_stack, cross))
     return false;
 
@@ -332,21 +342,23 @@ bool RegionsMayConflict(const TaskNode *a_task, const BufferRegion &a_region,
   ConstrSet a_ctx = a_task ? a_task->outer_ctx : ConstrSet();
   ConstrSet b_ctx = b_task ? b_task->outer_ctx : ConstrSet();
   ConstrSet loop_ctx;
-  if (cross && !loop_stack.empty()) {
+  if (cross) {
     Var inner_lv = loop_stack.back()->loop_var;
     a_ctx = a_ctx.RenameFrom("_p", a_sub, inner_lv);
     b_ctx = b_ctx.RenameFrom("_c", b_sub, inner_lv);
-    if (a_sub.count(inner_lv) && b_sub.count(inner_lv))
-      loop_ctx.AddConstr(b_sub[inner_lv] > a_sub[inner_lv]);
+    if (a_sub.count(inner_lv) && b_sub.count(inner_lv)) {
+      PrimExpr p = a_sub[inner_lv], c = b_sub[inner_lv];
+      loop_ctx.AddConstr(
+          offset < 0 ? (c > p) : (c == p + IntImm(inner_lv.dtype(), offset)));
+    }
   }
   loop_ctx.Merge(a_ctx).Merge(b_ctx).Populate(ana);
 
-  // Freshen mutable reads (BufferLoads etc.) that appear INLINE in the region
-  // bounds, per side: a read written verbatim in both bounds is not provably
-  // equal across the two access points (a store may sit between them), so it
-  // must become an independent unknown on each side.
+  // Freshen mutable reads (BufferLoads etc.) inline in the region bounds, per
+  // side: a read written verbatim in both bounds is not provably equal across
+  // the two access points (a store may sit between them), so it must become an
+  // independent unknown on each side.
   FreshenMutableReads freshen_a, freshen_b;
-
   PrimExpr any_dim_disjoint = Bool(false);
   for (size_t i = 0; i < ndim; ++i) {
     PrimExpr a_min = freshen_a(Substitute(a_rng[i]->min, a_sub));
@@ -360,16 +372,14 @@ bool RegionsMayConflict(const TaskNode *a_task, const BufferRegion &a_region,
   any_dim_disjoint = ana.Simplify(any_dim_disjoint);
   // Raw Z3 as a fallback catches the infeasible-context case that Analyzer's
   // constant-fold short-circuit misses.
-  if (ana.CanProve(any_dim_disjoint) ||
-      ana.z3_prover.CanProve(any_dim_disjoint)) {
-    return false;
-  }
-  return true;
+  return !(ana.CanProve(any_dim_disjoint) ||
+           ana.z3_prover.CanProve(any_dim_disjoint));
 }
 
 std::vector<DepInfo>
 AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
-                    const std::vector<For> &loop_stack) {
+                    const std::vector<For> &loop_stack,
+                    const ManualMultiBufferTable &manual) {
   const size_t n = nodes.size();
   std::vector<DepInfo> deps;
 
@@ -396,7 +406,7 @@ AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
         for (const auto &child : ctrl->children)
           children.push_back(child.get());
         stack.push_back(ctrl->control);
-        for (const auto &cdep : AnalyzeDependencies(children, stack)) {
+        for (const auto &cdep : AnalyzeDependencies(children, stack, manual)) {
           const VarNode *ckey = StorageKey(cdep.buffer);
           for (const auto &[cprod, ccons] : cdep.task_pairs) {
             out.emplace(ckey, cprod.task(), ccons.task());
@@ -418,6 +428,9 @@ AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
   };
 
   for (const auto *storage_key : storage_keys) {
+    auto it = manual.find(storage_key);
+    int64_t manual_versions = it == manual.end() ? 0 : it->second;
+
     auto touches = [&](size_t u) {
       for (const auto &region : nodes[u]->GetReadRegions()) {
         if (RegionUsesStorage(region, storage_key))
@@ -438,9 +451,7 @@ AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
           continue;
         if (!touches(j))
           continue;
-        bool same_iter = (i < j);
-        bool cross = !loop_stack.empty() && (i >= j);
-        if (!same_iter && !cross)
+        if (!manual_versions && loop_stack.empty() && i >= j)
           continue;
 
         auto a_w = CollectAccessPoints(nodes[i], storage_key, true,
@@ -455,38 +466,55 @@ AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
         std::set<std::pair<BufferAccessPoint, BufferAccessPoint>> pairs;
         std::optional<Buffer> dep_buffer;
         int64_t latency = -1;
+        int min_manual_dist = std::numeric_limits<int>::max();
 
-        auto consider =
-            [&](const std::set<BufferAccessPoint> &a_pts, bool a_write,
-                const std::set<BufferAccessPoint> &b_pts, bool b_write) {
-              for (const auto &a : a_pts) {
-                std::vector<BufferRegion> a_regions =
-                    TaskRegionsForStorage(a.task(), storage_key, a_write);
-                for (const auto &b : b_pts) {
-                  std::vector<BufferRegion> b_regions =
-                      TaskRegionsForStorage(b.task(), storage_key, b_write);
-                  for (const auto &rA : a_regions) {
-                    for (const auto &rB : b_regions) {
-                      if (!RegionsMayConflict(a.task(), rA, b.task(), rB,
-                                              loop_stack, cross))
-                        continue;
-                      // For alias buffers that share one data Var, use the
-                      // write-side logical buffer as the dependency buffer.
-                      if (!dep_buffer.has_value()) {
-                        dep_buffer = a_write ? rA->buffer : rB->buffer;
+        auto consider = [&](const std::set<BufferAccessPoint> &a_pts,
+                            bool a_write,
+                            const std::set<BufferAccessPoint> &b_pts,
+                            bool b_write) {
+          for (const auto &a : a_pts) {
+            std::vector<BufferRegion> a_regions =
+                TaskRegionsForStorage(a.task(), storage_key, a_write);
+            for (const auto &b : b_pts) {
+              std::vector<BufferRegion> b_regions =
+                  TaskRegionsForStorage(b.task(), storage_key, b_write);
+              for (const auto &rA : a_regions) {
+                for (const auto &rB : b_regions) {
+                  if (manual_versions) {
+                    // Find the smallest distance d in [0, N] at which this
+                    // access pair collides.
+                    int dist = -1;
+                    for (int d = (i < j ? 0 : 1); d <= manual_versions; ++d) {
+                      if (RegionsMayConflict(a.task(), rA, b.task(), rB,
+                                             loop_stack, d)) {
+                        dist = d;
+                        break;
                       }
-                      pairs.emplace(a, b);
-                      int64_t l =
-                          a.timestamp + a.task()->GetLatency() - b.timestamp;
-                      if (l < 0)
-                        l = 0;
-                      if (l > latency)
-                        latency = l;
                     }
+                    if (dist < 0)
+                      continue;
+                    min_manual_dist = std::min(min_manual_dist, dist);
+                  } else if (!RegionsMayConflict(a.task(), rA, b.task(), rB,
+                                                 loop_stack, i >= j ? -1 : 0)) {
+                    continue;
                   }
+                  // For alias buffers that share one data Var, use the
+                  // write-side logical buffer as the dependency buffer.
+                  if (!dep_buffer.has_value()) {
+                    dep_buffer = a_write ? rA->buffer : rB->buffer;
+                  }
+                  pairs.emplace(a, b);
+                  int64_t l =
+                      a.timestamp + a.task()->GetLatency() - b.timestamp;
+                  if (l < 0)
+                    l = 0;
+                  if (l > latency)
+                    latency = l;
                 }
               }
-            };
+            }
+          }
+        };
         consider(a_w, /*a_write=*/true, b_r, /*b_write=*/false);
         consider(a_w, /*a_write=*/true, b_w, /*b_write=*/true);
         consider(a_r, /*a_write=*/false, b_w, /*b_write=*/true);
@@ -509,11 +537,12 @@ AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
           ICHECK(dep_buffer.has_value())
               << "Dependency found without a representative write buffer for "
               << storage_key->name_hint;
+          int distance = manual_versions ? min_manual_dist : (i >= j ? -1 : 0);
           deps.push_back(
               {nodes[i], nodes[j], dep_buffer.value(),
                std::vector<std::pair<BufferAccessPoint, BufferAccessPoint>>(
                    pairs.begin(), pairs.end()),
-               cross, latency});
+               distance, latency});
         }
       }
     }

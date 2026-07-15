@@ -131,7 +131,8 @@ public:
       }
 
       // Buffer-region data dependencies
-      auto deps = AnalyzeDependencies(nodes, /*loop_stack=*/{});
+      auto deps =
+          AnalyzeDependencies(nodes, /*loop_stack=*/{}, manual_multi_buffer_);
       std::unordered_map<IRStructure *, size_t> node_idx;
       for (size_t i = 0; i < n; ++i) {
         node_idx[nodes[i]] = i;
@@ -462,7 +463,8 @@ public:
     // Buffer-region data dependencies
     std::vector<For> current_loop_stack = loop_stack;
     current_loop_stack.push_back(ctrl->control);
-    auto deps = AnalyzeDependencies(nodes, current_loop_stack);
+    auto deps =
+        AnalyzeDependencies(nodes, current_loop_stack, manual_multi_buffer_);
     std::unordered_map<IRStructure *, size_t> node_idx;
     for (size_t i = 0; i < n; ++i) {
       node_idx[nodes[i]] = i;
@@ -470,8 +472,8 @@ public:
     for (const auto &dep : deps) {
       size_t i = node_idx[dep.prod_node];
       size_t j = node_idx[dep.cons_node];
-      if (!dep.cross_iter) {
-        data_deps.emplace_back(i, j, 0, dep.latency);
+      if (dep.distance >= 0) {
+        data_deps.emplace_back(i, j, dep.distance, dep.latency);
       } else {
         const Buffer &buffer = dep.buffer;
         auto it = buffer_var_id.find(buffer);
@@ -814,9 +816,17 @@ public:
     buffer_versions_overrides_ = overrides;
   }
 
+  // Set the user-declared manual multi-buffer table (from
+  // annotate_manual_multi_buffer), threaded into dependency analysis so
+  // cross-iteration distances are solved per access pair.
+  void SetManualMultiBuffer(const ManualMultiBufferTable &manual) {
+    manual_multi_buffer_ = manual;
+  }
+
 private:
   std::map<std::string, int64_t> memory_limits_ = {{"shared", 48 * 1024}};
   std::map<std::string, int64_t> buffer_versions_overrides_;
+  ManualMultiBufferTable manual_multi_buffer_;
 };
 
 } // namespace tl

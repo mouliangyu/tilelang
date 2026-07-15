@@ -278,8 +278,9 @@ std::vector<SyncPoint>
 CollectSyncPoints(const std::vector<IRStructure *> &nodes, int num_wgs,
                   const MultiVersionBufferMap &buffer_info_map,
                   const std::map<Buffer, int64_t> &buffer_num_versions = {},
-                  const std::vector<For> &loop_stack = {}) {
-  auto deps = AnalyzeDependencies(nodes, loop_stack);
+                  const std::vector<For> &loop_stack = {},
+                  const ManualMultiBufferTable &manual = {}) {
+  auto deps = AnalyzeDependencies(nodes, loop_stack, manual);
 
   // Expand a task's warpgroup id into the concrete wg ids it participates in.
   auto expand_wgs = [&](int task_wg) {
@@ -300,8 +301,10 @@ CollectSyncPoints(const std::vector<IRStructure *> &nodes, int num_wgs,
       continue;
     }
 
-    int distance = 0;
-    if (dep.cross_iter) {
+    int distance;
+    if (dep.distance >= 0) {
+      distance = dep.distance;
+    } else {
       auto it = buffer_num_versions.find(dep.buffer);
       if (it != buffer_num_versions.end()) {
         distance = it->second;
@@ -316,6 +319,16 @@ CollectSyncPoints(const std::vector<IRStructure *> &nodes, int num_wgs,
       const auto &info = buffer_info_it->second;
       num_versions = info.num_versions;
       flag_loops = info.claim_loops;
+    } else {
+      auto it = manual.find(dep.buffer->data.get());
+      if (it != manual.end()) {
+        if (dep.distance > 0) {
+          num_versions = dep.distance;
+        } else {
+          num_versions = it->second;
+        }
+        flag_loops = loop_stack;
+      }
     }
 
     for (const auto &[ppt, cpt] : dep.task_pairs) {
@@ -657,7 +670,8 @@ DepClosure
 AnalyzeAndInsertBarriers(IRStructure *node, EventIdMap &event_id_map,
                          FlagInfoList &flag_infos, std::vector<For> &loop_stack,
                          std::vector<MultiVersionBufferInfo> &buffer_infos,
-                         MultiVersionBufferMap &buffer_info_map);
+                         MultiVersionBufferMap &buffer_info_map,
+                         const ManualMultiBufferTable &manual);
 
 // Analyze an ordered list of sibling nodes (either the root list or a loop
 // body): recurse into each child, then collect / optimize / emit this level's
@@ -667,12 +681,13 @@ AnalyzeNodeList(std::vector<IRStructure *> &nodes, EventIdMap &event_id_map,
                 FlagInfoList &flag_infos, std::vector<For> &loop_stack,
                 std::vector<MultiVersionBufferInfo> &buffer_infos,
                 MultiVersionBufferMap &buffer_info_map, bool is_loop_body,
-                const std::map<Buffer, int64_t> &buffer_num_versions) {
+                const std::map<Buffer, int64_t> &buffer_num_versions,
+                const ManualMultiBufferTable &manual) {
   DepClosure closure;
   for (auto *node : nodes) {
     DepClosure child_closure =
         AnalyzeAndInsertBarriers(node, event_id_map, flag_infos, loop_stack,
-                                 buffer_infos, buffer_info_map);
+                                 buffer_infos, buffer_info_map, manual);
     AddPromotedChildClosure(closure, node, child_closure);
   }
 
@@ -686,7 +701,7 @@ AnalyzeNodeList(std::vector<IRStructure *> &nodes, EventIdMap &event_id_map,
   }
 
   auto sync_points = CollectSyncPoints(nodes, 2, buffer_info_map,
-                                       buffer_num_versions, loop_stack);
+                                       buffer_num_versions, loop_stack, manual);
   int max_distance = 0;
   for (const auto &sp : sync_points) {
     max_distance = std::max(max_distance, sp.edge.distance);
@@ -705,7 +720,8 @@ DepClosure
 AnalyzeAndInsertBarriers(IRStructure *node, EventIdMap &event_id_map,
                          FlagInfoList &flag_infos, std::vector<For> &loop_stack,
                          std::vector<MultiVersionBufferInfo> &buffer_infos,
-                         MultiVersionBufferMap &buffer_info_map) {
+                         MultiVersionBufferMap &buffer_info_map,
+                         const ManualMultiBufferTable &manual) {
   if (!node)
     return {};
 
@@ -760,9 +776,10 @@ AnalyzeAndInsertBarriers(IRStructure *node, EventIdMap &event_id_map,
     std::vector<IRStructure *> nodes;
     for (auto &child : ctrl->children)
       nodes.push_back(child.get());
-    DepClosure closure = AnalyzeNodeList(
-        nodes, event_id_map, flag_infos, loop_stack, buffer_infos,
-        buffer_info_map, /*is_loop_body=*/true, ctrl->buffer_num_versions);
+    DepClosure closure =
+        AnalyzeNodeList(nodes, event_id_map, flag_infos, loop_stack,
+                        buffer_infos, buffer_info_map, /*is_loop_body=*/true,
+                        ctrl->buffer_num_versions, manual);
 
     for (const auto &buffer : scoped_buffers)
       buffer_info_map.erase(buffer);
@@ -785,13 +802,14 @@ void AnalyzeAndInsertBarriers(std::vector<std::shared_ptr<IRStructure>> &root,
                               EventIdMap &event_id_map,
                               FlagInfoList &flag_infos,
                               std::vector<MultiVersionBufferInfo> &buffer_infos,
-                              MultiVersionBufferMap &buffer_info_map) {
+                              MultiVersionBufferMap &buffer_info_map,
+                              const ManualMultiBufferTable &manual) {
   std::vector<For> loop_stack;
   std::vector<IRStructure *> nodes;
   for (auto &child : root)
     nodes.push_back(child.get());
   AnalyzeNodeList(nodes, event_id_map, flag_infos, loop_stack, buffer_infos,
-                  buffer_info_map, /*is_loop_body=*/false, {});
+                  buffer_info_map, /*is_loop_body=*/false, {}, manual);
 }
 
 } // namespace tl

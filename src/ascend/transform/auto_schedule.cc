@@ -81,6 +81,7 @@ class TilelangRootBodyExtractor : public StmtVisitor {
 public:
   Stmt body;
   std::map<std::string, int64_t> buffer_versions_overrides;
+  ManualMultiBufferTable manual_multi_buffer_versions;
   std::set<std::string> unlimit_memory_scopes;
   Optional<Var> sid;
 
@@ -95,6 +96,18 @@ public:
             if (auto *var = it.first.as<VarNode>()) {
               if (auto imm = it.second.as<int>()) {
                 buffer_versions_overrides[var->name_hint] = imm.value();
+              }
+            }
+          }
+        }
+      }
+      auto manual_ann = op->annotations.Get("tl.manual_multi_buffer");
+      if (manual_ann.has_value()) {
+        if (auto *map_obj = manual_ann.value().as<ffi::MapObj>()) {
+          for (const auto &it : *map_obj) {
+            if (auto *var = it.first.as<VarNode>()) {
+              if (auto imm = it.second.as<int>()) {
+                manual_multi_buffer_versions[var] = imm.value();
               }
             }
           }
@@ -1025,6 +1038,7 @@ PropagateReadRegions(const std::vector<std::shared_ptr<IRStructure>> &root) {
 static ScheduledKernelResult ScheduleSingleKernel(
     const Stmt &kernel_body, Target target,
     const std::map<std::string, int64_t> &buffer_versions_overrides = {},
+    const ManualMultiBufferTable &manual_multi_buffer_versions = {},
     const std::set<std::string> &unlimit_memory_scopes = {},
     Optional<Var> external_sid = {}) {
   // Build IRStructure from the body to schedule
@@ -1056,6 +1070,7 @@ static ScheduledKernelResult ScheduleSingleKernel(
     unit_builder.SetMemoryLimit(scope, kUnlimitedMemory);
   }
   unit_builder.SetBufferVersionsOverride(buffer_versions_overrides);
+  unit_builder.SetManualMultiBuffer(manual_multi_buffer_versions);
   unit_builder.ScheduleList(ir_structure);
 
   // Assign warpgroup IDs based on pipe and buffer scopes
@@ -1144,7 +1159,8 @@ static ScheduledKernelResult ScheduleSingleKernel(
   FlagInfoList flag_infos;
   MultiVersionBufferMap buffer_info_map;
   AnalyzeAndInsertBarriers(ir_structure, event_id_map, flag_infos,
-                           result.buffer_infos, buffer_info_map);
+                           result.buffer_infos, buffer_info_map,
+                           manual_multi_buffer_versions);
 
   Var sid;
   if (external_sid.has_value()) {
@@ -1258,6 +1274,7 @@ tvm::transform::Pass AutoSchedule() {
       auto overrides = extractor.buffer_versions_overrides;
       auto kr =
           ScheduleSingleKernel(body_to_schedule, target, overrides,
+                               extractor.manual_multi_buffer_versions,
                                extractor.unlimit_memory_scopes, extractor.sid);
 
       TilelangRootBodyReplacer replacer(kr.scheduled_body);
@@ -1301,6 +1318,7 @@ tvm::transform::Pass AutoSchedule() {
       auto overrides = extractor.buffer_versions_overrides;
       auto result =
           ScheduleSingleKernel(body_to_schedule, target, overrides,
+                               extractor.manual_multi_buffer_versions,
                                extractor.unlimit_memory_scopes, extractor.sid);
       Stmt scheduled_body = result.scheduled_body;
 

@@ -866,24 +866,36 @@ struct DepInfo {
   // Conflicting (producer access, consumer access) pairs. Each pair is a
   // concrete producer→consumer ordering that needs a sync.
   std::vector<std::pair<BufferAccessPoint, BufferAccessPoint>> task_pairs;
-  bool cross_iter;
+  // Cross-iteration distance of this dependency:
+  //   0   : same-iteration dependency.
+  //   -1  : cross-iteration dependency on an auto-versioned buffer; the true
+  //         distance equals the buffer's num_versions.
+  //   >=1 : dependency on a manually multi-buffered buffer, at the physical
+  //         iteration distance solved per access pair.
+  int distance;
   int64_t latency;
 };
 
-std::set<BufferAccessPoint> CollectAccessPoints(const IRStructure *node,
-                                                const Buffer &buffer,
-                                                bool is_write,
-                                                bool producer_side);
+// Table of user-declared manual multi-buffer buffers, keyed by the buffer's
+// data Var, value = number of versions N (the user allocated the buffer with an
+// explicit leading dim of size N and writes the version index into dim 0
+// themselves). Built per kernel from the `tl.manual_multi_buffer` annotation
+// and threaded through dependency analysis (to solve the real cross-iteration
+// distance) and the barrier pass.
+using ManualMultiBufferTable = std::unordered_map<const VarNode *, int64_t>;
 
 // Analyze data dependencies among scheduled TaskNode/ControlNode nodes.
 // `loop_stack` is the full enclosing serial loop stack at this level
 // (outermost-first). Empty means root/list level. Non-empty means the last loop
 // is the current loop body, enabling cross-iteration dependencies.
+// `manual` maps user-declared manual multi-buffer data Vars to their version
+// count; empty means no manual buffers.
 // An `i == j` control-node self-dependency whose producer→consumer pairs are
 // already established anywhere inside that node's own subtree is dropped.
 std::vector<DepInfo>
 AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
-                    const std::vector<For> &loop_stack);
+                    const std::vector<For> &loop_stack,
+                    const ManualMultiBufferTable &manual = {});
 
 // Helper function to print BufferRegion details
 inline void PrintBufferRegion(const BufferRegion &region,
