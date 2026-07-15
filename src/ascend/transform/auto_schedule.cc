@@ -615,7 +615,11 @@ private:
             elements *= 1;
           }
         }
-        return elements * DataType(copy->dst->dtype).bytes();
+        // Bits-based ceil so packed sub-byte dtypes (fp4 = 2 codes/byte) aren't
+        // over-counted (dtype.bytes() rounds 4 bits up to 1).
+        DataType dt(copy->dst->dtype);
+        int64_t elem_bits = dt.bits() * dt.lanes();
+        return (elements * elem_bits + 7) / 8;
       }
 
       void VisitExpr_(const CallNode *op) override {

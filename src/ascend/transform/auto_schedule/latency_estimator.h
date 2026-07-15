@@ -1078,7 +1078,8 @@ private:
       per_dtype = params_.valu_throughput_int8;
     if (per_dtype > 0)
       return per_dtype;
-    int64_t bytes = dtype.bytes();
+    // Per-element bytes; bits-based so packed sub-byte dtypes aren't mis-sized.
+    int64_t bytes = (dtype.bits() * dtype.lanes() + 7) / 8;
     return bytes > 0 ? safe_div(params_.valu_bandwidth, bytes) : 0;
   }
 
@@ -1688,11 +1689,12 @@ private:
       }
     }
 
-    // Get data type size in bytes
+    // Total size in bytes; bits-based so packed sub-byte dtypes (fp4 = 2
+    // codes/byte) aren't over-counted (dtype.bytes() rounds 4 bits up to 1).
     DataType dtype(buffer->dtype);
-    int64_t element_size = dtype.bytes();
+    int64_t elem_bits = dtype.bits() * dtype.lanes();
 
-    return total_elements * element_size;
+    return (total_elements * elem_bits + 7) / 8;
   }
 
   // Estimate latency for a single memory access

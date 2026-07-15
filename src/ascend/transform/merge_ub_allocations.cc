@@ -123,6 +123,28 @@ static int AscendScopeAlignBytes(const AllocBufferNode *alloc) {
  */
 namespace {
 
+// Bits-based byte sizing for UB buffers so packed sub-byte dtypes
+// (fp4 = 2 codes/byte) get the correct byte count instead of dtype.bytes()
+// rounding 4 bits up to 1 byte. elem_bits is dtype.bits() * dtype.lanes().
+inline int64_t PackedBytesFromElems(int64_t elements, int elem_bits) {
+  return (elem_bits % 8 == 0) ? elements * (elem_bits / 8)
+                              : (elements * elem_bits + 7) / 8;
+}
+inline PrimExpr PackedBytesFromElems(PrimExpr elements, int elem_bits) {
+  if (elem_bits % 8 == 0) {
+    return elements * make_const(elements.dtype(), elem_bits / 8);
+  }
+  return FloorDiv(elements * make_const(elements.dtype(), elem_bits) +
+                      make_const(elements.dtype(), 7),
+                  make_const(elements.dtype(), 8));
+}
+// Inverse: byte offset/count -> logical element count in the buffer's own
+// (possibly sub-byte) units.
+inline PrimExpr PackedElemsFromBytes(PrimExpr bytes, int elem_bits) {
+  return FloorDiv(bytes * make_const(bytes.dtype(), 8),
+                  make_const(bytes.dtype(), elem_bits));
+}
+
 class AllocateCollector : public StmtExprVisitor {
 public:
   void VisitStmt_(const AllocBufferNode *op) final {
@@ -2031,9 +2053,13 @@ public:
       auto const_ext = GetRef<AllocBuffer>(alloc).ConstantAllocationSize();
       if (!const_ext.has_value())
         return std::nullopt; // dynamic extent — handled separately upstream
-      int64_t bytes_per_elem =
-          alloc->buffer->dtype.bytes() * alloc->buffer->dtype.lanes();
-      return static_cast<size_t>(const_ext.value() * bytes_per_elem);
+      // Bits-based sizing so packed sub-byte dtypes (fp4 = 2 codes/byte) get
+      // the correct byte count instead of dtype.bytes() rounding 4 bits up
+      // to 1.
+      int elem_bits =
+          alloc->buffer->dtype.bits() * alloc->buffer->dtype.lanes();
+      return static_cast<size_t>(
+          PackedBytesFromElems(const_ext.value(), elem_bits));
     };
     auto get_buf_align = [&](const VarNode *var) -> int {
       int al = align_bytes;
@@ -2391,8 +2417,11 @@ private:
 
     for (const VarNode *var : sorted_vars) {
       const AllocBufferNode *alloc = shmem_allocs_.at(var);
-      int64_t bytes_per_elem = static_cast<int64_t>(
-          alloc->buffer->dtype.bytes() * alloc->buffer->dtype.lanes());
+      // Bits-based sizing so packed sub-byte dtypes (fp4 = 2 codes/byte) get
+      // the correct byte count instead of dtype.bytes() rounding 4 bits up
+      // to 1.
+      int elem_bits =
+          alloc->buffer->dtype.bits() * alloc->buffer->dtype.lanes();
 
       DataType size_dtype = DataType::Int(32);
       if (!alloc->buffer->shape.empty()) {
@@ -2402,14 +2431,15 @@ private:
         size_dtype = DataType::Int(32);
       }
 
-      PrimExpr size_expr = make_const(size_dtype, bytes_per_elem);
+      PrimExpr total_elems = make_const(size_dtype, 1);
       for (const PrimExpr &extent : alloc->buffer->shape) {
         PrimExpr e = extent;
         if (e.dtype() != size_dtype) {
           e = cast(size_dtype, e);
         }
-        size_expr = size_expr * e;
+        total_elems = total_elems * e;
       }
+      PrimExpr size_expr = PackedBytesFromElems(total_elems, elem_bits);
 
       int alignment = align_bytes_;
       // Scope-derived fractal / MicroAPI alignment, mirroring Pack's
@@ -2444,9 +2474,10 @@ private:
           auto alloc_it = shmem_allocs_.find(buffer_var_node);
           if (alloc_it != shmem_allocs_.end()) {
             const AllocBufferNode *alloc = alloc_it->second;
-            PrimExpr buffer_size_bytes = alloc->buffer->shape[0] *
-                                         alloc->buffer->dtype.bytes() *
-                                         alloc->buffer->dtype.lanes();
+            int dbg_elem_bits =
+                alloc->buffer->dtype.bits() * alloc->buffer->dtype.lanes();
+            PrimExpr buffer_size_bytes =
+                PackedBytesFromElems(alloc->buffer->shape[0], dbg_elem_bits);
             LOG(DEBUG) << "    Buffer: " << buffer_var_node->name_hint
                        << " (Type: " << alloc->buffer->dtype << ")"
                        << ", Start Offset: " << byte_offset
@@ -2591,7 +2622,9 @@ private:
     auto it = buffer_byte_offsets_.find(buffer_var.get());
     ICHECK(it != buffer_byte_offsets_.end())
         << "buffer_var = " << buffer_var->name_hint << ", dtype = " << dtype;
-    return indexdiv(it->second, dtype.bytes() * dtype.lanes());
+    // Byte offset -> element offset in the buffer's own units; bits-based so
+    // packed sub-byte dtypes (fp4 = 2 codes/byte) map back correctly.
+    return PackedElemsFromBytes(it->second, dtype.bits() * dtype.lanes());
   }
 
   bool HasBufferOffset(const Var &buffer_var) {

@@ -318,11 +318,16 @@ public:
     }
     std::map<Buffer, int64_t> annotated_buffer_versions;
     auto get_buffer_size = [](const Buffer &buffer) -> int64_t {
-      int64_t elem_size = buffer->dtype.bits() * buffer->dtype.lanes() / 8;
-      PrimExpr size = IntImm(DataType::Int(64), elem_size);
+      // Bits-based: dtype.bits()*lanes()/8 truncates sub-byte dtypes to 0
+      // (fp4 -> 0). Accumulate elements, then ceil(elements*bits/8).
+      int64_t elem_bits = buffer->dtype.bits() * buffer->dtype.lanes();
+      PrimExpr elems = IntImm(DataType::Int(64), 1);
       for (const auto &dim : buffer->shape) {
-        size *= dim;
+        elems *= dim;
       }
+      PrimExpr size = FloorDiv(elems * IntImm(DataType::Int(64), elem_bits) +
+                                   IntImm(DataType::Int(64), 7),
+                               IntImm(DataType::Int(64), 8));
       arith::Analyzer analyzer;
       auto size_val = analyzer.Simplify(size);
       if (const auto *int_imm = size_val.as<IntImmNode>()) {

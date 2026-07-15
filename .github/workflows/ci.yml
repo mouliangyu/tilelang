@@ -192,7 +192,7 @@ jobs:
           echo "import torch; print(f'torch: {torch.__version__}')" | uv run --no-project --script -
           echo "::group::torch.utils.collect_env"
           uv run --no-project -m -- torch.utils.collect_env
-          uv pip install /nfs-hg/prod/deepseek/permanent/shared/caohuanqi/pytorch/dist/torch_npu-2.10.0+git6893d1e-cp312-cp312-linux_aarch64.whl
+          uv pip install /nfs-hg/prod/deepseek/permanent/shared/caohuanqi/pytorch/dist/torch_npu-2.10.0.post4+git4421109-cp312-cp312-linux_aarch64.whl
           echo "::endgroup::"
 
       - name: Clear uv cache for self-hosted runners (if setup failed)
