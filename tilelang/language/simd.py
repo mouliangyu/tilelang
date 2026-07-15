@@ -191,11 +191,16 @@ def vld(addr, dist="NORM", off=None):
         if isinstance(dist, str):
             if dist.startswith("BRC_"):
                 extent = 1
-            elif dist == "E2B_B16":
-                # Expand-to-block: 8 bf16/u16 values → 8×16-lane blocks.
+            elif dist.startswith("E2B_"):
                 extent = 8
-            elif dist in ("UNPK_B16", "UNPK4_B8"):
-                extent = 64
+            elif dist == "BLK":
+                extent = 32
+            elif dist == "UNPK4_B8":
+                extent = lanes // 4
+            elif dist.startswith("US_") or dist.startswith("UNPK_"):
+                extent = lanes // 2
+            elif dist.startswith("DS_"):
+                extent = lanes * 2
         addr = access_ptr(addr, "r", extent=extent)
         vec_dtype = f"{elem_dtype}x{lanes}"
     else:
@@ -266,8 +271,10 @@ def vsts(addr, src, mask=None, dist="NORM_B32", off=None, extent=None):
             if isinstance(dist, str):
                 if dist.startswith("ONEPT_"):
                     extent = 1
-                elif dist in ("PK_B32", "PK4_B32"):
-                    extent = 64
+                elif dist.startswith("PK_"):
+                    extent = lanes // 2
+                elif dist.startswith("PK4_"):
+                    extent = lanes // 4
         addr = access_ptr(addr, "w", extent=extent)
     args = [addr, src, mask, dist]
     if off is not None:
