@@ -12,6 +12,7 @@
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/tirx/buffer.h>
+#include <tvm/tirx/expr.h>
 #include <tvm/tirx/op.h>
 
 #include <vector>
@@ -20,6 +21,19 @@ namespace tvm {
 namespace tl {
 
 using namespace tirx;
+
+/// Convert a logical element count into the byte count used by MTE copy
+/// descriptors. Sub-byte dtypes such as float4_e2m1fn are packed in Ascend
+/// storage (1 byte / 2 logical elements), so the byte count is
+/// ceil(elements * elem_bits / 8).
+inline PrimExpr AscendMTEBytesFromElements(PrimExpr elements, int elem_bits) {
+  if (elem_bits % 8 == 0) {
+    return elements * make_const(elements.dtype(), elem_bits / 8);
+  }
+  return FloorDiv(elements * make_const(elements.dtype(), elem_bits) +
+                      make_const(elements.dtype(), 7),
+                  make_const(elements.dtype(), 8));
+}
 
 // ---------------------------------------------------------------------------
 // StridedLayout: a flat sequence of (size, stride) modes, innermost first.
@@ -36,7 +50,7 @@ struct Mode {
 struct StridedLayout {
   std::vector<Mode> modes; ///< From innermost (stride smallest) to outermost
   PrimExpr offset; ///< Flat element offset to the first accessed element
-  int elem_bytes;  ///< Size of one element in bytes
+  int elem_bits;   ///< Size of one element in bits
 
   /// Construct a StridedLayout from a Buffer and the access Range.
   ///
@@ -47,9 +61,8 @@ struct StridedLayout {
   ///   - buf strides (explicit or row-major inferred) become mode strides
   ///
   /// Modes are stored innermost-first (i.e. modes[0] = last dimension).
-  static StridedLayout FromBufferRange(const Buffer &buf,
-                                       const Array<Range> &range,
-                                       int elem_bytes) {
+  static StridedLayout
+  FromBufferRange(const Buffer &buf, const Array<Range> &range, int elem_bits) {
     int ndim = static_cast<int>(range.size());
     auto I = [](int64_t v) { return make_const(DataType::Int(32), v); };
 
@@ -81,7 +94,7 @@ struct StridedLayout {
       modes[i] = {range[dim]->extent, strides[dim]};
     }
 
-    return StridedLayout{std::move(modes), offset, elem_bytes};
+    return StridedLayout{std::move(modes), offset, elem_bits};
   }
 
   /// Coalesce adjacent modes where the outer mode's stride equals the inner
@@ -105,7 +118,7 @@ struct StridedLayout {
     // If all modes were size-1, the total is 1 element; return single mode.
     if (filtered.empty()) {
       auto I = [](int64_t v) { return make_const(DataType::Int(32), v); };
-      return StridedLayout{{Mode{I(1), I(1)}}, offset, elem_bytes};
+      return StridedLayout{{Mode{I(1), I(1)}}, offset, elem_bits};
     }
 
     // Then coalesce contiguous adjacent modes
@@ -126,7 +139,7 @@ struct StridedLayout {
       }
     }
 
-    return StridedLayout{std::move(result), offset, elem_bytes};
+    return StridedLayout{std::move(result), offset, elem_bits};
   }
 };
 
@@ -136,117 +149,102 @@ struct StridedLayout {
 
 /// Describes a 2D strided DMA copy (the common denominator of GM<->UBuf MTE).
 struct MTECopy2D {
-  PrimExpr n_rows;    ///< Number of rows to copy
-  PrimExpr row_bytes; ///< Bytes per row (contiguous burst)
-  PrimExpr
-      src_stride_bytes; ///< Source: bytes between start of consecutive rows
-  PrimExpr dst_stride_bytes; ///< Dest: bytes between start of consecutive rows
+  PrimExpr n_rows;           ///< Number of rows to copy
+  PrimExpr row_elems;        ///< Logical elements per row (contiguous burst)
+  PrimExpr src_stride_elems; ///< Source: logical elements between rows
+  PrimExpr dst_stride_elems; ///< Dest: logical elements between rows
   PrimExpr src_offset;       ///< Source base offset in elements
   PrimExpr dst_offset;       ///< Dest base offset in elements
-
-  /// Outer loop dimensions (modes[2:] after coalesce), empty if <= 2D.
-  /// When non-empty, the caller must emit nested loops over these modes,
-  /// adjusting src/dst pointers by mode.stride * elem_bytes per iteration.
-  std::vector<Mode> outer_loops;
 };
 
 /// Plan a 2D MTE copy from coalesced source and destination layouts.
 ///
-/// The row size is determined by the minimum contiguous segment of src and dst.
-/// When the two sides have different innermost contiguous sizes, the larger
-/// side is logically split so that both share the same row_bytes.
+/// The row size is determined by the strided side's physical row boundary.
+/// A fully contiguous side may be split to match that boundary. Two strided
+/// sides must expose both the same innermost row boundary and the same row
+/// count; otherwise one 2D MTE descriptor cannot represent both address
+/// sequences with constant row strides.
 inline MTECopy2D PlanMTECopy(const StridedLayout &src_raw,
                              const StridedLayout &dst_raw,
                              arith::Analyzer *analyzer) {
   auto I = [](int64_t v) { return make_const(DataType::Int(32), v); };
-  int elem_bytes = src_raw.elem_bytes;
 
   // 1. Coalesce both sides independently
   StridedLayout src = src_raw.Coalesce(analyzer);
   StridedLayout dst = dst_raw.Coalesce(analyzer);
 
-  // 2. Determine the common row size = min of innermost contiguous segments.
-  PrimExpr src_inner = src.modes.empty() ? I(0) : src.modes[0].size;
-  PrimExpr dst_inner = dst.modes.empty() ? I(0) : dst.modes[0].size;
-
-  // Simplify for constant folding (e.g. 256*128 -> 32768)
-  src_inner = analyzer->Simplify(src_inner);
-  dst_inner = analyzer->Simplify(dst_inner);
-
-  PrimExpr row_elems;
-  bool src_is_smaller = false;
-  bool dst_is_smaller = false;
-
-  if (analyzer->CanProveEqual(src_inner, dst_inner)) {
-    row_elems = src_inner;
-  } else if (analyzer->CanProve(src_inner < dst_inner)) {
-    row_elems = src_inner;
-    src_is_smaller = true;
-  } else if (analyzer->CanProve(dst_inner < src_inner)) {
-    row_elems = dst_inner;
-    dst_is_smaller = true;
-  } else {
-    // Cannot compare symbolically; use the smaller of the two mode sizes.
-    // Fallback: assume dst (often the non-compact global side) is smaller.
-    row_elems = dst_inner;
-    dst_is_smaller = true;
-  }
-
-  PrimExpr row_bytes = row_elems * I(elem_bytes);
-
-  // 3. Compute total elements to determine n_rows.
-  //    total_elems is the same for src and dst (same copy region).
-  PrimExpr total_elems = I(1);
-  for (const auto &m : src.modes) {
-    total_elems = total_elems * m.size;
-  }
-  total_elems = analyzer->Simplify(total_elems);
-  PrimExpr n_rows = analyzer->Simplify(total_elems / row_elems);
-
-  // 4. Determine strides for each side.
-  //    - If a side's innermost mode == row_elems, stride comes from mode[1].
-  //    - If a side's innermost mode > row_elems (was split), stride = row_elems
-  //      (the split portion is contiguous, stride = row_elems * elem_bytes).
-  //    - If a side's innermost mode == row_elems and modes.size() == 1,
-  //      stride = row_bytes (contiguous, no gap).
-
-  auto get_stride_bytes = [&](const StridedLayout &layout,
-                              bool is_smaller_side) -> PrimExpr {
-    if (layout.modes.size() == 1) {
-      if (is_smaller_side) {
-        // This side determined row_elems; it has only 1 mode, meaning
-        // all data is contiguous. Stride = row_bytes (no gap).
-        return row_bytes;
-      } else {
-        // Other side is larger but was coalesced to 1 mode; it is fully
-        // contiguous. After splitting by row_elems, stride = row_bytes.
-        return row_bytes;
-      }
-    }
-    // modes.size() >= 2
-    if (analyzer->CanProveEqual(layout.modes[0].size, row_elems)) {
-      // Innermost mode matches exactly: stride from the next mode.
-      return layout.modes[1].stride * I(elem_bytes);
-    } else {
-      // Innermost mode is larger than row_elems (we split it).
-      // The split region is contiguous, so stride = row_bytes.
-      return row_bytes;
-    }
-  };
-
-  PrimExpr src_stride_bytes = get_stride_bytes(src, src_is_smaller);
-  PrimExpr dst_stride_bytes = get_stride_bytes(dst, dst_is_smaller);
-
-  // 5. Assert no >2D cases (not yet implemented).
+  // 2. A single MTE descriptor supports one contiguous row and one constant
+  // inter-row stride on each side. Keep unsupported higher-dimensional
+  // layouts out of the structural cases below.
+  ICHECK(!src.modes.empty() && !dst.modes.empty())
+      << "PlanMTECopy: empty coalesced layout.";
   ICHECK(src.modes.size() <= 2 && dst.modes.size() <= 2)
-      << "PlanMTECopy: >2D strided copy not yet supported. "
-      << "src has " << src.modes.size() << " modes, "
-      << "dst has " << dst.modes.size() << " modes after coalesce.";
-  std::vector<Mode> outer_loops;
+      << "PlanMTECopy: >2D strided copy not yet supported. " << "src has "
+      << src.modes.size() << " modes, " << "dst has " << dst.modes.size()
+      << " modes after coalesce.";
+  ICHECK(analyzer->CanProveEqual(src.modes[0].stride, I(1)) &&
+         analyzer->CanProveEqual(dst.modes[0].stride, I(1)))
+      << "PlanMTECopy: innermost MTE modes must be contiguous, got src stride "
+      << src.modes[0].stride << " and dst stride " << dst.modes[0].stride
+      << ".";
+
+  auto total_elems = [&](const StridedLayout &layout) -> PrimExpr {
+    PrimExpr total = I(1);
+    for (const auto &mode : layout.modes) {
+      total = total * mode.size;
+    }
+    return analyzer->Simplify(total);
+  };
+  PrimExpr src_total = total_elems(src);
+  PrimExpr dst_total = total_elems(dst);
+  ICHECK(analyzer->CanProveEqual(src_total, dst_total))
+      << "PlanMTECopy: source and destination regions must contain the same "
+         "number of elements, got src="
+      << src_total << " and dst=" << dst_total << ".";
+
+  // 3. Select the row boundary from layout structure rather than symbolic
+  // size ordering. A one-mode side is fully contiguous and can be split to
+  // match a two-mode side. If both sides are strided, their physical row
+  // boundaries and row counts must match exactly.
+  bool src_1d = src.modes.size() == 1;
+  bool dst_1d = dst.modes.size() == 1;
+  PrimExpr row_elems;
+  PrimExpr n_rows;
+  PrimExpr src_stride_elems;
+  PrimExpr dst_stride_elems;
+
+  if (src_1d && dst_1d) {
+    row_elems = src_total;
+    n_rows = I(1);
+    src_stride_elems = row_elems;
+    dst_stride_elems = row_elems;
+  } else if (!src_1d && dst_1d) {
+    row_elems = analyzer->Simplify(src.modes[0].size);
+    n_rows = analyzer->Simplify(src.modes[1].size);
+    src_stride_elems = src.modes[1].stride;
+    dst_stride_elems = row_elems;
+  } else if (src_1d && !dst_1d) {
+    row_elems = analyzer->Simplify(dst.modes[0].size);
+    n_rows = analyzer->Simplify(dst.modes[1].size);
+    src_stride_elems = row_elems;
+    dst_stride_elems = dst.modes[1].stride;
+  } else {
+    ICHECK(analyzer->CanProveEqual(src.modes[0].size, dst.modes[0].size))
+        << "PlanMTECopy: incompatible 2D row boundaries require outer-loop "
+           "lowering, got src inner="
+        << src.modes[0].size << " and dst inner=" << dst.modes[0].size << ".";
+    ICHECK(analyzer->CanProveEqual(src.modes[1].size, dst.modes[1].size))
+        << "PlanMTECopy: source and destination row counts differ, got src="
+        << src.modes[1].size << " and dst=" << dst.modes[1].size << ".";
+    row_elems = analyzer->Simplify(src.modes[0].size);
+    n_rows = analyzer->Simplify(src.modes[1].size);
+    src_stride_elems = src.modes[1].stride;
+    dst_stride_elems = dst.modes[1].stride;
+  }
 
   return MTECopy2D{
-      n_rows,     row_bytes,  src_stride_bytes,       dst_stride_bytes,
-      src.offset, dst.offset, std::move(outer_loops),
+      n_rows,           row_elems,  src_stride_elems,
+      dst_stride_elems, src.offset, dst.offset,
   };
 }
 

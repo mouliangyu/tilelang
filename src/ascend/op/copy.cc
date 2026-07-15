@@ -133,7 +133,7 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
                   arith::Analyzer *analyzer, int dma_path) {
   auto I = [](int64_t v) { return make_const(DataType::Int(32), v); };
   auto I64 = [](int64_t v) { return make_const(DataType::Int(64), v); };
-  int elem_bytes = op.src->dtype.bytes();
+  int elem_bits = op.src->dtype.bits();
 
   size_t ndim = op.src_range.size();
   PrimExpr inner_elems = op.src_range[ndim - 1]->extent;
@@ -142,11 +142,12 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
     n_rows = n_rows * op.src_range[i]->extent;
   }
 
-  PrimExpr row_bytes = inner_elems * I(elem_bytes);
+  PrimExpr row_bytes = AscendMTEBytesFromElements(inner_elems, elem_bits);
 
   // GM/UB row stride from the ND (identity) layout's row-major strides: the
   // outermost stride is the bytes between consecutive rows.
-  PrimExpr src_row_stride_bytes = AscendNDStrides(op.src)[0] * I(elem_bytes);
+  PrimExpr src_row_stride_bytes =
+      AscendMTEBytesFromElements(AscendNDStrides(op.src)[0], elem_bits);
 
   auto make_access_ptr = [&](const Buffer &buf, PrimExpr offset,
                              PrimExpr extent, int rw_mask) -> PrimExpr {
@@ -168,17 +169,24 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
   PrimExpr call;
   if (dma_path == 0 || dma_path == 1) {
     auto src_layout =
-        StridedLayout::FromBufferRange(op.src, op.src_range, elem_bytes);
+        StridedLayout::FromBufferRange(op.src, op.src_range, elem_bits);
     auto dst_layout =
-        StridedLayout::FromBufferRange(op.dst, op.dst_range, elem_bytes);
+        StridedLayout::FromBufferRange(op.dst, op.dst_range, elem_bits);
     auto plan = PlanMTECopy(src_layout, dst_layout, analyzer);
 
-    PrimExpr plan_total_elems = plan.row_bytes / I(elem_bytes) * plan.n_rows;
+    PrimExpr plan_row_bytes =
+        AscendMTEBytesFromElements(plan.row_elems, elem_bits);
+    PrimExpr plan_src_stride_bytes =
+        AscendMTEBytesFromElements(plan.src_stride_elems, elem_bits);
+    PrimExpr plan_dst_stride_bytes =
+        AscendMTEBytesFromElements(plan.dst_stride_elems, elem_bits);
+
+    PrimExpr plan_total_elems = plan.row_elems * plan.n_rows;
     PrimExpr plan_src_ptr =
         make_access_ptr(op.src, plan.src_offset, plan_total_elems, 1);
     PrimExpr plan_dst_ptr =
         make_access_ptr(op.dst, plan.dst_offset, plan_total_elems, 2);
-    PrimExpr plan_total_bytes = plan.row_bytes * plan.n_rows;
+    PrimExpr plan_total_bytes = plan_row_bytes * plan.n_rows;
 
     // Ascend GM->UB padding (data_select): an unaligned row is right-padded up
     // to the next 32B boundary and the pad lanes are filled from the pad-value
@@ -190,7 +198,7 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
       }
       return -1;
     };
-    int64_t rb_plan = as_int_plan(plan.row_bytes);
+    int64_t rb_plan = as_int_plan(plan_row_bytes);
     bool data_select = dma_path == 0 && op.GetDataSelect() != 0;
     // Padding right-pads each row up to the next 32B boundary, so it needs a
     // statically-known row byte length to compute the pad count. A symbolic
@@ -201,7 +209,7 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
     int64_t right_pad_elems = 0;
     if (data_select && rb_plan > 0 && (rb_plan % 32) != 0) {
       int64_t aligned_bytes = (rb_plan + 31) / 32 * 32;
-      right_pad_elems = (aligned_bytes - rb_plan) / elem_bytes;
+      right_pad_elems = ((aligned_bytes - rb_plan) * 8) / elem_bits;
     }
     bool do_pad = right_pad_elems > 0;
 
@@ -214,21 +222,21 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
     // multi-row path.
     bool plan_single_row =
         analyzer->CanProveEqual(plan.n_rows, I(1)) ||
-        (analyzer->CanProveEqual(plan.src_stride_bytes, plan.row_bytes) &&
-         analyzer->CanProveEqual(plan.dst_stride_bytes, plan.row_bytes));
+        (analyzer->CanProveEqual(plan_src_stride_bytes, plan_row_bytes) &&
+         analyzer->CanProveEqual(plan_dst_stride_bytes, plan_row_bytes));
 
     if (dma_path == 0) {
       if (do_pad) {
         // Padded copy: rightPadding fills the row tail from the pad-value
         // register (set_mov_pad_val). The destination stride is the physical
-        // UB row stride (plan.dst_stride_bytes), NOT the padded row width: the
+        // UB row stride (plan_dst_stride_bytes), NOT the padded row width: the
         // dst buffer may be over-allocated wider than align32(row), and rows
         // must land at their real stride to avoid clobbering each other.
         PrimExpr copy_call =
             Call(DataType::Void(), ascend_copy_gm_to_ubuf(),
-                 {plan_dst_ptr, plan_src_ptr, sid, plan.n_rows, plan.row_bytes,
+                 {plan_dst_ptr, plan_src_ptr, sid, plan.n_rows, plan_row_bytes,
                   zero, I(right_pad_elems), I(1), l2_cache_ctrl,
-                  plan.src_stride_bytes, plan.dst_stride_bytes});
+                  plan_src_stride_bytes, plan_dst_stride_bytes});
         return Evaluate(copy_call);
       }
       if (plan_single_row) {
@@ -239,8 +247,8 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
       } else {
         call = Call(DataType::Void(), ascend_copy_gm_to_ubuf(),
                     {plan_dst_ptr, plan_src_ptr, sid, plan.n_rows,
-                     plan.row_bytes, zero, zero, zero, l2_cache_ctrl,
-                     plan.src_stride_bytes, plan.dst_stride_bytes});
+                     plan_row_bytes, zero, zero, zero, l2_cache_ctrl,
+                     plan_src_stride_bytes, plan_dst_stride_bytes});
       }
     } else {
       constexpr int kStoreDefaultL2CacheCtrl = 4;
@@ -253,8 +261,8 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
       } else {
         call = Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
                     {plan_dst_ptr, plan_src_ptr, sid, plan.n_rows,
-                     plan.row_bytes, store_l2_cache_ctrl, plan.dst_stride_bytes,
-                     plan.src_stride_bytes});
+                     plan_row_bytes, store_l2_cache_ctrl, plan_dst_stride_bytes,
+                     plan_src_stride_bytes});
       }
     }
   } else if (dma_path == 2) {
@@ -331,7 +339,7 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
     } else {
       // Fallback: derive fractal params from logical shape (legacy path)
       PrimExpr c0 = I(16);
-      PrimExpr c0_k = I(AscendC0(elem_bytes * 8));
+      PrimExpr c0_k = I(AscendC0(elem_bits));
       size_t src_range_ndim = op.src_range.size();
       PrimExpr m_dim =
           src_range_ndim >= 2 ? op.src_range[src_range_ndim - 2]->extent : I(1);
