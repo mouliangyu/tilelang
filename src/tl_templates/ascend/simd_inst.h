@@ -108,6 +108,23 @@ __simd_callee__ inline vec_t<T> vlds(__ubuf__ T *src, Offset offset,
   return dst;
 }
 
+// Dual-dest memory load (ASC DIST_DINTLV_B16). Prefer ::vld(dst0,dst1,...)
+// which wraps ::vlds on dav-3510; matches asc_loadalign_v2_impl.h.
+template <typename T, typename Dist>
+__simd_callee__ inline vec_pair<vec_t<T>> vld_x2(__ubuf__ T *src, Dist dist) {
+  vec_pair<vec_t<T>> dst;
+  ::vld(dst.v0, dst.v1, src, dist);
+  return dst;
+}
+
+template <typename T, typename Offset, typename Dist>
+__simd_callee__ inline vec_pair<vec_t<T>> vld_x2(__ubuf__ T *src, Offset offset,
+                                                 Dist dist) {
+  vec_pair<vec_t<T>> dst;
+  ::vld(dst.v0, dst.v1, src, offset, dist);
+  return dst;
+}
+
 template <typename T>
 __simd_callee__ inline vec_t<T> vgatherb(__ubuf__ T *base, vector_u32 idx) {
   vec_t<T> dst;

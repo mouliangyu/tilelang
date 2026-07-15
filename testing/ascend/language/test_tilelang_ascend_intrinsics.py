@@ -1,6 +1,16 @@
+import numpy as np
+
 import tilelang.language as T
 import tilelang.testing
 from tilelang.engine.lower import lower
+from tvm import tirx
+from tvm.tirx import Call
+from tvm.tirx.stmt import Bind
+
+
+def _op_name(call_or_op):
+    op = getattr(call_or_op, "op", call_or_op)
+    return getattr(op, "name", None)
 
 
 def test_ascend_pipe_barrier():
@@ -193,6 +203,244 @@ def test_ascend_simd_3510_intrinsics_codegen():
     artifact = lower(func, target="ascend")
     source = artifact.kernel_source
     print(source)
+
+
+def test_ascend_simd_vld2_dintlv_b16_codegen():
+    """Compile-only check that S.vld2(DINTLV_B16) lowers to simd_inst::vld_x2."""
+
+    @T.prim_func
+    def func(A: T.Buffer((256,), "bfloat16"), B: T.Buffer((256,), "bfloat16")):
+        with T.Kernel(1) as _:
+            a_ub = T.alloc_shared((256,), "bfloat16")
+            b_ub = T.alloc_shared((256,), "bfloat16")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                m16 = T.simd.pset(16)
+                x0, x1 = T.simd.vld2(a_ub[0], dist="DINTLV_B16")
+                T.simd.vsts(b_ub[0], x0, m16, dist="NORM_B16")
+                T.simd.vsts(b_ub[128], x1, m16, dist="NORM_B16")
+            T.copy(b_ub, B)
+
+    source = lower(func, target="ascend").kernel_source
+    print(source)
+    assert "simd_inst::vld_x2<" in source
+    assert "DINTLV_B16" in source
+
+
+def test_ascend_simd_vld2_dintlv_b8_codegen():
+    """Compile-only check that S.vld2(DINTLV_B8) lowers for uint8 / float8."""
+
+    @T.prim_func
+    def func_u8(A: T.Buffer((512,), "uint8"), B: T.Buffer((512,), "uint8")):
+        with T.Kernel(1) as _:
+            a_ub = T.alloc_shared((512,), "uint8")
+            b_ub = T.alloc_shared((512,), "uint8")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                m8 = T.simd.pset(8)
+                x0, x1 = T.simd.vld2(a_ub[0], dist="DINTLV_B8")
+                T.simd.vsts(b_ub[0], x0, m8, dist="NORM_B8")
+                T.simd.vsts(b_ub[256], x1, m8, dist="NORM_B8")
+            T.copy(b_ub, B)
+
+    source = lower(func_u8, target="ascend").kernel_source
+    print(source)
+    assert "simd_inst::vld_x2<" in source
+    assert "DINTLV_B8" in source
+
+    @T.prim_func
+    def func_fp8(A: T.Buffer((512,), "float8_e4m3"), B: T.Buffer((512,), "float8_e4m3")):
+        with T.Kernel(1) as _:
+            a_ub = T.alloc_shared((512,), "float8_e4m3")
+            b_ub = T.alloc_shared((512,), "float8_e4m3")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                m8 = T.simd.pset(8)
+                x0, x1 = T.simd.vld2(a_ub[0], dist="DINTLV_B8")
+                T.simd.vsts(b_ub[0], x0, m8, dist="NORM_B8")
+                T.simd.vsts(b_ub[256], x1, m8, dist="NORM_B8")
+            T.copy(b_ub, B)
+
+    source_fp8 = lower(func_fp8, target="ascend").kernel_source
+    print(source_fp8)
+    assert "simd_inst::vld_x2<" in source_fp8
+    assert "DINTLV_B8" in source_fp8
+
+
+def test_ascend_simd_vld2_binds_once_at_site():
+    """vld2 must Bind once at the call site; unpack uses .v0/.v1 on that bind.
+
+    Kernel correctness depends on a single memory load, not a CSE/hoist of an
+    opaque load into two independent vld_x2 calls.
+    """
+
+    @T.prim_func
+    def func(A: T.Buffer((512,), "uint8"), B: T.Buffer((512,), "uint8")):
+        with T.Kernel(1) as _:
+            a_ub = T.alloc_shared((512,), "uint8")
+            b_ub = T.alloc_shared((512,), "uint8")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                m8 = T.simd.pset(8)
+                x0, x1 = T.simd.vld2(a_ub[0], dist="DINTLV_B8")
+                T.simd.vsts(b_ub[0], x0, m8, dist="NORM_B8")
+                T.simd.vsts(b_ub[256], x1, m8, dist="NORM_B8")
+            T.copy(b_ub, B)
+
+    vld2_binds = []
+    inline_vld2_pair_gets = []
+
+    def visit(node):
+        if isinstance(node, Bind) and isinstance(node.value, Call) and _op_name(node.value) == "tl.simd.vld2":
+            vld2_binds.append(node)
+        if isinstance(node, Call) and _op_name(node) == "tl.simd.pair_get":
+            pair_arg = node.args[0]
+            if isinstance(pair_arg, Call) and _op_name(pair_arg) == "tl.simd.vld2":
+                inline_vld2_pair_gets.append(node)
+
+    tirx.stmt_functor.post_order_visit(func.body, visit)
+    assert len(vld2_binds) == 1, f"expected one frontend Bind of vld2, got {len(vld2_binds)}"
+    assert not inline_vld2_pair_gets, "pair_get must reference the bound var, not an inline vld2"
+
+    source = lower(func, target="ascend").kernel_source
+    print(source)
+    assert source.count("simd_inst::vld_x2<") == 1
+    assert ".v0" in source and ".v1" in source
+
+
+def test_ascend_simd_dintlv_part_lane_roundtrip():
+    """Numpy model of CCE dintlv→vintlv→PART0..3→store-vintlv must be identity.
+
+    Catches lane-reconstruction bugs that wide bf16 tolerances can mask.
+    """
+
+    def vintlv(a: np.ndarray, b: np.ndarray):
+        n = a.shape[0]
+        half = n // 2
+        out0 = np.empty(n, dtype=a.dtype)
+        out1 = np.empty(n, dtype=a.dtype)
+        out0[0::2] = a[:half]
+        out0[1::2] = b[:half]
+        out1[0::2] = a[half:]
+        out1[1::2] = b[half:]
+        return out0, out1
+
+    def part(v: np.ndarray, p: int):
+        return v[p::4].copy()
+
+    src = np.arange(512, dtype=np.uint8)
+    d0, d1 = src[0::2].copy(), src[1::2].copy()
+    d0, d1 = vintlv(d0, d1)
+
+    y00, y01, y02, y03 = (part(d0, p) for p in range(4))
+    y10, y11, y12, y13 = (part(d1, p) for p in range(4))
+
+    # Store-side vintlv restore (matches cast_back_asc.dequant_fp8_512).
+    y00, y02 = vintlv(y00, y02)
+    y01, y03 = vintlv(y01, y03)
+    y10, y12 = vintlv(y10, y12)
+    y11, y13 = vintlv(y11, y13)
+    y00, y01 = vintlv(y00, y01)
+    y02, y03 = vintlv(y02, y03)
+    y10, y11 = vintlv(y10, y11)
+    y12, y13 = vintlv(y12, y13)
+
+    restored = np.concatenate([y00, y01, y02, y03, y10, y11, y12, y13])
+    np.testing.assert_array_equal(restored, src)
+
+
+def test_ascend_simd_vld2_rejects_unsupported_dist():
+    """Unsupported vld2 dists must fail at API time."""
+    raised = None
+
+    try:
+
+        @T.prim_func
+        def func(A: T.Buffer((256,), "bfloat16"), B: T.Buffer((128,), "bfloat16")):
+            with T.Kernel(1) as _:
+                a_ub = T.alloc_shared((256,), "bfloat16")
+                b_ub = T.alloc_shared((128,), "bfloat16")
+                with T.SimdVF():
+                    m16 = T.simd.pset(16)
+                    x0, x1 = T.simd.vld2(a_ub[0], dist="NORM_B16")
+                    T.simd.vsts(b_ub[0], x0, m16, dist="NORM_B16")
+
+    except ValueError as e:
+        raised = e
+
+    assert raised is not None and "DINTLV" in str(raised), raised
+
+
+def test_ascend_simd_vpack_u16_to_u8_codegen():
+    """Compile-only check that S.vpack(uint16) lowers to simd_inst::vpack<uint8_t>."""
+
+    @T.prim_func
+    def func(A: T.Buffer((128,), "uint16"), B: T.Buffer((256,), "uint8")):
+        with T.Kernel(1) as _:
+            a_ub = T.alloc_shared((128,), "uint16")
+            b_ub = T.alloc_shared((256,), "uint8")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                m16 = T.simd.pset(16)
+                a = T.simd.vld(a_ub[0], dist="NORM_B16")
+                packed = T.simd.vpack(a, 0)
+                T.simd.vsts(b_ub[0], packed, m16, dist="NORM_B8")
+            T.copy(b_ub, B)
+
+    source = lower(func, target="ascend").kernel_source
+    print(source)
+    assert "simd_inst::vpack<" in source
+    assert "uint8_t" in source
+
+
+def test_ascend_simd_vld_e2b_b16_extent():
+    """E2B_B16 loads use access_ptr extent=8 (8 dense values → 8×16-lane blocks)."""
+
+    @T.prim_func
+    def func(A: T.Buffer((128,), "bfloat16"), B: T.Buffer((128,), "bfloat16")):
+        with T.Kernel(1) as _:
+            a_ub = T.alloc_shared((128,), "bfloat16")
+            b_ub = T.alloc_shared((128,), "bfloat16")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                m16 = T.simd.pset(16)
+                x = T.simd.vld(a_ub[0], dist="E2B_B16")
+                T.simd.vsts(b_ub[0], x, m16, dist="NORM_B16")
+            T.copy(b_ub, B)
+
+    tir = str(func)
+    assert "access_ptr(a_ub[0], 8, 1)" in tir, tir
+    assert "E2B_B16" in tir
+    source = lower(func, target="ascend").kernel_source
+    print(source)
+    assert "E2B_B16" in source
+    # Latest ascend lowers E2B_B16 through vlds (offset form).
+    assert "simd_inst::vlds<" in source or "simd_inst::vld<" in source
+
+
+def test_ascend_simd_vsts_extent_override():
+    """Optional vsts(..., extent=N) overrides the default access_ptr footprint."""
+
+    @T.prim_func
+    def func(A: T.Buffer((128,), "bfloat16"), B: T.Buffer((128,), "bfloat16")):
+        with T.Kernel(1) as _:
+            a_ub = T.alloc_shared((128,), "bfloat16")
+            b_ub = T.alloc_shared((128,), "bfloat16")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                m8 = T.simd.pset(8)
+                x = T.simd.vld(a_ub[0], dist="NORM_B16")
+                # Dense PAT_VL8 recip pack: write only 8 elements, not full 128.
+                T.simd.vsts(b_ub[0], x, m8, dist="NORM_B16", extent=8)
+            T.copy(b_ub, B)
+
+    tir = str(func)
+    # Write mask=2; extent must be the override (8), not default lanes (128).
+    assert "access_ptr(b_ub[0], 8, 2)" in tir, tir
+    assert "access_ptr(b_ub[0], 128, 2)" not in tir
+    source = lower(func, target="ascend").kernel_source
+    print(source)
+    assert "simd_inst::vsts" in source
 
 
 def test_copy_pad_value_gm_to_ub():

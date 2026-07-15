@@ -1834,6 +1834,25 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     os << ")";
   }
+  // --- SimdVF dual-dest load: (addr, dist [, offset]) → vec_pair ---
+  else if (op->op.same_as(tl::simd_vld2())) {
+    ICHECK(op->args.size() >= 2 && op->args.size() <= 3);
+    DataType elem = op->dtype.element_of();
+    std::string dist = Downcast<StringImm>(op->args[1])->value;
+    bool has_off = (op->args.size() == 3);
+    os << "simd_inst::vld_x2<" << CCEUBufType(elem) << ">((" << "__ubuf__"
+       << " " << CCEUBufType(elem) << "*)";
+    PrintExpr(op->args[0], os); // addr
+    os << ", ";
+    if (has_off) {
+      os << "vag_b" << CCEElemWidthBits(elem) << "(";
+      PrintExpr(op->args[2], os);
+      os << "), " << dist;
+    } else {
+      os << dist;
+    }
+    os << ")";
+  }
   // --- SimdVF store: (addr, src, mask, dist [, offset]) ---
   else if (op->op.same_as(tl::simd_vsts())) {
     ICHECK(op->args.size() >= 3 && op->args.size() <= 5);

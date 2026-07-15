@@ -1,4 +1,4 @@
-"""Hoist duplicate vintlv/vdintlv pair calls used by pair_get.
+"""Hoist duplicate pure vintlv/vdintlv pair calls used by pair_get.
 
 ::
 
@@ -10,6 +10,10 @@
     vintlv_0 = vintlv(x, y)
     vintlv_1 = vdintlv(pair_get(vintlv_0, 0), pair_get(vintlv_0, 1))
     vsts(pair_get(vintlv_1, 0))
+
+Memory-op pairs (``tl.simd.vld2``) are intentionally excluded: they are opaque
+loads. The frontend binds each ``vld2`` once at its original program point;
+CSE/code-motion by structural_hash would be unsound across intervening stores.
 """
 
 from collections import defaultdict
@@ -26,11 +30,15 @@ def _op_name(call_or_op):
     return getattr(op, "name", None)
 
 
-def _is_pair_call(value):
-    return isinstance(value, Call) and _op_name(value) in (
-        "tl.simd.vintlv",
-        "tl.simd.vdintlv",
-    )
+# Pure register permutations only. Do NOT add tl.simd.vld2 here.
+_PURE_PAIR_OPS = (
+    "tl.simd.vintlv",
+    "tl.simd.vdintlv",
+)
+
+
+def _is_pure_pair_call(value):
+    return isinstance(value, Call) and _op_name(value) in _PURE_PAIR_OPS
 
 
 def _pair_key(value):
@@ -43,7 +51,7 @@ def _scan_pair_uses(body):
     def visitor(node):
         if isinstance(node, Call) and _op_name(node) == "tl.simd.pair_get":
             pair_arg = node.args[0]
-            if _is_pair_call(pair_arg):
+            if _is_pure_pair_call(pair_arg):
                 idx = int(node.args[1])
                 pairs[_pair_key(pair_arg)].append((idx, node, pair_arg))
 
@@ -90,7 +98,7 @@ class HoistSimdPairsMutator(PyStmtExprMutator):
         new_args = [self.visit_expr(arg) for arg in op.args]
         if _op_name(op) == "tl.simd.pair_get":
             pair_arg = op.args[0]
-            key = _pair_key(pair_arg) if _is_pair_call(pair_arg) else None
+            key = _pair_key(pair_arg) if _is_pure_pair_call(pair_arg) else None
             info = self._hoist_map.get(key)
             if info is not None:
                 pair_var = info
@@ -102,7 +110,7 @@ class HoistSimdPairsMutator(PyStmtExprMutator):
 
 
 def HoistSimdPairs():
-    """Hoist duplicate vintlv/vdintlv calls referenced through pair_get."""
+    """Hoist duplicate pure vintlv/vdintlv calls referenced through pair_get."""
 
     def pass_fn(func, mod, ctx):
         pair_uses = _scan_pair_uses(func.body)

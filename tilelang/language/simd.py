@@ -15,10 +15,13 @@ _Op = tirx.op.Op.get
 
 
 class SimdPair:
-    """Wraps a vintlv/vdintlv result, supports tuple unpacking: a, b = vintlv(x, y).
+    """Wraps a vintlv/vdintlv/vld2 result, supports unpacking: a, b = vintlv(x, y).
 
-    Note: ``a, b = ...`` generates two pair_get calls referencing the same vintlv
-    expression inline. The Ascend HoistSimdPairs pass eliminates the duplicate.
+    ``a, b = ...`` always emits two ``pair_get`` calls. For pure register
+    permutations (``vintlv`` / ``vdintlv``) the Ascend ``HoistSimdPairs`` pass
+    CSE's the duplicated pair expression. For opaque memory loads (``vld2``),
+    the frontend binds the pair once at the call site so hoist never
+    CSE/code-motions a load.
     """
 
     def __init__(self, pair):
@@ -189,6 +192,9 @@ def vld(addr, dist="NORM", off=None):
         if isinstance(dist, str):
             if dist.startswith("BRC_"):
                 extent = 1
+            elif dist == "E2B_B16":
+                # Expand-to-block: 8 bf16/u16 values → 8×16-lane blocks.
+                extent = 8
             elif dist in ("UNPK_B16", "UNPK4_B8"):
                 extent = 64
         addr = access_ptr(addr, "r", extent=extent)
@@ -203,21 +209,66 @@ def vld(addr, dist="NORM", off=None):
     return tirx.call_intrin(vec_dtype, _Op("tl.simd.vld"), *args)
 
 
-def vsts(addr, src, mask=None, dist="NORM_B32", off=None):
+_VLD2_DISTS = ("DINTLV_B8", "DINTLV_B16")
+
+
+def vld2(addr, dist="DINTLV_B16", off=None):
+    """Dual-dest vector load: ``a, b = vld2(x_ub[i, col], dist=\"DINTLV_B8\")``.
+
+    Supported dists:
+      - ``DINTLV_B8``: load 512×u8/fp8 → two 256-lane regs (even/odd bytes)
+      - ``DINTLV_B16``: load 256×bf16/u16 → two 128-lane regs
+
+    The access_ptr footprint is always 2× the single-vector width. Unlike
+    ``vintlv``/``vdintlv``, this is an opaque memory load: the pair is bound
+    once at this program point so ``HoistSimdPairs`` does not CSE or
+    code-motion it.
+    """
+    if isinstance(dist, str) and dist not in _VLD2_DISTS:
+        raise ValueError(f"vld2 only supports dist in {_VLD2_DISTS}, got {dist!r}")
+    if isinstance(addr, BufferLoad):
+        elem_dtype = str(addr.buffer.dtype)
+        lanes = _vreg_lanes(elem_dtype)
+        # Dual-dest deinterleave always consumes 2× vector width from UB.
+        extent = lanes * 2
+        addr = access_ptr(addr, "r", extent=extent)
+        vec_dtype = f"{elem_dtype}x{lanes}"
+    else:
+        # Pre-wrapped access_ptr: this path does not auto-double the footprint
+        # (same as vld). Callers must size extent to 2× vector width themselves.
+        inner_load = addr.args[0]
+        vec_dtype = _vec_dtype(inner_load.buffer.dtype)
+
+    args = [addr, dist]
+    if off is not None:
+        args.append(off)
+    pair = tirx.call_intrin(vec_dtype, _Op("tl.simd.vld2"), *args)
+    # Bind at the original site (opaque load). Requires an active IRBuilder —
+    # do not fall back to an unbound SimdPair (that reintroduces duplicate
+    # inline loads under unpack).
+    if not IRBuilder.is_in_scope():
+        raise RuntimeError("vld2 requires an active IRBuilder to bind the opaque load")
+    return SimdPair(_bind(pair))
+
+
+def vsts(addr, src, mask=None, dist="NORM_B32", off=None, extent=None):
     """Vector store: vsts(src, base, off, dist, mask).
 
     addr can be a BufferLoad auto-wrapped as tl.access_ptr.
+    Optional ``extent`` overrides the default access_ptr footprint (e.g. 8 for
+    a dense PAT_VL8 NORM_B16 recip pack).
     """
     if mask is None:
         mask = _default_mask(src.dtype)
     if isinstance(addr, BufferLoad):
         lanes = _vreg_lanes(addr.buffer.dtype)
-        extent = lanes
-        if isinstance(dist, str):
-            if dist.startswith("ONEPT_"):
-                extent = 1
-            elif dist in ("PK_B32", "PK4_B32"):
-                extent = 64
+        if extent is None:
+            extent = lanes
+            if isinstance(dist, str):
+                if dist.startswith("ONEPT_"):
+                    extent = 1
+                elif dist in ("PK_B32", "PK4_B32"):
+                    extent = 64
         addr = access_ptr(addr, "w", extent=extent)
     args = [addr, src, mask, dist]
     if off is not None:
@@ -520,14 +571,23 @@ def pair_get(pair, index):
 
 
 def vpack(src, part=0):
-    """Pack 32-bit lanes to 16-bit lanes: dst = vpack(src, LOWER/HIGHER)."""
+    """Pack wider lanes to narrower lanes: dst = vpack(src, LOWER/HIGHER).
+
+    Supports u32→u16 and u16→u8 (needed for dense UE8M0 scale packing).
+    """
     if isinstance(part, tirx.IntImm):
         part = int(part.value)
     if isinstance(part, int):
         part = ("LOWER", "HIGHER")[part]
     src_elem = str(src.dtype).split("x", 1)[0]
     src_lanes = src.dtype.lanes
-    pack_map = {"float32": "float16", "int32": "int16", "uint32": "uint16"}
+    pack_map = {
+        "float32": "float16",
+        "int32": "int16",
+        "uint32": "uint16",
+        "uint16": "uint8",
+        "int16": "int8",
+    }
     dst_elem = pack_map.get(src_elem, src_elem)
     vec_dtype = f"{dst_elem}x{src_lanes * 2}"
     return tirx.call_intrin(vec_dtype, _Op("tl.simd.vpack"), src, part)
