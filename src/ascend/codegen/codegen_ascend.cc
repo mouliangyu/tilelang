@@ -465,6 +465,10 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   this->PrintKernelLauncher(f, static_cast<std::string>(global_symbol.value()));
 }
 
+void CodeGenTileLangAscend::PreFunctionBody(const PrimFunc &f) {
+  this->stream << "  AscendC::InitSocState();\n";
+}
+
 void CodeGenTileLangAscend::PrintKernelLauncher(
     const PrimFunc &f, const std::string &global_symbol) {
   // The launcher receives kernel arguments by address (cuda-style void**, see

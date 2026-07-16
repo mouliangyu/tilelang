@@ -41,6 +41,7 @@ public:
                         std::ostream &os) final;
   void PrintVecElemStore(const std::string &vec, DataType t, int i,
                          const std::string &value) final;
+  void PreFunctionBody(const PrimFunc &f) final;
 
 protected:
   // Scalarize vector math calls (like CUDA)
