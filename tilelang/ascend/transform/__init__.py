@@ -68,6 +68,21 @@ def MarkScalarDcacheBypass():
     return _ffi_api.MarkScalarDcacheBypass()  # type: ignore
 
 
+def RewriteFlagToBuf():
+    """Split each hard_event's synchronization between the 8-slot flag namespace
+    and the shared 32-slot get_buf/rls_buf mutex pool to minimize wasted
+    flag_ids. When a hard_event's sync points total more than 8 event_ids, a 0/1
+    knapsack (capacity 8) keeps the subset of sync-point blocks that fills the
+    flag slots best (renumbered into [0,8)); the rest spill to the mutex pool as
+    get_buf/rls_buf pairs. Hard_events fitting within 8 slots are untouched, and
+    a kernel with no overflow is a no-op.
+
+    Must run after MergeUBAllocations (which uses set_flag/wait_flag as its
+    liveness-graph anchors).
+    """
+    return _ffi_api.RewriteFlagToBuf()  # type: ignore
+
+
 __all__ = [
     "AnnotateMultiBufferEligible",
     "AscendSimdVFLowerParallel",
@@ -80,4 +95,5 @@ __all__ = [
     "NormalizeMixedKernelSid",
     "NormalizeNoConflictHints",
     "RestoreWhileLoops",
+    "RewriteFlagToBuf",
 ]

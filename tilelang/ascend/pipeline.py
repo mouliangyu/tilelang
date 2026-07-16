@@ -128,6 +128,11 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
         disable_reuse=disable_reuse,
     )(mod)
 
+    # Split each hard_event between its 8-slot flag namespace and the shared
+    # get_buf/rls_buf mutex pool (knapsack) to minimize wasted flag_ids; a no-op
+    # when no hard_event overflows 8 slots.
+    mod = ascend_transform.RewriteFlagToBuf()(mod)
+
     mod = tilelang.transform.ThreadSync("shared")(mod)
     mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
     mod = tilelang.transform.MergeIfStmt()(mod)
