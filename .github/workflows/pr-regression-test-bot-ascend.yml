@@ -152,7 +152,7 @@ jobs:
           uv pip install --upgrade pip setuptools wheel
           uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu130
           uv pip install -v -r requirements-test.txt
-          uv pip install /nfs-hg/prod/deepseek/permanent/shared/caohuanqi/pytorch/dist/torch_npu-2.10.0+git6893d1e-cp312-cp312-linux_aarch64.whl
+          uv pip install /nfs-hg/prod/deepseek/permanent/shared/caohuanqi/pytorch/dist/torch_npu-2.10.0.post4+git4421109-cp312-cp312-linux_aarch64.whl
 
       - name: Clear uv cache for self-hosted runners (if setup failed)
         if: >-
