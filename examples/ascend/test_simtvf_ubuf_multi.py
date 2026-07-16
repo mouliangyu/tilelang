@@ -1,14 +1,16 @@
 """pytest test for example_simtvf_ubuf_multi.py — E = (A * B + C) * D."""
 
+import pytest
 import torch
 import tilelang
 
 from example_simtvf_ubuf_multi import ref_program, ubuf_multi
 
 
-def test_simtvf_ubuf_multi():
+@pytest.mark.parametrize("target", ["ascend", pytest.param("pto", marks=pytest.mark.pto)])
+def test_simtvf_ubuf_multi(target):
     N = 256
-    kernel = tilelang.compile(ubuf_multi(N), out_idx=-1)
+    kernel = tilelang.compile(ubuf_multi(N), target=target, out_idx=-1)
     device = torch.device("npu")
     a = torch.randn(N, dtype=torch.float32, device=device)
     b = torch.randn(N, dtype=torch.float32, device=device)
@@ -20,5 +22,7 @@ def test_simtvf_ubuf_multi():
 
 
 if __name__ == "__main__":
-    test_simtvf_ubuf_multi()
-    print("PASS: test_simtvf_ubuf_multi")
+    test_simtvf_ubuf_multi(target="ascend")
+    print("PASS: test_simtvf_ubuf_multi (ascend)")
+    test_simtvf_ubuf_multi(target="pto")
+    print("PASS: test_simtvf_ubuf_multi (pto)")

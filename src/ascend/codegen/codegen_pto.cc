@@ -1687,6 +1687,11 @@ void CodeGenTileLangPTO::EmitScalarizedLoad(const BufferLoadNode *op,
          << ", contiguous=" << lanes << ")";
       return;
     }
+    if (scope == "global" || scope.empty()) {
+      os << "scalar.load(" << GetVarID(op->buffer->data.get()) << ", "
+         << index_str << ", contiguous=" << lanes << ")";
+      return;
+    }
     LOG(FATAL) << "Unsupported PTO SIMT vector load scope: " << scope;
   }
 
@@ -1759,6 +1764,11 @@ void CodeGenTileLangPTO::EmitScalarizedStore(const BufferStoreNode *op) {
       }
       stream << "scalar.store(" << value << ", " << base << ", " << index_str
              << ")\n";
+      return;
+    }
+    if (scope == "global" || scope.empty()) {
+      stream << "scalar.store(" << value << ", "
+             << GetVarID(op->buffer->data.get()) << ", " << index_str << ")\n";
       return;
     }
     LOG(FATAL) << "Unsupported PTO SIMT vector store scope: " << scope;
