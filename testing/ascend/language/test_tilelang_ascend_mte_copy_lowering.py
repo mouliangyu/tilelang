@@ -225,8 +225,10 @@ def test_gm2ub_dynamic_rows_middle_dim():
     )
 
     source = kernel.get_kernel_source()
+    # The dynamic row count is clamped to the buffer's row extent (DYNAMIC_ROWS)
+    # so an out-of-range `n` cannot issue an OOB DMA.
     good = re.search(
-        r"copy_gm_to_ubuf_align_v2\([^;]*,\s*0,\s*n,\s*2048,\s*0,\s*0,\s*0,\s*0,\s*4096,\s*2048\);",
+        rf"copy_gm_to_ubuf_align_v2\([^;]*,\s*0,\s*min\(n,\s*{DYNAMIC_ROWS}\),\s*2048,\s*0,\s*0,\s*0,\s*0,\s*4096,\s*2048\);",
         source,
     )
     bad = re.search(

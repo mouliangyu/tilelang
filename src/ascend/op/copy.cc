@@ -94,6 +94,131 @@ PrimExpr ComputeFlatOffset(const Buffer &buf, const Array<Range> &range) {
   return offset;
 }
 
+struct BoundedDMACopyRanges {
+  Array<Range> src;
+  Array<Range> dst;
+  Optional<PrimExpr> has_data;
+};
+
+BoundedDMACopyRanges ClampDMACopyTail(const CopyNode &op,
+                                      arith::Analyzer *analyzer) {
+  BoundedDMACopyRanges result{op.src_range, op.dst_range, std::nullopt};
+  if (op.src_range.size() != op.src->shape.size() ||
+      op.dst_range.size() != op.dst->shape.size()) {
+    return result;
+  }
+
+  // Match axes after removing singleton dimensions, which are coalesced away
+  // when planning the DMA copy.
+  auto collect_non_singleton_axes = [](const Array<Range> &ranges) {
+    std::vector<size_t> axes;
+    for (size_t i = 0; i < ranges.size(); ++i) {
+      if (!is_one(ranges[i]->extent))
+        axes.push_back(i);
+    }
+    return axes;
+  };
+  std::vector<size_t> src_axes = collect_non_singleton_axes(op.src_range);
+  std::vector<size_t> dst_axes = collect_non_singleton_axes(op.dst_range);
+  if (src_axes.size() != dst_axes.size()) {
+    return result;
+  }
+
+  bool needs_clamp = false;
+  for (size_t i = 0; i < src_axes.size(); ++i) {
+    size_t src_axis = src_axes[i];
+    size_t dst_axis = dst_axes[i];
+    const Range &src = op.src_range[src_axis];
+    const Range &dst = op.dst_range[dst_axis];
+    if (!analyzer->CanProveEqual(src->extent, dst->extent) ||
+        !analyzer->CanProve(src->min >= make_zero(src->min.dtype()),
+                            arith::ProofStrength::kSymbolicBound) ||
+        !analyzer->CanProve(dst->min >= make_zero(dst->min.dtype()),
+                            arith::ProofStrength::kSymbolicBound)) {
+      return result;
+    }
+    if (!analyzer->CanProve(src->min + src->extent <= op.src->shape[src_axis],
+                            arith::ProofStrength::kSymbolicBound) ||
+        !analyzer->CanProve(dst->min + dst->extent <= op.dst->shape[dst_axis],
+                            arith::ProofStrength::kSymbolicBound)) {
+      needs_clamp = true;
+    }
+  }
+
+  PrimExpr singleton_guard = const_true();
+  auto analyze_singleton_axes = [&](const Array<Range> &ranges,
+                                    const Array<PrimExpr> &shape) {
+    for (size_t i = 0; i < ranges.size(); ++i) {
+      const Range &range = ranges[i];
+      if (!is_one(range->extent))
+        continue;
+      if (!analyzer->CanProve(range->min >= make_zero(range->min.dtype()) &&
+                                  range->min + range->extent <= shape[i],
+                              arith::ProofStrength::kSymbolicBound)) {
+        needs_clamp = true;
+      }
+
+      DataType dtype = range->extent.dtype();
+      auto cast_to_dtype = [dtype](PrimExpr value) {
+        return value.dtype() == dtype ? value : cast(dtype, value);
+      };
+      PrimExpr zero = make_zero(dtype);
+      PrimExpr remaining = cast_to_dtype(shape[i]) - cast_to_dtype(range->min);
+      PrimExpr valid_extent =
+          Min(cast_to_dtype(range->extent), Max(remaining, zero));
+      singleton_guard =
+          singleton_guard && (analyzer->Simplify(valid_extent) > zero);
+    }
+  };
+  analyze_singleton_axes(op.src_range, op.src->shape);
+  analyze_singleton_axes(op.dst_range, op.dst->shape);
+  if (!needs_clamp) {
+    return result;
+  }
+
+  Array<Range> src_range = op.src_range;
+  Array<Range> dst_range = op.dst_range;
+  PrimExpr has_data = const_true();
+
+  for (size_t i = 0; i < src_axes.size(); ++i) {
+    size_t src_axis = src_axes[i];
+    size_t dst_axis = dst_axes[i];
+    DataType dtype = op.src_range[src_axis]->extent.dtype();
+    auto cast_to_dtype = [dtype](PrimExpr value) {
+      return value.dtype() == dtype ? value : cast(dtype, value);
+    };
+    PrimExpr zero = make_zero(dtype);
+    PrimExpr extent = cast_to_dtype(op.src_range[src_axis]->extent);
+    PrimExpr src_remaining = cast_to_dtype(op.src->shape[src_axis]) -
+                             cast_to_dtype(op.src_range[src_axis]->min);
+    PrimExpr dst_remaining = cast_to_dtype(op.dst->shape[dst_axis]) -
+                             cast_to_dtype(op.dst_range[dst_axis]->min);
+    PrimExpr valid_extent =
+        Min(extent, Min(Max(src_remaining, zero), Max(dst_remaining, zero)));
+    valid_extent = analyzer->Simplify(valid_extent);
+
+    // Keep a possibly empty unit axis coalescible by guarding it with
+    // `has_data` instead of exposing a symbolic extent to PlanMTECopy.
+    PrimExpr layout_extent = valid_extent;
+    if (analyzer->CanProve(valid_extent <= make_const(dtype, 1),
+                           arith::ProofStrength::kSymbolicBound)) {
+      layout_extent = make_const(dtype, 1);
+    }
+    src_range.Set(src_axis, Range::FromMinExtent(op.src_range[src_axis]->min,
+                                                 layout_extent));
+    dst_range.Set(dst_axis, Range::FromMinExtent(op.dst_range[dst_axis]->min,
+                                                 layout_extent));
+    has_data = has_data && (valid_extent > zero);
+  }
+
+  has_data = has_data && singleton_guard;
+
+  result.src = std::move(src_range);
+  result.dst = std::move(dst_range);
+  result.has_data = analyzer->Simplify(has_data);
+  return result;
+}
+
 // Row-major element strides of an ND (GM/UB) buffer, derived from its ND
 // (identity) affine layout's output shape: strides[k] = product(shape[k+1..]).
 // Keeps copy parameters layout-driven for the ND side as well.
@@ -135,11 +260,18 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
   auto I64 = [](int64_t v) { return make_const(DataType::Int(64), v); };
   int elem_bits = op.src->dtype.bits();
 
-  size_t ndim = op.src_range.size();
-  PrimExpr inner_elems = op.src_range[ndim - 1]->extent;
+  BoundedDMACopyRanges bounded_ranges{op.src_range, op.dst_range, std::nullopt};
+  if (dma_path == 0 || dma_path == 1 || dma_path == 2 || dma_path == 7) {
+    bounded_ranges = ClampDMACopyTail(op, analyzer);
+  }
+  const Array<Range> &src_range = bounded_ranges.src;
+  const Array<Range> &dst_range = bounded_ranges.dst;
+
+  size_t ndim = src_range.size();
+  PrimExpr inner_elems = src_range[ndim - 1]->extent;
   PrimExpr n_rows = I(1);
   for (size_t i = 0; i + 1 < ndim; ++i) {
-    n_rows = n_rows * op.src_range[i]->extent;
+    n_rows = n_rows * src_range[i]->extent;
   }
 
   PrimExpr row_bytes = AscendMTEBytesFromElements(inner_elems, elem_bits);
@@ -156,8 +288,8 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
         {TypeAnnotation(buf->dtype), buf->data, offset, extent, I(rw_mask)});
   };
   PrimExpr total_elems = inner_elems * n_rows;
-  PrimExpr src_offset = ComputeFlatOffset(op.src, op.src_range);
-  PrimExpr dst_offset = ComputeFlatOffset(op.dst, op.dst_range);
+  PrimExpr src_offset = ComputeFlatOffset(op.src, src_range);
+  PrimExpr dst_offset = ComputeFlatOffset(op.dst, dst_range);
   PrimExpr src_ptr = make_access_ptr(op.src, src_offset, total_elems, 1);
   PrimExpr dst_ptr = make_access_ptr(op.dst, dst_offset, total_elems, 2);
 
@@ -169,9 +301,9 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
   PrimExpr call;
   if (dma_path == 0 || dma_path == 1) {
     auto src_layout =
-        StridedLayout::FromBufferRange(op.src, op.src_range, elem_bits);
+        StridedLayout::FromBufferRange(op.src, src_range, elem_bits);
     auto dst_layout =
-        StridedLayout::FromBufferRange(op.dst, op.dst_range, elem_bits);
+        StridedLayout::FromBufferRange(op.dst, dst_range, elem_bits);
     auto plan = PlanMTECopy(src_layout, dst_layout, analyzer);
 
     PrimExpr plan_row_bytes =
@@ -232,14 +364,12 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
         // UB row stride (plan_dst_stride_bytes), NOT the padded row width: the
         // dst buffer may be over-allocated wider than align32(row), and rows
         // must land at their real stride to avoid clobbering each other.
-        PrimExpr copy_call =
+        call =
             Call(DataType::Void(), ascend_copy_gm_to_ubuf(),
                  {plan_dst_ptr, plan_src_ptr, sid, plan.n_rows, plan_row_bytes,
                   zero, I(right_pad_elems), I(1), l2_cache_ctrl,
                   plan_src_stride_bytes, plan_dst_stride_bytes});
-        return Evaluate(copy_call);
-      }
-      if (plan_single_row) {
+      } else if (plan_single_row) {
         call = Call(DataType::Void(), ascend_copy_gm_to_ubuf(),
                     {plan_dst_ptr, plan_src_ptr, sid, I(1), plan_total_bytes,
                      zero, zero, zero, l2_cache_ctrl, plan_total_bytes,
@@ -525,7 +655,20 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
     LOG(FATAL) << "Unknown Ascend DMA path: " << dma_path;
   }
 
-  return Evaluate(call);
+  Stmt result = Evaluate(call);
+  if (bounded_ranges.has_data.defined()) {
+    // Clamped partial tails are represented by smaller extents in the DMA
+    // call above. Fully OOB tiles must not issue a zero-length or OOB DMA
+    // intrinsic, so drop statically empty copies and guard dynamic ones.
+    PrimExpr has_data = bounded_ranges.has_data.value();
+    if (is_zero(has_data)) {
+      return Evaluate(0);
+    }
+    if (!is_one(has_data)) {
+      result = IfThenElse(has_data, result);
+    }
+  }
+  return result;
 }
 
 Stmt LowerAscendNormalCopy(const CopyNode &op, const LowerArgs &T,
