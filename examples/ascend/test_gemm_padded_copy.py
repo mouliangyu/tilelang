@@ -1,6 +1,7 @@
 import torch
 import tilelang
 import tilelang.language as T
+import pytest
 
 
 def gemm_padded_copy(M, K, N_pad):
@@ -45,13 +46,14 @@ def ref_program(x, w):
     return x.float() @ w.float()
 
 
-def test_gemm_padded_copy():
+def _run_gemm_padded_copy(target):
     M, K = 256, 128
     N_pad = 112  # padded, N = N_pad - 16 = 96
     N = N_pad - 16
 
     kernel = tilelang.compile(
         gemm_padded_copy(M, K, N_pad),
+        target=target,
         out_idx=-1,
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False},
     )
@@ -65,6 +67,17 @@ def test_gemm_padded_copy():
     assert max_diff < 1e-2, f"max_diff={max_diff:.2e}"
 
 
+def test_gemm_padded_copy():
+    _run_gemm_padded_copy("ascend")
+
+
+@pytest.mark.pto
+def test_gemm_padded_copy_pto():
+    _run_gemm_padded_copy("pto")
+
+
 if __name__ == "__main__":
     test_gemm_padded_copy()
     print("PASS: test_gemm_padded_copy")
+    test_gemm_padded_copy_pto()
+    print("PASS: test_gemm_padded_copy_pto")

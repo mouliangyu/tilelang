@@ -26,6 +26,7 @@ class PTOGemmL1Template:
         tile_k: int,
         base_k: int,
         sub_k_tiles: int,
+        input_c0: int,
         sub_k_c0_blocks: int,
         a_l0_stage_elems: int,
         b_l0_stage_elems: int,
@@ -36,6 +37,7 @@ class PTOGemmL1Template:
             tile_k,
             base_k,
             sub_k_tiles,
+            input_c0,
             sub_k_c0_blocks,
             a_l0_stage_elems,
             b_l0_stage_elems,
@@ -51,6 +53,7 @@ class PTOGemmL1Template:
         tile_k: int,
         base_k: int,
         sub_k_tiles: int,
+        input_c0: int,
         sub_k_c0_blocks: int,
         a_l0_stage_elems: int,
         b_l0_stage_elems: int,
@@ -63,6 +66,7 @@ class PTOGemmL1Template:
             tile_k,
             base_k,
             sub_k_tiles,
+            input_c0,
             sub_k_c0_blocks,
             a_l0_stage_elems,
             b_l0_stage_elems,
@@ -72,6 +76,7 @@ class PTOGemmL1Template:
         self.tile_k = tile_k
         self.base_k = base_k
         self.sub_k_tiles = sub_k_tiles
+        self.input_c0 = input_c0
         self.sub_k_c0_blocks = sub_k_c0_blocks
         self.a_l0_stage_elems = a_l0_stage_elems
         self.b_l0_stage_elems = b_l0_stage_elems
@@ -92,6 +97,7 @@ class PTOGemmL1Template:
         tile_k: int,
         base_k: int,
         sub_k_tiles: int,
+        input_c0: int,
         sub_k_c0_blocks: int,
         a_l0_stage_elems: int,
         b_l0_stage_elems: int,
@@ -102,6 +108,7 @@ class PTOGemmL1Template:
             ("tile_k", tile_k),
             ("base_k", base_k),
             ("sub_k_tiles", sub_k_tiles),
+            ("input_c0", input_c0),
             ("sub_k_c0_blocks", sub_k_c0_blocks),
             ("a_l0_stage_elems", a_l0_stage_elems),
             ("b_l0_stage_elems", b_l0_stage_elems),
@@ -116,10 +123,10 @@ class PTOGemmL1Template:
             raise ValueError(f"tile_k must be divisible by base_k, got {tile_k} and {base_k}")
         if tile_k != base_k * sub_k_tiles:
             raise ValueError(f"tile_k must equal base_k * sub_k_tiles, got {tile_k} != {base_k} * {sub_k_tiles}")
-        if base_k % 16 != 0:
-            raise ValueError(f"base_k must be a multiple of 16, got {base_k}")
-        if sub_k_c0_blocks != base_k // 16:
-            raise ValueError(f"sub_k_c0_blocks must equal base_k // 16, got {sub_k_c0_blocks} != {base_k} // 16")
+        if base_k % input_c0 != 0:
+            raise ValueError(f"base_k must be divisible by input_c0, got {base_k} and {input_c0}")
+        if sub_k_c0_blocks != base_k // input_c0:
+            raise ValueError(f"sub_k_c0_blocks must equal base_k // input_c0, got {sub_k_c0_blocks} != {base_k} // {input_c0}")
         if a_l0_stage_elems != tile_m * base_k:
             raise ValueError(f"a_l0_stage_elems must equal tile_m * base_k, got {a_l0_stage_elems} != {tile_m} * {base_k}")
         if b_l0_stage_elems != tile_n * base_k:

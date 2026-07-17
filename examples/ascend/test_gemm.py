@@ -50,6 +50,11 @@ def test_gemm_auto_bf16_pto():
     _test_pto("bfloat16", 1e-2)
 
 
+@pytest.mark.pto
+def test_gemm_auto_fp8_pto():
+    _test_pto("float8_e4m3fn", 1e-1)
+
+
 def test_gemm_auto_fp32():
     _test("float32", 5e-3)
 
@@ -78,3 +83,5 @@ if __name__ == "__main__":
     print("PASS: test_gemm_auto_fp32")
     test_gemm_auto_bf16_pto()
     print("PASS: test_gemm_auto_bf16_pto")
+    test_gemm_auto_fp8_pto()
+    print("PASS: test_gemm_auto_fp8_pto")

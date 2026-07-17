@@ -39,6 +39,8 @@ std::string PtoTypeName(DataType t) {
       return "pto.f32";
     if (t.bits() == 16)
       return "pto.float16";
+  } else if (t.is_float8_e4m3fn()) {
+    return "pto.f8e4m3";
   } else if (t.is_bfloat16()) {
     return "pto.bf16";
   } else if (t.is_int() || t.is_uint()) {
@@ -71,6 +73,8 @@ DataType ParsePTODtype(const std::string &dtype_name) {
     return DataType::Float(16);
   if (dtype_name == "bfloat16" || dtype_name == "bfloat16_t")
     return DataType::BFloat(16);
+  if (dtype_name == "float8_e4m3fn" || dtype_name == "float8_e4m3_t")
+    return DataType(DataType::kFloat8_e4m3fn, 8, 1);
   if (dtype_name == "int64")
     return DataType::Int(64);
   if (dtype_name == "int32")
@@ -195,6 +199,22 @@ std::string AccStoreUnitFlagArg(int64_t unit_flag_ctrl) {
   LOG(FATAL) << "PTO GEMM unsupported L0C store unit_flag_ctrl="
              << unit_flag_ctrl;
   return "None";
+}
+
+bool IsSupportedPTOGemmInputDtype(DataType dtype) {
+  return dtype.is_bfloat16() || dtype.is_float8_e4m3fn();
+}
+
+int64_t PTOGemmInputC0(DataType dtype) {
+  ICHECK(IsSupportedPTOGemmInputDtype(dtype))
+      << "PTO GEMM L1 helper currently only supports bfloat16 and "
+         "float8_e4m3fn inputs, got "
+      << dtype;
+  int64_t elem_bytes = dtype.bytes();
+  ICHECK_GT(elem_bytes, 0) << "Invalid PTO GEMM input dtype size: " << dtype;
+  ICHECK_EQ(32 % elem_bytes, 0)
+      << "PTO GEMM input dtype byte size must divide 32, got " << dtype;
+  return 32 / elem_bytes;
 }
 
 DataType GetAnnotatedPointerDtype(const PrimExpr &expr,
@@ -921,14 +941,14 @@ void CodeGenTileLangPTO::EnsurePTOGemmHelper(const CallNode *op) {
   int64_t trans_b = ConstArgDim(op, 7, "tl.ascend_gemm_l1 trans_b");
   ICHECK_EQ(trans_b, 1) << "PTO GEMM L1 helper currently requires trans_b=1";
   ICHECK_EQ(tile_k % base_k, 0);
-  ICHECK_EQ(base_k % 16, 0);
 
   const auto *dtype_name = op->args[9].as<StringImmNode>();
   ICHECK(dtype_name) << "PTO GEMM L1 helper requires a constant input dtype "
                         "string at tl.ascend_gemm_l1 arg 9";
   DataType input_dtype = ParsePTODtype(dtype_name->value);
-  ICHECK(input_dtype.is_bfloat16())
-      << "PTO GEMM L1 helper currently only supports bfloat16 inputs, got "
+  ICHECK(IsSupportedPTOGemmInputDtype(input_dtype))
+      << "PTO GEMM L1 helper currently only supports bfloat16 and "
+         "float8_e4m3fn inputs, got "
       << input_dtype;
 
   DataType a_dtype = GetAnnotatedPointerDtype(op->args[1], input_dtype);
@@ -971,8 +991,12 @@ void CodeGenTileLangPTO::EnsurePTOGemmHelper(const CallNode *op) {
   gemm_emit_ctx_.a_l0_name = "a_l0_0";
   gemm_emit_ctx_.b_l0_name = "b_l0_0";
 
+  int64_t input_c0 = PTOGemmInputC0(input_dtype);
+  ICHECK_EQ(base_k % input_c0, 0)
+      << "PTO GEMM base_k must be divisible by input C0=" << input_c0
+      << " for dtype " << input_dtype;
   int64_t sub_k_tiles = tile_k / base_k;
-  int64_t sub_k_c0_blocks = base_k / 16;
+  int64_t sub_k_c0_blocks = base_k / input_c0;
   int64_t a_l0_stage_elems = tile_m * base_k;
   int64_t b_l0_stage_elems = base_k * tile_n;
 
@@ -987,8 +1011,8 @@ void CodeGenTileLangPTO::EnsurePTOGemmHelper(const CallNode *op) {
   PrintIndent();
   stream << gemm_emit_ctx_.helper_name << " = PTOGemmL1Template(" << tile_m
          << ", " << tile_n << ", " << tile_k << ", " << base_k << ", "
-         << sub_k_tiles << ", " << sub_k_c0_blocks << ", " << a_l0_stage_elems
-         << ", " << b_l0_stage_elems << ")\n";
+         << sub_k_tiles << ", " << input_c0 << ", " << sub_k_c0_blocks << ", "
+         << a_l0_stage_elems << ", " << b_l0_stage_elems << ")\n";
 }
 
 void CodeGenTileLangPTO::EmitAscendCopyGmToCbuf(const CallNode *op) {
@@ -997,11 +1021,8 @@ void CodeGenTileLangPTO::EmitAscendCopyGmToCbuf(const CallNode *op) {
   CheckConstZero(op->args[2], "sid");
   CheckConstZero(op->args[7], "loop4_src_stride");
 
-  // arg[10] dst_n_value and arg[11] physical_dtype are consumed by the AscendC
-  // codegen (MTE2 NZ-para / packed-SF pointer cast). The PTO fractal copy
-  // derives layout from shape/stride, so it only needs the standard path;
-  // reject the packed-SF variant (non-empty physical_dtype) which PTO cannot
-  // emit yet.
+  // arg[11] physical_dtype is consumed by the AscendC codegen for packed-SF
+  // pointer casts. Reject that variant because PTO cannot emit it yet.
   ICHECK(Downcast<StringImm>(op->args[11])->value.empty())
       << "PTO GM-to-L1 copy does not support packed scale-factor layouts";
 
@@ -1018,14 +1039,16 @@ void CodeGenTileLangPTO::EmitAscendCopyGmToCbuf(const CallNode *op) {
   std::string d_value = RemoveOutermostParentheses(PrintExpr_(op->args[6]));
   std::string smallc0_en = RemoveOutermostParentheses(PrintExpr_(op->args[8]));
   std::string src_stride = RemoveOutermostParentheses(PrintExpr_(op->args[3]));
+  std::string dst_n_value =
+      RemoveOutermostParentheses(PrintExpr_(op->args[10]));
 
   PrintIndent();
   stream << "pto.mte_gm_l1_frac(" << src << ", " << dst << ", "
          << (transpose == 0 ? "pto.FractalMode.ND2NZ" : "pto.FractalMode.DN2NZ")
          << ", shape=(" << n_value << ", " << d_value << "), src_layout=("
-         << src_stride << ",), dst_group=(1, 1, " << d_value << ", 0), ctrl=("
-         << l2_cache_ctrl << ", " << (smallc0_en == "0" ? "False" : smallc0_en)
-         << "))\n";
+         << src_stride << ",), dst_group=(1, 1, " << dst_n_value
+         << ", 0), ctrl=(" << l2_cache_ctrl << ", "
+         << (smallc0_en == "0" ? "False" : smallc0_en) << "))\n";
 }
 
 void CodeGenTileLangPTO::EmitPTOGemmRun(const std::string &a_mat,
