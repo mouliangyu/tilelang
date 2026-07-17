@@ -34,6 +34,11 @@ def NormalizeNoConflictHints():
     return _ffi_api.NormalizeNoConflictHints()  # type: ignore
 
 
+def AscendRemoveNoOp():
+    """Remove no-op statements using equality-safe store analysis."""
+    return _ffi_api.AscendRemoveNoOp()  # type: ignore
+
+
 def AutoSchedule():
     """Auto schedule for high-level operations"""
     return _ffi_api.AutoSchedule()  # type: ignore
@@ -94,6 +99,7 @@ def RewriteFlagToBuf():
 
 __all__ = [
     "AnnotateMultiBufferEligible",
+    "AscendRemoveNoOp",
     "AscendSimdVFLowerParallel",
     "AutoSchedule",
     "IfConditionExtract",

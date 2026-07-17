@@ -113,8 +113,10 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.UnrollLoop()(mod)
     mod = s_tir.transform.RenormalizeSplitPattern()(mod)
     mod = tirx.transform.Simplify()(mod)
-    mod = tirx.transform.RemoveNoOp()(mod)
-    mod = s_tir.transform.HoistIfThenElse()(mod)
+    mod = ascend_transform.AscendRemoveNoOp()(mod)
+    mod = s_tir.transform.HoistIfThenElse().passes[0](mod)
+    mod = tirx.transform.Simplify()(mod)
+    mod = ascend_transform.AscendRemoveNoOp()(mod)
 
     mod = tirx.transform.VerifyMemory()(mod)
     mod = tirx.transform.AnnotateEntryFunc()(mod)
