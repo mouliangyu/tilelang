@@ -68,6 +68,15 @@ def MarkScalarDcacheBypass():
     return _ffi_api.MarkScalarDcacheBypass()  # type: ignore
 
 
+def RewriteFp4ToFp4x2():
+    """Retype genuine fp4 (float4_e2m1fn, lanes=1) storage into the 1-byte
+    packed-pair form (float4_e2m1fnx2, lanes=2), halving fp4 element counts /
+    offsets / indices so pointer arithmetic addresses bytes correctly. fp4
+    views over non-fp4 storage are left untouched.
+    """
+    return _ffi_api.RewriteFp4ToFp4x2()  # type: ignore
+
+
 def RewriteFlagToBuf():
     """Split each hard_event's synchronization between the 8-slot flag namespace
     and the shared 32-slot get_buf/rls_buf mutex pool to minimize wasted
@@ -95,5 +104,6 @@ __all__ = [
     "NormalizeMixedKernelSid",
     "NormalizeNoConflictHints",
     "RestoreWhileLoops",
+    "RewriteFp4ToFp4x2",
     "RewriteFlagToBuf",
 ]

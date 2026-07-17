@@ -1477,6 +1477,13 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     // index (ramp base / lanes) and take the address of that register slot.
     bool is_local_vreg = (scope == "local" && load->indices.size() == 1 &&
                           load->indices[0].dtype().lanes() >= 32);
+    // Packed fp4 (float4_e2m1fnx2) held in GM/UBuf: emitted as the 1-byte
+    // `float4_e2m1x2_t`. Handle only after the local-vreg / L0-L1 cases, since
+    // a fp4 SIMD register slot must still use the register-index addressing
+    // below.
+    bool is_fp4_ptr = load->dtype.is_float4_e2m1fn() &&
+                      load->indices.size() == 1 && !is_local_vreg &&
+                      !needs_ptr_arith;
     if (is_local_vreg) {
       PrimExpr index = load->indices[0];
       const auto *ramp = index.as<RampNode>();
@@ -1500,6 +1507,27 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         }
       }
       os << ")";
+    } else if (is_fp4_ptr) {
+      // Packed fp4 (float4_e2m1fnx2): the tvm_access_ptr lowering scaled the
+      // offset by lanes and wrapped a Ramp (treating the packed pair as a
+      // 2-wide vector). Recover the scalar byte index (ramp base / lanes) and
+      // emit a plain 1-byte pointer `(&(((scope float4_e2m1x2_t*)var)[byte]))`.
+      std::string fp4_scope =
+          !scope.empty() ? scope
+                         : std::string(GetPtrStorageScope(load->buffer->data));
+      PrimExpr index = load->indices[0];
+      const auto *ramp = index.as<RampNode>();
+      PrimExpr base = ramp ? ramp->base : index;
+      int lanes = index.dtype().lanes();
+      PrimExpr byte_idx =
+          lanes > 1 ? analyzer_.Simplify(
+                          floordiv(base, make_const(base.dtype(), lanes)))
+                    : base;
+      os << "(&(((";
+      PrintStorageScope(fp4_scope, os);
+      os << "float4_e2m1x2_t*)" << GetVarID(buf_var) << ")[";
+      PrintExpr(byte_idx, os);
+      os << "]))";
     } else {
       CodeGenC::VisitExpr_(op, os);
     }

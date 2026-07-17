@@ -102,6 +102,12 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tirx.transform.Simplify()(mod)
     mod = tilelang.transform.VectorizeLoop(enable_vectorize=allow_vectorize(pass_ctx=pass_ctx))(mod)
 
+    # Retype packed 4-bit float (float4_e2m1fn) storage into the 1-byte
+    # packed-pair form (float4_e2m1fnx2) and halve fp4 offsets/indices, so
+    # codegen only ever sees a valid 1-byte fp4 element. Must run after the
+    # access_ptr/copy offsets are materialized and before MergeUBAllocations.
+    mod = ascend_transform.RewriteFp4ToFp4x2()(mod)
+
     if not _has_vf_region(mod):
         mod = tilelang.transform.LoopUnswitching()(mod)
     mod = tilelang.transform.UnrollLoop()(mod)
