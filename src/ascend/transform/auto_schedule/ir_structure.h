@@ -602,6 +602,14 @@ public:
 
   Kind GetKind() const override { return Kind::kControl; }
 
+  bool BodyHasLoopBreak() const {
+    for (const auto &child : children) {
+      if (child && child->ContainsLoopBreak())
+        return true;
+    }
+    return false;
+  }
+
   // Resource pipe mask (aggregate from children)
   uint16_t GetPipeMask() const override {
     uint16_t mask = 0;

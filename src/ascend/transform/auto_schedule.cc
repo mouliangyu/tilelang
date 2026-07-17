@@ -1159,12 +1159,10 @@ static ScheduledKernelResult ScheduleSingleKernel(
       t->SetWarpgroupId(fallback_wg);
   }
 
-  EventIdMap event_id_map;
   FlagInfoList flag_infos;
   MultiVersionBufferMap buffer_info_map;
-  AnalyzeAndInsertBarriers(ir_structure, event_id_map, flag_infos,
-                           result.buffer_infos, buffer_info_map,
-                           manual_multi_buffer_versions);
+  AnalyzeAndInsertBarriers(ir_structure, flag_infos, result.buffer_infos,
+                           buffer_info_map, manual_multi_buffer_versions);
 
   Var sid;
   if (external_sid.has_value()) {

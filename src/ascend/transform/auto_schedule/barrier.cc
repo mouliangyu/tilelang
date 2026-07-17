@@ -123,14 +123,7 @@ struct SyncInsertionSite {
       }
       if (node->IsControl()) {
         const ControlNode *ctrl = static_cast<const ControlNode *>(node);
-        bool body_has_loop_break = false;
-        for (const auto &child : ctrl->children) {
-          if (child && child->ContainsLoopBreak()) {
-            body_has_loop_break = true;
-            break;
-          }
-        }
-        if (body_has_loop_break) {
+        if (ctrl->BodyHasLoopBreak()) {
           break;
         }
       }
@@ -189,14 +182,7 @@ struct SyncInsertionSite {
       if (!node || !node->IsControl() || node->HasConditions())
         continue;
       const auto *ctrl = static_cast<const ControlNode *>(node);
-      bool body_has_loop_break = false;
-      for (const auto &child : ctrl->children) {
-        if (child && child->ContainsLoopBreak()) {
-          body_has_loop_break = true;
-          break;
-        }
-      }
-      if (body_has_loop_break)
+      if (ctrl->BodyHasLoopBreak())
         continue;
       const ForNode *for_node = ctrl->control.get();
       PrimExpr loop_var = for_node->loop_var;
@@ -250,10 +236,14 @@ struct SyncPoint {
   DepEdge edge;
   int num_versions;
   std::vector<For> flag_loops;
+  SyncInsertionSite reuse_src;
+  SyncInsertionSite reuse_dst;
+  size_t allocation_index;
 
   SyncPoint(DepEdge edge, int num_versions, std::vector<For> flag_loops)
       : edge(std::move(edge)), num_versions(num_versions),
-        flag_loops(std::move(flag_loops)) {}
+        flag_loops(std::move(flag_loops)), reuse_src(this->edge.src),
+        reuse_dst(this->edge.dst) {}
 
   PrimExpr FlagIteration() const { return CalculateIterationCount(flag_loops); }
 
@@ -274,12 +264,27 @@ struct SyncPoint {
 
 using DepClosure = std::set<DepEdge>;
 
+struct FlagAllocation {
+  std::vector<size_t> sync_points;
+  int num_versions;
+  bool cross_iter;
+  int base_id;
+
+  FlagAllocation(size_t sync_point, int num_versions, bool cross_iter,
+                 int base_id)
+      : sync_points{sync_point}, num_versions(num_versions),
+        cross_iter(cross_iter), base_id(base_id) {}
+};
+
+constexpr int kIntraCoreFlagLimit = 8;
+constexpr int kCrossCoreFlagLimit = 16;
+
 std::vector<SyncPoint>
 CollectSyncPoints(const std::vector<IRStructure *> &nodes, int num_wgs,
                   const MultiVersionBufferMap &buffer_info_map,
+                  const ManualMultiBufferTable &manual = {},
                   const std::map<Buffer, int64_t> &buffer_num_versions = {},
-                  const std::vector<For> &loop_stack = {},
-                  const ManualMultiBufferTable &manual = {}) {
+                  const std::vector<For> &loop_stack = {}) {
   auto deps = AnalyzeDependencies(nodes, loop_stack, manual);
 
   // Expand a task's warpgroup id into the concrete wg ids it participates in.
@@ -497,12 +502,10 @@ static void OptimizeFlagVersions(std::vector<SyncPoint> &sync_points,
     return true;
   };
   for (auto &sp : sync_points) {
-    if (sp.edge.distance > 0)
-      continue;
     if (sp.edge.src.pipe == sp.edge.dst.pipe)
       continue;
-    if (!same_loop_nest(sp.flag_loops))
-      continue;
+    bool is_innermost = same_loop_nest(sp.flag_loops);
+    int innermost_num_versions = is_innermost ? sp.num_versions : 1;
     int min_distance = std::numeric_limits<int>::max();
     for (const auto &edge : closure) {
       if (edge.src == sp.edge.dst && edge.dst == sp.edge.src) {
@@ -519,11 +522,20 @@ static void OptimizeFlagVersions(std::vector<SyncPoint> &sync_points,
                           : IntImm(inner->extent.dtype(), 1);
       arith::Analyzer ana;
       if (ana.CanProve(inner->extent <=
-                       IntImm(inner->extent.dtype(), sp.num_versions) * step)) {
+                       IntImm(inner->extent.dtype(), innermost_num_versions) *
+                           step)) {
         continue;
       }
     }
-    if (min_distance > sp.num_versions) {
+    if (sp.edge.distance > 0) {
+      if (sp.edge.distance != innermost_num_versions || min_distance > 0) {
+        LOG(WARNING) << "cross-iteration flag " << sp.edge.src.pipe << "->"
+                     << sp.edge.dst.pipe
+                     << ": the synchronization ring is malformed.";
+      }
+      continue;
+    }
+    if (min_distance > innermost_num_versions) {
       LOG(WARNING) << "flag " << sp.edge.src.pipe << "->" << sp.edge.dst.pipe
                    << ": reverse ordering too loose to bound flag reuse.";
       continue;
@@ -533,12 +545,221 @@ static void OptimizeFlagVersions(std::vector<SyncPoint> &sync_points,
                    << ": dependency cycle (reverse distance <= 0).";
       continue;
     }
-    sp.num_versions = min_distance;
+    if (is_innermost) {
+      sp.num_versions = min_distance;
+    }
   }
 }
 
-void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
-                      FlagInfoList &flag_infos, EventIdMap &event_id_map) {
+static bool IsCrossCore(const SyncPoint &sp) {
+  return sp.edge.src.wg != sp.edge.dst.wg;
+}
+
+static bool UsesFlag(const SyncPoint &sp) {
+  return IsCrossCore(sp) || sp.edge.src.pipe != sp.edge.dst.pipe;
+}
+
+static bool HasSameFlagKind(const SyncPoint &a, const SyncPoint &b) {
+  return a.edge.src.wg == b.edge.src.wg && a.edge.src.pipe == b.edge.src.pipe &&
+         a.edge.dst.wg == b.edge.dst.wg && a.edge.dst.pipe == b.edge.dst.pipe;
+}
+
+static std::string FlagDomain(const SyncPoint &sp) {
+  if (IsCrossCore(sp))
+    return "Cube-Vector";
+  return GetHardEvent(sp.edge.src.pipe, sp.edge.dst.pipe);
+}
+
+static bool HasClosureEdge(const DepClosure &closure,
+                           const SyncInsertionSite &src,
+                           const SyncInsertionSite &dst, int distance) {
+  return closure.count(DepEdge(src, dst, distance, false)) ||
+         closure.count(DepEdge(src, dst, distance, true));
+}
+
+static bool CanReuse(const SyncPoint &a, const SyncPoint &b,
+                     const DepClosure &closure, bool allow_cross_iter) {
+  if (!UsesFlag(a) || !UsesFlag(b) || !HasSameFlagKind(a, b))
+    return false;
+
+  bool a_cross_iter = a.edge.distance > 0;
+  bool b_cross_iter = b.edge.distance > 0;
+  if (a_cross_iter != b_cross_iter)
+    return false;
+
+  if (!a_cross_iter) {
+    bool a_before_b = HasClosureEdge(closure, a.reuse_dst, b.reuse_src, 0) &&
+                      HasClosureEdge(closure, b.reuse_dst, a.reuse_src, 1);
+    bool b_before_a = HasClosureEdge(closure, b.reuse_dst, a.reuse_src, 0) &&
+                      HasClosureEdge(closure, a.reuse_dst, b.reuse_src, 1);
+    return a_before_b != b_before_a;
+  }
+
+  if (!allow_cross_iter)
+    return false;
+
+  bool a_before_b = HasClosureEdge(closure, a.reuse_src, b.reuse_dst, 0) &&
+                    HasClosureEdge(closure, b.reuse_src, a.reuse_dst, 1);
+  bool b_before_a = HasClosureEdge(closure, b.reuse_src, a.reuse_dst, 0) &&
+                    HasClosureEdge(closure, a.reuse_src, b.reuse_dst, 1);
+  return a_before_b != b_before_a;
+}
+
+static void PromoteReuseSites(SyncPoint &sp, IRStructure *node) {
+  if (!node->HasConditions()) {
+    sp.reuse_src.chain.insert(sp.reuse_src.chain.begin(), node);
+    sp.reuse_dst.chain.insert(sp.reuse_dst.chain.begin(), node);
+    return;
+  }
+
+  bool cross_iter = sp.edge.distance > 0;
+  auto collapse = [&](SyncInsertionSite &site, bool at_beginning) {
+    site.node = node;
+    site.at_beginning = at_beginning;
+    site.chain = {node};
+  };
+  collapse(sp.reuse_src, !cross_iter);
+  collapse(sp.reuse_dst, cross_iter);
+}
+
+static void RecordReusablePairs(
+    const std::vector<size_t> &a_points, const std::vector<size_t> &b_points,
+    const DepClosure &closure, const std::vector<SyncPoint> &sync_points,
+    bool allow_cross_iter,
+    std::set<std::pair<size_t, size_t>> &reusable_pairs) {
+  for (const auto &a : a_points) {
+    for (const auto &b : b_points) {
+      if (a == b ||
+          !CanReuse(sync_points[a], sync_points[b], closure, allow_cross_iter))
+        continue;
+      reusable_pairs.emplace(std::min(a, b), std::max(a, b));
+    }
+  }
+}
+
+static std::vector<FlagAllocation>
+PlanFlagAllocations(std::vector<SyncPoint> &sync_points,
+                    const std::set<std::pair<size_t, size_t>> &reusable_pairs) {
+  std::vector<FlagAllocation> allocations;
+  std::map<std::string, int> required_ids;
+  std::map<std::string, int> next_id;
+  for (const auto &sp : sync_points) {
+    if (!UsesFlag(sp))
+      continue;
+    std::string domain = FlagDomain(sp);
+    required_ids[domain] += sp.num_versions;
+  }
+
+  for (bool cross_iter : {true, false}) {
+    std::vector<size_t> candidates;
+    for (size_t i = 0; i < sync_points.size(); ++i) {
+      if (UsesFlag(sync_points[i]) &&
+          (sync_points[i].edge.distance > 0) == cross_iter) {
+        candidates.push_back(i);
+      }
+    }
+    std::stable_sort(
+        candidates.begin(), candidates.end(), [&](size_t a, size_t b) {
+          return sync_points[a].num_versions > sync_points[b].num_versions;
+        });
+
+    for (size_t index : candidates) {
+      SyncPoint &sp = sync_points[index];
+      bool compatible = false;
+      std::string domain = FlagDomain(sp);
+      int limit = IsCrossCore(sp) ? kCrossCoreFlagLimit : kIntraCoreFlagLimit;
+      if (required_ids[domain] > limit) {
+        for (size_t allocation_index = 0; allocation_index < allocations.size();
+             ++allocation_index) {
+          FlagAllocation &allocation = allocations[allocation_index];
+          if (allocation.cross_iter != cross_iter ||
+              !HasSameFlagKind(sp, sync_points[allocation.sync_points.front()]))
+            continue;
+          compatible = true;
+          for (size_t member : allocation.sync_points) {
+            if (!reusable_pairs.count(
+                    {std::min(index, member), std::max(index, member)})) {
+              compatible = false;
+              break;
+            }
+          }
+          if (compatible) {
+            ICHECK_GE(allocation.num_versions, sp.num_versions);
+            required_ids[domain] -= sp.num_versions;
+            allocation.sync_points.push_back(index);
+            sp.allocation_index = allocation_index;
+            break;
+          }
+        }
+      }
+      if (compatible)
+        continue;
+      sp.allocation_index = allocations.size();
+      int base_id = next_id[domain];
+      allocations.emplace_back(index, sp.num_versions, cross_iter, base_id);
+      next_id[domain] += sp.num_versions;
+      if (base_id <= limit && next_id[domain] > limit) {
+        LOG(WARNING) << "Ascend auto-schedule allocated " << next_id[domain]
+                     << " flag ids for " << domain << " after safe reuse, "
+                     << "exceeding the dav-3510 limit of " << limit << ".";
+      }
+    }
+  }
+  return allocations;
+}
+
+static void AppendCrossIterFlagInfo(const std::vector<SyncPoint> &sync_points,
+                                    const FlagAllocation &allocation,
+                                    FlagInfoList &flag_infos) {
+  const SyncPoint &sp = sync_points[allocation.sync_points.front()];
+  std::string hard_event = GetHardEvent(sp.edge.src.pipe, sp.edge.dst.pipe);
+  size_t pos = hard_event.find('_');
+  std::string prod_pipe = "PIPE_" + hard_event.substr(0, pos);
+  std::string cons_pipe = "PIPE_" + hard_event.substr(pos + 1);
+  int base_id = allocation.base_id;
+
+  if (!IsCrossCore(sp)) {
+    for (int version = 0; version < allocation.num_versions; ++version) {
+      flag_infos.push_back(
+          FlagInfo{sp.edge.src.wg, Integer(base_id + version), hard_event, 0});
+    }
+    return;
+  }
+
+  // Cross-core set uses the producer pipe; wait uses the consumer pipe.
+  if (!sp.edge.src.wg) {
+    for (int version = 0; version < allocation.num_versions; ++version) {
+      flag_infos.push_back(
+          FlagInfo{0, Integer(base_id + version), prod_pipe, 1});
+    }
+    for (int sid = 0; sid < 2; ++sid) {
+      for (int version = 0; version < allocation.num_versions; ++version) {
+        flag_infos.push_back(
+            FlagInfo{1, Integer(base_id + sid * 16 + version), cons_pipe, 2});
+      }
+    }
+  } else {
+    for (int sid = 0; sid < 2; ++sid) {
+      for (int version = 0; version < allocation.num_versions; ++version) {
+        flag_infos.push_back(
+            FlagInfo{1, Integer(base_id + sid * 16 + version), prod_pipe, 1});
+      }
+    }
+    for (int version = 0; version < allocation.num_versions; ++version) {
+      flag_infos.push_back(
+          FlagInfo{0, Integer(base_id + version), cons_pipe, 2});
+    }
+  }
+}
+
+static void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
+                             const std::vector<FlagAllocation> &allocations,
+                             FlagInfoList &flag_infos) {
+  for (const auto &allocation : allocations) {
+    if (allocation.cross_iter)
+      AppendCrossIterFlagInfo(sync_points, allocation, flag_infos);
+  }
+
   for (const auto &sp : sync_points) {
     std::string hard_event = GetHardEvent(sp.edge.src.pipe, sp.edge.dst.pipe);
     size_t pos = hard_event.find('_');
@@ -547,111 +768,59 @@ void InsertSyncPoints(const std::vector<SyncPoint> &sync_points,
     PrimExpr prod_guard = sp.edge.src.GetGuard();
     PrimExpr cons_guard = sp.edge.dst.GetGuard();
     PrimExpr flag_iteration = sp.FlagIteration();
-    bool cross_core = sp.edge.src.wg != sp.edge.dst.wg;
-    if (cross_core) {
-      auto cc_id = event_id_map.find("Cube-Vector");
-      if (cc_id == event_id_map.end()) {
-        event_id_map["Cube-Vector"] = 0;
-        cc_id = event_id_map.find("Cube-Vector");
+
+    if (!IsCrossCore(sp) && prod_pipe == cons_pipe) {
+      // The scalar, vector, and cube pipes already execute in program order.
+      if (prod_pipe == "PIPE_S" || prod_pipe == "PIPE_V" ||
+          prod_pipe == "PIPE_M") {
+        continue;
       }
-      int cc_base_id = cc_id->second;
-      cc_id->second += sp.num_versions;
+      Stmt barrier = MakeAscendPipeBarrier(prod_pipe);
+      InsertStatementIntoScheduledNode(sp.edge.dst.node, barrier, true,
+                                       sp.edge.dst.wg, cons_guard);
+      continue;
+    }
 
-      if (sp.edge.distance > 0) {
-        // Cross-core set uses the producer pipe; wait uses the consumer pipe.
-        if (!sp.edge.src.wg) {
-          for (int base = 0; base < sp.num_versions; ++base) {
-            flag_infos.push_back(FlagInfo{0, cc_base_id + base, prod_pipe, 1});
-          }
-          for (unsigned s = 0; s != 2; ++s) {
-            for (int base = 0; base < sp.num_versions; ++base) {
-              flag_infos.push_back(FlagInfo{
-                  1, Integer(cc_base_id + s * 16 + base), cons_pipe, 2});
-            }
-          }
-        } else {
-          for (unsigned s = 0; s != 2; ++s) {
-            for (int base = 0; base < sp.num_versions; ++base) {
-              flag_infos.push_back(FlagInfo{
-                  1, Integer(cc_base_id + s * 16 + base), prod_pipe, 1});
-            }
-          }
-          for (int base = 0; base < sp.num_versions; ++base) {
-            flag_infos.push_back(FlagInfo{0, cc_base_id + base, cons_pipe, 2});
-          }
-        }
-      }
+    const FlagAllocation &allocation = allocations[sp.allocation_index];
+    int base_id = allocation.base_id;
+    PrimExpr event_id =
+        indexmod(flag_iteration, Integer(sp.num_versions)) + base_id;
 
-      PrimExpr cc_event_id =
-          indexmod(flag_iteration, Integer(sp.num_versions)) + cc_base_id;
-
+    if (IsCrossCore(sp)) {
       if (!sp.edge.src.wg) {
-        Stmt set_stmt = MakeAscendCrossCoreSetFlag(4, prod_pipe, cc_event_id);
+        Stmt set_stmt = MakeAscendCrossCoreSetFlag(4, prod_pipe, event_id);
         InsertStatementIntoScheduledNode(sp.edge.src.node, set_stmt, false,
                                          sp.edge.src.wg, prod_guard);
-        for (unsigned s = 0; s != 2; ++s) {
+        for (int sid = 0; sid < 2; ++sid) {
           Stmt wait_stmt = MakeAscendCrossCoreWaitFlag(
               4, cons_pipe,
               indexmod(flag_iteration, Integer(sp.num_versions)) +
-                  Integer(cc_base_id + 16 * s));
+                  Integer(base_id + 16 * sid));
           InsertStatementIntoScheduledNode(sp.edge.dst.node, wait_stmt, true,
                                            sp.edge.dst.wg, cons_guard);
         }
       } else {
-        for (unsigned s = 0; s != 2; ++s) {
+        for (int sid = 0; sid < 2; ++sid) {
           Stmt set_stmt = MakeAscendCrossCoreSetFlag(
               4, prod_pipe,
               indexmod(flag_iteration, Integer(sp.num_versions)) +
-                  Integer(cc_base_id + 16 * s));
+                  Integer(base_id + 16 * sid));
           InsertStatementIntoScheduledNode(sp.edge.src.node, set_stmt, false,
                                            sp.edge.src.wg, prod_guard);
         }
-        Stmt wait_stmt = MakeAscendCrossCoreWaitFlag(4, cons_pipe, cc_event_id);
+        Stmt wait_stmt = MakeAscendCrossCoreWaitFlag(4, cons_pipe, event_id);
         InsertStatementIntoScheduledNode(sp.edge.dst.node, wait_stmt, true,
                                          sp.edge.dst.wg, cons_guard);
       }
-    } else {
-      // When producer and consumer share the same pipe, insert a pipe_barrier
-      // before the consumer to ensure pipeline ordering.
-      if (prod_pipe == cons_pipe) {
-        // The scalar pipe (PIPE_S) issues instructions in program order
-        if (prod_pipe == "PIPE_S") {
-          continue;
-        }
-        if (prod_pipe == "PIPE_V" || prod_pipe == "PIPE_M") {
-          continue;
-        }
-        Stmt barrier = MakeAscendPipeBarrier(prod_pipe);
-        InsertStatementIntoScheduledNode(sp.edge.dst.node, barrier, true,
-                                         sp.edge.dst.wg, cons_guard);
-        continue;
-      }
-      auto base_id = event_id_map.find(hard_event);
-      if (base_id == event_id_map.end()) {
-        event_id_map[hard_event] = 0;
-        base_id = event_id_map.find(hard_event);
-      }
-      int base_id_val = base_id->second;
-      base_id->second += sp.num_versions;
-
-      PrimExpr event_id =
-          indexmod(flag_iteration, Integer(sp.num_versions)) + base_id_val;
-
-      if (sp.edge.distance > 0) {
-        for (int base = 0; base < sp.num_versions; ++base) {
-          flag_infos.push_back(FlagInfo{
-              sp.edge.src.wg, Integer(base_id_val + base), hard_event, 0});
-        }
-      }
-
-      Stmt set_stmt = MakeAscendSetFlag(hard_event, event_id);
-      InsertStatementIntoScheduledNode(sp.edge.src.node, set_stmt, false,
-                                       sp.edge.src.wg, prod_guard);
-
-      Stmt wait_stmt = MakeAscendWaitFlag(hard_event, event_id);
-      InsertStatementIntoScheduledNode(sp.edge.dst.node, wait_stmt, true,
-                                       sp.edge.dst.wg, cons_guard);
+      continue;
     }
+
+    Stmt set_stmt = MakeAscendSetFlag(hard_event, event_id);
+    InsertStatementIntoScheduledNode(sp.edge.src.node, set_stmt, false,
+                                     sp.edge.src.wg, prod_guard);
+    Stmt wait_stmt = MakeAscendWaitFlag(hard_event, event_id);
+    InsertStatementIntoScheduledNode(sp.edge.dst.node, wait_stmt, true,
+                                     sp.edge.dst.wg, cons_guard);
   }
 }
 
@@ -664,31 +833,34 @@ static DepClosure DistanceZeroClosure(const DepClosure &closure) {
   return result;
 }
 
-// Recursively analyze a node's subtree, emit its barriers, and return the
-// distance-0 dependency closure of that subtree (for the parent to compose).
-DepClosure
-AnalyzeAndInsertBarriers(IRStructure *node, EventIdMap &event_id_map,
-                         FlagInfoList &flag_infos, std::vector<For> &loop_stack,
-                         std::vector<MultiVersionBufferInfo> &buffer_infos,
-                         MultiVersionBufferMap &buffer_info_map,
-                         const ManualMultiBufferTable &manual);
-
-// Analyze an ordered list of sibling nodes (either the root list or a loop
-// body): recurse into each child, then collect / optimize / emit this level's
-// barriers. Returns this level's distance-0 closure.
 static DepClosure
-AnalyzeNodeList(std::vector<IRStructure *> &nodes, EventIdMap &event_id_map,
-                FlagInfoList &flag_infos, std::vector<For> &loop_stack,
+AnalyzeNode(IRStructure *node, std::vector<SyncPoint> &sync_points,
+            std::set<std::pair<size_t, size_t>> &reusable_pairs,
+            std::vector<For> &loop_stack,
+            std::vector<MultiVersionBufferInfo> &buffer_infos,
+            MultiVersionBufferMap &buffer_info_map,
+            const ManualMultiBufferTable &manual,
+            std::vector<size_t> &visible_sync_points);
+
+static DepClosure
+AnalyzeNodeList(std::vector<IRStructure *> &nodes,
+                std::vector<SyncPoint> &sync_points,
+                std::set<std::pair<size_t, size_t>> &reusable_pairs,
+                std::vector<For> &loop_stack,
                 std::vector<MultiVersionBufferInfo> &buffer_infos,
-                MultiVersionBufferMap &buffer_info_map, bool is_loop_body,
+                MultiVersionBufferMap &buffer_info_map,
+                const ManualMultiBufferTable &manual, bool is_loop_body,
                 const std::map<Buffer, int64_t> &buffer_num_versions,
-                const ManualMultiBufferTable &manual) {
+                std::vector<size_t> &visible_sync_points) {
   DepClosure closure;
+  std::vector<std::vector<size_t>> child_sync_points;
   for (auto *node : nodes) {
+    std::vector<size_t> child_points;
     DepClosure child_closure =
-        AnalyzeAndInsertBarriers(node, event_id_map, flag_infos, loop_stack,
-                                 buffer_infos, buffer_info_map, manual);
+        AnalyzeNode(node, sync_points, reusable_pairs, loop_stack, buffer_infos,
+                    buffer_info_map, manual, child_points);
     AddPromotedChildClosure(closure, node, child_closure);
+    child_sync_points.push_back(std::move(child_points));
   }
 
   if (is_loop_body) {
@@ -700,28 +872,51 @@ AnalyzeNodeList(std::vector<IRStructure *> &nodes, EventIdMap &event_id_map,
                      });
   }
 
-  auto sync_points = CollectSyncPoints(nodes, 2, buffer_info_map,
-                                       buffer_num_versions, loop_stack, manual);
-  int max_distance = 0;
-  for (const auto &sp : sync_points) {
+  auto local_sync_points = CollectSyncPoints(nodes, 2, buffer_info_map, manual,
+                                             buffer_num_versions, loop_stack);
+  int max_distance = loop_stack.empty() ? 0 : 1;
+  for (const auto &sp : local_sync_points) {
     max_distance = std::max(max_distance, sp.edge.distance);
   }
   AddSamePipeEdges(closure, nodes, 2, max_distance);
-  OptimizeSyncPoints(sync_points, closure, max_distance);
+  OptimizeSyncPoints(local_sync_points, closure, max_distance);
   if (is_loop_body)
-    OptimizeFlagVersions(sync_points, closure, loop_stack);
-  InsertSyncPoints(sync_points, flag_infos, event_id_map);
+    OptimizeFlagVersions(local_sync_points, closure, loop_stack);
+
+  std::vector<size_t> local_points;
+  local_points.reserve(local_sync_points.size());
+  for (auto &sp : local_sync_points) {
+    size_t index = sync_points.size();
+    local_points.push_back(index);
+    sync_points.push_back(std::move(sp));
+  }
+
+  for (size_t i = 0; i < child_sync_points.size(); ++i) {
+    for (size_t j = i + 1; j < child_sync_points.size(); ++j) {
+      RecordReusablePairs(child_sync_points[i], child_sync_points[j], closure,
+                          sync_points, true, reusable_pairs);
+    }
+    RecordReusablePairs(child_sync_points[i], local_points, closure,
+                        sync_points, false, reusable_pairs);
+    visible_sync_points.insert(visible_sync_points.end(),
+                               child_sync_points[i].begin(),
+                               child_sync_points[i].end());
+  }
+  RecordReusablePairs(local_points, local_points, closure, sync_points, false,
+                      reusable_pairs);
+  visible_sync_points.insert(visible_sync_points.end(), local_points.begin(),
+                             local_points.end());
   return DistanceZeroClosure(closure);
 }
 
-// Node overload: dispatch a single node. Returns its subtree's distance-0
-// closure.
-DepClosure
-AnalyzeAndInsertBarriers(IRStructure *node, EventIdMap &event_id_map,
-                         FlagInfoList &flag_infos, std::vector<For> &loop_stack,
-                         std::vector<MultiVersionBufferInfo> &buffer_infos,
-                         MultiVersionBufferMap &buffer_info_map,
-                         const ManualMultiBufferTable &manual) {
+static DepClosure
+AnalyzeNode(IRStructure *node, std::vector<SyncPoint> &sync_points,
+            std::set<std::pair<size_t, size_t>> &reusable_pairs,
+            std::vector<For> &loop_stack,
+            std::vector<MultiVersionBufferInfo> &buffer_infos,
+            MultiVersionBufferMap &buffer_info_map,
+            const ManualMultiBufferTable &manual,
+            std::vector<size_t> &visible_sync_points) {
   if (!node)
     return {};
 
@@ -729,8 +924,7 @@ AnalyzeAndInsertBarriers(IRStructure *node, EventIdMap &event_id_map,
     auto *ctrl = static_cast<ControlNode *>(node);
     if (ctrl->children.empty())
       return {};
-    const ForNode *for_node = ctrl->control.get();
-    if (!for_node)
+    if (!ctrl->control.defined())
       return {};
     loop_stack.push_back(ctrl->control);
 
@@ -776,14 +970,22 @@ AnalyzeAndInsertBarriers(IRStructure *node, EventIdMap &event_id_map,
     std::vector<IRStructure *> nodes;
     for (auto &child : ctrl->children)
       nodes.push_back(child.get());
-    DepClosure closure =
-        AnalyzeNodeList(nodes, event_id_map, flag_infos, loop_stack,
-                        buffer_infos, buffer_info_map, /*is_loop_body=*/true,
-                        ctrl->buffer_num_versions, manual);
+    std::vector<size_t> child_points;
+    DepClosure closure = AnalyzeNodeList(
+        nodes, sync_points, reusable_pairs, loop_stack, buffer_infos,
+        buffer_info_map, manual,
+        /*is_loop_body=*/true, ctrl->buffer_num_versions, child_points);
 
     for (const auto &buffer : scoped_buffers)
       buffer_info_map.erase(buffer);
     loop_stack.pop_back();
+    if (!ctrl->BodyHasLoopBreak()) {
+      for (size_t index : child_points) {
+        SyncPoint &sp = sync_points[index];
+        PromoteReuseSites(sp, node);
+      }
+      visible_sync_points = std::move(child_points);
+    }
     return closure;
   }
 
@@ -799,17 +1001,23 @@ AnalyzeAndInsertBarriers(IRStructure *node, EventIdMap &event_id_map,
 }
 
 void AnalyzeAndInsertBarriers(std::vector<std::shared_ptr<IRStructure>> &root,
-                              EventIdMap &event_id_map,
                               FlagInfoList &flag_infos,
                               std::vector<MultiVersionBufferInfo> &buffer_infos,
                               MultiVersionBufferMap &buffer_info_map,
                               const ManualMultiBufferTable &manual) {
+  std::vector<SyncPoint> sync_points;
+  std::set<std::pair<size_t, size_t>> reusable_pairs;
   std::vector<For> loop_stack;
   std::vector<IRStructure *> nodes;
   for (auto &child : root)
     nodes.push_back(child.get());
-  AnalyzeNodeList(nodes, event_id_map, flag_infos, loop_stack, buffer_infos,
-                  buffer_info_map, /*is_loop_body=*/false, {}, manual);
+  std::vector<size_t> visible_sync_points;
+  AnalyzeNodeList(nodes, sync_points, reusable_pairs, loop_stack, buffer_infos,
+                  buffer_info_map, manual, /*is_loop_body=*/false, {},
+                  visible_sync_points);
+  std::vector<FlagAllocation> allocations =
+      PlanFlagAllocations(sync_points, reusable_pairs);
+  InsertSyncPoints(sync_points, allocations, flag_infos);
 }
 
 } // namespace tl

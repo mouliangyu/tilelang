@@ -36,8 +36,6 @@ struct MultiVersionBufferInfo {
 using MultiVersionBufferMap = std::unordered_map<Buffer, MultiVersionBufferInfo,
                                                  ObjectPtrHash, ObjectPtrEqual>;
 
-using EventIdMap = std::unordered_map<std::string, int>;
-
 struct FlagInfo {
   int warpgroup_id;
   PrimExpr flag_var;
@@ -47,7 +45,6 @@ struct FlagInfo {
 using FlagInfoList = std::vector<FlagInfo>;
 
 void AnalyzeAndInsertBarriers(std::vector<std::shared_ptr<IRStructure>> &root,
-                              EventIdMap &event_id_map,
                               FlagInfoList &flag_infos,
                               std::vector<MultiVersionBufferInfo> &buffer_infos,
                               MultiVersionBufferMap &buffer_info_map,
