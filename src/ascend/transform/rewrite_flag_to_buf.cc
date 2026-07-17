@@ -58,6 +58,15 @@ constexpr int kMaxBufId = 32;
 // Number of event_id slots a single set_flag/wait_flag event-pair supports.
 constexpr int kFlagSlotsPerPair = 8;
 
+// gemm_l1 / blockscaled_gemm_l1 templates hold a 2-slot double-buffer window
+// [buf_offset, buf_offset+1] in the mutex pool (see src/tl_templates/ascend/
+// gemm.h, sk & 1). Spilled flags must not reuse those slots.
+constexpr int kGemmL1BufSlots = 2;
+
+// Arg index of the buf_offset operand in each gemm_l1 intrinsic call.
+constexpr int kGemmL1BufOffsetArg = 10;
+constexpr int kBlockscaledGemmL1BufOffsetArg = 14;
+
 // Split "PROD_CONS" -> {"PIPE_PROD", "PIPE_CONS"}.
 std::pair<std::string, std::string> SplitHardEvent(const std::string &he) {
   size_t pos = he.find('_');
@@ -112,11 +121,15 @@ std::pair<int64_t, int64_t> EventIdRange(arith::Analyzer *ana,
 }
 
 // Phase A: collect, per hard_event, the raw event_id ranges of every flag call.
+// Also tracks the highest buf_id reserved by gemm_l1 intrinsics so spilled
+// flags can start allocating past them.
 class FlagUsageCollector : public StmtExprVisitor {
 public:
   std::unordered_map<std::string, std::vector<std::pair<int64_t, int64_t>>>
       ranges;
   std::vector<std::string> order; // first-encounter order
+  // Highest buf_id reserved by gemm_l1 + 1 (0 if no gemm_l1 present).
+  int64_t reserved_hwm = 0;
 
   void VisitStmt_(const ForNode *op) final {
     analyzer_.Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent));
@@ -133,11 +146,30 @@ public:
       } else {
         it->second.push_back(range);
       }
+    } else {
+      ReserveGemmL1Bufs(op);
     }
     StmtExprVisitor::VisitExpr_(op);
   }
 
 private:
+  // gemm_l1 templates internally occupy buf_ids [buf_offset, buf_offset+1].
+  void ReserveGemmL1Bufs(const CallNode *op) {
+    int arg_idx;
+    if (op->op.same_as(ascend_gemm_l1())) {
+      arg_idx = kGemmL1BufOffsetArg;
+    } else if (op->op.same_as(ascend_blockscaled_gemm_l1())) {
+      arg_idx = kBlockscaledGemmL1BufOffsetArg;
+    } else {
+      return;
+    }
+    ICHECK_LT(static_cast<size_t>(arg_idx), op->args.size())
+        << "RewriteFlagToBuf: gemm_l1 call missing buf_offset arg";
+    const auto *off = op->args[arg_idx].as<IntImmNode>();
+    ICHECK(off) << "RewriteFlagToBuf: gemm_l1 buf_offset must be a constant";
+    reserved_hwm = std::max(reserved_hwm, off->value + kGemmL1BufSlots);
+  }
+
   arith::Analyzer analyzer_;
 };
 
@@ -271,7 +303,8 @@ PrimFunc RewriteFlagToBufFn(PrimFunc f) {
     return f;
 
   std::unordered_map<std::string, std::vector<BlockAssign>> assign;
-  int mutex_running = 0;
+  // Start spilled buf_id allocation past the slots gemm_l1 already reserves.
+  int mutex_running = static_cast<int>(collector.reserved_hwm);
   std::ostringstream layout;
   for (const std::string &he : collector.order) {
     std::vector<Block> blocks = CoalesceBlocks(collector.ranges[he]);
