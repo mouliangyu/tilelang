@@ -106,9 +106,6 @@ def z3_schedule_python(
     # Create Z3 solver
     solver = z3.Optimize(ctx=ctx)
     solver.set("rlimit", 1000000)
-    # Pin the randomization seed and force single-threaded solving so the
-    # returned model is deterministic across identical runs.
-    solver.set("random_seed", 42)
 
     # Create start time variables
     start_vars = [z3.Int(f"start_{i}", ctx) for i in range(n)]
