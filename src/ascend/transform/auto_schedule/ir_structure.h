@@ -60,6 +60,7 @@ enum class SpecialRegister : uint8_t {
   kHf32Mode = 1 << 0,    // set_hf32_mode      <- read by Cube (MAD) ops
   kPadValue = 1 << 1,    // set_copy_pad_value <- read by padded MTE2 copies
   kLoopControl = 1 << 2, // loop_break         <- read by every sibling (fence)
+  kAtomicMode = 1 << 3,  // set_atomic         <- read by GM-store copies
 };
 
 // Structure to represent a specific access to a buffer (used for ordering
@@ -292,11 +293,16 @@ public:
       mask |= static_cast<uint8_t>(SpecialRegister::kHf32Mode);
     if (ReadsPadValueRegister())
       mask |= static_cast<uint8_t>(SpecialRegister::kPadValue);
+    if (ReadsAtomicRegister())
+      mask |= static_cast<uint8_t>(SpecialRegister::kAtomicMode);
     return mask;
   }
 
   // Whether this node contains a padded GM->UB copy.
   virtual bool ReadsPadValueRegister() const { return false; }
+
+  // Whether this node contains a copy that stores to GM.
+  virtual bool ReadsAtomicRegister() const { return false; }
 
   bool WritesSpecialRegister(SpecialRegister reg) const {
     return (GetSpecialWriteMask() & static_cast<uint8_t>(reg)) != 0;
@@ -342,6 +348,9 @@ public:
   // pad-value register.
   bool ReadsPadValueRegister() const override { return reads_pad_value_; }
 
+  // A copy that stores to GM in this leaf reads the atomic-mode register.
+  bool ReadsAtomicRegister() const override { return reads_atomic_; }
+
   // Memory access regions (collected during analysis)
   std::vector<BufferRegion> GetReadRegions() const override {
     return read_regions_;
@@ -373,6 +382,7 @@ public:
   void SetHbmMask(uint16_t mask) { hbm_mask_ = mask; }
   void SetSpecialWriteMask(uint8_t mask) { special_write_mask_ = mask; }
   void SetReadsPadValue(bool v) { reads_pad_value_ = v; }
+  void SetReadsAtomic(bool v) { reads_atomic_ = v; }
   void AddSpecialWrite(SpecialRegister reg) {
     special_write_mask_ |= static_cast<uint8_t>(reg);
   }
@@ -560,6 +570,7 @@ private:
   uint8_t special_write_mask_{0};
   // Whether a padded GM->UB copy in this leaf reads the pad-value register.
   bool reads_pad_value_{false};
+  bool reads_atomic_{false};
 
   // Memory access regions (collected during analysis)
   std::vector<BufferRegion> read_regions_;
@@ -636,6 +647,16 @@ public:
         return true;
     }
     return task && task->ReadsPadValueRegister();
+  }
+
+  // A loop reads the atomic register if any child (or its own task) stores to
+  // GM.
+  bool ReadsAtomicRegister() const override {
+    for (const auto &child : children) {
+      if (child && child->ReadsAtomicRegister())
+        return true;
+    }
+    return task && task->ReadsAtomicRegister();
   }
 
   // Memory access regions (aggregate from children & task)

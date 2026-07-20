@@ -376,6 +376,9 @@ protected:
         task_node->AddSpecialWrite(SpecialRegister::kHf32Mode);
       } else if (call->op.same_as(tl::ascend_set_copy_pad_value())) {
         task_node->AddSpecialWrite(SpecialRegister::kPadValue);
+      } else if (call->op.same_as(tl::ascend_set_atomic()) ||
+                 call->op.same_as(tl::ascend_set_atomic_none())) {
+        task_node->AddSpecialWrite(SpecialRegister::kAtomicMode);
       }
     }
 
@@ -537,6 +540,9 @@ private:
       uint16_t hbm_mask{0};
       // A padded GM->UB copy (data_select / pad_value) reads the pad register.
       bool reads_pad_value{false};
+      // A copy that stores to GM (fixpipe L0C->GM or MTE3 UB->GM) reads the
+      // atomic-mode register.
+      bool reads_atomic{false};
 
       // Tensor Core shape information (multiple shapes possible)
       struct TensorCoreShape {
@@ -639,6 +645,9 @@ private:
           // against that scalar write — not every MTE2 copy.
           if (copy_obj->GetDataSelect() != 0)
             reads_pad_value = true;
+          // A store to GM reads the atomic-mode register (see reads_atomic).
+          if (IsGlobalBuffer(copy->dst))
+            reads_atomic = true;
           copy_infos.emplace_back(copy->src.scope(), copy->dst.scope(),
                                   DataType(copy->dst->dtype),
                                   CalculateCopyBytes(copy), copy_pipe);
@@ -719,6 +728,8 @@ private:
       task_node->SetHbmMask(analyzer.hbm_mask);
       if (analyzer.reads_pad_value)
         task_node->SetReadsPadValue(true);
+      if (analyzer.reads_atomic)
+        task_node->SetReadsAtomic(true);
       // Set Tensor Core shape information if available
       for (const auto &shape : analyzer.tensor_core_shapes) {
         if (shape.m > 0 && shape.n > 0 && shape.k > 0) {
@@ -1077,10 +1088,12 @@ static ScheduledKernelResult ScheduleSingleKernel(
   unit_builder.SetManualMultiBuffer(manual_multi_buffer_versions);
   unit_builder.ScheduleList(ir_structure);
 
-  // Assign warpgroup IDs based on pipe and buffer scopes
+  // Assign warpgroup IDs based on pipe and buffer scopes.
   {
     std::vector<TaskNodeWithContext> all_tasks;
     CollectAllTaskNodesWithContext(ir_structure, all_tasks);
+    std::vector<TaskNode *> atomic_writers;
+    uint8_t store_wg_mask = 0;
     for (auto &task_ctx : all_tasks) {
       auto *t = task_ctx.task;
       uint16_t m = t->GetPipeMask();
@@ -1108,6 +1121,9 @@ static ScheduledKernelResult ScheduleSingleKernel(
       } else if (t->WritesSpecialRegister(SpecialRegister::kPadValue)) {
         // set_copy_pad_value runs on the vector core (AIV).
         t->SetWarpgroupId(0);
+      } else if (t->WritesSpecialRegister(SpecialRegister::kAtomicMode)) {
+        // Pinned below, once every store's warpgroup is known.
+        atomic_writers.push_back(t);
       } else if (t->UsesPipe(ResourcePipe::kScalar) || m == 0) {
         // A scalar / mask-0 task issues on the S pipe, but its warpgroup is
         // still fixed by the on-chip memory it touches: UB is AIV-side (wg0),
@@ -1132,6 +1148,25 @@ static ScheduledKernelResult ScheduleSingleKernel(
           t->SetWarpgroupId(kWarpgroupBroadcast);
         }
       }
+      // A store reads the atomic register; record which core it lands on. Its
+      // warpgroup is set above (fixpipe/MTE3 branches), so it is final here.
+      if (t->ReadsAtomicRegister()) {
+        int wg = t->GetWarpgroupId();
+        if (wg == 0)
+          store_wg_mask |= kDemandWg0;
+        else if (wg == 1)
+          store_wg_mask |= kDemandWg1;
+      }
+    }
+
+    // Pin each set_atomic to the storing warpgroup: one core -> that core;
+    // both -> broadcast (arms on each; a no-op on a unit that does not store).
+    if (!atomic_writers.empty() && store_wg_mask != 0) {
+      int atomic_wg = (store_wg_mask == kDemandWg0)   ? 0
+                      : (store_wg_mask == kDemandWg1) ? 1
+                                                      : kWarpgroupBroadcast;
+      for (auto *t : atomic_writers)
+        t->SetWarpgroupId(atomic_wg);
     }
   }
 

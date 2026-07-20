@@ -423,6 +423,58 @@ def set_hf32_mode(mode=None):
     )
 
 
+_ATOMIC_OPS = ("add", "max", "min")
+# Accumulate types the dav_3510 store-mode atomic supports (CANN
+# kernel_operator_set_atomic_impl.h: SupportType<float, half, int16_t, int32_t,
+# int8_t, bfloat16_t>).
+_ATOMIC_DTYPES = ("float32", "float", "float16", "bfloat16", "int8", "int16", "int32")
+
+
+def set_atomic(op="add", dtype="float32"):
+    """Arm an Ascend hardware store-mode atomic op.
+
+    Call once before the stores it should affect. With the flag armed, an
+    ordinary L0C->GM (``T.copy``) or UB->GM (``T.dual_copy``) store reduces into
+    GM (``D op= tile``) in hardware instead of overwriting — no vector loop.
+    Clear with :func:`set_atomic_none` to restore plain stores.
+
+    Generates ``AscendC::SetAtomic{Add,Max,Min}<T>()``.
+
+    Parameters
+    ----------
+    op : "add" | "max" | "min"
+        The store-mode reduction.
+    dtype : str
+        Accumulate type of the GM destination. One of float32/float16/bfloat16/
+        int8/int16/int32 (the dav_3510-supported set).
+
+    Example
+    -------
+    >>> T.set_atomic("add", "float32")   # arm
+    >>> # ... stores that should accumulate into GM ...
+    >>> T.set_atomic_none()              # restore
+    """
+    if op not in _ATOMIC_OPS:
+        raise ValueError(f"set_atomic op must be one of {_ATOMIC_OPS}, got {op!r}")
+    if dtype not in _ATOMIC_DTYPES:
+        raise ValueError(f"set_atomic dtype must be one of {_ATOMIC_DTYPES}, got {dtype!r}")
+    # Pass a typed zero so codegen reads its dtype to instantiate SetAtomic*<T>().
+    return tirx.call_intrin(
+        "void",
+        tirx.op.Op.get("tl.ascend_set_atomic"),
+        tirx.StringImm(op),
+        tirx.const(0, dtype),
+    )
+
+
+def set_atomic_none():
+    """Clear the Ascend store-mode atomic flag, restoring plain (overwrite) stores.
+
+    Call once to undo :func:`set_atomic`.
+    """
+    return tirx.call_intrin("void", tirx.op.Op.get("tl.ascend_set_atomic_none"))
+
+
 __all__ = [
     "ascend_pipe_barrier",
     "ascend_set_flag",
@@ -438,4 +490,6 @@ __all__ = [
     "ascend_get_buf",
     "ascend_rls_buf",
     "set_hf32_mode",
+    "set_atomic",
+    "set_atomic_none",
 ]

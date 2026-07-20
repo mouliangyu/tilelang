@@ -3,13 +3,17 @@ import tilelang.language as T
 from tilelang.profiler import do_bench
 
 
-def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", out_dtype="float32", MIXED=None, hf32=None, enable_unit_flag=True):
+def gemm(
+    M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", out_dtype="float32", MIXED=None, hf32=None, enable_unit_flag=True, acc=False
+):
     """Auto-scheduled GEMM.
 
     dtype: 'bfloat16' or 'float32'.
     out_dtype: 'bfloat16' or 'float32'.
     MIXED: True/False/None (auto: bf16→mixed, fp32→cube-only).
     hf32: None (off) / 'nearest_zero' / 'nearest_even' (fp32 only).
+    acc: if True, accumulate ``C += A @ B^T`` into the pre-initialized output via
+         a store-mode atomic (``T.set_atomic``); C is then an in/out buffer.
     """
     NUM_BLOCKS = 32
     is_fp32 = dtype == "float32"
@@ -63,6 +67,10 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", out_dtype="float3
             w_l1 = T.alloc_l1((TILE_N, TILE_K), dtype)
             temp = T.alloc_shared((TILE_M // 2, TILE_N), out_dtype)
 
+            # Accumulate C += A @ B^T: arm a store-mode atomic once, so the ordinary
+            # epilogue store below does an in-hardware read-modify-write into C.
+            if acc:
+                T.set_atomic("add", out_dtype)
             for tile_idx in T.Persistent([OUT_TILES], NUM_BLOCKS, bx):
                 m_tile, n_tile = aswt_swizzle(tile_idx)
                 for kt in T.Pipelined(K_TILES, num_stages=NUM_STAGES):
@@ -74,6 +82,8 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", out_dtype="float3
                     T.dual_copy(temp, C[m_tile * TILE_M : (m_tile + 1) * TILE_M, n_tile * TILE_N : (n_tile + 1) * TILE_N])
                 else:
                     T.copy(res, C[m_tile * TILE_M, n_tile * TILE_N], unit_flag_ctrl=UF_3)
+            if acc:
+                T.set_atomic_none()
 
     return main
 
@@ -81,10 +91,14 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", out_dtype="float3
 import torch
 
 
-def ref_program(x, w, out_dtype="float32"):
+def ref_program(x, w, c=None, out_dtype="float32"):
     if out_dtype == "bfloat16":
-        return (x @ w.T).to(torch.bfloat16)
-    return x.float() @ w.float().T
+        out = (x @ w.T).to(torch.bfloat16)
+    else:
+        out = x.float() @ w.float().T
+    if c is not None:
+        out = out + c
+    return out
 
 
 def run_regression_perf(M=8192, K=8192, N=8192, dtype="bfloat16", hf32=None):
@@ -114,23 +128,34 @@ if __name__ == "__main__":
     device = torch.device("npu")
     M, K, N = 8192, 8192, 8192
 
-    test_pairs = [
-        ("float8_e4m3fn", 1e-1, "float32"),
-        ("bfloat16", 1e-2, "float32"),
-        ("float32", 5e-3, "float32"),
-        ("bfloat16", 1e-2, "bfloat16"),
+    # (label, dtype, out_dtype, hf32, acc, threshold)
+    cases = [
+        ("fp8", "float8_e4m3fn", "float32", None, False, 1e-1),
+        ("bf16", "bfloat16", "float32", None, False, 1e-2),
+        ("fp32", "float32", "float32", None, False, 5e-3),
+        ("bf16 out=bf16", "bfloat16", "bfloat16", None, False, 1e-2),
+        ("fp32 HF32", "float32", "float32", "nearest_even", False, 2e-1),
+        ("bf16 acc", "bfloat16", "float32", None, True, 5e-3),
+        ("bf16 acc out=bf16", "bfloat16", "bfloat16", None, True, 1e-2),
     ]
 
-    for dt, thresh, out_dt in test_pairs:
-        print(f"\n=== {dt} GEMM ===")
-        program = gemm(M, K, N, dtype=dt, out_dtype=out_dt)
-        kernel = tilelang.compile(program, out_idx=-1)
+    for label, dt, out_dt, hf32, acc, thresh in cases:
+        print(f"\n=== {label} GEMM ===")
+        kernel = tilelang.compile(
+            gemm(M, K, N, dtype=dt, out_dtype=out_dt, hf32=hf32, acc=acc),
+            out_idx=None if acc else -1,
+        )
         print("Compilation succeeded!")
 
         x = torch.randn(M, K, device=device).to(dtype=getattr(torch, dt))
         w = torch.randn(N, K, device=device).to(dtype=getattr(torch, dt))
+        c0 = torch.randn(M, N, device=device, dtype=getattr(torch, out_dt)) if acc else None
 
-        c = kernel(x, w)
+        if acc:
+            c = c0.clone()  # atomic-add accumulates into the output in place
+            kernel(x, w, c)
+        else:
+            c = kernel(x, w)
         torch.npu.synchronize()
 
         expected = ref_program(x, w, out_dtype=out_dt)
@@ -139,31 +164,11 @@ if __name__ == "__main__":
 
         # Quick benchmark
         NUM_REPEATS = 100 if dt == "bfloat16" else 50
+        args = (x, w, c) if acc else (x, w)
 
-        def run_kernel(kernel=kernel, x=x, w=w):
-            return kernel(x, w)
+        def run_kernel(kernel=kernel, args=args):
+            return kernel(*args)
 
         latency_ms = do_bench(run_kernel, backend="msprof", _n_warmup=30, _n_repeat=NUM_REPEATS)
         flops = 2.0 * M * N * K
         print(f"  {latency_ms:.3f} ms/iter  |  {flops / (latency_ms / 1e3) / 1e12:.1f} TFLOPS")
-
-    # HF32 benchmark
-    print("\n=== float32 HF32 GEMM ===")
-    program = gemm(M, K, N, dtype="float32", hf32="nearest_even")
-    kernel = tilelang.compile(program, out_idx=-1)
-    print("Compilation succeeded!")
-    x = torch.randn(M, K, dtype=torch.float32, device=device)
-    w = torch.randn(N, K, dtype=torch.float32, device=device)
-    c = kernel(x, w)
-    torch.npu.synchronize()
-    expected = ref_program(x, w)
-    max_diff = torch.max(torch.abs(c - expected)).item()
-    print(f"  max_diff={max_diff:.2e} (HF32 rel_err ~3e-4)")
-    NUM_REPEATS = 50
-
-    def run_kernel():
-        return kernel(x, w)
-
-    latency_ms = do_bench(run_kernel, backend="msprof", _n_warmup=30, _n_repeat=NUM_REPEATS)
-    flops = 2.0 * M * N * K
-    print(f"  {latency_ms:.3f} ms/iter  |  {flops / (latency_ms / 1e3) / 1e12:.1f} TFLOPS")

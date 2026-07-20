@@ -1148,6 +1148,27 @@ TVM_DLL const Op &ascend_rls_buf();
 TVM_DLL const Op &ascend_set_hf32_mode();
 
 /*!
+ * \brief Ascend arm a hardware store-mode atomic op for GM stores.
+ *
+ * ascend_set_atomic(op_str, typed_zero)
+ *   op_str:     "add" | "max" | "min"
+ *   typed_zero: a constant whose dtype selects the accumulate type T
+ *               (float / half / int16 / int32 / int8 / bfloat16).
+ *
+ * Emits AscendC::SetAtomic{Add,Max,Min}<T>(). Arm once; subsequent L0C->GM /
+ * UB->GM stores reduce into GM in hardware. Clear with
+ * ascend_set_atomic_none().
+ */
+TVM_DLL const Op &ascend_set_atomic();
+
+/*!
+ * \brief Ascend clear the store-mode atomic flag (restore plain store).
+ *
+ * ascend_set_atomic_none()
+ */
+TVM_DLL const Op &ascend_set_atomic_none();
+
+/*!
  * \brief Programmatic dependency trigger.
  *
  * pdl_trigger()

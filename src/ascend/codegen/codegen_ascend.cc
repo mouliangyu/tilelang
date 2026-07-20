@@ -1070,6 +1070,24 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
                                  : "HF32TransMode::NEAREST_EVEN")
                    << ");\n";
     }
+  } else if (op->op.same_as(tl::ascend_set_atomic())) {
+    ICHECK_EQ(op->args.size(), 2)
+        << "tl.ascend_set_atomic expects 2 arguments (op_str, typed_zero)";
+    std::string atomic_op = Downcast<StringImm>(op->args[0])->value;
+    const char *fn = atomic_op == "max"   ? "SetAtomicMax"
+                     : atomic_op == "min" ? "SetAtomicMin"
+                                          : "SetAtomicAdd";
+    ICHECK(atomic_op == "add" || atomic_op == "max" || atomic_op == "min")
+        << "tl.ascend_set_atomic op must be add/max/min, got " << atomic_op;
+    this->PrintIndent();
+    this->stream << "AscendC::" << fn << "<";
+    this->PrintType(op->args[1].dtype(), this->stream);
+    this->stream << ">();\n";
+  } else if (op->op.same_as(tl::ascend_set_atomic_none())) {
+    ICHECK_EQ(op->args.size(), 0)
+        << "tl.ascend_set_atomic_none expects no arguments";
+    this->PrintIndent();
+    this->stream << "AscendC::SetAtomicNone();\n";
   } else if (op->op.same_as(tl::ascend_reduce_add())) {
     os << "asc_reduce_add(" << PrintExpr(op->args[0]) << ")";
   } else if (op->op.same_as(tl::ascend_reduce_max())) {

@@ -59,6 +59,29 @@ def test_gemm_auto_fp32():
     _test("float32", 5e-3)
 
 
+def _test_acc(out_dtype, thresh):
+    """C += A @ B^T via store-mode atomic; C is an in/out buffer."""
+    M, K, N = 8192, 8192, 8192
+    device = torch.device("npu")
+    kernel = tilelang.compile(gemm(M, K, N, dtype="bfloat16", out_dtype=out_dtype, acc=True))
+    x = torch.randn(M, K, device=device, dtype=torch.bfloat16)
+    w = torch.randn(N, K, device=device, dtype=torch.bfloat16)
+    c0 = torch.randn(M, N, device=device, dtype=getattr(torch, out_dtype))
+    expected = ref_program(x, w, out_dtype=out_dtype, c=c0)
+    c = c0.clone()
+    kernel(x, w, c)
+    torch.npu.synchronize()
+    # Relative error: bf16 output rounds each element, so a max-abs bound is
+    # dominated by rounding of large K=8192 accumulations.
+    rel = (c.float() - expected.float()).abs().mean().item() / expected.float().abs().mean().clamp_min(1e-6).item()
+    assert rel < thresh, f"acc out={out_dtype} rel={rel:.2e}"
+
+
+def test_gemm_auto_acc():
+    _test_acc("float32", 1e-2)
+    _test_acc("bfloat16", 1e-2)
+
+
 def test_gemm_auto_fp32_hf32():
     M, K, N = 8192, 8192, 8192
     device = torch.device("npu")
@@ -85,3 +108,5 @@ if __name__ == "__main__":
     print("PASS: test_gemm_auto_bf16_pto")
     test_gemm_auto_fp8_pto()
     print("PASS: test_gemm_auto_fp8_pto")
+    test_gemm_auto_acc()
+    print("PASS: test_gemm_auto_acc")
