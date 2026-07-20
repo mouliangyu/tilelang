@@ -98,12 +98,20 @@ def z3_schedule_python(
 
     assert Z3_AVAILABLE, "z3-solver package is required but not installed"
 
+    # Use a private Z3 context so this solve is isolated from global-context
+    # state accumulated by other solves in the same process (see the loop
+    # scheduler for why this is required for deterministic results).
+    ctx = z3.Context()
+
     # Create Z3 solver
-    solver = z3.Optimize()
+    solver = z3.Optimize(ctx=ctx)
     solver.set("rlimit", 1000000)
+    # Pin the randomization seed and force single-threaded solving so the
+    # returned model is deterministic across identical runs.
+    solver.set("random_seed", 42)
 
     # Create start time variables
-    start_vars = [z3.Int(f"start_{i}") for i in range(n)]
+    start_vars = [z3.Int(f"start_{i}", ctx) for i in range(n)]
 
     # Add constraints: start times must be non-negative
     for var in start_vars:
@@ -125,7 +133,7 @@ def z3_schedule_python(
             ii_j = iis[j]
 
             # Create ordering variable
-            o_ij = z3.Bool(f"O_{i}_{j}")
+            o_ij = z3.Bool(f"O_{i}_{j}", ctx)
 
             # If o_ij is True (i before j), then start_j >= start_i + ii_i
             solver.add(z3.Implies(o_ij, start_vars[j] >= start_vars[i] + ii_i))
@@ -137,7 +145,7 @@ def z3_schedule_python(
                 print(f"[Python Z3] Resource dependency between {i} and {j}: ii_i={ii_i}, ii_j={ii_j}")
 
     # Objective: minimize maximum completion time (makespan)
-    makespan = z3.Int("makespan")
+    makespan = z3.Int("makespan", ctx)
     for i in range(n):
         latency_i = latencies[i]
         solver.add(makespan >= start_vars[i] + latency_i)
@@ -297,6 +305,12 @@ def z3_schedule_loop_python(
 
     assert Z3_AVAILABLE, "z3-solver package is required but not installed"
 
+    # Use a private Z3 context so this solve is isolated from any global-context
+    # state accumulated by other solves in the same process. Sharing the global
+    # context makes repeated identical solves return different (equally valid)
+    # models run-to-run; a fresh context per call keeps the result deterministic.
+    ctx = z3.Context()
+
     # Binary search for minimal II
     # Lower bound: 1 cycle
     # Upper bound: sum of all latencies (conservative)
@@ -315,14 +329,13 @@ def z3_schedule_loop_python(
             print(f"[Python Z3 Loop] Testing II = {ii_mid}")
 
         # Create solver for feasibility check
-        solver = z3.Solver()
+        solver = z3.Solver(ctx=ctx)
         if seed is not None:
             solver.set("random_seed", seed)
-            solver.set("smt.random_seed", seed)
         solver.set("rlimit", 1000000)
 
-        k_vars = [z3.Int(f"k_{i}") for i in range(n)]
-        r_vars = [z3.Int(f"r_{i}") for i in range(n)]
+        k_vars = [z3.Int(f"k_{i}", ctx) for i in range(n)]
+        r_vars = [z3.Int(f"r_{i}", ctx) for i in range(n)]
         start_vars = [k_vars[i] * ii_mid + r_vars[i] for i in range(n)]
 
         for i in range(n):
@@ -330,7 +343,7 @@ def z3_schedule_loop_python(
             solver.add(r_vars[i] >= 0)
             solver.add(r_vars[i] < ii_mid)
 
-        buffer_vars = [z3.Int(f"buf_{i}") for i in range(len(buffer_sizes))]
+        buffer_vars = [z3.Int(f"buf_{i}", ctx) for i in range(len(buffer_sizes))]
         for i in range(len(buffer_sizes)):
             solver.add(buffer_vars[i] >= 1)
             solver.add(buffer_vars[i] <= num_stages)
@@ -363,7 +376,7 @@ def z3_schedule_loop_python(
                 ii_j = iis[j]
 
                 # Create ordering variable
-                o_ij = z3.Bool(f"O_{i}_{j}")
+                o_ij = z3.Bool(f"O_{i}_{j}", ctx)
 
                 solver.add(z3.Implies(o_ij, r_vars[j] - r_vars[i] >= ii_i))
                 solver.add(z3.Implies(o_ij, r_vars[i] - r_vars[j] + ii_mid >= ii_j))
@@ -727,6 +740,7 @@ def z3_schedule_loop_ffi(
             memory_groups_list,
             stage_order_deps_list,
             enable_offset=bool(enable_offset),
+            seed=42,
         )
 
     # Return start_times and buffer_versions as separate arrays for easier FFI handling

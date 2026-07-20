@@ -384,13 +384,18 @@ AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
   const size_t n = nodes.size();
   std::vector<DepInfo> deps;
 
-  std::set<const VarNode *> storage_keys;
+  std::vector<const VarNode *> storage_keys;
+  std::unordered_set<const VarNode *> storage_keys_seen;
+  auto add_storage_key = [&](const VarNode *key) {
+    if (storage_keys_seen.insert(key).second)
+      storage_keys.push_back(key);
+  };
   for (size_t i = 0; i < n; ++i) {
     for (const auto &region : nodes[i]->GetReadRegions()) {
-      storage_keys.insert(StorageKey(region->buffer));
+      add_storage_key(StorageKey(region->buffer));
     }
     for (const auto &region : nodes[i]->GetWriteRegions()) {
-      storage_keys.insert(StorageKey(region->buffer));
+      add_storage_key(StorageKey(region->buffer));
     }
   }
 

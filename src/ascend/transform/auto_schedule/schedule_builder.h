@@ -300,7 +300,11 @@ public:
     // Then we need to add variables and constraints in Z3 scheduler for these
     // buffers.
     std::vector<int64_t> buffer_sizes;
-    std::map<const VarNode *, std::vector<Buffer>> storage_to_buffers;
+    // Insertion-order-preserving storage->buffers map. The ordered key vector
+    // is iterated in first-encountered (program) order rather than pointer
+    // order, so buffer id assignment fed to Z3 is deterministic run-to-run.
+    std::vector<const VarNode *> storage_keys_ordered;
+    std::unordered_map<const VarNode *, std::vector<Buffer>> storage_to_buffers;
     std::map<Buffer, size_t> buffer_var_id;
     // Build memory groups from memory_limits_ map.
     // std::map iteration is ordered by key: "shared" then "shared.l1".
@@ -347,7 +351,13 @@ public:
           !IsL0BBuffer(buffer)) {
         return; // Only consider on-chip buffers for multi-buffer
       }
-      auto &aliases = storage_to_buffers[buffer->data.get()];
+      const VarNode *key = buffer->data.get();
+      auto it = storage_to_buffers.find(key);
+      if (it == storage_to_buffers.end()) {
+        storage_keys_ordered.push_back(key);
+        it = storage_to_buffers.emplace(key, std::vector<Buffer>{}).first;
+      }
+      auto &aliases = it->second;
       bool seen_alias = false;
       for (const auto &alias : aliases) {
         if (alias.same_as(buffer)) {
@@ -359,7 +369,8 @@ public:
         aliases.push_back(buffer);
     });
 
-    for (const auto &[storage_key, buffers] : storage_to_buffers) {
+    for (const auto *storage_key : storage_keys_ordered) {
+      const auto &buffers = storage_to_buffers.at(storage_key);
       ICHECK(!buffers.empty());
       const Buffer &buffer = buffers.front();
       std::string scope;
