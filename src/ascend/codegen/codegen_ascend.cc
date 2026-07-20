@@ -2610,14 +2610,23 @@ inline void PrintConst(const FloatImmNode *op, std::ostream &os,
       op->dtype.is_float()) {
     std::ostringstream temp;
     if (std::isinf(op->value)) {
-      temp << "AscendC::NumericLimits<";
-      p->PrintType(op->dtype, temp);
-      temp << ">::" << (op->value < 0 ? "NegativeInfinity" : "Infinity")
-           << "()";
+      temp << "tl::limits::";
+      if (op->dtype.is_float()) {
+        temp << (op->value < 0 ? "kFloatNInf" : "kFloatInf");
+      } else if (op->dtype.is_float16()) {
+        temp << (op->value < 0 ? "kHalfNInf" : "kHalfInf");
+      } else {
+        temp << (op->value < 0 ? "kBf16NInf" : "kBf16Inf");
+      }
     } else if (std::isnan(op->value)) {
-      temp << "AscendC::NumericLimits<";
-      p->PrintType(op->dtype, temp);
-      temp << ">::QuietNaN()";
+      temp << "tl::limits::";
+      if (op->dtype.is_float()) {
+        temp << "kFloatNaN";
+      } else if (op->dtype.is_float16()) {
+        temp << "kHalfNaN";
+      } else {
+        temp << "kBf16NaN";
+      }
     } else {
       p->PrintType(op->dtype, temp);
       temp << '(' << std::hexfloat << op->value << 'f';

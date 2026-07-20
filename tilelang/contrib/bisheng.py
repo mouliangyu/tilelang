@@ -93,7 +93,9 @@ def compile_ascend(
     file_target = path_target if path_target else temp_target
 
     cmd = [find_bisheng_path()]
-    cmd += ["-fPIC"]
+    cmd += ["-fPIC", "-std=c++20"]
+    # Avoid using mmap to write linker output, thus more friendly for distributed FS
+    cmd += ["-Wl,--no-mmap-output-file"]
     if target_format == "so":
         cmd += ["-shared"]
     else:

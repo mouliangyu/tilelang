@@ -163,6 +163,9 @@ class LibraryGenerator:
             command = [
                 find_bisheng_path(),
                 "-fPIC",
+                "-std=c++20",
+                # Avoid using mmap to write linker output, thus more friendly for distributed FS
+                "-Wl,--no-mmap-output-file",
                 "--shared",
                 src.name,
             ]
