@@ -76,7 +76,7 @@ struct ascend_nd2nz_scatter_impl<
       __ubuf__ T *srcBase = src_ub + pass * VL_T;
       for (int r = 0; r < ROWS; ++r) {
         auto reg = V::vlds(srcBase + r * COLS, 0, NORM);
-        V::vsstb(reg, dstPtr, STRIDE, mask, POST_UPDATE);
+        dstPtr = V::vsstb(reg, dstPtr, STRIDE, mask, POST_UPDATE);
       }
       ++pass;
     }
@@ -107,8 +107,8 @@ struct ascend_nd2nz_scatter_impl<ROWS, COLS, float, bfloat16_t,
         auto castReg = V::vcvt<bfloat16_t>(srcReg, f32Mask, ROUND_R, RS_DISABLE,
                                            PART_EVEN, MODE_ZEROING);
         auto packReg = V::vpack<uint16_t>((V::vec_t<uint32_t> &)castReg, LOWER);
-        V::vsstb((V::vec_t<bfloat16_t> &)packReg, dstPtr, STRIDE, bf16Mask,
-                 POST_UPDATE);
+        dstPtr = V::vsstb((V::vec_t<bfloat16_t> &)packReg, dstPtr, STRIDE,
+                          bf16Mask, POST_UPDATE);
       }
     }
   }
@@ -151,8 +151,8 @@ struct ascend_nd2nz_scatter_impl<ROWS, COLS, bfloat16_t, float,
         auto dst_lo = V::vcvt<float>(src, bf16Mask, PART_EVEN, MODE_ZEROING);
         auto dst_hi = V::vcvt<float>(src, bf16Mask, PART_ODD, MODE_ZEROING);
         auto [dst_half0, dst_half1] = V::vintlv(dst_lo, dst_hi);
-        V::vsstb(dst_half0, dstPtr0, STRIDE, f32Mask, POST_UPDATE);
-        V::vsstb(dst_half1, dstPtr1, STRIDE, f32Mask, POST_UPDATE);
+        dstPtr0 = V::vsstb(dst_half0, dstPtr0, STRIDE, f32Mask, POST_UPDATE);
+        dstPtr1 = V::vsstb(dst_half1, dstPtr1, STRIDE, f32Mask, POST_UPDATE);
       }
     }
   }

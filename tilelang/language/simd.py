@@ -213,7 +213,7 @@ def vld(addr, dist="NORM", off=None):
     return tirx.call_intrin(vec_dtype, _Op("tl.simd.vld"), *args)
 
 
-_VLD2_DISTS = ("DINTLV_B8", "DINTLV_B16")
+_VLD2_DISTS = ("DINTLV_B8", "DINTLV_B16", "DINTLV_B32")
 
 
 def vld2(addr, dist="DINTLV_B16", off=None):
@@ -222,6 +222,7 @@ def vld2(addr, dist="DINTLV_B16", off=None):
     Supported dists:
       - ``DINTLV_B8``: load 512×u8/fp8 → two 256-lane regs (even/odd bytes)
       - ``DINTLV_B16``: load 256×bf16/u16 → two 128-lane regs
+      - ``DINTLV_B32``: load 128×f32/u32 → two 64-lane regs
 
     The access_ptr footprint is always 2× the single-vector width. This is an
     opaque memory load: the pair is bound once at this program point so the two
@@ -282,13 +283,51 @@ def vsts(addr, src, mask=None, dist="NORM_B32", off=None, extent=None):
     return tirx.call_intrin("void", _Op("tl.simd.vsts"), *args)
 
 
-def vsstb(src, base, stride, mask=None):
-    """Scatter-store 32B blocks with block stride: vsstb(src, base, stride, mask)."""
+def vsstb(src, base, stride, mask=None, update=False):
+    """Scatter-store 32B blocks with an optional POST_UPDATE pointer.
+
+    Passing a regular buffer access performs a store and returns ``void``.
+    Set ``update=True`` with the mutable handle returned by
+    :func:`make_ubuf_ptr` to enable POST_UPDATE and return the advanced
+    pointer, which should be assigned back to the same handle::
+
+        dst_ptr = T.simd.make_ubuf_ptr(dst_ub[0], "bfloat16")
+        dst_ptr = T.simd.vsstb(src, dst_ptr, stride, mask, update=True)
+    """
     if mask is None:
         mask = _default_mask(src.dtype)
-    if isinstance(base, BufferLoad):
+    mutable_pointer = isinstance(base, BufferLoad) and base.buffer.scope() == "local.var" and str(base.dtype) == "handle"
+    if update and not mutable_pointer:
+        raise ValueError("vsstb update=True base must be a pointer from make_ubuf_ptr")
+    if isinstance(base, BufferLoad) and not mutable_pointer:
         base = access_ptr(base, "w", extent=_vreg_lanes(base.buffer.dtype))
-    return tirx.call_intrin("void", _Op("tl.simd.vsstb"), src, base, stride, mask)
+    args = [src, base, stride, mask]
+    if update:
+        args.append("POST_UPDATE")
+    return tirx.call_intrin(
+        "handle" if update else "void",
+        _Op("tl.simd.vsstb"),
+        *args,
+    )
+
+
+def make_ubuf_ptr(buf_access, dtype):
+    """Allocate a mutable UB pointer for POST_UPDATE :func:`vsstb` calls.
+
+    The pointer is carried by a ``local.var`` handle buffer. Assigning the
+    handle returned by :func:`vsstb` writes it back into the same mutable
+    carrier::
+
+        dst_ptr = T.simd.make_ubuf_ptr(dst_ub[0], "bfloat16")
+        dst_ptr = T.simd.vsstb(src, dst_ptr, stride, mask, update=True)
+    """
+    if isinstance(buf_access, BufferLoad):
+        buf_access = access_ptr(buf_access, "rw")
+    elif str(buf_access.dtype) != "handle":
+        raise ValueError("make_ubuf_ptr expects a buffer access or handle expression")
+
+    pointer = _alloc_var("handle", buf_access, scope="local.var")
+    return pointer
 
 
 # -- Binary arithmetic ------------------------------------------------------------

@@ -1932,9 +1932,11 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << ");\n";
   }
 
-  // --- SimdVF scatter-store blocks: (src, base, stride, mask) ---
+  // --- SimdVF scatter-store blocks: (src, base, stride, mask [, post]) ---
   else if (op->op.same_as(tl::simd_vsstb())) {
-    ICHECK_EQ(op->args.size(), 4);
+    ICHECK(op->args.size() == 4 || op->args.size() == 5);
+    bool post_update = op->args.size() == 5;
+    ICHECK_EQ(op->dtype.is_handle(), post_update);
     DataType dtype = op->args[0].dtype().element_of();
     // Capture operands first so SSA temporaries (e.g. from reinterpret) are
     // emitted on their own lines before the call statement.
@@ -1942,10 +1944,20 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::string base = this->PrintExpr(op->args[1]);
     std::string stride = this->PrintExpr(op->args[2]);
     std::string mask = this->PrintExpr(op->args[3]);
-    this->PrintIndent();
-    this->stream << "simd_inst::vsstb(" << src << ", (__ubuf__ "
-                 << CCEUBufType(dtype) << "*)" << base << ", " << stride << ", "
-                 << mask << ");\n";
+    if (post_update) {
+      // Keep POST_UPDATE as an expression so the frontend can write the
+      // advanced pointer back into its mutable handle carrier.
+      std::string post = Downcast<StringImm>(op->args[4])->value;
+      ICHECK_EQ(post, "POST_UPDATE");
+      os << "simd_inst::vsstb(" << src << ", (__ubuf__ " << CCEUBufType(dtype)
+         << "*)" << base << ", " << stride << ", " << mask << ", " << post
+         << ")";
+    } else {
+      this->PrintIndent();
+      this->stream << "simd_inst::vsstb(" << src << ", (__ubuf__ "
+                   << CCEUBufType(dtype) << "*)" << base << ", " << stride
+                   << ", " << mask << ");\n";
+    }
   }
   // --- SimdVF scatter-store: (src, base, index, mask) ---
   else if (op->op.same_as(tl::simd_vscatter())) {
@@ -2489,7 +2501,10 @@ void CodeGenTileLangAscend::VisitStmt_(const AllocBufferNode *op) {
         << "local.var should be scalar";
     DataType dtype = op->buffer->dtype;
     std::string vid = AllocVarID(op->buffer->data.get());
-    PrimExpr init = tirx::make_const(dtype, 0);
+    ffi::Optional<PrimExpr> init;
+    if (!dtype.is_handle()) {
+      init = tirx::make_const(dtype, 0);
+    }
     auto init_it = op->annotations.find(tl::attr::kLocalVarInit);
     if (init_it != op->annotations.end()) {
       PrimExpr user_init = Downcast<PrimExpr>((*init_it).second);
@@ -2499,9 +2514,18 @@ void CodeGenTileLangAscend::VisitStmt_(const AllocBufferNode *op) {
       init = user_init;
     }
     PrintIndent();
-    PrintType(dtype, stream);
+    if (dtype.is_handle()) {
+      // Handle local variables are exclusively mutable UB pointers in SimdVF.
+      stream << "__ubuf__ void*";
+    } else {
+      PrintType(dtype, stream);
+    }
     stream << " " << vid << " = ";
-    PrintExpr(init, stream);
+    if (init.defined()) {
+      PrintExpr(init.value(), stream);
+    } else {
+      stream << "nullptr";
+    }
     stream << ";\n";
     alloc_storage_scope_[op->buffer->data.get()] = scope;
     RegisterHandleType(op->buffer->data.get(), dtype);

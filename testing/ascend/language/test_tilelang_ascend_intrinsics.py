@@ -205,6 +205,51 @@ def test_ascend_simd_3510_intrinsics_codegen():
     print(source)
 
 
+def test_ascend_simd_vsstb_threads_pointer_state():
+    """POST_UPDATE returns a handle that updates one mutable pointer."""
+
+    @T.prim_func
+    def func(A: T.Buffer((256,), "bfloat16"), B: T.Buffer((256,), "bfloat16")):
+        with T.Kernel(1) as _:
+            a_ub = T.alloc_shared((256,), "bfloat16")
+            b_ub = T.alloc_shared((256,), "bfloat16")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                mask = T.simd.pset(16)
+                src = T.simd.vld(a_ub[0])
+                dst_ptr = T.simd.make_ubuf_ptr(b_ub[0], "bfloat16")
+                dst_ptr = T.simd.vsstb(src, dst_ptr, T.int32((3 << 16) | 1), mask, update=True)
+                dst_ptr = T.simd.vsstb(src, dst_ptr, T.int32((3 << 16) | 1), mask, update=True)
+                T.simd.mem_bar("VST_VLD")
+            T.copy(b_ub, B)
+
+    pointer_stores = []
+
+    def visit(node):
+        if isinstance(node, tirx.BufferStore) and node.buffer.scope() == "local.var" and node.buffer.dtype == "handle":
+            pointer_stores.append(node)
+
+    tirx.stmt_functor.post_order_visit(func.body, visit)
+    assert len(pointer_stores) == 3
+    pointer = pointer_stores[0].buffer
+    for store in pointer_stores:
+        assert store.buffer.same_as(pointer)
+
+    for store in pointer_stores[1:]:
+        update = store.value
+        assert isinstance(update, Call)
+        assert _op_name(update) == "tl.simd.vsstb"
+        assert update.dtype == "handle"
+        assert update.args[1].dtype == "handle"
+        assert str(update.args[4]) == '"POST_UPDATE"'
+
+    source = lower(func, target="ascend").kernel_source
+    print(source)
+    assert "__ubuf__ void* dst_ptr" in source
+    assert source.count("simd_inst::vsstb(") == 2
+    assert source.count("POST_UPDATE") == 2
+
+
 def test_ascend_simd_vld2_dintlv_b16_codegen():
     """Compile-only check that S.vld2(DINTLV_B16) lowers to simd_inst::vld_x2."""
 
@@ -225,6 +270,28 @@ def test_ascend_simd_vld2_dintlv_b16_codegen():
     print(source)
     assert "simd_inst::vld_x2<" in source
     assert "DINTLV_B16" in source
+
+
+def test_ascend_simd_vld2_dintlv_b32_codegen():
+    """Compile-only check that S.vld2(DINTLV_B32) supports float32."""
+
+    @T.prim_func
+    def func(A: T.Buffer((128,), "float32"), B: T.Buffer((128,), "float32")):
+        with T.Kernel(1) as _:
+            a_ub = T.alloc_shared((128,), "float32")
+            b_ub = T.alloc_shared((128,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                m32 = T.simd.pset(32)
+                x0, x1 = T.simd.vld2(a_ub[0], dist="DINTLV_B32")
+                T.simd.vsts(b_ub[0], x0, m32, dist="NORM_B32")
+                T.simd.vsts(b_ub[64], x1, m32, dist="NORM_B32")
+            T.copy(b_ub, B)
+
+    source = lower(func, target="ascend").kernel_source
+    print(source)
+    assert "simd_inst::vld_x2<" in source
+    assert "DINTLV_B32" in source
 
 
 def test_ascend_simd_vld2_dintlv_b8_codegen():

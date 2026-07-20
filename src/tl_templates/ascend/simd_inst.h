@@ -663,9 +663,11 @@ __simd_callee__ inline void vsstb(vec_t<T> src, __ubuf__ T *base,
 }
 
 template <typename T, typename Post>
-__simd_callee__ inline void vsstb(vec_t<T> src, __ubuf__ T *&base,
-                                  int32_t stride, vector_bool mask, Post post) {
+__simd_callee__ inline __ubuf__ T *vsstb(vec_t<T> src, __ubuf__ T *base,
+                                         int32_t stride, vector_bool mask,
+                                         Post post) {
   ::vsstb(src, base, stride, mask, post);
+  return base;
 }
 
 template <typename T, typename Dist>
