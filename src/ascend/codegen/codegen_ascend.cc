@@ -133,6 +133,21 @@ void CodeGenTileLangAscend::Init(bool output_ssa) {
   decl_stream << "#include <tl_templates/ascend/debug.h>\n";
 }
 
+void CodeGenTileLangAscend::PrintFuncPrefix(std::ostream &os) {
+  os << "extern \"C\" ";
+  switch (kernel_mode_) {
+  case AscendKernelMode::kMix:
+    os << "__global__ __mix__(1, " << mix_aiv_count_ << ") ";
+    break;
+  case AscendKernelMode::kVector:
+    os << "__global__ __vector__ ";
+    break;
+  case AscendKernelMode::kCube:
+    os << "__global__ __cube__ ";
+    break;
+  }
+}
+
 void CodeGenTileLangAscend::PrintCCEVectorSuffix(DataType t, std::ostream &os) {
   os << CCEVectorSuffix(t);
 }
@@ -401,17 +416,6 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   bool no_alias = f->HasNonzeroAttr(tirx::attr::kNoAlias);
 
   this->PrintFuncPrefix(stream);
-  switch (kernel_mode_) {
-  case AscendKernelMode::kMix:
-    this->stream << "__global__ __mix__(1, " << mix_aiv_count_ << ") ";
-    break;
-  case AscendKernelMode::kVector:
-    this->stream << "__global__ __vector__ ";
-    break;
-  case AscendKernelMode::kCube:
-    this->stream << "__global__ __cube__ ";
-    break;
-  }
   CodeGenC::PrintType(f->ret_type, stream);
   CodeGenC::PrintExtraAttrs(f, stream);
   this->stream << " " << static_cast<std::string>(global_symbol.value()) << "(";
@@ -459,110 +463,10 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   this->EndScope(func_scope);
   this->PrintIndent();
   this->stream << "}\n\n";
-
-  // Emit the tvm_ffi launcher alongside the kernel so the bisheng-compiled .so
-  // exports a stable `extern "C"` entry the AscendModule can dlsym.
-  this->PrintKernelLauncher(f, static_cast<std::string>(global_symbol.value()));
 }
 
 void CodeGenTileLangAscend::PreFunctionBody(const PrimFunc &f) {
   this->stream << "  AscendC::InitSocState();\n";
-}
-
-void CodeGenTileLangAscend::PrintKernelLauncher(
-    const PrimFunc &f, const std::string &global_symbol) {
-  // The launcher receives kernel arguments by address (cuda-style void**, see
-  // PackFuncVoidAddr): void_args[i] points to argument i. Pointer params hold a
-  // `void*` at that address; scalar params hold the scalar value.
-  //
-  // grid (flattened blockIdx extent) and smem (dynamic shared-memory bytes) are
-  // baked here from the PrimFunc's `thread_extent` / `dyn_shared_memory_buf`
-  // attrs, mirroring the cython host wrapper. We deliberately do NOT use the
-  // grid/smem passed by the runtime: the upstream LaunchParamConfig folds
-  // Ascend-specific launch tags such as `cthread`/`vthread` into the grid dims,
-  // which would corrupt the launch grid. The stream is taken from the caller.
-  //
-  // The grid is rendered as a C++ expression (not just a static literal) so
-  // that dynamic launch bounds such as `blockIdx.x = ceildiv(num_tokens, ...)`
-  // resolve at runtime against the scalar params, matching the cython path.
-  ffi::Optional<PrimExpr> grid_expr;
-  if (auto opt = f->GetAttr<ffi::Map<ffi::String, PrimExpr>>("thread_extent")) {
-    for (const auto &kv : opt.value()) {
-      const std::string tag = kv.first;
-      if (tag.compare(0, 9, "blockIdx.") == 0) {
-        grid_expr =
-            grid_expr.defined() ? (grid_expr.value() * kv.second) : kv.second;
-      }
-    }
-  }
-  int64_t smem = 0;
-  if (auto opt = f->GetAttr<Integer>("dyn_shared_memory_buf")) {
-    smem = opt.value()->value;
-  }
-
-  std::ostringstream os;
-  os << "#ifdef __cplusplus\n";
-  os << "extern \"C\"\n";
-  os << "#endif\n";
-  os << "void __tl_launch_" << global_symbol
-     << "(void** void_args, uint32_t grid, uint32_t smem, void* stream) {\n";
-
-  // Build the unpacked argument list, casting each void_args[i] to the
-  // corresponding kernel parameter type. Scalar params are bound to named
-  // locals first so the grid expression (which may reference them) resolves.
-  std::vector<std::string> call_args;
-  for (size_t i = 0; i < f->params.size(); ++i) {
-    const tirx::Var &v = f->params[i];
-    if (v.dtype().is_handle()) {
-      // Pointer parameter: emit the fully-qualified pointer type (storage
-      // scope + element type) and load the pointer value from void_args[i].
-      std::ostringstream ty;
-      auto it = alloc_storage_scope_.find(v.get());
-      if (it != alloc_storage_scope_.end()) {
-        PrintStorageScope(it->second, ty);
-      }
-      if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
-        CodeGenC::PrintType(ptr->element_type, ty);
-      } else {
-        ty << "void";
-      }
-      std::ostringstream arg;
-      arg << "(*reinterpret_cast<" << ty.str() << "**>(void_args[" << i
-          << "]))";
-      call_args.push_back(arg.str());
-    } else {
-      // Scalar parameter: bind to a named local so a dynamic grid expression
-      // can reference it by name (via GetVarID / PrintExpr).
-      std::ostringstream ty;
-      CodeGenC::PrintType(v.dtype(), ty);
-      std::string vid = GetVarID(v.get());
-      os << "  " << ty.str() << " " << vid << " = (*reinterpret_cast<"
-         << ty.str() << "*>(void_args[" << i << "]));\n";
-      call_args.push_back(vid);
-    }
-  }
-
-  std::string joined;
-  for (size_t i = 0; i < call_args.size(); ++i) {
-    if (i != 0)
-      joined += ", ";
-    joined += call_args[i];
-  }
-
-  std::string grid_str;
-  if (grid_expr.defined()) {
-    arith::Analyzer analyzer;
-    grid_str = PrintExpr(analyzer.Simplify(grid_expr.value()));
-  } else {
-    grid_str = "1";
-  }
-
-  // Suppress unused-parameter warnings for the runtime-supplied grid/smem.
-  os << "  (void)grid; (void)smem;\n";
-  os << "  " << global_symbol << "<<<" << grid_str << ", " << smem
-     << ", stream>>>(" << joined << ");\n";
-  os << "}\n\n";
-  this->stream << os.str();
 }
 
 ffi::Array<Var>

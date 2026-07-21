@@ -155,8 +155,15 @@ private:
       // use the first appearance as def.
       if (!defined_thread.count(iv.get())) {
         defined_thread.insert(iv.get());
-        info_.launch_params.push_back(iv->thread_tag);
         thread_extent.Set(iv->thread_tag, op->value);
+        // Ascend launches only a grid of AI cores. Internal cthread/vthread
+        // domains belong to SimtVF regions and must not be interpreted as
+        // block dimensions by the generic runtime launch metadata.
+        std::string thread_tag = iv->thread_tag;
+        if (!TargetIsAscend(info_.target) ||
+            thread_tag.rfind("blockIdx.", 0) == 0) {
+          info_.launch_params.push_back(iv->thread_tag);
+        }
       }
     }
 

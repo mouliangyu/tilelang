@@ -4,14 +4,16 @@
 #include "support/check.h"
 #include <tvm/ffi/extra/module.h>
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/ir/transform.h>
 
 namespace tvm {
 
 // Defined in src/ascend/runtime/ascend_module.cc.
 namespace ascend {
 ffi::Module
-AscendModuleCreate(ffi::String source, ffi::String fmt,
-                   ffi::Map<ffi::String, runtime::FunctionInfo> fmap);
+AscendModuleCreate(ffi::Bytes code, ffi::String fmt,
+                   ffi::Map<ffi::String, runtime::FunctionInfo> fmap,
+                   ffi::Map<ffi::String, ffi::String> source);
 } // namespace ascend
 
 namespace codegen {
@@ -96,11 +98,21 @@ ffi::Module BuildTileLangAscend(IRModule mod, Target target) {
     code = (*f)(code, target).cast<std::string>();
   }
 
-  // Return a runnable Ascend module. The kernel source is bisheng-compiled
-  // lazily (on first launch) inside the module; on the tvm_ffi path the host
-  // stub resolves the kernel through tvm_call_packed -> GetFunction.
-  return ascend::AscendModuleCreate(ffi::String(code), ffi::String("asc"),
-                                    ExtractFuncInfo(mod));
+  std::string aibin;
+  if (const auto f =
+          ffi::Function::GetGlobal("tilelang_callback_ascend_compile")) {
+    tvm::transform::PassContext pass_ctx =
+        tvm::transform::PassContext::Current();
+    aibin = (*f)(code, target, pass_ctx->config).cast<std::string>();
+  } else {
+    ICHECK(false) << "tilelang_callback_ascend_compile is not registered";
+  }
+
+  ffi::Map<ffi::String, ffi::String> source_map;
+  source_map.Set("asc", ffi::String(code));
+  return ascend::AscendModuleCreate(ffi::Bytes(aibin.data(), aibin.size()),
+                                    ffi::String("aibin"), ExtractFuncInfo(mod),
+                                    std::move(source_map));
 }
 
 ffi::Module BuildTileLangAscendWithoutCompile(IRModule mod, Target target) {

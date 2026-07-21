@@ -68,6 +68,7 @@ class LibraryGenerator:
     def compile_lib(self, timeout: float = None):
         target = self.target
         verbose = self.verbose
+        extra_compile_options = [item for flag in (self.compile_flags or []) for item in flag.split()]
         if is_cuda_target(target):
             from tilelang.env import CUTLASS_INCLUDE_DIR
 
@@ -154,23 +155,31 @@ class LibraryGenerator:
             self.compile_pto_lib()
             return
         elif is_ascend_target(target):
-            from tilelang.contrib.bisheng import find_bisheng_path
+            from tilelang.contrib.bisheng import (
+                find_bisheng_path,
+                get_bisheng_compile_options,
+                get_npu_arch,
+                normalize_options,
+            )
 
             src = tempfile.NamedTemporaryFile(mode="w", suffix=".asc", delete=False)  # noqa: SIM115
             libpath = src.name.replace(".asc", ".so")
 
-            npu_arch = os.environ.get("ASCEND_NPU_ARCH", "dav-3510")
+            npu_arch = get_npu_arch()
+            configured_options = normalize_options((self.pass_configs or {}).get(PassConfigKey.TL_DEVICE_COMPILE_FLAGS))
+            explicit_options = normalize_options(self.compile_flags)
+            extra_compile_options = []
+            for option in [*configured_options, *explicit_options]:
+                if option not in extra_compile_options:
+                    extra_compile_options.append(option)
             command = [
                 find_bisheng_path(),
-                "-fPIC",
-                "-std=c++20",
+                *get_bisheng_compile_options(npu_arch),
                 # Avoid using mmap to write linker output, thus more friendly for distributed FS
                 "-Wl,--no-mmap-output-file",
                 "--shared",
                 src.name,
             ]
-            if npu_arch:
-                command += [f"--npu-arch={npu_arch}"]
         elif is_cpu_target(target):
             from tilelang.contrib.cc import get_cplus_compiler
 
@@ -188,8 +197,7 @@ class LibraryGenerator:
             "-I" + TILELANG_TEMPLATE_PATH,
         ]
 
-        if self.compile_flags:
-            command += [item for flag in self.compile_flags for item in flag.split() if item not in command]
+        command += [item for item in extra_compile_options if item not in command]
 
         command += ["-o", libpath]
 

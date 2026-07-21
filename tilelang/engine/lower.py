@@ -196,45 +196,46 @@ def tilelang_callback_hip_compile(code, target):
 
 
 @tvm_ffi.register_global_func("tilelang_callback_ascend_compile", override=True)
-def tilelang_callback_ascend_compile(code, target):
-    obj = bisheng.compile_ascend(
-        code,
-        target_format="o",
-        options=[
-            "-I" + TILELANG_TEMPLATE_PATH,
-        ],
-        verbose=False,
+def tilelang_callback_ascend_compile(code, target, pass_config=None):
+    """Compile AscendC source into a cached, executable CCE ELF."""
+    cfg = pass_config or {}
+    extra_flags = bisheng.normalize_options(cfg.get(PassConfigKey.TL_DEVICE_COMPILE_FLAGS))
+    options = ["-I" + TILELANG_TEMPLATE_PATH, *extra_flags]
+
+    target_arch = None
+    for attr_name in ("arch", "mcpu"):
+        value = target.attrs.get(attr_name)
+        if value is not None:
+            target_arch = str(value)
+            break
+    target_arch = bisheng.get_npu_arch(target_arch)
+
+    compile_options = bisheng.get_bisheng_compile_options(target_arch, options)
+    linker_options = bisheng.get_aibin_linker_options()
+
+    from tilelang.cache.ascend_binary_cache import AscendBinaryCache
+
+    cache_key = AscendBinaryCache.make_key(
+        code=code,
+        target_kind=target.kind.name,
+        target_arch=target_arch,
+        compile_format=AscendBinaryCache.binary_format,
+        options=compile_options,
+        linker_options=linker_options,
     )
+    cached_binary = AscendBinaryCache.load(cache_key)
+    if cached_binary is not None:
+        return bytearray(cached_binary)
 
-    return obj
-
-
-@tvm_ffi.register_global_func("tilelang_callback_ascend_compile_so", override=True)
-def tilelang_callback_ascend_compile_so(code):
-    """Bisheng-compile AscendC source into a shared library and return its path.
-
-    Used by the tvm_ffi runtime module (AscendModuleNode) which dlopens the
-    returned .so and resolves the per-kernel ``__tl_launch_<name>`` launchers.
-    The library is written into TILELANG_TMP_DIR with a unique name so concurrent
-    compiles do not collide; it persists for the lifetime of the loaded module.
-    """
-    import os
-    import uuid
-
-    from tilelang import env
-
-    os.makedirs(env.TILELANG_TMP_DIR, exist_ok=True)
-    lib_path = os.path.join(env.TILELANG_TMP_DIR, f"ascend_{os.getpid()}_{uuid.uuid4().hex}.so")
-    bisheng.compile_ascend(
+    aibin = bisheng.compile_ascend(
         code,
-        target_format="so",
-        options=[
-            "-I" + TILELANG_TEMPLATE_PATH,
-        ],
-        path_target=lib_path,
-        verbose=False,
+        target_format="aibin",
+        npu_arch=target_arch,
+        options=options,
+        verbose=env.get_default_verbose(),
     )
-    return lib_path
+    AscendBinaryCache.save(cache_key, aibin)
+    return aibin
 
 
 def extrac_params(func: tirx.PrimFunc) -> list[KernelParam]:
