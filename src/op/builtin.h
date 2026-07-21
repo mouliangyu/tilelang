@@ -990,6 +990,19 @@ TVM_DLL const Op &ascend_copy_ubuf_to_gm();
 TVM_DLL const Op &ascend_copy_gm_to_cbuf();
 
 /*!
+ * \brief Fill an L1 (CBuf) NZ matrix region with a scalar value.
+ *
+ * ascend_fill_l1(dst, byte_offset, raw_value, repeat_times, block_num_32b,
+ *                dst_gap_32b, fill_word_bits)
+ *
+ * Emits create_cbuf_matrix at dst + byte_offset. The three geometry fields map
+ * directly to the instruction config bit field. fill_word_bits selects a raw
+ * uint16_t or uint32_t destination view, and raw_value carries the repeated
+ * element bit pattern.
+ */
+TVM_DLL const Op &ascend_fill_l1();
+
+/*!
  * \brief Ascend load from CBuf (L1) to CA (L0A).
  *
  * ascend_load_cbuf_to_ca(dst, src, mStartPosition, kStartPosition,

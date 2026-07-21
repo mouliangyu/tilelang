@@ -28,7 +28,7 @@ def make_ascend_nz_layout(buffer: BufferLikeType):
     return _ffi_api.make_ascend_nz_layout(buf)
 
 
-def make_ascend_major_k_layout(buffer: BufferLikeType):
+def make_ascend_major_k_layout(buffer: BufferLikeType, k_align: int = 1):
     """
     Create an Ascend fractal layout for logical ``[.., MN, K]`` tiles.
 
@@ -36,7 +36,7 @@ def make_ascend_major_k_layout(buffer: BufferLikeType):
     major: ``(.., mn, k) -> [.., k / C0, mn / 16, mn % 16, k % C0]``.
     """
     buf, _, _ = _get_buffer_info(buffer)
-    return _ffi_api.make_ascend_major_k_layout(buf)
+    return _ffi_api.make_ascend_major_k_layout(buf, k_align)
 
 
 def make_ascend_major_mn_layout(buffer: BufferLikeType):
@@ -115,7 +115,17 @@ class FractalLayoutInfo:
         row16_axis: 0 = row, 1 = col
     """
 
-    __slots__ = ("kind", "c0", "row_frac", "rows", "cols", "outer0", "outer1", "c0_axis", "row16_axis")
+    __slots__ = (
+        "kind",
+        "c0",
+        "row_frac",
+        "rows",
+        "cols",
+        "outer0",
+        "outer1",
+        "c0_axis",
+        "row16_axis",
+    )
 
     def __init__(self, kind, c0, row_frac, rows, cols, outer0, outer1, c0_axis, row16_axis):
         self.kind = kind

@@ -657,6 +657,13 @@ private:
         } else if (op->op.same_as(tl::ascend_nd2nz_post_copy())) {
           // Per-D-group copy_ubuf_to_cbuf: UB -> L1 = MTE3.
           pipe_mask |= static_cast<uint16_t>(ResourcePipe::kMTE3);
+        } else if (op->op.same_as(tl::ascend_fill_l1())) {
+          // create_cbuf_matrix L1 padding fill runs on the MTE1 pipe, same as
+          // the L1->L0 loads. AscendInsertOOBPadding emits it as a standalone
+          // statement before AutoSchedule so this classification keeps the fill
+          // ordered on the MTE1 queue relative to the loads that read the
+          // buffer.
+          pipe_mask |= static_cast<uint16_t>(ResourcePipe::kMTE1);
         } else if (op->op.same_as(gemm_op)) {
           pipe_mask |= static_cast<uint16_t>(ResourcePipe::kCube);
 

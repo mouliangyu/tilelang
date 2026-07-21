@@ -9,6 +9,7 @@
 #include "ascend_mte_plan.h"
 #include "backend/common/target_utils.h"
 #include "layout/layout.h"
+#include "oob_padding.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 #include "transform/common/loop_fusion_utils.h"
@@ -18,6 +19,7 @@
 #include <tvm/tirx/stmt_functor.h>
 
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace tvm {
@@ -28,26 +30,6 @@ using namespace tirx;
 namespace ascend {
 
 namespace {
-
-int GetDMAPath(const Buffer &src, const Buffer &dst) {
-  if (IsGlobalBuffer(src) && IsSharedBuffer(dst))
-    return 0;
-  if (IsSharedBuffer(src) && IsGlobalBuffer(dst))
-    return 1;
-  if (IsGlobalBuffer(src) && IsL1Buffer(dst))
-    return 2;
-  if (IsL1Buffer(src) && IsL0ABuffer(dst))
-    return 3;
-  if (IsL1Buffer(src) && IsL0BBuffer(dst))
-    return 4;
-  if (IsL0CBuffer(src) && IsSharedBuffer(dst))
-    return 5;
-  if (IsSharedBuffer(src) && IsL1Buffer(dst))
-    return 6;
-  if (IsL0CBuffer(src) && IsGlobalBuffer(dst))
-    return 7;
-  return -1;
-}
 
 bool IsDMACopy(const CopyNode &op) { return GetDMAPath(op.src, op.dst) >= 0; }
 
@@ -94,131 +76,6 @@ PrimExpr ComputeFlatOffset(const Buffer &buf, const Array<Range> &range) {
   return offset;
 }
 
-struct BoundedDMACopyRanges {
-  Array<Range> src;
-  Array<Range> dst;
-  Optional<PrimExpr> has_data;
-};
-
-BoundedDMACopyRanges ClampDMACopyTail(const CopyNode &op,
-                                      arith::Analyzer *analyzer) {
-  BoundedDMACopyRanges result{op.src_range, op.dst_range, std::nullopt};
-  if (op.src_range.size() != op.src->shape.size() ||
-      op.dst_range.size() != op.dst->shape.size()) {
-    return result;
-  }
-
-  // Match axes after removing singleton dimensions, which are coalesced away
-  // when planning the DMA copy.
-  auto collect_non_singleton_axes = [](const Array<Range> &ranges) {
-    std::vector<size_t> axes;
-    for (size_t i = 0; i < ranges.size(); ++i) {
-      if (!is_one(ranges[i]->extent))
-        axes.push_back(i);
-    }
-    return axes;
-  };
-  std::vector<size_t> src_axes = collect_non_singleton_axes(op.src_range);
-  std::vector<size_t> dst_axes = collect_non_singleton_axes(op.dst_range);
-  if (src_axes.size() != dst_axes.size()) {
-    return result;
-  }
-
-  bool needs_clamp = false;
-  for (size_t i = 0; i < src_axes.size(); ++i) {
-    size_t src_axis = src_axes[i];
-    size_t dst_axis = dst_axes[i];
-    const Range &src = op.src_range[src_axis];
-    const Range &dst = op.dst_range[dst_axis];
-    if (!analyzer->CanProveEqual(src->extent, dst->extent) ||
-        !analyzer->CanProve(src->min >= make_zero(src->min.dtype()),
-                            arith::ProofStrength::kSymbolicBound) ||
-        !analyzer->CanProve(dst->min >= make_zero(dst->min.dtype()),
-                            arith::ProofStrength::kSymbolicBound)) {
-      return result;
-    }
-    if (!analyzer->CanProve(src->min + src->extent <= op.src->shape[src_axis],
-                            arith::ProofStrength::kSymbolicBound) ||
-        !analyzer->CanProve(dst->min + dst->extent <= op.dst->shape[dst_axis],
-                            arith::ProofStrength::kSymbolicBound)) {
-      needs_clamp = true;
-    }
-  }
-
-  PrimExpr singleton_guard = const_true();
-  auto analyze_singleton_axes = [&](const Array<Range> &ranges,
-                                    const Array<PrimExpr> &shape) {
-    for (size_t i = 0; i < ranges.size(); ++i) {
-      const Range &range = ranges[i];
-      if (!is_one(range->extent))
-        continue;
-      if (!analyzer->CanProve(range->min >= make_zero(range->min.dtype()) &&
-                                  range->min + range->extent <= shape[i],
-                              arith::ProofStrength::kSymbolicBound)) {
-        needs_clamp = true;
-      }
-
-      DataType dtype = range->extent.dtype();
-      auto cast_to_dtype = [dtype](PrimExpr value) {
-        return value.dtype() == dtype ? value : cast(dtype, value);
-      };
-      PrimExpr zero = make_zero(dtype);
-      PrimExpr remaining = cast_to_dtype(shape[i]) - cast_to_dtype(range->min);
-      PrimExpr valid_extent =
-          Min(cast_to_dtype(range->extent), Max(remaining, zero));
-      singleton_guard =
-          singleton_guard && (analyzer->Simplify(valid_extent) > zero);
-    }
-  };
-  analyze_singleton_axes(op.src_range, op.src->shape);
-  analyze_singleton_axes(op.dst_range, op.dst->shape);
-  if (!needs_clamp) {
-    return result;
-  }
-
-  Array<Range> src_range = op.src_range;
-  Array<Range> dst_range = op.dst_range;
-  PrimExpr has_data = const_true();
-
-  for (size_t i = 0; i < src_axes.size(); ++i) {
-    size_t src_axis = src_axes[i];
-    size_t dst_axis = dst_axes[i];
-    DataType dtype = op.src_range[src_axis]->extent.dtype();
-    auto cast_to_dtype = [dtype](PrimExpr value) {
-      return value.dtype() == dtype ? value : cast(dtype, value);
-    };
-    PrimExpr zero = make_zero(dtype);
-    PrimExpr extent = cast_to_dtype(op.src_range[src_axis]->extent);
-    PrimExpr src_remaining = cast_to_dtype(op.src->shape[src_axis]) -
-                             cast_to_dtype(op.src_range[src_axis]->min);
-    PrimExpr dst_remaining = cast_to_dtype(op.dst->shape[dst_axis]) -
-                             cast_to_dtype(op.dst_range[dst_axis]->min);
-    PrimExpr valid_extent =
-        Min(extent, Min(Max(src_remaining, zero), Max(dst_remaining, zero)));
-    valid_extent = analyzer->Simplify(valid_extent);
-
-    // Keep a possibly empty unit axis coalescible by guarding it with
-    // `has_data` instead of exposing a symbolic extent to PlanMTECopy.
-    PrimExpr layout_extent = valid_extent;
-    if (analyzer->CanProve(valid_extent <= make_const(dtype, 1),
-                           arith::ProofStrength::kSymbolicBound)) {
-      layout_extent = make_const(dtype, 1);
-    }
-    src_range.Set(src_axis, Range::FromMinExtent(op.src_range[src_axis]->min,
-                                                 layout_extent));
-    dst_range.Set(dst_axis, Range::FromMinExtent(op.dst_range[dst_axis]->min,
-                                                 layout_extent));
-    has_data = has_data && (valid_extent > zero);
-  }
-
-  has_data = has_data && singleton_guard;
-
-  result.src = std::move(src_range);
-  result.dst = std::move(dst_range);
-  result.has_data = analyzer->Simplify(has_data);
-  return result;
-}
-
 // Row-major element strides of an ND (GM/UB) buffer, derived from its ND
 // (identity) affine layout's output shape: strides[k] = product(shape[k+1..]).
 // Keeps copy parameters layout-driven for the ND side as well.
@@ -260,12 +117,12 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
   auto I64 = [](int64_t v) { return make_const(DataType::Int(64), v); };
   int elem_bits = op.src->dtype.bits();
 
-  BoundedDMACopyRanges bounded_ranges{op.src_range, op.dst_range, std::nullopt};
-  if (dma_path == 0 || dma_path == 1 || dma_path == 2 || dma_path == 7) {
-    bounded_ranges = ClampDMACopyTail(op, analyzer);
-  }
-  const Array<Range> &src_range = bounded_ranges.src;
-  const Array<Range> &dst_range = bounded_ranges.dst;
+  // OOB tail clamping (and the empty-tile has_data guard) is performed before
+  // AutoSchedule by the AscendInsertOOBPadding pass, which rewrites this copy's
+  // ranges in place. By the time lowering runs, op.src_range / op.dst_range are
+  // already the in-bounds ranges, so no clamp is needed here.
+  const Array<Range> &src_range = op.src_range;
+  const Array<Range> &dst_range = op.dst_range;
 
   size_t ndim = src_range.size();
   PrimExpr inner_elems = src_range[ndim - 1]->extent;
@@ -398,9 +255,9 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
   } else if (dma_path == 2) {
     AscendFractalLayoutInfo dst_layout;
     bool has_dst_layout = false;
-    if (T.layout_map.count(op.dst)) {
-      has_dst_layout = TryExtractAscendFractalLayout(T.layout_map[op.dst],
-                                                     op.dst, &dst_layout);
+    if (auto layout = FindLayoutForBuffer(T.layout_map, op.dst)) {
+      has_dst_layout =
+          TryExtractAscendFractalLayout(layout.value(), op.dst, &dst_layout);
       ICHECK(has_dst_layout)
           << "GM->L1 copy expects an Ascend fractal layout on the L1 dst "
           << op.dst->name;
@@ -421,11 +278,33 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
         dst_n_value = dst_n_value * op.dst_range[i]->extent;
       }
     }
+
+    size_t src_ndim = src_range.size();
+    ICHECK_GE(src_ndim, 2U)
+        << "Ascend GM->L1 copy requires at least a 2D source region for "
+           "buffer "
+        << op.src->name;
+    for (size_t i = 0; i + 2 < src_ndim; ++i) {
+      ICHECK(analyzer->CanProve(
+          op.src_range[i]->min + op.src_range[i]->extent <= op.src->shape[i],
+          arith::ProofStrength::kSymbolicBound))
+          << "Ascend GM->L1 auto padding only supports OOB on the trailing "
+             "two source dimensions, got source ranges "
+          << op.src_range << " for buffer " << op.src->name << " shape "
+          << op.src->shape;
+    }
+
+    PrimExpr valid_inner_elems = src_range[src_ndim - 1]->extent;
+    PrimExpr valid_n_rows = I(1);
+    for (size_t i = 0; i + 1 < src_ndim; ++i) {
+      valid_n_rows = valid_n_rows * src_range[i]->extent;
+    }
+
     PrimExpr transpose_flag = I(needs_transpose ? 1 : 0);
     // For dn2nz (transpose), SDK expects nValue=width(cols) and
     // dValue=height(rows), which is the reverse of nd2nz.
-    PrimExpr n_value = needs_transpose ? inner_elems : n_rows;
-    PrimExpr d_value = needs_transpose ? n_rows : inner_elems;
+    PrimExpr n_value = needs_transpose ? valid_inner_elems : valid_n_rows;
+    PrimExpr d_value = needs_transpose ? valid_n_rows : valid_inner_elems;
     std::string physical_dtype;
     if (has_dst_layout && dst_layout.kind == AscendFractalKind::kSF &&
         op.src->dtype.bits() == 8 && op.dst->dtype.bits() == 8) {
@@ -436,6 +315,10 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
                 {dst_ptr, src_ptr, sid, src_row_stride_bytes, l2_cache_ctrl,
                  n_value, d_value, zero, zero, transpose_flag, dst_n_value,
                  StringImm(physical_dtype)});
+    // OOB clamping, the empty-tile has_data guard and the padding fill for a
+    // padded GM->L1 copy are all handled before lowering by the
+    // AscendInsertOOBPadding pass, so lowering just emits the DMA call.
+
   } else if (dma_path == 3 || dma_path == 4) {
     // M/K positions go through intrinsic args; leading dims (e.g. version)
     // through the pointer offset.  MakeAccessPtrFromRegion splits offset/extent
@@ -445,18 +328,20 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
 
     AscendFractalLayoutInfo src_info;
     AscendFractalLayoutInfo dst_info;
+    Optional<Layout> src_layout = FindLayoutForBuffer(T.layout_map, op.src);
+    Optional<Layout> dst_layout = FindLayoutForBuffer(T.layout_map, op.dst);
     bool have_src_layout =
-        T.layout_map.count(op.src) &&
-        TryExtractAscendFractalLayout(T.layout_map[op.src], op.src, &src_info);
+        src_layout.defined() &&
+        TryExtractAscendFractalLayout(src_layout.value(), op.src, &src_info);
     bool have_dst_layout =
-        T.layout_map.count(op.dst) &&
-        TryExtractAscendFractalLayout(T.layout_map[op.dst], op.dst, &dst_info);
+        dst_layout.defined() &&
+        TryExtractAscendFractalLayout(dst_layout.value(), op.dst, &dst_info);
 
     PrimExpr m_start, k_start, m_step, k_step, src_stride, dst_stride;
 
     if (have_src_layout && have_dst_layout) {
       AscendFractalRegionInfo src_region;
-      ICHECK(TryExtractAscendFractalRegion(T.layout_map[op.src], op.src_range,
+      ICHECK(TryExtractAscendFractalRegion(src_layout.value(), op.src_range,
                                            &src_region))
           << "Failed to map L1->L0 source region through layout for buffer "
           << op.src->name;
@@ -507,17 +392,18 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
           MakeAccessPtrFromRegion(BufferRegion(sf_buf, op.sf_range), 1, false);
 
       AscendFractalLayoutInfo sf_info;
-      bool have_sf_layout = T.layout_map.count(sf_buf) &&
-                            TryExtractAscendFractalLayout(T.layout_map[sf_buf],
-                                                          sf_buf, &sf_info) &&
-                            sf_info.kind == AscendFractalKind::kSF;
+      Optional<Layout> sf_layout = FindLayoutForBuffer(T.layout_map, sf_buf);
+      bool have_sf_layout =
+          sf_layout.defined() &&
+          TryExtractAscendFractalLayout(sf_layout.value(), sf_buf, &sf_info) &&
+          sf_info.kind == AscendFractalKind::kSF;
 
       PrimExpr sf_m_start, sf_m_step, sf_k_start, sf_k_step, sf_src_stride,
           sf_dst_stride;
 
       if (have_sf_layout) {
         AscendFractalRegionInfo sf_region;
-        ICHECK(TryExtractAscendFractalRegion(T.layout_map[sf_buf], op.sf_range,
+        ICHECK(TryExtractAscendFractalRegion(sf_layout.value(), op.sf_range,
                                              &sf_region))
             << "Failed to map L1->L0 SF region through layout for buffer "
             << sf_buf->name;
@@ -655,20 +541,10 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
     LOG(FATAL) << "Unknown Ascend DMA path: " << dma_path;
   }
 
-  Stmt result = Evaluate(call);
-  if (bounded_ranges.has_data.defined()) {
-    // Clamped partial tails are represented by smaller extents in the DMA
-    // call above. Fully OOB tiles must not issue a zero-length or OOB DMA
-    // intrinsic, so drop statically empty copies and guard dynamic ones.
-    PrimExpr has_data = bounded_ranges.has_data.value();
-    if (is_zero(has_data)) {
-      return Evaluate(0);
-    }
-    if (!is_one(has_data)) {
-      result = IfThenElse(has_data, result);
-    }
-  }
-  return result;
+  // The empty-tile has_data guard is applied by AscendInsertOOBPadding (it
+  // wraps this copy in IfThenElse before lowering), so emit the DMA call
+  // directly.
+  return Evaluate(call);
 }
 
 Stmt LowerAscendNormalCopy(const CopyNode &op, const LowerArgs &T,
@@ -724,8 +600,73 @@ struct Copy {
       }
 
       int dma_path = GetDMAPath(op.src, op.dst);
-      if ((dma_path == 3 || dma_path == 4) && !T.layout_map.count(op.src)) {
-        result_map.Set(op.src, MakeAscendMajorKLayout(op.src));
+      if (dma_path == 2 && level == InferLevel::kFree &&
+          !FindLayoutForBuffer(T.layout_map, op.dst).defined()) {
+        // A standalone GM->L1 copy has no downstream L0/GEMM consumer to
+        // anchor its layout. Preserve the canonical legacy K-col NZ layout as
+        // a free-mode fallback.
+        result_map.Set(op.dst, MakeAscendMajorKLayout(op.dst));
+      } else if (dma_path == 3 || dma_path == 4) {
+        int k_align = op.sf.defined() ? 64 : 1;
+        Optional<Layout> existing_src_layout =
+            FindLayoutForBuffer(T.layout_map, op.src);
+        Layout src_layout = existing_src_layout.defined()
+                                ? existing_src_layout.value()
+                                : MakeAscendMajorKLayout(op.src);
+        if (!existing_src_layout.defined()) {
+          result_map.Set(op.src, src_layout);
+        }
+        AscendFractalLayoutInfo src_info;
+        ICHECK(TryExtractAscendFractalLayout(src_layout, op.src, &src_info))
+            << "Ascend L1->L0 copy expects a fractal layout on source L1 "
+            << op.src->name;
+
+        // Transpose swaps the semantic roles of the physical C0 and row16
+        // axes. Keep the stored layout physical, and use this operation-local
+        // view to identify K and MN.
+        LogicalAxis effective_c0_axis = src_info.c0_axis;
+        LogicalAxis effective_row16_axis = src_info.row16_axis;
+        if (op.GetTranspose()) {
+          std::swap(effective_c0_axis, effective_row16_axis);
+        }
+        auto axis_extent = [](const Buffer &buffer, LogicalAxis axis) {
+          size_t ndim = buffer->shape.size();
+          return axis == LogicalAxis::kRow ? buffer->shape[ndim - 2]
+                                           : buffer->shape[ndim - 1];
+        };
+        auto check_alignment = [&](const PrimExpr &extent, int alignment,
+                                   const std::string &what) {
+          PrimExpr divisor = make_const(extent.dtype(), alignment);
+          PrimExpr zero = make_const(extent.dtype(), 0);
+          ICHECK(T.analyzer->CanProveEqual(FloorMod(extent, divisor), zero))
+              << what << " must be divisible by " << alignment << ", got "
+              << extent;
+        };
+
+        if (k_align > 1) {
+          check_alignment(axis_extent(op.src, effective_c0_axis), k_align,
+                          "Ascend blockscaled source L1 K allocation extent");
+        }
+        if (op.GetTranspose()) {
+          // A 16xC0 source fractal becomes C0x16 after the L1->L0 transpose.
+          // Therefore the source L1 MN axis (last dim) and destination L0 MN
+          // axis (second-to-last dim) must both cover complete C0 groups.
+          int c0 = AscendC0(op.src->dtype.bits());
+          check_alignment(axis_extent(op.src, effective_row16_axis), c0,
+                          "Ascend transposed source L1 MN allocation extent");
+          check_alignment(op.dst->shape[op.dst->shape.size() - 2], c0,
+                          "Ascend transposed destination L0 MN allocation "
+                          "extent");
+        }
+        if (op.sf.defined()) {
+          // An MX L1->L0 copy feeds block-scaled MAD, so the destination L0
+          // allocation must satisfy the same static K alignment as its L1
+          // source. MakeAscendMajorKLayout performs that divisibility check
+          // before constructing a layout. Deliberately discard the returned
+          // layout: the destination layout is owned by its allocation or
+          // explicit annotation and must not be overwritten by copy inference.
+          MakeAscendMajorKLayout(op.dst, k_align);
+        }
       }
 
       // Layout constraints for Ascend Cube-side data buffers are now attached

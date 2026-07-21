@@ -746,6 +746,11 @@ TIR_DEFINE_TL_BUILTIN(ascend_copy_gm_to_cbuf)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(ascend_fill_l1)
+    .set_num_inputs(7)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 // 9 args for a plain L1→L0 data load; optionally 13 args when an MX
 // scale-factor companion load is attached (see src/ascend/op/copy.cc).
 TIR_DEFINE_TL_BUILTIN(ascend_load_cbuf_to_ca)

@@ -20,7 +20,7 @@ namespace tl {
 // (16 for bf16/fp16, 32 for fp8, 8 for fp32). In MajorK, cols is the reduce-K
 // axis; in MajorMN, cols is the output M/N axis. The legacy NZ name is kept as
 // an alias of MajorK during the transition.
-Layout MakeAscendMajorKLayout(const tirx::Buffer &buffer);
+Layout MakeAscendMajorKLayout(const tirx::Buffer &buffer, int k_align = 1);
 Layout MakeAscendMajorMNLayout(const tirx::Buffer &buffer);
 Layout MakeAscendL0CLayout(const tirx::Buffer &buffer);
 Layout MakeAscendSFLayout(const tirx::Buffer &buffer);

@@ -48,6 +48,54 @@ def make_2d_dynamic_inner_copy(hidden: int, block_m: int = 128, block_k: int = 1
     return copy_2d
 
 
+def make_transpose_gm_to_l1_oob_kernel(m: int, n: int, k: int, tile_m: int, tile_n: int, tile_k: int):
+    """GEMM whose A is loaded transposed GM->L1 with a non-square L1 tile.
+
+    A is stored as (K, M) and loaded with transpose=True into an (tile_m, tile_k)
+    L1 tile. When tile_m != tile_k the transposed axes must be paired correctly
+    during OOB tail clamping; otherwise the clamp compares/clamps the wrong axis.
+    """
+    m_tiles = (m + tile_m - 1) // tile_m
+    n_tiles = (n + tile_n - 1) // tile_n
+    k_tiles = (k + tile_k - 1) // tile_k
+
+    @T.prim_func
+    def kernel(
+        A: T.Buffer((k, m), "bfloat16"),
+        B: T.Buffer((n, k), "bfloat16"),
+        C: T.Buffer((m, n), "float32"),
+    ):
+        with T.Kernel(m_tiles * n_tiles) as bx:
+            m_tile = bx // n_tiles
+            n_tile = bx % n_tiles
+            a_l1 = T.alloc_l1((tile_m, tile_k), "bfloat16")
+            b_l1 = T.alloc_l1((tile_n, tile_k), "bfloat16")
+            a_l0 = T.alloc_l0a((tile_m, tile_k), "bfloat16")
+            b_l0 = T.alloc_l0b((tile_n, tile_k), "bfloat16")
+            acc = T.alloc_l0c((tile_m, tile_n), "float32")
+
+            for kt in T.serial(k_tiles):
+                T.copy(
+                    A[kt * tile_k : (kt + 1) * tile_k, m_tile * tile_m : (m_tile + 1) * tile_m],
+                    a_l1,
+                    transpose=True,
+                )
+                T.copy(
+                    B[n_tile * tile_n : (n_tile + 1) * tile_n, kt * tile_k : (kt + 1) * tile_k],
+                    b_l1,
+                )
+                T.copy(a_l1, a_l0)
+                T.copy(b_l1, b_l0)
+                T.gemm(a_l0, b_l0, acc, transpose_B=True, clear_accum=(kt == 0))
+
+            T.copy(
+                acc,
+                C[m_tile * tile_m : (m_tile + 1) * tile_m, n_tile * tile_n : (n_tile + 1) * tile_n],
+            )
+
+    return kernel
+
+
 def make_bf16_gemm_oob_kernel(m: int, n: int, k: int):
     m_tiles = (m + GEMM_TILE_M - 1) // GEMM_TILE_M
     n_tiles = (n + GEMM_TILE_N - 1) // GEMM_TILE_N
@@ -148,6 +196,28 @@ def test_bf16_gemm_oob_multi_axis_tail() -> None:
                 rtol=1e-2,
                 atol=1e-2,
             )
+
+
+def test_transpose_gm_to_l1_oob_nonsquare_tile() -> None:
+    # Transposed GM->L1 load with a non-square L1 tile (tile_m != tile_k) and M/K
+    # both OOB. Exercises transposed-axis pairing during OOB tail clamping.
+    m, n, k = 200, 128, 100
+    tile_m, tile_n, tile_k = 128, 128, 32
+    torch.manual_seed(7)
+    a_t = torch.randn((k, m), dtype=torch.bfloat16, device="npu")  # A stored as (K, M)
+    b = torch.randn((n, k), dtype=torch.bfloat16, device="npu")
+
+    kernel = tilelang.compile(
+        make_transpose_gm_to_l1_oob_kernel(m, n, k, tile_m, tile_n, tile_k),
+        out_idx=-1,
+        target="ascend",
+    )
+    actual = kernel(a_t, b)
+    torch.npu.synchronize()
+
+    expected = a_t.float().T @ b.float().T  # A logical = (M, K); C = A @ B.T
+    assert actual.shape == (m, n)
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":

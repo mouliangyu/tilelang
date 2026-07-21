@@ -116,7 +116,7 @@ public:
     return default_value;
   }
 
-  // Ascend GM->UB padding fill value.
+  // Ascend GM->UB hardware padding selection.
   int GetDataSelect() const {
     if (auto val = annotations.Get("data_select")) {
       if (auto int_val = val->as<IntImmNode>()) {
@@ -124,6 +124,13 @@ public:
       }
     }
     return 0;
+  }
+
+  Optional<PrimExpr> GetPadValue() const {
+    if (auto value = annotations.Get("pad_value")) {
+      return Downcast<PrimExpr>(value.value());
+    }
+    return std::nullopt;
   }
 
   /*!

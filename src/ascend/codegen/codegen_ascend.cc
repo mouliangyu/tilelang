@@ -1229,6 +1229,28 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     if (op->args.size() >= 4 && op->args[3].as<StringImmNode>())
       this->stream << ", " << Downcast<StringImm>(op->args[3])->value;
     this->stream << ");\n";
+  } else if (op->op.same_as(tl::ascend_fill_l1())) {
+    ICHECK_EQ(op->args.size(), 7)
+        << "tl.ascend_fill_l1 expects exactly 7 arguments";
+    const auto *fill_word_bits = op->args[6].as<IntImmNode>();
+    ICHECK(fill_word_bits &&
+           (fill_word_bits->value == 16 || fill_word_bits->value == 32))
+        << "tl.ascend_fill_l1 fill_word_bits must be 16 or 32";
+    this->PrintIndent();
+    this->stream << "create_cbuf_matrix((__cbuf__ uint" << fill_word_bits->value
+                 << "_t*)((__cbuf__ uint8_t*)";
+    this->PrintExpr(op->args[0], this->stream);
+    this->stream << " + ";
+    this->PrintExpr(op->args[1], this->stream);
+    this->stream << "), (uint64_t)(";
+    this->PrintExpr(op->args[3], this->stream);
+    this->stream << ") | ((uint64_t)(";
+    this->PrintExpr(op->args[4], this->stream);
+    this->stream << ") << 16) | ((uint64_t)(";
+    this->PrintExpr(op->args[5], this->stream);
+    this->stream << ") << 32), (uint32_t)(";
+    this->PrintExpr(op->args[2], this->stream);
+    this->stream << "));\n";
   } else if (op->op.same_as(tl::ascend_load_cbuf_to_ca()) ||
              op->op.same_as(tl::ascend_load_cbuf_to_cb())) {
     const bool is_ca = op->op.same_as(tl::ascend_load_cbuf_to_ca());

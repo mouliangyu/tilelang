@@ -4,7 +4,7 @@ from tilelang.tileop.gemm.gemm_base import GemmBase
 from tilelang import language as T
 from tilelang.layout import make_ascend_major_k_layout, make_ascend_sf_layout, try_extract_fractal_layout
 from tilelang.transform.simplify import _Simplify
-from tvm import DataType, tirx
+from tvm import DataType, arith, tirx
 from tvm.ir import Range
 from tvm.target import Target
 
@@ -85,11 +85,27 @@ _ASCEND_DTYPE_MAP = {
 
 
 class GemmMAD(GemmBase):
+    def _check_blockscaled_k_alignment(self):
+        if not self.is_blockscaled:
+            return
+        remainder = self.K % 64
+        if isinstance(remainder, int):
+            aligned = remainder == 0
+        else:
+            analyzer = arith.Analyzer()
+            aligned = analyzer.can_prove_equal(remainder, tirx.const(0, remainder.dtype))
+        assert aligned, (
+            f"Ascend blockscaled GEMM requires operation K to be divisible by 64, got K={self.K}. "
+            "Pad the participating L1/L0 buffers and invoke GEMM with the padded K extent."
+        )
+
     def infer_layout(self, target: Target, thread_nums: int):
+        self._check_blockscaled_k_alignment()
         layouts = {}
-        if self._is_l1_input():
-            layouts[self.A] = make_ascend_major_k_layout(self.A)
-            layouts[self.B] = make_ascend_major_k_layout(self.B)
+        k_align = 64 if self.is_blockscaled else 1
+        if self._is_l1_input() or self.is_blockscaled:
+            layouts[self.A] = make_ascend_major_k_layout(self.A, k_align=k_align)
+            layouts[self.B] = make_ascend_major_k_layout(self.B, k_align=k_align)
         if self.SFARegion is not None:
             layouts[self.SFARegion.buffer] = make_ascend_sf_layout(self.SFARegion.buffer)
         if self.SFBRegion is not None:
@@ -104,6 +120,7 @@ class GemmMAD(GemmBase):
         thread_var: tirx.Var,
         mbar_phase_expr: tirx.PrimExpr | None = None,
     ):
+        self._check_blockscaled_k_alignment()
         self._layout_map = layout_map
         assert not self.trans_A, f"Ascend Cube requires transpose_A=False, got {self.trans_A}"
         assert self.trans_B, f"Ascend Cube requires transpose_B=True, got {self.trans_B}"

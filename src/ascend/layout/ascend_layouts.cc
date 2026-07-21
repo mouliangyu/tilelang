@@ -61,12 +61,33 @@ static Layout MakeAscendMajorKLayout2D(PrimExpr rows, PrimExpr cols,
   return Layout(Array<PrimExpr>{rows, cols}, {co, ro, ri, ci});
 }
 
-Layout MakeAscendMajorKLayout(const Buffer &buffer) {
+static void CheckStaticDivisible(const PrimExpr &value, int divisor,
+                                 const std::string &what) {
+  if (divisor <= 1) {
+    return;
+  }
+  arith::Analyzer analyzer;
+  PrimExpr simplified = analyzer.Simplify(value);
+  const int64_t *int_value = as_const_int(simplified);
+  ICHECK(int_value != nullptr)
+      << what << " requires a static extent to verify divisibility by "
+      << divisor << ", got " << value;
+  ICHECK(*int_value % divisor == 0)
+      << what << " requires K-axis extent to be divisible by " << divisor
+      << ", got " << *int_value
+      << ". For blockscaled GEMM, GM->L1 copy supports auto padding for "
+         "tail K values, so allocate the L1/L0 K axis to a multiple of "
+      << divisor << ".";
+}
+
+Layout MakeAscendMajorKLayout(const Buffer &buffer, int k_align) {
   ICHECK(buffer.defined() && buffer->shape.size() >= 2)
       << "MakeAscendMajorKLayout expects rank >= 2 buffer";
   size_t n = buffer->shape.size();
   PrimExpr rows = buffer->shape[n - 2];
   PrimExpr cols = buffer->shape[n - 1];
+  CheckStaticDivisible(cols, k_align,
+                       "Ascend MajorK layout for " + buffer->name);
   auto base = MakeAscendMajorKLayout2D(rows, cols, buffer->dtype.bits());
   return ExpandLayout2D(base, buffer);
 }
@@ -130,6 +151,19 @@ Layout MakeAscendSFLayout(const Buffer &buffer) {
   ICHECK(buffer->dtype.bits() > 0 && 16 % buffer->dtype.bits() == 0)
       << "SF layout expects storage dtype whose bit width divides 16, got "
       << buffer->dtype;
+  if (buffer->dtype.bits() != 16) {
+    arith::Analyzer analyzer;
+    PrimExpr k_extent = analyzer.Simplify(k);
+    const int64_t *k_value = as_const_int(k_extent);
+    ICHECK(k_value != nullptr)
+        << "SF_K layout for non-uint16 storage requires a static K-axis "
+           "extent to verify 2-byte alignment, got "
+        << k;
+    ICHECK((*k_value * buffer->dtype.bits()) % 16 == 0)
+        << "SF_K layout for " << buffer->name << " with dtype " << buffer->dtype
+        << " requires the K-axis extent to be 2-byte aligned. Got K="
+        << *k_value << ". Pad the K-axis with identity e8m0 scale value 127.";
+  }
   auto base = MakeAscendSFLayout2D(mn, k, buffer->dtype.bits());
   return ExpandLayout2D(base, buffer);
 }
@@ -351,7 +385,9 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = reflection;
   refl::GlobalDef()
       .def("tl.make_ascend_major_k_layout",
-           [](const Buffer &buffer) { return MakeAscendMajorKLayout(buffer); })
+           [](const Buffer &buffer, int k_align) {
+             return MakeAscendMajorKLayout(buffer, k_align);
+           })
       .def("tl.make_ascend_major_mn_layout",
            [](const Buffer &buffer) { return MakeAscendMajorMNLayout(buffer); })
       .def("tl.make_ascend_l0c_layout",

@@ -49,6 +49,20 @@ def AscendSimdVFLowerParallel():
     return _ffi_api.AscendSimdVFLowerParallel()  # type: ignore
 
 
+def AscendInsertOOBPadding():
+    """Clamp DMA copy OOB tails and emit GM->L1 padding fills before AutoSchedule.
+
+    For every DMA copy this rewrites the copy to its in-bounds ranges and wraps
+    it in the has_data guard; for a padded GM->L1 copy it also appends the
+    create_cbuf_matrix fill(s) as standalone ascend_fill_l1 statements. Runs
+    after InsertNd2Nz and before AutoSchedule so each fill is scheduled as its
+    own MTE1 task and ordered against the L1->L0 loads that read the padded
+    buffer. copy.cc lowering consumes the clamped ranges and no longer performs
+    any OOB/padding handling.
+    """
+    return _ffi_api.AscendInsertOOBPadding()  # type: ignore
+
+
 def MergeUBAllocations(align_bytes: int = 16, disable_reuse: bool = False):
     """MergeUBAllocations
 
@@ -100,6 +114,7 @@ def RewriteFlagToBuf():
 __all__ = [
     "AnnotateMultiBufferEligible",
     "AscendRemoveNoOp",
+    "AscendInsertOOBPadding",
     "AscendSimdVFLowerParallel",
     "AutoSchedule",
     "IfConditionExtract",

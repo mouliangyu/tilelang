@@ -72,6 +72,12 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     # reject (e.g. casting copies) are by now rewritten into a SIMD_VF scatter.
     tilelang.ascend.analysis.VFChecker()(mod)
 
+    # Clamp DMA copy OOB tails and emit GM->L1 padding fills (create_cbuf_matrix)
+    # as standalone statements so AutoSchedule schedules each fill as its own
+    # MTE1 task and orders it against the L1->L0 loads that read the padded
+    # buffer. Must run before AutoSchedule.
+    mod = ascend_transform.AscendInsertOOBPadding()(mod)
+
     if allow_autoschedule(pass_ctx=pass_ctx):
         mod = ascend_transform.NormalizeControlFlowForSchedule()(mod)
         mod = ascend_transform.AnnotateMultiBufferEligible()(mod)
