@@ -1854,30 +1854,10 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   // --- SimdVF gather elements: (base, index, mask) ---
   else if (op->op.same_as(tl::simd_vgather2())) {
     ICHECK_EQ(op->args.size(), 3);
-    auto get_vgather2_base_elem = [](const PrimExpr &ptr,
-                                     DataType fallback) -> DataType {
-      const auto *call = ptr.as<CallNode>();
-      if (!call) {
-        return fallback;
-      }
-      if (call->op.same_as(tl::access_ptr())) {
-        ICHECK_EQ(call->args.size(), 3U)
-            << "tl.access_ptr expects 3 args: (BufferLoad, extent, rw_mask)";
-        const auto *load = call->args[0].as<BufferLoadNode>();
-        ICHECK(load) << "tl.access_ptr arg0 must be BufferLoad";
-        return load->buffer->dtype;
-      }
-      if (call->op.same_as(tirx::builtin::tvm_access_ptr())) {
-        ICHECK_GE(call->args.size(), 1U)
-            << "tvm_access_ptr expects a type annotation arg";
-        DataType dtype = call->args[0].dtype();
-        return dtype.lanes() == 1 ? dtype : dtype.element_of();
-      }
-      return fallback;
-    };
-    DataType elem = get_vgather2_base_elem(op->args[0], op->dtype.element_of());
-    os << "simd_inst::vgather2<" << CCEUBufType(elem) << ">((" << "__ubuf__ "
-       << CCEUBufType(elem) << "*)";
+    // No explicit template arg / pointer cast: the base already prints as a
+    // typed `__ubuf__ ELEM*`, so overload resolution picks the widening
+    // uint8_t/int8_t intrinsic (uint8 -> uint16) from the source pointer type.
+    os << "simd_inst::vgather2(";
     PrintExpr(op->args[0], os); // base
     os << ", ";
     PrintExpr(op->args[1], os); // index
