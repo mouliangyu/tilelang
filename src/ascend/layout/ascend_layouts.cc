@@ -61,6 +61,24 @@ static Layout MakeAscendMajorKLayout2D(PrimExpr rows, PrimExpr cols,
   return Layout(Array<PrimExpr>{rows, cols}, {co, ro, ri, ci});
 }
 
+// MajorMN fractal: the contiguous output M/N axis is the rows axis (dim -2)
+// instead of the cols axis, so the C0 grouping falls on rows and the 16-fractal
+// grouping falls on cols. The forward map is the "swapped" form
+// (i, j) -> [i / C0, j / 16, j % 16, i % C0], recognized by
+// TryExtractAscendFractalLayout as c0_axis == kRow.
+static Layout MakeAscendMajorMNLayout2D(PrimExpr rows, PrimExpr cols,
+                                        int element_bits) {
+  PrimExpr c0 = Integer(AscendC0(element_bits));
+  PrimExpr row_frac = Integer(kAscendRowFractal);
+  Var i = InputPlaceholder(0); // row (contiguous M/N axis)
+  Var j = InputPlaceholder(1); // col (reduce-K axis)
+  PrimExpr co = FloorDiv(i, c0);
+  PrimExpr ci = FloorMod(i, c0);
+  PrimExpr ro = FloorDiv(j, row_frac);
+  PrimExpr ri = FloorMod(j, row_frac);
+  return Layout(Array<PrimExpr>{rows, cols}, {co, ro, ri, ci});
+}
+
 static void CheckStaticDivisible(const PrimExpr &value, int divisor,
                                  const std::string &what) {
   if (divisor <= 1) {
@@ -92,11 +110,19 @@ Layout MakeAscendMajorKLayout(const Buffer &buffer, int k_align) {
   return ExpandLayout2D(base, buffer);
 }
 
-Layout MakeAscendMajorMNLayout(const Buffer &buffer) {
-  // Same physical convention as MajorK. The distinction is semantic: for a
-  // [K, MN] logical tile, the contiguous cols axis is output M/N instead of the
-  // reduce-K axis.
-  return MakeAscendMajorKLayout(buffer);
+Layout MakeAscendMajorMNLayout(const Buffer &buffer, int k_align) {
+  // For a [.., K, MN] logical tile the contiguous rows axis (dim -2) is the
+  // output M/N axis, so C0 groups rows and the 16-fractal groups cols. This is
+  // the swapped counterpart of MajorK and yields c0_axis == kRow.
+  ICHECK(buffer.defined() && buffer->shape.size() >= 2)
+      << "MakeAscendMajorMNLayout expects rank >= 2 buffer";
+  size_t n = buffer->shape.size();
+  PrimExpr rows = buffer->shape[n - 2];
+  PrimExpr cols = buffer->shape[n - 1];
+  CheckStaticDivisible(rows, k_align,
+                       "Ascend MajorMN layout for " + buffer->name);
+  auto base = MakeAscendMajorMNLayout2D(rows, cols, buffer->dtype.bits());
+  return ExpandLayout2D(base, buffer);
 }
 
 Layout MakeAscendNZLayout(const Buffer &buffer) {
@@ -389,7 +415,9 @@ TVM_FFI_STATIC_INIT_BLOCK() {
              return MakeAscendMajorKLayout(buffer, k_align);
            })
       .def("tl.make_ascend_major_mn_layout",
-           [](const Buffer &buffer) { return MakeAscendMajorMNLayout(buffer); })
+           [](const Buffer &buffer, int k_align) {
+             return MakeAscendMajorMNLayout(buffer, k_align);
+           })
       .def("tl.make_ascend_l0c_layout",
            [](const Buffer &buffer) { return MakeAscendL0CLayout(buffer); })
       .def("tl.make_ascend_sf_layout",

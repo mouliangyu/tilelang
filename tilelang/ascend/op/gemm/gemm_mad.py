@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from tilelang.tileop.gemm.gemm_base import GemmBase
 from tilelang import language as T
-from tilelang.layout import make_ascend_major_k_layout, make_ascend_sf_layout, try_extract_fractal_layout
+from tilelang.layout import (
+    make_ascend_major_k_layout,
+    make_ascend_major_mn_layout,
+    make_ascend_sf_layout,
+    try_extract_fractal_layout,
+)
 from tilelang.transform.simplify import _Simplify
 from tvm import DataType, arith, tirx
 from tvm.ir import Range
@@ -102,10 +107,22 @@ class GemmMAD(GemmBase):
     def infer_layout(self, target: Target, thread_nums: int):
         self._check_blockscaled_k_alignment()
         layouts = {}
+        # Choose K-major vs MN-major so that each operand's reduce-K axis lands
+        # on the C0 axis.  Blockscaled GEMM always uses K-major; non-blockscaled
+        # uses trans flags to pick the major:
+        #   A: trans_A=False -> K-major; trans_A=True -> MN-major
+        #   B: trans_B=True  -> K-major; trans_B=False -> MN-major
         k_align = 64 if self.is_blockscaled else 1
-        if self._is_l1_input() or self.is_blockscaled:
-            layouts[self.A] = make_ascend_major_k_layout(self.A, k_align=k_align)
-            layouts[self.B] = make_ascend_major_k_layout(self.B, k_align=k_align)
+
+        def _a_layout(buf):
+            return make_ascend_major_mn_layout(buf, k_align=k_align) if self.trans_A else make_ascend_major_k_layout(buf, k_align=k_align)
+
+        def _b_layout(buf):
+            return make_ascend_major_k_layout(buf, k_align=k_align) if self.trans_B else make_ascend_major_mn_layout(buf, k_align=k_align)
+
+        if self._is_l1_input() or self._is_l0_input() or self.is_blockscaled:
+            layouts[self.A] = _a_layout(self.A)
+            layouts[self.B] = _b_layout(self.B)
         if self.SFARegion is not None:
             layouts[self.SFARegion.buffer] = make_ascend_sf_layout(self.SFARegion.buffer)
         if self.SFBRegion is not None:
@@ -122,19 +139,6 @@ class GemmMAD(GemmBase):
     ):
         self._check_blockscaled_k_alignment()
         self._layout_map = layout_map
-        assert not self.trans_A, f"Ascend Cube requires transpose_A=False, got {self.trans_A}"
-        assert self.trans_B, f"Ascend Cube requires transpose_B=True, got {self.trans_B}"
-
-        # Validate fractal layouts on A/B/C.  mad requires A and B to be
-        # MajorK (reduce axis = C0-axis) and C to be L0C accumulator.
-        for name, buf in [("A", self.A), ("B", self.B)]:
-            if buf is None:
-                continue
-            layout = _find_layout(layout_map, buf)
-            if layout is not None:
-                info = try_extract_fractal_layout(layout, buf)
-                assert info is not None, f"GEMM {name} buffer {buf.name} must carry an Ascend fractal layout"
-                assert info.c0_axis == 1, f"GEMM {name} buffer {buf.name}: reduce axis must be C0-axis (col), got c0_axis={info.c0_axis}"
 
         if self.C is not None:
             layout = _find_layout(layout_map, self.C)
@@ -143,6 +147,7 @@ class GemmMAD(GemmBase):
                 assert info is not None, f"GEMM C buffer {self.C.name} must carry an Ascend fractal layout"
 
         if self._is_l1_input():
+            assert not self.trans_A and self.trans_B, "Ascend L1 GEMM currently only supports trans_A=False, trans_B=True (NT)."
             if self.is_blockscaled:
                 assert self.SFARegion is not None and self.SFBRegion is not None, (
                     "blockscaled_gemm with L1 A/B inputs requires sfa and sfb buffers"
@@ -155,6 +160,9 @@ class GemmMAD(GemmBase):
 
     def _is_l1_input(self):
         return self.A.scope() == "shared.l1" and self.B.scope() == "shared.l1"
+
+    def _is_l0_input(self):
+        return self.A.scope() == "shared.l0a" and self.B.scope() == "shared.l0b"
 
     def _input_dtype(self):
         return str(self.a_dtype)

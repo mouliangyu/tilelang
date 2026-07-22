@@ -107,38 +107,22 @@ def alloc_l1(shape: ShapeType, dtype: DType, scope="shared.l1") -> Buffer:
     return T.sblock_alloc_buffer(shape, dtype, scope=scope)
 
 
-def alloc_l0a(shape: ShapeType, dtype: DType, scope="shared.l0a", major: Literal["K"] | None = "K") -> Buffer:
+def alloc_l0a(shape: ShapeType, dtype: DType, scope="shared.l0a") -> Buffer:
     """Allocate an L0A buffer (__ca__) on Ascend NPU.
 
-    Args:
-        shape: Buffer shape
-        dtype: Data type
-        scope: Memory scope. Defaults to "shared.l0a"
-        major: Ascend Cube semantic major. L0A is a mad input and must be
-            canonical K-major; use ``None`` only for low-level/manual code.
+    Layout is deferred to the consuming gemm operation, which infers K-major
+    or MN-major from its transpose flags.
     """
-    if major not in ("K", None):
-        raise ValueError(f"L0A only supports major='K' or None, got {major!r}")
-    buf = T.sblock_alloc_buffer(shape, dtype, scope=scope)
-    _annotate_ascend_major_layout(buf, major)
-    return buf
+    return T.sblock_alloc_buffer(shape, dtype, scope=scope)
 
 
-def alloc_l0b(shape: ShapeType, dtype: DType, scope="shared.l0b", major: Literal["K"] | None = "K") -> Buffer:
+def alloc_l0b(shape: ShapeType, dtype: DType, scope="shared.l0b") -> Buffer:
     """Allocate an L0B buffer (__cb__) on Ascend NPU.
 
-    Args:
-        shape: Buffer shape
-        dtype: Data type
-        scope: Memory scope. Defaults to "shared.l0b"
-        major: Ascend Cube semantic major. L0B is a mad input and must be
-            canonical K-major; use ``None`` only for low-level/manual code.
+    Layout is deferred to the consuming gemm operation, which infers K-major
+    or MN-major from its transpose flags.
     """
-    if major not in ("K", None):
-        raise ValueError(f"L0B only supports major='K' or None, got {major!r}")
-    buf = T.sblock_alloc_buffer(shape, dtype, scope=scope)
-    _annotate_ascend_major_layout(buf, major)
-    return buf
+    return T.sblock_alloc_buffer(shape, dtype, scope=scope)
 
 
 def alloc_l0c(shape: ShapeType, dtype: DType, scope="shared.l0c", layout: bool = True) -> Buffer:

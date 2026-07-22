@@ -39,7 +39,7 @@ def make_ascend_major_k_layout(buffer: BufferLikeType, k_align: int = 1):
     return _ffi_api.make_ascend_major_k_layout(buf, k_align)
 
 
-def make_ascend_major_mn_layout(buffer: BufferLikeType):
+def make_ascend_major_mn_layout(buffer: BufferLikeType, k_align: int = 1):
     """
     Create an Ascend fractal layout for logical ``[.., K, MN]`` tiles.
 
@@ -47,7 +47,7 @@ def make_ascend_major_mn_layout(buffer: BufferLikeType):
     major: ``(.., k, mn) -> [.., mn / C0, k / 16, k % 16, mn % C0]``.
     """
     buf, _, _ = _get_buffer_info(buffer)
-    return _ffi_api.make_ascend_major_mn_layout(buf)
+    return _ffi_api.make_ascend_major_mn_layout(buf, k_align)
 
 
 def make_ascend_l0c_layout(buffer: BufferLikeType):

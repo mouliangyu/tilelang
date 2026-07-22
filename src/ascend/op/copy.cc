@@ -374,10 +374,23 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
       dst_stride = dn >= 2 ? op.dst->shape[dn - 2] / c0 : I(1);
     }
 
-    // Transpose is explicitly specified by the user via T.copy(...,
-    // transpose=True). Auto-derivation from shape relationship is not safe
-    // (fails on square matrices).
-    bool needs_transpose = op.GetTranspose();
+    // The user may request an explicit transpose via T.copy(..,
+    // transpose=True).  Additionally, when the L1 source and the L0
+    // destination carry different fractal majors (e.g. a K-major L1 tile
+    // feeding an MN-major L0 fractal, or vice versa), an implicit transpose is
+    // required to reconcile the two layouts.  The effective transpose is the
+    // XOR of the user request and the major mismatch: two transposes cancel.
+    //
+    // L1 tiles are canonically K-major (reduce-K on the C0 axis); when the L1
+    // source carries no explicit layout we assume K-major so the mismatch is
+    // driven purely by the inferred L0 major.
+    bool user_transpose = op.GetTranspose();
+    LogicalAxis src_c0_axis =
+        have_src_layout ? src_info.c0_axis : LogicalAxis::kCol;
+    LogicalAxis dst_c0_axis =
+        have_dst_layout ? dst_info.c0_axis : LogicalAxis::kCol;
+    bool major_mismatch = src_c0_axis != dst_c0_axis;
+    bool needs_transpose = user_transpose ^ major_mismatch;
 
     auto intrinsic =
         dma_path == 3 ? ascend_load_cbuf_to_ca() : ascend_load_cbuf_to_cb();
@@ -621,12 +634,30 @@ struct Copy {
             << "Ascend L1->L0 copy expects a fractal layout on source L1 "
             << op.src->name;
 
+        // The effective transpose is the XOR of the user's explicit request
+        // and the implicit transpose caused by a K-major L1 source feeding an
+        // MN-major L0 destination (or vice versa): two transposes cancel.
+        // Mirror the logic in LowerDMACopy so the alignment guard covers both
+        // explicit and implicit transposes.
+        bool effective_transpose = op.GetTranspose();
+        {
+          Optional<Layout> dst_layout =
+              FindLayoutForBuffer(T.layout_map, op.dst);
+          AscendFractalLayoutInfo dst_info;
+          if (dst_layout.defined() &&
+              TryExtractAscendFractalLayout(dst_layout.value(), op.dst,
+                                            &dst_info)) {
+            bool major_mismatch = src_info.c0_axis != dst_info.c0_axis;
+            effective_transpose = op.GetTranspose() ^ major_mismatch;
+          }
+        }
+
         // Transpose swaps the semantic roles of the physical C0 and row16
         // axes. Keep the stored layout physical, and use this operation-local
         // view to identify K and MN.
         LogicalAxis effective_c0_axis = src_info.c0_axis;
         LogicalAxis effective_row16_axis = src_info.row16_axis;
-        if (op.GetTranspose()) {
+        if (effective_transpose) {
           std::swap(effective_c0_axis, effective_row16_axis);
         }
         auto axis_extent = [](const Buffer &buffer, LogicalAxis axis) {
@@ -647,25 +678,18 @@ struct Copy {
           check_alignment(axis_extent(op.src, effective_c0_axis), k_align,
                           "Ascend blockscaled source L1 K allocation extent");
         }
-        if (op.GetTranspose()) {
-          // A 16xC0 source fractal becomes C0x16 after the L1->L0 transpose.
-          // Therefore the source L1 MN axis (last dim) and destination L0 MN
-          // axis (second-to-last dim) must both cover complete C0 groups.
+        if (effective_transpose) {
+          // After the L1->L0 transpose the source MN axis becomes the L0 C0
+          // axis (must cover complete C0 groups) and the source K axis becomes
+          // the L0 row16 axis (must cover complete 16-row groups).  With the
+          // axes already swapped above, effective_c0_axis points at the source
+          // MN axis and effective_row16_axis at the source K axis.
           int c0 = AscendC0(op.src->dtype.bits());
-          check_alignment(axis_extent(op.src, effective_row16_axis), c0,
+          int row_frac = 16;
+          check_alignment(axis_extent(op.src, effective_c0_axis), c0,
                           "Ascend transposed source L1 MN allocation extent");
-          check_alignment(op.dst->shape[op.dst->shape.size() - 2], c0,
-                          "Ascend transposed destination L0 MN allocation "
-                          "extent");
-        }
-        if (op.sf.defined()) {
-          // An MX L1->L0 copy feeds block-scaled MAD, so the destination L0
-          // allocation must satisfy the same static K alignment as its L1
-          // source. MakeAscendMajorKLayout performs that divisibility check
-          // before constructing a layout. Deliberately discard the returned
-          // layout: the destination layout is owned by its allocation or
-          // explicit annotation and must not be overwritten by copy inference.
-          MakeAscendMajorKLayout(op.dst, k_align);
+          check_alignment(axis_extent(op.src, effective_row16_axis), row_frac,
+                          "Ascend transposed source L1 K allocation extent");
         }
       }
 

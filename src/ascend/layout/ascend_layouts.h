@@ -21,7 +21,7 @@ namespace tl {
 // axis; in MajorMN, cols is the output M/N axis. The legacy NZ name is kept as
 // an alias of MajorK during the transition.
 Layout MakeAscendMajorKLayout(const tirx::Buffer &buffer, int k_align = 1);
-Layout MakeAscendMajorMNLayout(const tirx::Buffer &buffer);
+Layout MakeAscendMajorMNLayout(const tirx::Buffer &buffer, int k_align = 1);
 Layout MakeAscendL0CLayout(const tirx::Buffer &buffer);
 Layout MakeAscendSFLayout(const tirx::Buffer &buffer);
 Layout MakeAscendNZLayout(const tirx::Buffer &buffer);
