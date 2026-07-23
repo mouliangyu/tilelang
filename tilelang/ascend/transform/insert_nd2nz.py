@@ -4,13 +4,14 @@ Runs after LayoutInference (which anchors Cube-side L1 buffers to the NZ
 fractal layout) and before AutoSchedule. Any plain ``tl.tileop.copy`` from a UB
 (``shared``) buffer into an L1 (``shared.l1``) buffer whose layout was inferred
 as NZ is rewritten into the ``ascend_nd2nz_scatter`` + ``ascend_nd2nz_post_copy``
-sequence. Emitting it here (rather than at trace time) lets AutoSchedule
-sync/multi-buffer the two steps.
+sequence. A padded UB source carrying the standard NZ layout is already packed,
+so only the post-copy is emitted. Emitting it here (rather than at trace time)
+lets AutoSchedule sync/multi-buffer the steps.
 """
 
 from __future__ import annotations
 
-from tvm import tirx
+from tvm import arith, tirx
 from tvm.tirx import Call, Evaluate, SBlock, SeqStmt
 from tvm.tirx.stmt_functor import ir_transform, post_order_visit
 from tvm.tirx.transform import prim_func_pass
@@ -77,6 +78,25 @@ def _collect_nz_l1_vars(body) -> set:
     return nz_vars
 
 
+def _collect_prepacked_nz_ub_vars(body) -> set:
+    """buffer.data Vars of pre-packed padded-NZ UB buffers."""
+    from tilelang.layout import make_ascend_nz_layout
+
+    nz_source_vars = set()
+
+    def visit(node):
+        if isinstance(node, SBlock):
+            lm = node.annotations.get("layout_map")
+            if lm is None:
+                return
+            for buf, layout in lm.items():
+                if buf.scope() in _UB_SCOPES and layout.is_equal(make_ascend_nz_layout(buf)):
+                    nz_source_vars.add(buf.data)
+
+    post_order_visit(body, visit)
+    return nz_source_vars
+
+
 def _region_parts(region_call):
     """(buffer, BufferLoad, extents) from a tl.region call, or None."""
     if not (isinstance(region_call, Call) and _op_name(region_call) == _REGION_OP):
@@ -102,7 +122,51 @@ def _access_ptr(load, extents, rw_mask):
     return _tl_access_ptr(load, rw_mask, extent=_prod(extents))
 
 
-def _rewrite_copy(value, nz_l1_vars, pending_allocs):
+def _validate_prepacked_nz_source(src_buf, src_load, src_ext, rows, cols, full_rows):
+    """Validate a padded-NZ source region and return its pointer extents."""
+    analyzer = arith.Analyzer()
+
+    # Ascend codegen reads rows/cols/full_rows as compile-time integers.
+    if _const_int(rows) is None or _const_int(cols) is None or _const_int(full_rows) is None:
+        raise ValueError(
+            f"NZ post-copy from {src_buf.name} requires static rows/cols/full_rows "
+            f"(got rows={rows}, cols={cols}, full_rows={full_rows}); Ascend codegen reads "
+            "these as compile-time integers."
+        )
+
+    # Leading scalar indices are encoded in tl.region as singleton ranges
+    # (extent=1). The trailing data region excludes the final padding row.
+    src_mins = list(src_load.indices)
+    if len(src_ext) != len(src_buf.shape) or len(src_mins) != len(src_ext):
+        raise ValueError(
+            f"NZ source {src_buf.name} region rank must match its buffer rank: buffer rank={len(src_buf.shape)}, region rank={len(src_ext)}"
+        )
+    if any(not analyzer.can_prove_equal(extent, 1) for extent in src_ext[:-2]):
+        raise ValueError(f"NZ source {src_buf.name} leading region extents must all be 1, got {src_ext[:-2]}")
+    row_min, col_min = src_mins[-2], src_mins[-1]
+    trailing_mins_are_zero = analyzer.can_prove_equal(row_min, 0) and analyzer.can_prove_equal(col_min, 0)
+    trailing_extents_are_full = analyzer.can_prove_equal(src_buf.shape[-2], src_ext[-2] + 1) and analyzer.can_prove_equal(
+        src_buf.shape[-1], src_ext[-1]
+    )
+    if not trailing_mins_are_zero or not trailing_extents_are_full:
+        raise ValueError(
+            f"NZ source {src_buf.name} trailing region must cover the full padded matrix: "
+            f"mins={src_mins[-2:]}, extents={src_ext[-2:]}, buffer shape={src_buf.shape[-2:]}"
+        )
+
+    if not analyzer.can_prove_equal(src_ext[-2], rows) or not analyzer.can_prove_equal(src_ext[-1], cols):
+        raise ValueError(
+            f"NZ source {src_buf.name} region {src_ext[-2]}x{src_ext[-1]} must match the "
+            f"post-copy geometry {rows}x{cols}; post_copy interprets the source with the "
+            "destination's trailing extents."
+        )
+
+    src_ptr_ext = list(src_ext)
+    src_ptr_ext[-2] = src_buf.shape[-2]
+    return src_ptr_ext
+
+
+def _rewrite_copy(value, nz_l1_vars, nz_source_vars, pending_allocs):
     """Return replacement Stmt for a UB(ND)->L1(NZ) copy, else None."""
     if not (isinstance(value, Call) and _op_name(value) == _COPY_OP):
         return None
@@ -118,6 +182,8 @@ def _rewrite_copy(value, nz_l1_vars, pending_allocs):
         return None
     if dst_buf.data not in nz_l1_vars or len(dst_ext) < 2:
         return None
+
+    src_is_nz = src_buf.data in nz_source_vars
 
     # dual_copy detection: trust the ``double`` / ``dual_dst_ctl`` annotations
     # that the frontend dual_copy() attaches, NOT a 2x shape-ratio guess.
@@ -139,7 +205,8 @@ def _rewrite_copy(value, nz_l1_vars, pending_allocs):
     full_rows = dst_buf.shape[-2]
     src_dtype_str = _to_dtype_str(src_buf.dtype)
     dst_dtype_str = _to_dtype_str(dst_buf.dtype)
-    src_ptr = _access_ptr(src_load, src_ext, "r")
+    src_ptr_ext = _validate_prepacked_nz_source(src_buf, src_load, src_ext, rows, cols, full_rows) if src_is_nz else src_ext
+    src_ptr = _access_ptr(src_load, src_ptr_ext, "r")
     dst_ptr = _access_ptr(dst_load, dst_ext, "w")
 
     elem_bytes = (dst_buf.dtype.bits + 7) // 8
@@ -151,9 +218,25 @@ def _rewrite_copy(value, nz_l1_vars, pending_allocs):
     # stripped before codegen).
     dual_extras = [tirx.const(split_dim_neg2, "int32"), half_extent] if is_dual else []
 
+    if src_is_nz:
+        if not same_dtype:
+            raise ValueError(f"NZ source {src_buf.name} cannot be post-copied with a dtype conversion ({src_buf.dtype} -> {dst_buf.dtype})")
+        return Evaluate(tirx.call_intrin("handle", post_copy_op, dst_ptr, src_ptr, rows, cols, full_rows, dst_dtype_str, *dual_extras))
+
     if cols_i is not None and cols_i * elem_bytes == 32 and same_dtype and not is_dual:
         # Single D-group: NZ == ND, post_copy reads the ND source directly.
-        return Evaluate(tirx.call_intrin("handle", post_copy_op, dst_ptr, src_ptr, rows, cols, full_rows, dst_dtype_str))
+        return Evaluate(
+            tirx.call_intrin(
+                "handle",
+                post_copy_op,
+                dst_ptr,
+                src_ptr,
+                rows,
+                cols,
+                full_rows,
+                dst_dtype_str,
+            )
+        )
 
     # Multi-fractal scatter path. rows/cols may be symbolic; size the scratch
     # buffer symbolically (as the old copy_op._emit_nd2nz_seq did) instead of
@@ -169,7 +252,17 @@ def _rewrite_copy(value, nz_l1_vars, pending_allocs):
     tmp_r = _access_ptr(tmp_load, [cols_pad], "r")
 
     scatter = tirx.call_intrin("handle", tirx.op.Op.get(_SCATTER_OP), src_ptr, tmp_w, rows, cols, dst_dtype_str, src_dtype_str)
-    post = tirx.call_intrin("handle", post_copy_op, dst_ptr, tmp_r, rows, cols, full_rows, dst_dtype_str, *dual_extras)
+    post = tirx.call_intrin(
+        "handle",
+        post_copy_op,
+        dst_ptr,
+        tmp_r,
+        rows,
+        cols,
+        full_rows,
+        dst_dtype_str,
+        *dual_extras,
+    )
     return SeqStmt([Evaluate(scatter), Evaluate(post)])
 
 
@@ -180,6 +273,7 @@ def InsertNd2Nz():
         nz_l1_vars = _collect_nz_l1_vars(func.body)
         if not nz_l1_vars:
             return func
+        nz_source_vars = _collect_prepacked_nz_ub_vars(func.body)
 
         alloc_stack: list[list] = []
 
@@ -190,7 +284,7 @@ def InsertNd2Nz():
 
         def post(node):
             if isinstance(node, Evaluate):
-                rew = _rewrite_copy(node.value, nz_l1_vars, alloc_stack[-1])
+                rew = _rewrite_copy(node.value, nz_l1_vars, nz_source_vars, alloc_stack[-1])
                 return rew if rew is not None else node
             if isinstance(node, SBlock):
                 pending = alloc_stack.pop()
