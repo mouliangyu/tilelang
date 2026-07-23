@@ -30,6 +30,15 @@ namespace tl {
 
 using namespace tirx;
 
+struct AutoScheduleAttrSpec {
+  const char *key;
+  bool is_assumption;
+};
+
+// Returns the propagation semantics for an AttrStmt key supported by
+// AutoSchedule, or nullptr when the attribute is not in the allowlist.
+const AutoScheduleAttrSpec *FindAutoScheduleAttr(const ffi::String &key);
+
 inline int64_t GetSharedMemoryLimit(Target target) {
   if (TargetIsHopper(target)) {
     return 228 * 1024;

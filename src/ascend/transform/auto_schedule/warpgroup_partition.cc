@@ -152,14 +152,22 @@ public:
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tirx::attr::tilelang_assume) {
-      PrimExpr new_node = VisitExpr(Downcast<PrimExpr>(op->node));
+    if (FindAutoScheduleAttr(op->attr_key) != nullptr) {
+      Any new_node = op->node;
+      bool node_changed = false;
+      if (const auto *expr_node = op->node.as<PrimExprNode>()) {
+        PrimExpr old_node = GetRef<PrimExpr>(expr_node);
+        PrimExpr rewritten_node = VisitExpr(old_node);
+        node_changed = !rewritten_node.same_as(old_node);
+        new_node = std::move(rewritten_node);
+      }
+      PrimExpr new_value = VisitExpr(op->value);
       Stmt new_body = VisitStmt(op->body);
-      if (new_node.same_as(Downcast<PrimExpr>(op->node)) &&
+      if (!node_changed && new_value.same_as(op->value) &&
           new_body.same_as(op->body)) {
         return GetRef<Stmt>(op);
       }
-      return AttrStmt(new_node, op->attr_key, op->value, new_body, op->span);
+      return AttrStmt(new_node, op->attr_key, new_value, new_body, op->span);
     }
     return StmtExprMutator::VisitStmt_(op);
   }
@@ -183,16 +191,36 @@ static PrimExpr SubstituteLetVarsExpr(PrimExpr expr,
   return LetVarSubstituter(vmap)(std::move(expr));
 }
 
-// Copy a node's `guards` (conditions + assumes) onto its clone, applying the
-// let-var remap so renamed warpgroup-local vars referenced inside a guard stay
-// defined.
-static void CloneConditions(const IRStructure *src, IRStructure *dst,
-                            const Map<Var, PrimExpr> &var_remap) {
-  std::vector<Guard> remapped;
+// Copy a node's guards (If conditions + supported AttrStmt wrappers) onto its
+// clone, applying the let-var remap so renamed warpgroup-local vars referenced
+// inside a guard stay defined.
+static void CloneGuards(const IRStructure *src, IRStructure *dst,
+                        const Map<Var, PrimExpr> &var_remap) {
+  GuardList remapped;
   remapped.reserve(src->GetGuards().size());
-  for (const auto &g : src->GetGuards()) {
-    remapped.push_back(
-        Guard{SubstituteLetVarsExpr(g.expr, var_remap), g.is_assume});
+  for (const auto &guard : src->GetGuards()) {
+    if (guard->IsCondition()) {
+      const auto *condition_guard =
+          static_cast<const ConditionGuard *>(guard.get());
+      PrimExpr condition =
+          SubstituteLetVarsExpr(condition_guard->condition, var_remap);
+      remapped.push_back(
+          std::make_unique<ConditionGuard>(std::move(condition)));
+    } else {
+      const auto *attribute_guard =
+          static_cast<const AttributeGuard *>(guard.get());
+      Any node = attribute_guard->node;
+      if (const auto *expr_node = node.as<PrimExprNode>()) {
+        node = SubstituteLetVarsExpr(GetRef<PrimExpr>(expr_node), var_remap);
+      }
+      PrimExpr value = attribute_guard->value;
+      if (value.defined()) {
+        value = SubstituteLetVarsExpr(std::move(value), var_remap);
+      }
+      remapped.push_back(std::make_unique<AttributeGuard>(
+          std::move(node), attribute_guard->key, std::move(value),
+          attribute_guard->span));
+    }
   }
   dst->SetGuards(std::move(remapped));
 }
@@ -200,7 +228,7 @@ static void CloneConditions(const IRStructure *src, IRStructure *dst,
 static void CloneSchedulingMetadata(const IRStructure *src, IRStructure *dst,
                                     int warpgroup_id,
                                     const Map<Var, PrimExpr> &var_remap) {
-  CloneConditions(src, dst, var_remap);
+  CloneGuards(src, dst, var_remap);
   dst->SetStage(src->GetStage());
   dst->SetStartTime(src->GetStartTime());
   auto copy_stmt_list = [&](const std::vector<Stmt> &src_stmts,
@@ -383,19 +411,12 @@ static Stmt GuardWithIf(const Stmt &body, const PrimExpr &condition) {
 }
 
 // Re-wrap a body in its guard deltas, innermost-first. A conditional guard
-// becomes `if (expr) body`; a `tl.assume` guard becomes
-// `AttrStmt(expr, tilelang_assume, body)` so the fact is scoped directly around
-// the statements that need it (the prover/codegen re-reads `op->node`).
+// becomes `if (expr) body`; an attribute guard restores its original AttrStmt.
 // Reverse iteration preserves source nesting order: the outermost guard (front
 // of the list) ends up as the outermost wrapper.
-static Stmt GuardWithGuards(Stmt body, const std::vector<Guard> &guards) {
+static Stmt GuardWithGuards(Stmt body, const GuardList &guards) {
   for (auto it = guards.rbegin(); it != guards.rend(); ++it) {
-    if (it->is_assume) {
-      body =
-          AttrStmt(it->expr, tirx::attr::tilelang_assume, StringImm(""), body);
-    } else {
-      body = IfThenElse(it->expr, body);
-    }
+    body = (*it)->Wrap(std::move(body));
   }
   return body;
 }

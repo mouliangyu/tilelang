@@ -390,6 +390,10 @@ private:
   }
 
   Stmt VisitStmt_(const SBlockNode *op) final {
+    Map<String, Any> previous_block_annotations = block_annotations_;
+    Map<Var, PrimExpr> previous_safe_value_map = safe_value_map_;
+    block_annotations_ = op->annotations;
+
     bool is_simt_vf = (op->name_hint == "SIMT_VF");
     IterVar saved_thread_var;
     if (is_simt_vf) {
@@ -403,9 +407,17 @@ private:
     }
     for (auto match_buffer : op->match_buffers) {
       buffer_map_.insert({match_buffer->buffer->data, match_buffer->buffer});
+      buffer_data_to_buffer_.Set(match_buffer->buffer->data,
+                                 match_buffer->buffer);
     }
     for (auto buffer : op->alloc_buffers) {
       buffer_data_to_buffer_.Set(buffer->data, buffer);
+    }
+    RecordSafeValueAnnotations(op);
+    if (!safe_value_map_.empty()) {
+      block_annotations_.Set(attr::kSafeValueMap, safe_value_map_);
+    } else {
+      block_annotations_.erase(attr::kSafeValueMap);
     }
     Map<Var, Layout> vmap;
     if (op->annotations.count(attr::kLayoutMap)) {
@@ -545,6 +557,8 @@ private:
       Stmt lowered = simt_vf_op->Lower(lower_args, analyzer_);
       PopSimtVFThreadContext();
       thread_var_ = saved_thread_var;
+      block_annotations_ = std::move(previous_block_annotations);
+      safe_value_map_ = std::move(previous_safe_value_map);
       return lowered;
     }
 
@@ -593,9 +607,13 @@ private:
       lower_args.alloc_mbarrier = mbarrier_callback;
       lower_args.update_barrier_arrive = barrier_arrive_callback;
       Stmt lowered = simd_vf_op->Lower(lower_args, analyzer_);
+      block_annotations_ = std::move(previous_block_annotations);
+      safe_value_map_ = std::move(previous_safe_value_map);
       return lowered;
     }
 
+    block_annotations_ = std::move(previous_block_annotations);
+    safe_value_map_ = std::move(previous_safe_value_map);
     return block;
   }
 
@@ -1325,7 +1343,7 @@ private:
     if (call && call->op.as<GlobalVarNode>())
       return Downcast<Evaluate>(IRMutatorWithAnalyzer::VisitStmt_(op));
 
-    auto tile_op = ParseOperator(GetRef<Stmt>(op));
+    auto tile_op = ParseOperator(GetRef<Stmt>(op), block_annotations_);
     if (!tile_op.defined())
       return IRMutatorWithAnalyzer::VisitStmt_(op);
 
@@ -1715,8 +1733,21 @@ private:
     return ComputeThreadBounds(thread_var_, *analyzer_);
   }
 
+  void RecordSafeValueAnnotations(const SBlockNode *op) {
+    if (!op->annotations.count(attr::kSafeValueMap)) {
+      return;
+    }
+    auto map = Downcast<Map<Var, PrimExpr>>(
+        op->annotations.Get(attr::kSafeValueMap).value());
+    for (const auto &[var, safe_value] : map) {
+      safe_value_map_.Set(var, safe_value);
+    }
+  }
+
   Target target_;
+  Map<String, Any> block_annotations_;
   Map<Var, Buffer> buffer_data_to_buffer_;
+  Map<Var, PrimExpr> safe_value_map_;
   Map<Buffer, Layout> layout_map_;
   Map<Buffer, Layout> layout_remap_;
   Map<Buffer, Buffer> buffer_remap_;

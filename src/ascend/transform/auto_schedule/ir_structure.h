@@ -14,7 +14,6 @@
 #include <functional>
 #include <map>
 #include <memory>
-#include <optional>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -24,6 +23,7 @@ namespace tvm {
 namespace tl {
 
 using namespace tirx;
+using ffi::Any;
 using ffi::String;
 
 // Forward declarations
@@ -136,12 +136,70 @@ using TaskAccessPredicate = std::function<bool(const TaskNode *task)>;
 
 PrimExpr CalculateIterationCount(const std::vector<For> &loops);
 
-// A guard introduced at a node relative to its nearest surviving
-// structural ancestor.
-struct Guard {
-  PrimExpr expr;
-  bool is_assume{false};
+// A wrapper introduced at a node relative to its nearest surviving structural
+// ancestor. Guards are scheduling metadata rather than schedulable tasks.
+class Guard {
+public:
+  enum class Kind { kCondition, kAttribute };
+
+  virtual ~Guard() = default;
+  virtual Kind GetKind() const = 0;
+  virtual std::unique_ptr<Guard> Clone() const = 0;
+  virtual void SubstituteVar(const Var &old_var, const Var &new_var) = 0;
+  virtual Stmt Wrap(Stmt body) const = 0;
+
+  bool IsCondition() const { return GetKind() == Kind::kCondition; }
+  bool IsAttribute() const { return GetKind() == Kind::kAttribute; }
 };
+
+class ConditionGuard final : public Guard {
+public:
+  explicit ConditionGuard(PrimExpr condition)
+      : condition(std::move(condition)) {}
+
+  Kind GetKind() const final { return Kind::kCondition; }
+  std::unique_ptr<Guard> Clone() const final {
+    return std::make_unique<ConditionGuard>(condition);
+  }
+  void SubstituteVar(const Var &old_var, const Var &new_var) final {
+    condition = Substitute(condition, {{old_var, new_var}});
+  }
+  Stmt Wrap(Stmt body) const final {
+    return IfThenElse(condition, std::move(body));
+  }
+
+  PrimExpr condition;
+};
+
+class AttributeGuard final : public Guard {
+public:
+  AttributeGuard(Any node, String key, PrimExpr value, Span span)
+      : node(std::move(node)), key(std::move(key)), value(std::move(value)),
+        span(std::move(span)) {}
+
+  Kind GetKind() const final { return Kind::kAttribute; }
+  std::unique_ptr<Guard> Clone() const final {
+    return std::make_unique<AttributeGuard>(node, key, value, span);
+  }
+  void SubstituteVar(const Var &old_var, const Var &new_var) final {
+    if (node.as<PrimExprNode>()) {
+      node = Substitute(Downcast<PrimExpr>(node), {{old_var, new_var}});
+    }
+    if (value.defined()) {
+      value = Substitute(value, {{old_var, new_var}});
+    }
+  }
+  Stmt Wrap(Stmt body) const final {
+    return AttrStmt(node, key, value, std::move(body), span);
+  }
+
+  Any node;
+  String key;
+  PrimExpr value;
+  Span span;
+};
+
+using GuardList = std::vector<std::unique_ptr<Guard>>;
 
 // Base class for all IR nodes in scheduling
 class IRStructure {
@@ -159,25 +217,27 @@ public:
 
   // Guard deltas introduced at this node relative to its nearest
   // surviving structural ancestor.
-  const std::vector<Guard> &GetGuards() const { return guards_; }
+  const GuardList &GetGuards() const { return guards_; }
   bool HasGuards() const { return !guards_.empty(); }
   // True iff the node carries a real *conditional* guard
   bool HasConditions() const {
-    for (const auto &g : guards_) {
-      if (!g.is_assume)
+    for (const auto &guard : guards_) {
+      if (guard->IsCondition())
         return true;
     }
     return false;
   }
-  void SetGuards(std::vector<Guard> guards) { guards_ = std::move(guards); }
+  void SetGuards(GuardList guards) { guards_ = std::move(guards); }
   // Prepend a conditional guard (the delta stack is built outermost-last, so
   // new outer guards go to the front).
   void PrependCondition(const PrimExpr &cond) {
-    guards_.insert(guards_.begin(), Guard{cond, /*is_assume=*/false});
+    guards_.insert(guards_.begin(), std::make_unique<ConditionGuard>(cond));
   }
-  // Prepend a `tl.assume` fact guard.
-  void PrependAssumption(const PrimExpr &fact) {
-    guards_.insert(guards_.begin(), Guard{fact, /*is_assume=*/true});
+  // Prepend an AttrStmt wrapper supported by AutoSchedule.
+  void PrependAttribute(const Any &node, const String &key,
+                        const PrimExpr &value, const Span &span) {
+    guards_.insert(guards_.begin(),
+                   std::make_unique<AttributeGuard>(node, key, value, span));
   }
 
   // Pipeline stage assigned by the Z3 scheduler: producer = 0, consumers
@@ -194,11 +254,12 @@ public:
   bool IsTask() const { return GetKind() == Kind::kTask; }
   bool IsControl() const { return GetKind() == Kind::kControl; }
 
-  // Substitute a var inside this node's own `guards` deltas. Call from each
-  // node's SubstituteVar override so warpgroup renaming reaches guards too.
-  void SubstituteVarInConditions(const Var &old_var, const Var &new_var) {
-    for (auto &g : guards_) {
-      g.expr = Substitute(g.expr, {{old_var, new_var}});
+  // Substitute a var inside this node's own guard deltas. Call from each
+  // node's SubstituteVar override so warpgroup renaming reaches both If
+  // conditions and propagated AttrStmt fields.
+  void SubstituteVarInGuards(const Var &old_var, const Var &new_var) {
+    for (auto &guard : guards_) {
+      guard->SubstituteVar(old_var, new_var);
     }
   }
 
@@ -217,7 +278,11 @@ public:
   }
 
   void CopyBaseMetadataFrom(const IRStructure &other) {
-    guards_ = other.guards_;
+    guards_.clear();
+    guards_.reserve(other.guards_.size());
+    for (const auto &guard : other.guards_) {
+      guards_.push_back(guard->Clone());
+    }
     before = other.before;
     after = other.after;
     stage_ = other.stage_;
@@ -315,7 +380,7 @@ public:
   }
 
 private:
-  std::vector<Guard> guards_;
+  GuardList guards_;
   int stage_{0};
   size_t index_{0};
   int64_t start_time_{0};
@@ -412,7 +477,7 @@ public:
       }
     }
     stmt = Substitute(stmt, {{old_var, new_var}});
-    SubstituteVarInConditions(old_var, new_var);
+    SubstituteVarInGuards(old_var, new_var);
     SubstituteVarInSchedulingMetadata(old_var, new_var);
   }
   void SetLatency(int64_t latency) override { latency_ = latency; }
@@ -769,7 +834,7 @@ public:
           Substitute(control->step.value(), {{old_var, new_var}});
     }
     control = new_for;
-    SubstituteVarInConditions(old_var, new_var);
+    SubstituteVarInGuards(old_var, new_var);
     SubstituteVarInSchedulingMetadata(old_var, new_var);
   }
 
@@ -1017,9 +1082,17 @@ inline void PrintIRStructure(const IRStructure *node, int indent = 0) {
 
   std::string indent_str(indent * 2, ' ');
 
-  for (const auto &g : node->GetGuards()) {
-    LOG(INFO) << indent_str << "  [" << (g.is_assume ? "assume" : "guard")
-              << "] " << g.expr;
+  for (const auto &guard : node->GetGuards()) {
+    if (guard->IsAttribute()) {
+      const auto *attribute_guard =
+          static_cast<const AttributeGuard *>(guard.get());
+      LOG(INFO) << indent_str << "  [attr " << attribute_guard->key << "] "
+                << attribute_guard->node;
+    } else {
+      const auto *condition_guard =
+          static_cast<const ConditionGuard *>(guard.get());
+      LOG(INFO) << indent_str << "  [guard] " << condition_guard->condition;
+    }
   }
 
   if (node->IsTask()) {

@@ -75,6 +75,20 @@ namespace tl {
 using namespace tirx;
 using ffi::GetRef;
 
+// AttrStmt wrappers that AutoSchedule supports.
+static const AutoScheduleAttrSpec kAutoScheduleAttrs[] = {
+    {tirx::attr::tilelang_assume, true},
+    {tl::attr::kAssumeRequiresRuntimeCheck, false},
+};
+
+const AutoScheduleAttrSpec *FindAutoScheduleAttr(const String &key) {
+  for (const AutoScheduleAttrSpec &spec : kAutoScheduleAttrs) {
+    if (key == spec.key)
+      return &spec;
+  }
+  return nullptr;
+}
+
 // Mutator to extract the body of tilelang_root block and optional
 // buffer version overrides annotation.
 class TilelangRootBodyExtractor : public StmtVisitor {
@@ -139,10 +153,14 @@ public:
   }
 };
 
+static bool IsAutoScheduleAttrWrapper(const AttrStmtNode *op) {
+  return FindAutoScheduleAttr(op->attr_key) != nullptr;
+}
+
 // Detect multiple kernel launches in the PrimFunc body.
 // In tilelang, when multiple T.Kernel() blocks are used, the IR structure is:
 //   root block body:
-//     AttrStmt(tl.assume, ...)
+//     AttrStmt(tl.assume_requires_runtime_check, ...)
 //       AttrStmt(tl.assume, ...)
 //         SeqStmt [
 //           AttrStmt(blockIdx.x, thread_extent, ..., kernel1_subtree),
@@ -164,9 +182,9 @@ public:
       inner = &br->block->body;
     }
 
-    // Peel through AttrStmt(tl.assume, ...) chains
+    // Peel through Attribute chains.
     while (const auto *attr = inner->as<AttrStmtNode>()) {
-      if (attr->attr_key != "tl.assume")
+      if (!IsAutoScheduleAttrWrapper(attr))
         break;
       inner = &attr->body;
     }
@@ -204,7 +222,7 @@ private:
   }
 };
 
-// Mutator that replaces the inner SeqStmt (inside root block -> tl.assume
+// Mutator that replaces the inner SeqStmt (inside root block -> assume-wrapper
 // chain) with a new body. Used to reassemble multi-kernel results.
 class InnerSeqStmtReplacer : public StmtMutator {
 public:
@@ -232,11 +250,11 @@ public:
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) override {
-    if (op->attr_key == "tl.assume") {
+    if (IsAutoScheduleAttrWrapper(op)) {
       auto new_body = this->VisitStmt(op->body);
       if (new_body.same_as(op->body))
         return GetRef<Stmt>(op);
-      return AttrStmt(op->node, op->attr_key, op->value, new_body);
+      return AttrStmt(op->node, op->attr_key, op->value, new_body, op->span);
     }
     return GetRef<Stmt>(op);
   }
@@ -421,15 +439,21 @@ protected:
     }
   }
 
-  // Stamp a `tl.assume` fact onto every schedule candidate produced for the
-  // assume's body
-  void StampAssumptionOnBranch(IRStructure *node, const PrimExpr &fact) {
+  // Stamp a supported AttrStmt onto every schedule candidate produced for its
+  // body. Attr metadata remains an ordered guard delta and is not materialized
+  // as a schedulable task.
+  void StampAttributeOnBranch(IRStructure *node, const Any &attr_node,
+                              const String &key, const PrimExpr &value,
+                              const Span &span) {
     if (!node)
       return;
     auto stamp_task = [&](IRStructure *item, TaskNode *sink) {
-      item->PrependAssumption(fact);
+      item->PrependAttribute(attr_node, key, value, span);
       if (sink) {
-        AnalyzeResourceUsage(Evaluate(fact), sink, /*only_variables=*/true);
+        if (const auto *expr_node = attr_node.as<PrimExprNode>()) {
+          AnalyzeResourceUsage(Evaluate(GetRef<PrimExpr>(expr_node)), sink,
+                               /*only_variables=*/true);
+        }
       }
     };
     if (node->IsTask()) {
@@ -437,7 +461,7 @@ protected:
     } else if (node->IsControl()) {
       stamp_task(node, static_cast<ControlNode *>(node)->task.get());
     } else {
-      node->PrependAssumption(fact);
+      node->PrependAttribute(attr_node, key, value, span);
     }
   }
 
@@ -475,28 +499,33 @@ protected:
   }
 
   void VisitStmt_(const AttrStmtNode *op) override {
-    ICHECK_EQ(op->attr_key, tirx::attr::tilelang_assume)
+    const AutoScheduleAttrSpec *attr_spec = FindAutoScheduleAttr(op->attr_key);
+    ICHECK(attr_spec != nullptr)
         << "AutoSchedule IRStructureBuilder only supports AttrStmt "
-           "`tl.assume` inside the schedulable tilelang_root body. "
+           "keys listed in kAutoScheduleAttrs inside the schedulable "
+           "tilelang_root body. "
            "Unsupported attr_key: "
         << op->attr_key;
 
-    // No dedicated assume TaskNode: the fact is stamped onto the body's
-    // schedule candidates as an `is_assume` guard delta (see
-    // StampAssumptionOnBranch), mirroring how IfThenElse stamps conditions.
-    // Materializing it as its own task used to (a) inject spurious read-var
-    // dependencies and a wasted sequence slot, and (b) scope the fact to an
-    // empty body at codegen, hiding it from the loads/stores that actually
-    // need it. Keep the fact in the prover environment for region proving via
-    // MakeGuard while building the body.
-    auto fact = Downcast<PrimExpr>(op->node);
+    // Supported AttrStmts become ordered guard deltas on every candidate.
+    // tl.assume additionally enters the prover environment while its body is
+    // built; transparent attrs only preserve their source nesting.
     std::vector<std::shared_ptr<IRStructure>> body_list;
-    {
-      auto guard = MakeGuard(fact, /*is_assume=*/true);
+    if (attr_spec->is_assumption) {
+      auto guard = MakeGuard(Downcast<PrimExpr>(op->node), /*is_assume=*/true);
+      body_list = BuildList(op->body);
+    } else {
       body_list = BuildList(op->body);
     }
+    if (body_list.empty()) {
+      auto task_node = std::make_shared<TaskNode>();
+      task_node->stmt = Evaluate(0);
+      StampCtx(task_node.get());
+      body_list.push_back(std::move(task_node));
+    }
     for (auto &node : body_list) {
-      StampAssumptionOnBranch(node.get(), fact);
+      StampAttributeOnBranch(node.get(), op->node, op->attr_key, op->value,
+                             op->span);
       result_.push_back(std::move(node));
     }
   }
@@ -856,10 +885,12 @@ static void AssignScalarWarpgroupByDemand(
   auto add_guard_demand = [&](const IRStructure *node, uint8_t mask) {
     if (!mask)
       return;
-    for (const auto &g : node->GetGuards()) {
-      if (g.is_assume)
+    for (const auto &guard : node->GetGuards()) {
+      if (!guard->IsCondition())
         continue;
-      for (const Var &v : UndefinedVars(g.expr))
+      const auto *condition_guard =
+          static_cast<const ConditionGuard *>(guard.get());
+      for (const Var &v : UndefinedVars(condition_guard->condition))
         var_demand[v.get()] |= mask;
     }
   };

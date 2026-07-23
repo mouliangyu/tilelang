@@ -574,7 +574,7 @@ Stmt LowerAscendNormalCopy(const CopyNode &op, const LowerArgs &T,
                                     InferLevel::kFree};
   for (auto level : levels) {
     par_op->InferLayout({T.target, T.thread_bounds, T.layout_map, analyzer,
-                         false, T.buffer_remap, T.bind_var_to_expr},
+                         T.buffer_remap, T.bind_var_to_expr},
                         level);
   }
 

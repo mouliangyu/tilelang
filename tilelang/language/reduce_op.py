@@ -3,10 +3,10 @@
 from __future__ import annotations
 from typing import Literal
 from tvm import tirx
-from tilelang.language import copy, macro, alloc_fragment
+from tilelang.language import copy, macro, alloc_fragment, evaluate
 from tilelang.language.vf import inside_simdvf
-from tilelang.utils.language import to_tile_region, retrieve_shape, _get_buffer
-from tilelang.utils.language import is_shared, is_fragment
+from tilelang.utils.language import to_buffer_region, to_tile_region, retrieve_shape, _get_buffer
+from tilelang.utils.language import is_shared, is_fragment, is_local
 from tvm.script.ir_builder import IRBuilder
 
 
@@ -45,6 +45,9 @@ def reduce(
     """
     if batch < 1:
         raise ValueError(f"batch must be >= 1, got {batch}")
+    out_buffer = to_buffer_region(out).buffer
+    if reduce_type in ("bitand", "bitor", "bitxor") and not (out_buffer.dtype.startswith(("int", "uint")) or out_buffer.dtype == "bool"):
+        raise ValueError(f"reduce_{reduce_type} requires an integer/bool buffer, got dtype {out_buffer.dtype}")
     # input shape: [X, d, Y], expected output shape: [X, Y] or [X, 1, Y]
     buf_shape = retrieve_shape(buffer)
     out_shape = retrieve_shape(out)
@@ -63,6 +66,22 @@ def reduce(
         annotations["nan_propagate"] = True
     if not annotations:
         annotations = None
+
+    # Emit local reductions before macro expansion so alloc_var retains its
+    # underlying Buffer rather than becoming a scalar expression.
+    if is_local(buffer) and out_buffer.scope() in ("local", "local.var"):
+        return evaluate(
+            tirx.call_intrin(
+                "handle",
+                tirx.op.Op.get(_REDUCE_OP_KEY),
+                to_tile_region(buffer, access_type="r"),
+                to_tile_region(out_buffer, access_type="w"),
+                reduce_type,
+                dim,
+                clear,
+                annotations=annotations,
+            )
+        )
 
     @macro
     def reduce_macro(buffer: tirx.Buffer, out: tirx.Buffer, reduce_type: str, dim: int, clear: bool) -> None:
