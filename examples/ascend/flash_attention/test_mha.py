@@ -1,16 +1,20 @@
-"""pytest test for example_flash_attn.py — FlashAttention Mix kernel (SimdVF softmax)."""
+"""pytest test for example_mha.py — MHA Mix kernel (SimdVF softmax)."""
 
 import torch
 import tilelang
 
-from example_flash_attn import flash_attention, ref_program
+from example_mha import mha, ref_program
 
 
-def test_flash_attn():
+def test_mha():
     D = 128
     SEQ_LEN = 4096
 
-    kernel = tilelang.compile(flash_attention(D, SEQ_LEN), out_idx=-1)
+    kernel = tilelang.compile(
+        mha(D, SEQ_LEN),
+        out_idx=-1,
+        pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
+    )
 
     device = torch.device("npu")
     torch.manual_seed(42)
@@ -28,5 +32,5 @@ def test_flash_attn():
 
 
 if __name__ == "__main__":
-    test_flash_attn()
-    print("PASS: test_flash_attn")
+    test_mha()
+    print("PASS: test_mha")

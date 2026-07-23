@@ -21,7 +21,7 @@ modified; we only reuse their public JSON-marker contract.
 
 from __future__ import annotations
 
-import importlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -30,6 +30,8 @@ import time
 
 import tilelang.testing
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
 # Must match the marker the shared collectors (`regression_all.py`,
 # `run_perf_regression_ascend.sh`) grep for.
 _MARKER = "__TILELANG_PERF_RESULTS_JSON__="
@@ -37,31 +39,52 @@ _ENV_ENTRY = "TL_PERF_REGRESSION_ENTRY"  # child: run only this single entry
 _ENV_TIMEOUT = "TL_PERF_REGRESSION_TIMEOUT"  # parent: per-entry timeout (seconds)
 _DEFAULT_ENTRY_TIMEOUT = 900.0
 
-# (entry name, example module, run_regression_perf kwargs). One row == one isolated child.
+# (entry name, example path relative to this file, run_regression_perf kwargs).
+# One row == one isolated child. The path may live in a subfolder (e.g. flash_attention/);
+# the child puts its directory on sys.path so intra-folder imports (``from core import …``)
+# resolve without any dotted-module gymnastics.
 _ENTRIES: list[tuple[str, str, dict]] = [
-    ("ascend_gemm_bf16", "example_gemm", {"dtype": "bfloat16"}),
-    ("ascend_gemm_fp32", "example_gemm", {"dtype": "float32"}),
-    ("ascend_gemm_fp32_hf32", "example_gemm", {"dtype": "float32", "hf32": "nearest_even"}),
-    ("ascend_gemm_l0", "example_gemm_l0", {}),
-    ("ascend_gemm_mix_manual", "example_gemm_mix_manual", {}),
-    ("ascend_gemm_mixedkernel", "example_gemm_mixedkernel", {}),
-    ("ascend_gemm_bypass_l2", "example_gemm_bypass_l2", {}),
-    ("ascend_gemm_various_shapes", "example_gemm_various_shapes", {}),
-    ("ascend_blockscaled_gemm", "example_blockscaled_gemm", {}),
-    ("ascend_flash_attn", "example_flash_attn", {}),
-    ("ascend_rmsnorm", "example_rmsnorm", {}),
-    ("ascend_buffer_version_annotation", "example_buffer_version_annotation", {}),
-    ("ascend_atomic_add", "example_atomic_add", {}),
-    ("ascend_simdvf_topk_gate", "example_simdvf_topk_gate", {}),
-    ("ascend_simdvf_vecadd", "example_simdvf_vecadd", {}),
-    ("ascend_simdvf_vecadd_lower", "example_simdvf_vecadd_lower", {}),
-    ("ascend_simtvf_vecadd", "example_simtvf_vecadd", {}),
-    ("ascend_simtvf_vecadd_mutex", "example_simtvf_vecadd_mutex", {}),
-    ("ascend_simdvf_per_token_cast_to_fp8", "example_simdvf_per_token_cast_to_fp8", {}),
-    ("ascend_simtvf_per_token_cast_to_fp8", "example_simtvf_per_token_cast_to_fp8", {}),
-    ("ascend_crosslevel_multibuffer", "example_crosslevel_multibuffer", {}),
-    ("ascend_compress", "example_compress", {}),
+    ("ascend_gemm_bf16", "example_gemm.py", {"dtype": "bfloat16"}),
+    ("ascend_gemm_fp32", "example_gemm.py", {"dtype": "float32"}),
+    ("ascend_gemm_fp32_hf32", "example_gemm.py", {"dtype": "float32", "hf32": "nearest_even"}),
+    ("ascend_gemm_l0", "example_gemm_l0.py", {}),
+    ("ascend_gemm_mix_manual", "example_gemm_mix_manual.py", {}),
+    ("ascend_gemm_mixedkernel", "example_gemm_mixedkernel.py", {}),
+    ("ascend_gemm_bypass_l2", "example_gemm_bypass_l2.py", {}),
+    ("ascend_gemm_various_shapes", "example_gemm_various_shapes.py", {}),
+    ("ascend_blockscaled_gemm", "example_blockscaled_gemm.py", {}),
+    ("ascend_mha", "flash_attention/example_mha.py", {}),
+    ("ascend_gqa", "flash_attention/example_gqa.py", {}),
+    ("ascend_rmsnorm", "example_rmsnorm.py", {}),
+    ("ascend_buffer_version_annotation", "example_buffer_version_annotation.py", {}),
+    ("ascend_atomic_add", "example_atomic_add.py", {}),
+    ("ascend_simdvf_topk_gate", "example_simdvf_topk_gate.py", {}),
+    ("ascend_simdvf_vecadd", "example_simdvf_vecadd.py", {}),
+    ("ascend_simdvf_vecadd_lower", "example_simdvf_vecadd_lower.py", {}),
+    ("ascend_simtvf_vecadd", "example_simtvf_vecadd.py", {}),
+    ("ascend_simtvf_vecadd_mutex", "example_simtvf_vecadd_mutex.py", {}),
+    ("ascend_simdvf_per_token_cast_to_fp8", "example_simdvf_per_token_cast_to_fp8.py", {}),
+    ("ascend_simtvf_per_token_cast_to_fp8", "example_simtvf_per_token_cast_to_fp8.py", {}),
+    ("ascend_crosslevel_multibuffer", "example_crosslevel_multibuffer.py", {}),
+    ("ascend_compress", "example_compress.py", {}),
 ]
+
+
+def _load_example(rel_path: str):
+    """Import an example by file path, with its own directory on sys.path[0].
+
+    Loading by path (rather than dotted module name) lets a subfolder example
+    (e.g. ``flash_attention/example_mha.py``) use plain ``from core import …``
+    against a sibling ``core.py`` — the same way it resolves when run directly.
+    """
+    file_path = os.path.join(_HERE, rel_path)
+    example_dir = os.path.dirname(file_path)
+    sys.path.insert(0, example_dir)
+    mod_name = "_regression_example_" + os.path.splitext(os.path.basename(rel_path))[0]
+    spec = importlib.util.spec_from_file_location(mod_name, file_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _run_child(entry_name: str) -> int:
@@ -76,10 +99,10 @@ def _run_child(entry_name: str) -> int:
         print(_MARKER + json.dumps([]), flush=True)
         return 1
 
-    _, module_name, kwargs = spec
+    _, rel_path, kwargs = spec
     results: list[dict] = []
     try:
-        module = importlib.import_module(module_name)
+        module = _load_example(rel_path)
         # process_func records into the shared _RESULTS and retries non-positive latency.
         from tilelang.testing import perf_regression as pr
 
@@ -107,7 +130,7 @@ def _run_parent() -> int:
     print(f"  {total} entries, {timeout:.0f}s per-entry timeout")
     print(f"{'=' * 60}")
 
-    for idx, (entry_name, _module, _kwargs) in enumerate(_ENTRIES, 1):
+    for idx, (entry_name, _path, _kwargs) in enumerate(_ENTRIES, 1):
         print(f"\n  ├─ [{idx}/{total}] {entry_name}", end="", flush=True)
         child_env = {**os.environ, _ENV_ENTRY: entry_name, "TL_PERF_REGRESSION_FORMAT": "json"}
         start = time.perf_counter()
