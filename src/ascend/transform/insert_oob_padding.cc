@@ -79,7 +79,7 @@ PrimExpr MakeFillBasePtr(const CopyNode *copy) {
 
 // Build the standalone padding fill statements for a padded GM->L1 copy, or an
 // empty vector when the copy needs no padding. Mirrors copy.cc's dma_path 2
-// kMajorLike branch (valid extents from the clamped source, dst geometry from
+// major-layout branch (valid extents from the clamped source, dst geometry from
 // the full destination range).
 std::vector<Stmt> MakeL1PaddingStmts(const CopyNode *copy,
                                      const LayoutMap &layout_map,
@@ -98,7 +98,7 @@ std::vector<Stmt> MakeL1PaddingStmts(const CopyNode *copy,
     return stmts;
   // Only the major-like (data) NZ fractal needs an explicit padding fill; the
   // scale-factor (kSF) layout does not go through this path.
-  if (dst_layout.kind != AscendFractalKind::kMajorLike)
+  if (!IsAscendMajorKind(dst_layout.kind))
     return stmts;
 
   // Clamp the copy's ranges the same way copy.cc lowering will, to recover the

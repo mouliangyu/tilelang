@@ -60,21 +60,23 @@ tirx::Buffer MakeStridedSlice(const tirx::Buffer &phys_buf,
 
 // ── Ascend fractal layout analysis ──────────────────────────────────
 //
-// These utilities inspect a Layout's forward map to determine whether it
-// matches the canonical Ascend fractal structure and, if so, which logical
-// axis is grouped by C0 and which by 16.  The parser works by checking the
-// trailing four output slots:
-//
-//   [axis_c0 / C0, axis_16 / 16, axis_16 % 16, axis_c0 % C0]
-//
-// This avoids structural-equality against constructor outputs and correctly
-// distinguishes C0 from row-fractal even when C0 == 16 (bf16/fp16).
+// Canonical Ascend layouts carry an explicit semantic kind. Analysis derives
+// C0, outer extents, and logical axis roles from that tag and the buffer.
+// Untagged layouts are rejected so that a missing canonical constructor or a
+// transform that drops the tag is exposed by CI instead of guessed from a
+// potentially ambiguous simplified forward map.
 
 enum class AscendFractalKind {
-  kMajorLike, // [col/C0, row/16, row%16, col%C0] or swapped
-  kL0C,       // [col/16, row/16, row%16, col%16] (fixed 16×16 accumulator)
-  kSF,        // [row/16, col/pack, row%16, col%pack] for MX scale factors
+  kMajorK = 0,  // [col/C0, row/16, row%16, col%C0]
+  kL0C = 1,     // [col/16, row/16, row%16, col%16] (fixed accumulator)
+  kSF = 2,      // [row/16, col/pack, row%16, col%pack] for MX scale factors
+  kMajorMN = 3, // [row/C0, col/16, col%16, row%C0]
 };
+
+inline bool IsAscendMajorKind(AscendFractalKind kind) {
+  return kind == AscendFractalKind::kMajorK ||
+         kind == AscendFractalKind::kMajorMN;
+}
 
 enum class LogicalAxis {
   kRow, // logical dim -2
@@ -104,8 +106,8 @@ struct AscendFractalRegionInfo {
   Range col_inner; // C0% (or 16%) region
 };
 
-/// Try to parse \p layout as an Ascend fractal layout for \p buf.
-/// Returns true and fills \p out on success.
+/// Extract information from a tagged canonical Ascend fractal layout.
+/// Returns false for undefined/invalid inputs and fails for an untagged layout.
 bool TryExtractAscendFractalLayout(const Layout &layout,
                                    const tirx::Buffer &buf,
                                    AscendFractalLayoutInfo *out);

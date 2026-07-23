@@ -3,10 +3,18 @@
 # pylint: disable=invalid-name
 from __future__ import annotations
 
+import tvm_ffi
+
 from tilelang import _ffi_api
 from tilelang._typing import BufferLikeType
 
+from .layout import Layout
 from .swizzle import _get_buffer_info
+
+
+@tvm_ffi.register_object("tl.AscendFractalLayout")
+class _AscendFractalLayout(Layout):
+    """Internal tagged representation of a canonical Ascend layout."""
 
 
 def make_ascend_nz_layout(buffer: BufferLikeType):
@@ -96,15 +104,14 @@ def make_strided_slice(phys_buf, layout, logical_region):
 
 
 class FractalLayoutInfo:
-    """Parsed view of an Ascend fractal layout.
+    """Semantic view of a canonical Ascend fractal layout.
 
     This is a Python wrapper around the C++ ``TryExtractAscendFractalLayout``
-    utility.  It inspects the layout's forward map to determine which logical
-    axis is grouped by C0 and which by 16, without relying on structural
-    equality against a constructor output.
+    utility. The layout kind is recorded by the canonical constructor; the
+    remaining fields are derived from that tag and the buffer.
 
     Attributes:
-        kind: 0 = MajorLike (C0-axis), 1 = L0C (fixed 16×16), 2 = SF
+        kind: 0 = MajorK, 1 = L0C (fixed 16×16), 2 = SF, 3 = MajorMN
         c0: C0 value (or 16 for L0C, pack for SF)
         row_frac: always 16
         rows: logical rows (dim -2)
@@ -140,7 +147,7 @@ class FractalLayoutInfo:
 
     def __repr__(self):
         axis_name = {0: "row", 1: "col"}
-        kind_name = {0: "MajorLike", 1: "L0C", 2: "SF"}
+        kind_name = {0: "MajorK", 1: "L0C", 2: "SF", 3: "MajorMN"}
         return (
             f"FractalLayoutInfo(kind={kind_name.get(self.kind, '?')}, "
             f"c0={self.c0}, row_frac={self.row_frac}, "
@@ -151,10 +158,14 @@ class FractalLayoutInfo:
 
 
 def try_extract_fractal_layout(layout, buffer):
-    """Try to parse ``layout`` as an Ascend fractal layout for ``buffer``.
+    """Get semantic information from a canonical Ascend fractal layout.
 
     Returns:
-        FractalLayoutInfo if the layout matches, otherwise None.
+        FractalLayoutInfo, or None when the input is undefined/invalid.
+
+    Raises:
+        InternalError: If ``layout`` was not made by a canonical Ascend layout
+            constructor or a transform dropped its semantic tag.
     """
     buf, _, _ = _get_buffer_info(buffer)
     result = _ffi_api.try_extract_fractal_layout(layout, buf)

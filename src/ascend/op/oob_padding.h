@@ -84,7 +84,8 @@ std::pair<PrimExpr, int> MakeL1FillPattern(const CopyNode &op);
  *
  * \param dst_ptr Base pointer to the destination L1 buffer (byte offset is
  *                computed internally and passed as the fill's arg[1]).
- * \param dst_n   Destination NZ row count (outer1 * row_frac for kMajorLike).
+ * \param dst_n   Destination NZ row count (outer1 * row_frac for major
+ * layouts).
  * \param valid_cols In-bounds column extent actually filled by the copy.
  */
 Optional<Stmt> MakeL1ColPadding(const CopyNode &op,

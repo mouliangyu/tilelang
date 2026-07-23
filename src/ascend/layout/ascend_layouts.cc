@@ -6,7 +6,6 @@
 
 #include "support/check.h"
 #include <tvm/arith/analyzer.h>
-#include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/tirx/op.h>
@@ -41,6 +40,69 @@ static Layout ExpandLayout2D(const Layout &base, const Buffer &buffer) {
 // MajorK while the frontend migrates to explicit major names.
 static constexpr int kAscendRowFractal = 16;
 
+namespace {
+
+// Canonical Ascend layouts retain their semantic kind and logical axis roles.
+// Small extents can simplify different forward maps to the same expressions,
+// so these properties cannot always be reconstructed from the map alone.
+class AscendFractalLayoutNode : public LayoutNode {
+public:
+  AscendFractalLayoutNode() = default;
+  AscendFractalLayoutNode(Array<PrimExpr> input_size,
+                          Array<PrimExpr> forward_index, AscendFractalKind kind)
+      : LayoutNode(std::move(input_size), std::move(forward_index)),
+        kind_(static_cast<int>(kind)) {}
+
+  AscendFractalKind Kind() const {
+    return static_cast<AscendFractalKind>(kind_);
+  }
+  Layout Expand(const Array<PrimExpr> &leading_shape) const final;
+
+  static void RegisterReflection() {
+    namespace refl = reflection;
+    refl::ObjectDef<AscendFractalLayoutNode>().def_ro(
+        "kind", &AscendFractalLayoutNode::kind_);
+  }
+
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.AscendFractalLayout",
+                                    AscendFractalLayoutNode, LayoutNode);
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
+      kTVMFFISEqHashKindTreeNode;
+
+private:
+  int kind_{-1};
+};
+
+Layout MakeTaggedAscendFractalLayout(Array<PrimExpr> input_size,
+                                     Array<PrimExpr> forward_index,
+                                     AscendFractalKind kind) {
+  ObjectPtr<LayoutNode> node = make_object<AscendFractalLayoutNode>(
+      std::move(input_size), std::move(forward_index), kind);
+  return Layout(std::move(node));
+}
+
+std::pair<LogicalAxis, LogicalAxis> GetAxesForKind(AscendFractalKind kind) {
+  ICHECK(kind == AscendFractalKind::kMajorK ||
+         kind == AscendFractalKind::kMajorMN ||
+         kind == AscendFractalKind::kL0C || kind == AscendFractalKind::kSF);
+  if (kind == AscendFractalKind::kMajorMN) {
+    return {LogicalAxis::kRow, LogicalAxis::kCol};
+  }
+  return {LogicalAxis::kCol, LogicalAxis::kRow};
+}
+
+Layout
+AscendFractalLayoutNode::Expand(const Array<PrimExpr> &leading_shape) const {
+  Layout expanded = LayoutNode::Expand(leading_shape);
+  if (leading_shape.empty()) {
+    return expanded;
+  }
+  return MakeTaggedAscendFractalLayout(expanded->InputShape(),
+                                       expanded->GetForwardIndex(), Kind());
+}
+
+} // namespace
+
 // Column fractal C0 = 32 bytes / element_size, expressed from element bits.
 int AscendC0(int element_bits) {
   ICHECK(element_bits > 0 && 256 % element_bits == 0)
@@ -58,7 +120,9 @@ static Layout MakeAscendMajorKLayout2D(PrimExpr rows, PrimExpr cols,
   PrimExpr ri = FloorMod(i, row_frac);
   PrimExpr co = FloorDiv(j, c0);
   PrimExpr ci = FloorMod(j, c0);
-  return Layout(Array<PrimExpr>{rows, cols}, {co, ro, ri, ci});
+  return MakeTaggedAscendFractalLayout(Array<PrimExpr>{rows, cols},
+                                       {co, ro, ri, ci},
+                                       AscendFractalKind::kMajorK);
 }
 
 // MajorMN fractal: the contiguous output M/N axis is the rows axis (dim -2)
@@ -76,7 +140,9 @@ static Layout MakeAscendMajorMNLayout2D(PrimExpr rows, PrimExpr cols,
   PrimExpr ci = FloorMod(i, c0);
   PrimExpr ro = FloorDiv(j, row_frac);
   PrimExpr ri = FloorMod(j, row_frac);
-  return Layout(Array<PrimExpr>{rows, cols}, {co, ro, ri, ci});
+  return MakeTaggedAscendFractalLayout(Array<PrimExpr>{rows, cols},
+                                       {co, ro, ri, ci},
+                                       AscendFractalKind::kMajorMN);
 }
 
 static void CheckStaticDivisible(const PrimExpr &value, int divisor,
@@ -137,7 +203,8 @@ static Layout MakeAscendL0CLayout2D(PrimExpr rows, PrimExpr cols) {
   PrimExpr mi = FloorMod(i, frac);
   PrimExpr no = FloorDiv(j, frac);
   PrimExpr ni = FloorMod(j, frac);
-  return Layout(Array<PrimExpr>{rows, cols}, {no, mo, mi, ni});
+  return MakeTaggedAscendFractalLayout(
+      Array<PrimExpr>{rows, cols}, {no, mo, mi, ni}, AscendFractalKind::kL0C);
 }
 
 Layout MakeAscendL0CLayout(const Buffer &buffer) {
@@ -163,7 +230,8 @@ static Layout MakeAscendSFLayout2D(PrimExpr mn, PrimExpr k, int element_bits) {
   PrimExpr mi = FloorMod(i, mn_frac);
   PrimExpr ko = FloorDiv(j, pack);
   PrimExpr pi = FloorMod(j, pack);
-  return Layout(Array<PrimExpr>{mn, k}, {mo, ko, mi, pi});
+  return MakeTaggedAscendFractalLayout(Array<PrimExpr>{mn, k}, {mo, ko, mi, pi},
+                                       AscendFractalKind::kSF);
 }
 
 Layout MakeAscendSFLayout(const Buffer &buffer) {
@@ -206,127 +274,41 @@ bool TryExtractAscendFractalLayout(const Layout &layout, const Buffer &buf,
   PrimExpr rows = buf->shape[n - 2];
   PrimExpr cols = buf->shape[n - 1];
   PrimExpr row_frac = I(16);
-  PrimExpr c0 = I(AscendC0(buf->dtype.bits()));
-  PrimExpr sf_pack = I(0);
-  bool can_be_sf = buf->dtype.bits() > 0 && 16 % buf->dtype.bits() == 0;
-  if (can_be_sf) {
-    sf_pack = I(16 / buf->dtype.bits());
-  }
 
-  Array<PrimExpr> fwd = layout->GetForwardIndex();
-  if (fwd.size() < 4)
-    return false;
-  Array<PrimExpr> vars = layout->GetForwardVars();
-  if (vars.size() < 2)
-    return false;
-  PrimExpr row = vars[vars.size() - 2];
-  PrimExpr col = vars[vars.size() - 1];
-
-  arith::Analyzer analyzer;
-  Array<PrimExpr> input_shape = layout->InputShape();
-  for (size_t i = 0; i < vars.size() && i < input_shape.size(); ++i) {
-    if (const auto *var = vars[i].as<VarNode>()) {
-      analyzer.Bind(GetRef<Var>(var), Range(0, input_shape[i]));
-    }
-  }
-  auto same = [&](const PrimExpr &a, const PrimExpr &b) {
-    return StructuralEqual()(analyzer.Simplify(a), analyzer.Simplify(b));
-  };
-  auto div_expr = [](const PrimExpr &v, const PrimExpr &f) {
-    return FloorDiv(v, f);
-  };
   auto ceildiv_expr = [](const PrimExpr &v, const PrimExpr &f) {
     return FloorDiv(v + f - Integer(1), f);
   };
-  auto mod_expr = [](const PrimExpr &v, const PrimExpr &f) {
-    return FloorMod(v, f);
-  };
+  const auto *tagged = layout.as<AscendFractalLayoutNode>();
+  ICHECK(tagged != nullptr)
+      << "Expected a tagged canonical Ascend fractal layout for buffer "
+      << buf->name << ", but got layout type " << layout->GetTypeKey()
+      << ". Construct the layout with MakeAscendMajorKLayout, "
+         "MakeAscendMajorMNLayout, MakeAscendL0CLayout, or "
+         "MakeAscendSFLayout.";
 
-  size_t m = fwd.size();
-  PrimExpr o0 = fwd[m - 4];
-  PrimExpr o1 = fwd[m - 3];
-  PrimExpr i0 = fwd[m - 2];
-  PrimExpr i1 = fwd[m - 1];
-  auto matches = [&](const PrimExpr &outer0_axis, const PrimExpr &outer1_axis,
-                     const PrimExpr &inner0_axis, const PrimExpr &inner1_axis,
-                     PrimExpr outer0_factor, PrimExpr outer1_factor,
-                     PrimExpr inner0_factor, PrimExpr inner1_factor) {
-    return same(o0, div_expr(outer0_axis, outer0_factor)) &&
-           same(o1, div_expr(outer1_axis, outer1_factor)) &&
-           same(i0, mod_expr(inner0_axis, inner0_factor)) &&
-           same(i1, mod_expr(inner1_axis, inner1_factor));
-  };
-  auto matches_standard = [&](const PrimExpr &c0_axis,
-                              const PrimExpr &row16_axis, PrimExpr c0_factor,
-                              PrimExpr row16_factor) {
-    return matches(c0_axis, row16_axis, row16_axis, c0_axis, c0_factor,
-                   row16_factor, row16_factor, c0_factor);
-  };
-  auto matches_sf = [&](const PrimExpr &mn_axis, const PrimExpr &k_axis,
-                        PrimExpr mn_factor, PrimExpr k_factor) {
-    return matches(mn_axis, k_axis, mn_axis, k_axis, mn_factor, k_factor,
-                   mn_factor, k_factor);
-  };
-
-  // Standard fractal: col/C0, row/16 (L1 NZ layout)
-  if (matches_standard(col, row, c0, row_frac)) {
-    bool is_l0c =
-        buf.scope() == "shared.l0c" || buf.scope() == "shared.l0c.dyn";
-    *out = {is_l0c ? AscendFractalKind::kL0C : AscendFractalKind::kMajorLike,
-            c0,
-            row_frac,
-            rows,
-            cols,
-            ceildiv_expr(cols, c0),
-            ceildiv_expr(rows, row_frac),
-            LogicalAxis::kCol,
-            LogicalAxis::kRow};
-    return true;
+  AscendFractalKind kind = tagged->Kind();
+  auto [c0_axis, row16_axis] = GetAxesForKind(kind);
+  PrimExpr c0;
+  if (kind == AscendFractalKind::kL0C) {
+    c0 = row_frac;
+  } else if (kind == AscendFractalKind::kSF) {
+    int element_bits = buf->dtype.bits();
+    ICHECK(element_bits > 0 && 16 % element_bits == 0)
+        << "Tagged Ascend SF layout expects element bits to divide 16, got "
+        << element_bits << " for buffer " << buf->name;
+    c0 = I(16 / element_bits);
+  } else {
+    c0 = I(AscendC0(buf->dtype.bits()));
   }
-
-  // SF_K fractal: row/16, col/pack where pack = 16 bits / element bits.
-  if (can_be_sf && matches_sf(row, col, row_frac, sf_pack)) {
-    *out = {AscendFractalKind::kSF,
-            sf_pack,
-            row_frac,
-            rows,
-            cols,
-            ceildiv_expr(rows, row_frac),
-            ceildiv_expr(cols, sf_pack),
-            LogicalAxis::kCol,
-            LogicalAxis::kRow};
-    return true;
-  }
-
-  // Swapped: row/C0, col/16
-  if (matches_standard(row, col, c0, row_frac)) {
-    *out = {AscendFractalKind::kMajorLike,
-            c0,
-            row_frac,
-            rows,
-            cols,
-            ceildiv_expr(rows, c0),
-            ceildiv_expr(cols, row_frac),
-            LogicalAxis::kRow,
-            LogicalAxis::kCol};
-    return true;
-  }
-
-  // L0C fixed 16×16: col/16, row/16
-  if (matches_standard(col, row, row_frac, row_frac)) {
-    *out = {AscendFractalKind::kL0C,
-            row_frac,
-            row_frac,
-            rows,
-            cols,
-            ceildiv_expr(cols, row_frac),
-            ceildiv_expr(rows, row_frac),
-            LogicalAxis::kCol,
-            LogicalAxis::kRow};
-    return true;
-  }
-
-  return false;
+  auto axis_extent = [&](LogicalAxis axis) {
+    return axis == LogicalAxis::kRow ? rows : cols;
+  };
+  PrimExpr c0_outer = ceildiv_expr(axis_extent(c0_axis), c0);
+  PrimExpr row16_outer = ceildiv_expr(axis_extent(row16_axis), row_frac);
+  PrimExpr outer0 = kind == AscendFractalKind::kSF ? row16_outer : c0_outer;
+  PrimExpr outer1 = kind == AscendFractalKind::kSF ? c0_outer : row16_outer;
+  *out = {kind, c0, row_frac, rows, cols, outer0, outer1, c0_axis, row16_axis};
+  return true;
 }
 
 bool TryExtractAscendFractalRegion(const Layout &layout,
@@ -409,6 +391,7 @@ tirx::Buffer MakeStridedSlice(const tirx::Buffer &phys_buf,
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = reflection;
+  AscendFractalLayoutNode::RegisterReflection();
   refl::GlobalDef()
       .def("tl.make_ascend_major_k_layout",
            [](const Buffer &buffer, int k_align) {
