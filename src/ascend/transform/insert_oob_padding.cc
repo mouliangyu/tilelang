@@ -204,7 +204,15 @@ private:
         // buffer whose entire valid region is empty still gets its fill below.)
         copy_stmt = Evaluate(0);
       } else if (!is_one(has_data)) {
-        copy_stmt = IfThenElse(has_data, copy_stmt);
+        // The enclosing loop/thread/if constraints (e.g. the Persistent wave
+        // guard `w*64+bx < ceildiv(num_tokens,32)`) may already guarantee at
+        // least one valid element. When provable, keep the clamped copy
+        // UNCONDITIONAL: the tail guard is redundant, and an unconditional
+        // write keeps the dst buffer write-first so multi-buffer eligibility /
+        // annotate_buffer_versions apply.
+        if (!analyzer_->CanProve(has_data)) {
+          copy_stmt = IfThenElse(has_data, copy_stmt);
+        }
       }
     }
 
