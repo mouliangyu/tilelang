@@ -13,6 +13,10 @@ and validate supported layout combinations end-to-end on NPU:
   physical row boundary.
 * ``test_gm2ub_2d_to_2d`` — two strided sides with matching row boundaries keep
   their independent row strides.
+* ``test_gm2ub_single_element_rows`` — a coalesced strided vector is represented
+  as one-element MTE rows.
+* ``test_fp4_column_alignment`` — packed FP4 rows must contain whole bytes in
+  both GM->UBuf and UBuf->GM copies, so odd-width column copies are rejected.
 * ``test_gm2ub_dynamic_rows_middle_dim`` — a runtime-sized strided source chooses
   the physical source row boundary instead of relying on symbolic size ordering.
 * ``test_gm2ub_incompatible_2d_rejected`` — two different physical row boundaries
@@ -193,6 +197,67 @@ def test_gm2ub_2d_to_2d():
     torch.npu.synchronize()
 
     torch.testing.assert_close(out, src[:, :COLS].reshape(-1).contiguous())
+
+
+def gm2ub_single_element_rows():
+    @T.prim_func
+    def kernel(
+        src: T.Buffer((ROWS, WIDTH), "int32"),
+        dst: T.Buffer((ROWS,), "int32"),
+    ):
+        with T.Kernel(1) as _:
+            buf = T.alloc_shared((ROWS, 1), "int32")
+            T.copy(src[:, 0:1], buf)
+            T.copy(buf, dst)
+
+    return kernel
+
+
+def test_gm2ub_single_element_rows():
+    kernel = tilelang.compile(
+        gm2ub_single_element_rows(),
+        out_idx=-1,
+        target="ascend",
+    )
+
+    source = kernel.get_kernel_source()
+    good = re.search(
+        r"copy_gm_to_ubuf_align_v2\([^;]*,\s*0,\s*4,\s*4,\s*0,\s*0,\s*0,\s*0,\s*256,\s*4\);",
+        source,
+    )
+    assert good is not None, source
+
+    device = torch.device("npu")
+    src = torch.arange(ROWS * WIDTH, dtype=torch.int32, device=device).reshape(ROWS, WIDTH)
+    out = kernel(src)
+    torch.npu.synchronize()
+
+    torch.testing.assert_close(out, src[:, 0].contiguous())
+
+
+def fp4_column_copy(cols):
+    @T.prim_func
+    def kernel(
+        src: T.Tensor((ROWS, WIDTH), T.float4_e2m1fn),
+        dst: T.Tensor((ROWS, WIDTH), T.float4_e2m1fn),
+    ):
+        with T.Kernel(1) as _:
+            buf = T.alloc_shared((ROWS, WIDTH), T.float4_e2m1fn)
+            T.copy(src[:, :cols], buf[:, :cols])
+            T.copy(buf[:, :cols], dst[:, :cols])
+
+    return kernel
+
+
+@pytest.mark.parametrize("cols", [1, 3, 5])
+def test_fp4_odd_column_count_rejected(cols):
+    with pytest.raises(Exception, match="packed sub-byte row must be byte-aligned"):
+        tilelang.compile(fp4_column_copy(cols), out_idx=-1, target="ascend")
+
+
+@pytest.mark.parametrize("cols", [2, 4, 6])
+def test_fp4_even_column_count_allowed(cols):
+    tilelang.compile(fp4_column_copy(cols), out_idx=-1, target="ascend")
 
 
 DYNAMIC_ROWS = 4

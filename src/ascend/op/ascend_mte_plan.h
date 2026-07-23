@@ -99,12 +99,16 @@ struct StridedLayout {
 
   /// Coalesce adjacent modes where the outer mode's stride equals the inner
   /// mode's size * stride (i.e. they are contiguous in memory).
-  /// Also eliminates size-1 modes (they carry no data extent).
+  /// Also eliminates size-1 modes (they carry no data extent). If the
+  /// innermost surviving mode is strided, its implicit one-element contiguous
+  /// MTE row is made explicit.
   ///
-  /// Returns a new StridedLayout with fewer modes.
+  /// Returns a normalized StridedLayout suitable for MTE planning.
   StridedLayout Coalesce(arith::Analyzer *analyzer) const {
     if (modes.empty())
       return *this;
+
+    auto I = [](int64_t v) { return make_const(DataType::Int(32), v); };
 
     // First, filter out size-1 modes (they don't contribute to data layout)
     std::vector<Mode> filtered;
@@ -117,7 +121,6 @@ struct StridedLayout {
     }
     // If all modes were size-1, the total is 1 element; return single mode.
     if (filtered.empty()) {
-      auto I = [](int64_t v) { return make_const(DataType::Int(32), v); };
       return StridedLayout{{Mode{I(1), I(1)}}, offset, elem_bits};
     }
 
@@ -137,6 +140,10 @@ struct StridedLayout {
       } else {
         result.push_back(cur);
       }
+    }
+
+    if (!analyzer->CanProveEqual(result[0].stride, I(1))) {
+      result.insert(result.begin(), Mode{I(1), I(1)});
     }
 
     return StridedLayout{std::move(result), offset, elem_bits};
@@ -240,6 +247,16 @@ inline MTECopy2D PlanMTECopy(const StridedLayout &src_raw,
     n_rows = analyzer->Simplify(src.modes[1].size);
     src_stride_elems = src.modes[1].stride;
     dst_stride_elems = dst.modes[1].stride;
+  }
+
+  // A packed sub-byte row must contain a whole number of bytes. Otherwise MTE
+  // rounds every row up and can overrun the packed destination.
+  if (src.elem_bits < 8) {
+    PrimExpr row_bits = analyzer->Simplify(row_elems * I(src.elem_bits));
+    ICHECK(analyzer->CanProveEqual(FloorMod(row_bits, I(8)), I(0)))
+        << "PlanMTECopy: packed sub-byte row must be byte-aligned, got "
+        << row_elems << " elements at " << src.elem_bits
+        << " bits per element.";
   }
 
   return MTECopy2D{
