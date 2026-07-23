@@ -120,21 +120,11 @@ jobs:
           echo "UV_CACHE_DIR=${XDG_CACHE_HOME}/uv" | tee -a "${GITHUB_ENV}"
           echo "PRE_COMMIT_HOME=${XDG_CACHE_HOME}/pip/.pre-commit" | tee -a "${GITHUB_ENV}"
 
-          # PTO toolchain
-          export PTO_SOURCE_DIR=/nfs-hg/prod/deepseek/permanent/xuruifan/PTOAS
-          export PTO_BUILD_DIR=${PTO_SOURCE_DIR}/build
-          export PTO_PYTHON_ROOT=${PTO_BUILD_DIR}/python
-          export PTO_PTODSL_ROOT=${PTO_SOURCE_DIR}/ptodsl
-          export LLVM_BUILD_DIR=/nfs-hg/prod/deepseek/permanent/xuruifan/llvm-project/build
-          export MLIR_PYTHON_ROOT=${LLVM_BUILD_DIR}/tools/mlir/python_packages/mlir_core
-          echo "PTO_SOURCE_DIR=${PTO_SOURCE_DIR}" | tee -a "${GITHUB_ENV}"
-          echo "PTO_BUILD_DIR=${PTO_BUILD_DIR}" | tee -a "${GITHUB_ENV}"
-          echo "PTO_PYTHON_ROOT=${PTO_PYTHON_ROOT}" | tee -a "${GITHUB_ENV}"
-          echo "LLVM_BUILD_DIR=${LLVM_BUILD_DIR}" | tee -a "${GITHUB_ENV}"
-          echo "MLIR_PYTHON_ROOT=${MLIR_PYTHON_ROOT}" | tee -a "${GITHUB_ENV}"
-          echo "PTO_PTODSL_ROOT=${PTO_PTODSL_ROOT}" | tee -a "${GITHUB_ENV}"
-          echo "PYTHONPATH=${MLIR_PYTHON_ROOT}:${PTO_PTODSL_ROOT}:${PTO_PYTHON_ROOT}" | tee -a "${GITHUB_ENV}"
-          echo "${PTO_SOURCE_DIR}/build/tools/ptoas:${PTO_SOURCE_DIR}/build/tools/ptobc" | tee -a "${GITHUB_PATH}"
+          # PTO toolchain is provided by the self-contained `ptoas` wheel installed
+          # in the "Setup venv" step (auditwheel-repaired: bundles the LLVM/MLIR
+          # shared libs with $ORIGIN RPATH, ptodsl, mlir dialects, and the ptoas CLI
+          # console script). No PYTHONPATH / PATH / LD_LIBRARY_PATH wiring to a build
+          # tree is needed anymore.
 
           # CANN runtime env for torch_npu autoload (libascendcl.so, liburma.so.0, ...).
           # The runner daemon does not inherit the container-injected CANN environment,
@@ -147,8 +137,8 @@ jobs:
           # driver / urma library paths injected by the container but absent from set_env.sh
           export LD_LIBRARY_PATH="/usr/local/Ascend/lib64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver_libs:${LD_LIBRARY_PATH}"
 
-          # Propagate the assembled CANN + PTO/LLVM environment to subsequent steps.
-          export LD_LIBRARY_PATH="${LLVM_BUILD_DIR}/lib:${PTO_BUILD_DIR}/lib:${LD_LIBRARY_PATH}"
+          # Propagate the assembled CANN environment to subsequent steps.
+          # (PTO/LLVM libs are self-contained inside the installed `ptoas` wheel.)
           {
             echo "ASCEND_TOOLKIT_HOME=${ASCEND_TOOLKIT_HOME}"
             echo "ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
@@ -193,6 +183,10 @@ jobs:
           echo "::group::torch.utils.collect_env"
           uv run --no-project -m -- torch.utils.collect_env
           uv pip install /nfs-hg/prod/deepseek/permanent/shared/caohuanqi/pytorch/dist/torch_npu-2.10.0.post4+git4421109-cp312-cp312-linux_aarch64.whl
+          # Self-contained PTO toolchain (ptodsl + mlir dialects + ptoas CLI, with
+          # bundled LLVM/MLIR shared libs). Replaces the PYTHONPATH/PATH/LD_LIBRARY_PATH
+          # wiring to a PTOAS/LLVM build tree.
+          uv pip install /nfs-hg/prod/deepseek/permanent/shared/xuruifan/ptoas-0.1.1-cp312-cp312-manylinux_2_34_aarch64.whl
           echo "::endgroup::"
 
       - name: Clear uv cache for self-hosted runners (if setup failed)
