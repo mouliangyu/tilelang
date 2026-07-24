@@ -926,6 +926,22 @@ TVM_DLL const Op &ascend_set_flag();
 TVM_DLL const Op &ascend_wait_flag();
 
 /*!
+ * \brief Ascend inter-core synchronization arrive intrinsic.
+ *
+ * ascend_sync_inter_arrive(pipe_string, flag_id)
+ *
+ */
+TVM_DLL const Op &ascend_sync_inter_arrive();
+
+/*!
+ * \brief Ascend inter-core synchronization wait intrinsic.
+ *
+ * ascend_sync_inter_wait(pipe_string, flag_id)
+ *
+ */
+TVM_DLL const Op &ascend_sync_inter_wait();
+
+/*!
  * \brief Ascend thread fence intrinsic.
  *
  * ascend_threadfence()

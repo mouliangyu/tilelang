@@ -41,6 +41,22 @@ def test_ascend_set_wait_flag():
     assert "AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0)" in source
 
 
+def test_ascend_sync_inter_arrive_wait():
+    @T.prim_func
+    def func(A: T.Buffer((16,), "float32"), flag_id: T.int32):
+        with T.Kernel(1) as _:
+            T.ascend_sync_inter_arrive("PIPE_FIX", 3)
+            T.ascend_sync_inter_wait("PIPE_MTE3", flag_id)
+            A[0] = T.float32(1)
+
+    artifact = lower(func, target="ascend")
+    source = artifact.kernel_source
+    print(source)
+    assert source.count("#include <c_api/asc_simd.h>") == 1
+    assert "asc_sync_inter_arrive(PIPE_FIX, 3);" in source
+    assert "asc_sync_inter_wait(PIPE_MTE3, flag_id);" in source
+
+
 def test_ascend_threadfence():
     @T.prim_func
     def func(A: T.Buffer((16,), "float32")):

@@ -71,6 +71,52 @@ def ascend_wait_flag(hard_event: str, event_id) -> None:
     return tirx.call_intrin("void", tirx.op.Op.get("tl.ascend_wait_flag"), hard_event, event_id)
 
 
+def ascend_sync_inter_arrive(pipe: str, flag_id) -> None:
+    """Signal an Ascend inter-core synchronization event.
+
+    Generates: asc_sync_inter_arrive(pipe, flag_id);
+
+    Parameters
+    ----------
+    pipe : str
+        Pipeline type, e.g., "PIPE_MTE3", "PIPE_FIX".
+    flag_id : int or PrimExpr
+        Inter-core synchronization flag ID.
+
+    Example
+    -------
+    >>> T.ascend_sync_inter_arrive("PIPE_FIX", flag_id)
+    """
+    if not isinstance(pipe, str):
+        raise TypeError(f"pipe must be a string, got {type(pipe)}")
+    if isinstance(flag_id, int):
+        flag_id = tirx.IntImm("int32", flag_id)
+    return tirx.call_intrin("void", tirx.op.Op.get("tl.ascend_sync_inter_arrive"), pipe, flag_id)
+
+
+def ascend_sync_inter_wait(pipe: str, flag_id) -> None:
+    """Wait for an Ascend inter-core synchronization event.
+
+    Generates: asc_sync_inter_wait(pipe, flag_id);
+
+    Parameters
+    ----------
+    pipe : str
+        Pipeline type, e.g., "PIPE_MTE3", "PIPE_FIX".
+    flag_id : int or PrimExpr
+        Inter-core synchronization flag ID.
+
+    Example
+    -------
+    >>> T.ascend_sync_inter_wait("PIPE_MTE3", flag_id)
+    """
+    if not isinstance(pipe, str):
+        raise TypeError(f"pipe must be a string, got {type(pipe)}")
+    if isinstance(flag_id, int):
+        flag_id = tirx.IntImm("int32", flag_id)
+    return tirx.call_intrin("void", tirx.op.Op.get("tl.ascend_sync_inter_wait"), pipe, flag_id)
+
+
 def ascend_threadfence() -> None:
     """Insert an AscendC thread fence.
 
@@ -479,6 +525,8 @@ __all__ = [
     "ascend_pipe_barrier",
     "ascend_set_flag",
     "ascend_wait_flag",
+    "ascend_sync_inter_arrive",
+    "ascend_sync_inter_wait",
     "ascend_threadfence",
     "ascend_reduce_add",
     "ascend_reduce_max",
