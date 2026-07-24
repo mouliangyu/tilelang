@@ -1974,7 +1974,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
              op->op.same_as(tl::atomic_add_ret_elem_op()) ||
              op->op.same_as(tl::atomic_max_ret_elem_op()) ||
              op->op.same_as(tl::atomic_min_ret_elem_op())) {
-    ICHECK_GE(op->args.size(), 2);
+    ICHECK(op->args.size() == 2 || op->args.size() == 3)
+        << "Ascend scalar atomic ops expect (ptr, value[, memory_order])";
     const char *fn = nullptr;
     bool is_ret = false;
     if (op->op.same_as(tl::atomic_add_elem_op()) ||
@@ -1993,9 +1994,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       // correctly scoped, element-typed, offset pointer.
       out << "asc_atomic_" << fn << "(" << PrintExpr(op->args[0]) << ", ";
       PrintExpr(op->args[1], out);
-      if (op->args.size() > 2) {
-        out << ", " << PrintExpr(op->args[2]);
-      }
+      // Ascend SIMT atomic APIs only accept (ptr, value). The optional
+      // cross-backend memory-order argument is intentionally ignored.
       out << ")";
     };
     if (is_ret) {

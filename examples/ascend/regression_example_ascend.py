@@ -57,7 +57,7 @@ _ENTRIES: list[tuple[str, str, dict]] = [
     ("ascend_gqa", "flash_attention/example_gqa.py", {}),
     ("ascend_rmsnorm", "example_rmsnorm.py", {}),
     ("ascend_buffer_version_annotation", "example_buffer_version_annotation.py", {}),
-    ("ascend_atomic_add", "example_atomic_add.py", {}),
+    ("ascend_atomic_add", "example_atomic.py", {}),
     ("ascend_simdvf_topk_gate", "example_simdvf_topk_gate.py", {}),
     ("ascend_simdvf_vecadd", "example_simdvf_vecadd.py", {}),
     ("ascend_simdvf_vecadd_lower", "example_simdvf_vecadd_lower.py", {}),
