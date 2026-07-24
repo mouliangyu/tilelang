@@ -29,12 +29,25 @@ namespace ascend {
 
 using namespace tirx;
 
+/*! \brief Ascend DMA route selected from the source/destination scopes. */
+enum class DMAPath {
+  kNone,
+  kGMToUB,
+  kUBToGM,
+  kGMToL1,
+  kL1ToL0A,
+  kL1ToL0B,
+  kL0CToUB,
+  kUBToL1,
+  kL0CToGM,
+};
+
 /*!
- * \brief Ascend DMA path id for a copy between the given buffer scopes, or -1
- *        when it is not a DMA copy. Path ids: 0 GM->UB, 1 UB->GM, 2 GM->L1,
- *        3 L1->L0A, 4 L1->L0B, 5 L0C->UB, 6 UB->L1, 7 L0C->GM.
+ * \brief Classify a copy between the given buffer scopes.
+ * \return The matching Ascend DMA route, or DMAPath::kNone when the copy is
+ * not handled by an Ascend DMA instruction.
  */
-int GetDMAPath(const Buffer &src, const Buffer &dst);
+DMAPath GetDMAPath(const Buffer &src, const Buffer &dst);
 
 /*!
  * \brief Look up a buffer's inferred Layout in a layout map, matching either

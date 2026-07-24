@@ -78,9 +78,9 @@ PrimExpr MakeFillBasePtr(const CopyNode *copy) {
 }
 
 // Build the standalone padding fill statements for a padded GM->L1 copy, or an
-// empty vector when the copy needs no padding. Mirrors copy.cc's dma_path 2
-// major-layout branch (valid extents from the clamped source, dst geometry from
-// the full destination range).
+// empty vector when the copy needs no padding. Mirrors copy.cc's
+// DMAPath::kGMToL1 major-layout branch (valid extents from the clamped source,
+// dst geometry from the full destination range).
 std::vector<Stmt> MakeL1PaddingStmts(const CopyNode *copy,
                                      const LayoutMap &layout_map,
                                      arith::Analyzer *analyzer) {
@@ -173,10 +173,12 @@ private:
     Copy copy_obj(call->args, call->annotations);
     const CopyNode *copy = copy_obj.get();
 
-    int dma_path = ascend::GetDMAPath(copy->src, copy->dst);
+    ascend::DMAPath dma_path = ascend::GetDMAPath(copy->src, copy->dst);
     // Only DMA paths that copy.cc used to clamp participate in OOB handling.
-    bool clampable =
-        dma_path == 0 || dma_path == 1 || dma_path == 2 || dma_path == 7;
+    bool clampable = dma_path == ascend::DMAPath::kGMToUB ||
+                     dma_path == ascend::DMAPath::kUBToGM ||
+                     dma_path == ascend::DMAPath::kGMToL1 ||
+                     dma_path == ascend::DMAPath::kL0CToGM;
     if (!clampable) {
       return Parent::VisitStmt_(op);
     }

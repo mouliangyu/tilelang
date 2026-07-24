@@ -17,24 +17,24 @@ namespace ascend {
 
 using namespace tirx;
 
-int GetDMAPath(const Buffer &src, const Buffer &dst) {
+DMAPath GetDMAPath(const Buffer &src, const Buffer &dst) {
   if (IsGlobalBuffer(src) && IsSharedBuffer(dst))
-    return 0;
+    return DMAPath::kGMToUB;
   if (IsSharedBuffer(src) && IsGlobalBuffer(dst))
-    return 1;
+    return DMAPath::kUBToGM;
   if (IsGlobalBuffer(src) && IsL1Buffer(dst))
-    return 2;
+    return DMAPath::kGMToL1;
   if (IsL1Buffer(src) && IsL0ABuffer(dst))
-    return 3;
+    return DMAPath::kL1ToL0A;
   if (IsL1Buffer(src) && IsL0BBuffer(dst))
-    return 4;
+    return DMAPath::kL1ToL0B;
   if (IsL0CBuffer(src) && IsSharedBuffer(dst))
-    return 5;
+    return DMAPath::kL0CToUB;
   if (IsSharedBuffer(src) && IsL1Buffer(dst))
-    return 6;
+    return DMAPath::kUBToL1;
   if (IsL0CBuffer(src) && IsGlobalBuffer(dst))
-    return 7;
-  return -1;
+    return DMAPath::kL0CToGM;
+  return DMAPath::kNone;
 }
 
 Optional<Layout> FindLayoutForBuffer(const LayoutMap &layout_map,

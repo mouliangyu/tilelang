@@ -31,7 +31,9 @@ namespace ascend {
 
 namespace {
 
-bool IsDMACopy(const CopyNode &op) { return GetDMAPath(op.src, op.dst) >= 0; }
+bool IsDMACopy(const CopyNode &op) {
+  return GetDMAPath(op.src, op.dst) != DMAPath::kNone;
+}
 
 bool IsInsideSimtVF(const LowerArgs &T) {
   if (!T.thread_var.defined()) {
@@ -112,7 +114,7 @@ static int GetCCQuantPre(DataType src_dtype, DataType dst_dtype) {
 }
 
 Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
-                  arith::Analyzer *analyzer, int dma_path) {
+                  arith::Analyzer *analyzer, DMAPath dma_path) {
   auto I = [](int64_t v) { return make_const(DataType::Int(32), v); };
   auto I64 = [](int64_t v) { return make_const(DataType::Int(64), v); };
   int elem_bits = op.src->dtype.bits();
@@ -156,7 +158,7 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
 
   PrimExpr total_bytes = row_bytes * n_rows;
   PrimExpr call;
-  if (dma_path == 0 || dma_path == 1) {
+  if (dma_path == DMAPath::kGMToUB || dma_path == DMAPath::kUBToGM) {
     auto src_layout =
         StridedLayout::FromBufferRange(op.src, src_range, elem_bits);
     auto dst_layout =
@@ -188,7 +190,7 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
       return -1;
     };
     int64_t rb_plan = as_int_plan(plan_row_bytes);
-    bool data_select = dma_path == 0 && op.GetDataSelect() != 0;
+    bool data_select = dma_path == DMAPath::kGMToUB && op.GetDataSelect() != 0;
     // Padding right-pads each row up to the next 32B boundary, so it needs a
     // statically-known row byte length to compute the pad count. A symbolic
     // row extent would silently skip padding and read garbage tail lanes.
@@ -214,7 +216,7 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
         (analyzer->CanProveEqual(plan_src_stride_bytes, plan_row_bytes) &&
          analyzer->CanProveEqual(plan_dst_stride_bytes, plan_row_bytes));
 
-    if (dma_path == 0) {
+    if (dma_path == DMAPath::kGMToUB) {
       if (do_pad) {
         // Padded copy: rightPadding fills the row tail from the pad-value
         // register (set_mov_pad_val). The destination stride is the physical
@@ -252,7 +254,7 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
                      plan_src_stride_bytes});
       }
     }
-  } else if (dma_path == 2) {
+  } else if (dma_path == DMAPath::kGMToL1) {
     AscendFractalLayoutInfo dst_layout;
     bool has_dst_layout = false;
     if (auto layout = FindLayoutForBuffer(T.layout_map, op.dst)) {
@@ -319,7 +321,7 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
     // padded GM->L1 copy are all handled before lowering by the
     // AscendInsertOOBPadding pass, so lowering just emits the DMA call.
 
-  } else if (dma_path == 3 || dma_path == 4) {
+  } else if (dma_path == DMAPath::kL1ToL0A || dma_path == DMAPath::kL1ToL0B) {
     // M/K positions go through intrinsic args; leading dims (e.g. version)
     // through the pointer offset.  MakeAccessPtrFromRegion splits offset/extent
     // the same way: leading dims → offset, last two (M×K) → extent.
@@ -392,8 +394,8 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
     bool major_mismatch = src_c0_axis != dst_c0_axis;
     bool needs_transpose = user_transpose ^ major_mismatch;
 
-    auto intrinsic =
-        dma_path == 3 ? ascend_load_cbuf_to_ca() : ascend_load_cbuf_to_cb();
+    auto intrinsic = dma_path == DMAPath::kL1ToL0A ? ascend_load_cbuf_to_ca()
+                                                   : ascend_load_cbuf_to_cb();
     Array<PrimExpr> ld_args = {
         dst_ptr,    src_base_ptr, m_start,
         k_start,    m_step,       k_step,
@@ -461,7 +463,7 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
       ld_args.push_back(sf_dst_stride); // [15] sf_dst_stride
     }
     call = Call(DataType::Void(), intrinsic, ld_args);
-  } else if (dma_path == 5) {
+  } else if (dma_path == DMAPath::kL0CToUB) {
     AscendFractalLayoutInfo info;
     PrimExpr loop_src_stride = n_rows;
 
@@ -501,7 +503,7 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
                  zero,   // wino_post_en
                  zero,   // broadcast_en
                  zero}); // NZ2DN_en
-  } else if (dma_path == 6) {
+  } else if (dma_path == DMAPath::kUBToL1) {
     ICHECK(!op.GetNd2Nz())
         << "Ascend nd2nz UB->L1 copy must be emitted directly from the Python "
            "frontend (tilelang/language/copy_op.py); it should never reach "
@@ -510,7 +512,7 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
     PrimExpr n_burst_val = total_bytes / I(32);
     call = Call(DataType::Void(), ascend_copy_ubuf_to_cbuf(),
                 {dst_ptr, src_ptr, zero, n_burst_val, I(1), zero, zero});
-  } else if (dma_path == 7) {
+  } else if (dma_path == DMAPath::kL0CToGM) {
     AscendFractalLayoutInfo info;
     PrimExpr loop_src_stride = n_rows;
 
@@ -551,7 +553,7 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
               zero,   // [23] broadcast_en
               zero}); // [24] NZ2DN_en
   } else {
-    LOG(FATAL) << "Unknown Ascend DMA path: " << dma_path;
+    LOG(FATAL) << "Unknown Ascend DMA path";
   }
 
   // The empty-tile has_data guard is applied by AscendInsertOOBPadding (it
@@ -612,14 +614,15 @@ struct Copy {
         result_map.Set(sf_buf, MakeAscendSFLayout(sf_buf));
       }
 
-      int dma_path = GetDMAPath(op.src, op.dst);
-      if (dma_path == 2 && level == InferLevel::kFree &&
+      DMAPath dma_path = GetDMAPath(op.src, op.dst);
+      if (dma_path == DMAPath::kGMToL1 && level == InferLevel::kFree &&
           !FindLayoutForBuffer(T.layout_map, op.dst).defined()) {
         // A standalone GM->L1 copy has no downstream L0/GEMM consumer to
         // anchor its layout. Preserve the canonical legacy K-col NZ layout as
         // a free-mode fallback.
         result_map.Set(op.dst, MakeAscendMajorKLayout(op.dst));
-      } else if (dma_path == 3 || dma_path == 4) {
+      } else if (dma_path == DMAPath::kL1ToL0A ||
+                 dma_path == DMAPath::kL1ToL0B) {
         int k_align = op.sf.defined() ? 64 : 1;
         Optional<Layout> existing_src_layout =
             FindLayoutForBuffer(T.layout_map, op.src);
@@ -709,8 +712,8 @@ struct Copy {
                     arith::Analyzer *analyzer) {
     if (!IsInsideSimtVF(T) && !IsLocalBuffer(op.src) &&
         !IsLocalBuffer(op.dst)) {
-      int dma_path = GetDMAPath(op.src, op.dst);
-      if (dma_path >= 0) {
+      DMAPath dma_path = GetDMAPath(op.src, op.dst);
+      if (dma_path != DMAPath::kNone) {
         return LowerDMACopy(op, T, analyzer, dma_path);
       }
     }
