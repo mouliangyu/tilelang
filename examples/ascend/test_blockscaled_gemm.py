@@ -1,9 +1,9 @@
-"""pytest test for block-scaled GEMM with mxFP8."""
+"""pytest tests for block-scaled GEMM with MXFP8 and MXFP4 E2M1."""
 
 import torch
 import tilelang
 import tilelang.language as T
-from example_blockscaled_gemm import gemm, ref_program
+from example_blockscaled_gemm import FP4_DTYPE, gemm, make_inputs, ref_program
 from example_blockscaled_gemm_l0 import gemm as gemm_l0
 from example_blockscaled_gemm_l0 import ref_program as ref_program_l0
 
@@ -48,6 +48,47 @@ def _test_l0(dtype, thresh, M=4096, K=4096, N=4096, seed=42):
     denom = expected.abs().mean().clamp_min(1e-6)
     rel_err = (c - expected).abs().mean() / denom
     assert rel_err.item() < thresh, f"{dtype} L0 rel_err={rel_err.item():.2e}"
+    return rel_err.item()
+
+
+def _test_fp4(gemm_impl, path, thresh=1e-5, M=256, K=512, N=256, seed=42):
+    torch.manual_seed(seed)
+    kernel = tilelang.compile(gemm_impl(M, K, N, dtype=FP4_DTYPE), out_idx=-1)
+    device = torch.device("npu")
+    x, w, sfx, sfw, sfx_e8m0, sfw_e8m0 = make_inputs(M, K, N, FP4_DTYPE, device)
+    actual = kernel(x, w, sfx, sfw)
+    torch.npu.synchronize()
+    expected = ref_program(
+        x.cpu(),
+        w.cpu(),
+        sfx_e8m0.cpu(),
+        sfw_e8m0.cpu(),
+        logical_k=K,
+    ).to(device)
+    denom = expected.abs().mean().clamp_min(1e-6)
+    rel_err = (actual - expected).abs().mean() / denom
+    assert rel_err.item() < thresh, f"FP4 {path} E2M1 rel_err={rel_err.item():.2e}"
+    return rel_err.item()
+
+
+def _test_fp4_byte_view(thresh=1e-5, M=512, K=1024, N=512, seed=42):
+    torch.manual_seed(seed)
+    program = gemm(M, K, N, dtype=FP4_DTYPE, packed_fp4_input=True)
+    kernel = tilelang.compile(program, out_idx=-1)
+    device = torch.device("npu")
+    x, w, sfx, sfw, sfx_e8m0, sfw_e8m0 = make_inputs(M, K, N, FP4_DTYPE, device)
+    actual = kernel(x.view(torch.int8), w.view(torch.int8), sfx, sfw)
+    torch.npu.synchronize()
+    expected = ref_program(
+        x.cpu(),
+        w.cpu(),
+        sfx_e8m0.cpu(),
+        sfw_e8m0.cpu(),
+        logical_k=K,
+    ).to(device)
+    denom = expected.abs().mean().clamp_min(1e-6)
+    rel_err = (actual - expected).abs().mean() / denom
+    assert rel_err.item() < thresh, f"FP4 E2M1 byte-view rel_err={rel_err.item():.2e}"
     return rel_err.item()
 
 
@@ -119,6 +160,31 @@ def test_blockscaled_gemm_fp8_8192():
 def test_blockscaled_gemm_fp8_4096():
     err = _test("float8_e4m3fn", 1e-2, M=4096, N=4096, K=4096, seed=123)
     print(f"test_blockscaled_gemm_fp8_4096: PASS  rel_err={err:.2e}")
+
+
+def test_blockscaled_gemm_fp4_e2m1():
+    err = _test_fp4(gemm, "l1")
+    print(f"test_blockscaled_gemm_fp4_e2m1: PASS  rel_err={err:.2e}")
+
+
+def test_blockscaled_gemm_l0_fp4_e2m1():
+    err = _test_fp4(gemm_l0, "l0")
+    print(f"test_blockscaled_gemm_l0_fp4_e2m1: PASS  rel_err={err:.2e}")
+
+
+def test_blockscaled_gemm_fp4_e2m1_byte_view():
+    err = _test_fp4_byte_view()
+    print(f"test_blockscaled_gemm_fp4_e2m1_byte_view: PASS  rel_err={err:.2e}")
+
+
+def test_blockscaled_gemm_fp4_e2m1_8192():
+    err = _test_fp4(gemm, "l1", M=8192, K=8192, N=8192, seed=123)
+    print(f"test_blockscaled_gemm_fp4_e2m1_8192: PASS  rel_err={err:.2e}")
+
+
+def test_blockscaled_gemm_l0_fp4_e2m1_8192():
+    err = _test_fp4(gemm_l0, "l0", M=8192, K=8192, N=8192, seed=456)
+    print(f"test_blockscaled_gemm_l0_fp4_e2m1_8192: PASS  rel_err={err:.2e}")
 
 
 def test_blockscaled_gemm_l0_sf_transpose_small_matrices():

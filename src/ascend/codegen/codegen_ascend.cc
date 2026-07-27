@@ -122,6 +122,23 @@ std::string CCEUBufType(DataType dtype) {
   return "float";
 }
 
+DataType GetAccessPtrElementType(const PrimExpr &ptr) {
+  const auto *call = ptr.as<CallNode>();
+  if (!call)
+    return DataType();
+  if (call->op.same_as(tirx::builtin::tvm_access_ptr())) {
+    DataType dtype = call->args[0].dtype();
+    return dtype.lanes() == 1 ? dtype : dtype.element_of();
+  }
+  if (call->op.same_as(tl::access_ptr()) ||
+      call->op.same_as(tirx::builtin::address_of())) {
+    const auto *load = call->args[0].as<BufferLoadNode>();
+    ICHECK(load);
+    return load->buffer->dtype;
+  }
+  return DataType();
+}
+
 } // namespace
 
 void CodeGenTileLangAscend::Init(bool output_ssa) {
@@ -1184,7 +1201,13 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::ascend_load_cbuf_to_ca()) ||
              op->op.same_as(tl::ascend_load_cbuf_to_cb())) {
     const bool is_ca = op->op.same_as(tl::ascend_load_cbuf_to_ca());
-    const char *fn = is_ca ? "load_cbuf_to_ca" : "load_cbuf_to_cb";
+    DataType src_dtype = GetAccessPtrElementType(op->args[1]);
+    DataType dst_dtype = GetAccessPtrElementType(op->args[0]);
+    const bool is_s4 =
+        src_dtype.is_float4_e2m1fn() || dst_dtype.is_float4_e2m1fn();
+    const char *fn = is_s4
+                         ? (is_ca ? "load_cbuf_to_ca_s4" : "load_cbuf_to_cb_s4")
+                         : (is_ca ? "load_cbuf_to_ca" : "load_cbuf_to_cb");
     const char *fn_mx = is_ca ? "load_cbuf_to_ca_mx" : "load_cbuf_to_cb_mx";
     // 9 args: plain data load. 16 args: data load + MX scale-factor companion.
     ICHECK(op->args.size() == 9 || op->args.size() == 16)
@@ -1471,6 +1494,17 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       os << "*)" << GetVarID(buf_var);
       if (load->indices.size() == 1) {
         PrimExpr idx = load->indices[0];
+        // LowerIntrin represents an fp4x2 access as a 2-lane Ramp and scales
+        // its packed-byte offset by the lane count.  L0/L1 pointers need the
+        // same scalar-byte recovery as GM/UB pointers below; otherwise this
+        // prints invalid pointer arithmetic such as `ptr + int2(...)`.
+        if (load->dtype.is_float4_e2m1fn() && idx.dtype().lanes() > 1) {
+          const auto *ramp = idx.as<RampNode>();
+          ICHECK(ramp) << "Expected a Ramp index for packed fp4 L0/L1 access, "
+                       << "got " << idx;
+          idx = analyzer_.Simplify(floordiv(
+              ramp->base, make_const(ramp->base.dtype(), idx.dtype().lanes())));
+        }
         if (!is_zero(idx)) {
           os << " + ";
           PrintExpr(idx, os);

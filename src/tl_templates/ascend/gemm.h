@@ -137,7 +137,8 @@ __aicore__ inline void ascend_blockscaled_gemm_l1(
     __cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr, __cbuf__ InT *cbuf_b_ptr,
     __cbuf__ SFT *cbuf_sfa_ptr, __cbuf__ SFT *cbuf_sfb_ptr, int clear_accum,
     int buf_offset = 0, int sf_k_offset = 0, int unit_flag_ctrl = 0) {
-  constexpr int C0 = 32 / sizeof(InT);
+  constexpr bool is_fp4 = std::is_same_v<InT, float4_e2m1x2_t>;
+  constexpr int C0 = is_fp4 ? 64 : 32 / sizeof(InT);
   constexpr int FRAC_N = 16;
 
   static_assert(K % TILE_K_SUB == 0, "K must be divisible by TILE_K_SUB");
@@ -152,8 +153,10 @@ __aicore__ inline void ascend_blockscaled_gemm_l1(
   constexpr int mStepA = M / FRAC_N;
   constexpr int mStepB = N / FRAC_N;
   constexpr int kStep = TILE_K_SUB / C0;
-  constexpr int L0A_STAGE = M * TILE_K_SUB;
-  constexpr int L0B_STAGE = N * TILE_K_SUB;
+
+  constexpr int kPerSlot = is_fp4 ? 2 : 1;
+  constexpr int L0A_STAGE = M * TILE_K_SUB / kPerSlot;
+  constexpr int L0B_STAGE = N * TILE_K_SUB / kPerSlot;
 
   static constexpr int kSFDivisor = 64;
   static constexpr int kSFPack = 2;
@@ -167,16 +170,35 @@ __aicore__ inline void ascend_blockscaled_gemm_l1(
   for (int sk = 0; sk < SUB_K; ++sk) {
     get_buf(PIPE_MTE1, buf_offset + (sk & 1), false);
 
-    load_cbuf_to_ca((__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)), cbuf_a_ptr, 0,
-                    (sk * kStep), mStepA, kStep, mStepA, mStepA, 0);
+    if constexpr (is_fp4) {
+      load_cbuf_to_ca_s4((__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)),
+                         cbuf_a_ptr, 0, (sk * kStep), mStepA, kStep, mStepA,
+                         mStepA, 0);
 
-    if constexpr (TRANS_B) {
-      load_cbuf_to_cb((__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), cbuf_b_ptr,
-                      0, (sk * kStep), mStepB, kStep, mStepB, mStepB, 0);
+      if constexpr (TRANS_B) {
+        load_cbuf_to_cb_s4((__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)),
+                           cbuf_b_ptr, 0, (sk * kStep), mStepB, kStep, mStepB,
+                           mStepB, 0);
+      } else {
+        constexpr int srcStrideNN = K / C0;
+        load_cbuf_to_cb_s4((__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)),
+                           cbuf_b_ptr, (sk * kStep), 0, kStep, mStepB,
+                           srcStrideNN, kStep, 1);
+      }
     } else {
-      constexpr int srcStrideNN = K / C0;
-      load_cbuf_to_cb((__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), cbuf_b_ptr,
-                      (sk * kStep), 0, kStep, mStepB, srcStrideNN, kStep, 1);
+      load_cbuf_to_ca((__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)), cbuf_a_ptr,
+                      0, (sk * kStep), mStepA, kStep, mStepA, mStepA, 0);
+
+      if constexpr (TRANS_B) {
+        load_cbuf_to_cb((__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)),
+                        cbuf_b_ptr, 0, (sk * kStep), mStepB, kStep, mStepB,
+                        mStepB, 0);
+      } else {
+        constexpr int srcStrideNN = K / C0;
+        load_cbuf_to_cb((__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)),
+                        cbuf_b_ptr, (sk * kStep), 0, kStep, mStepB, srcStrideNN,
+                        kStep, 1);
+      }
     }
 
     {

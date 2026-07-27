@@ -86,6 +86,7 @@ _ASCEND_DTYPE_MAP = {
     "int32": "int32_t",
     "float8_e4m3": "float8_e4m3_t",
     "float8_e4m3fn": "float8_e4m3_t",
+    "float4_e2m1fn": "float4_e2m1x2_t",
 }
 
 
@@ -169,13 +170,14 @@ class GemmMAD(GemmBase):
 
     def _compute_tile_k_sub(self):
         input_dtype = self._input_dtype()
-        elem_bytes = DataType(input_dtype).bits // 8
-        c0 = 32 // elem_bytes
+        elem_bits = DataType(input_dtype).bits
+        assert 256 % elem_bits == 0, f"Unsupported dtype for Ascend GEMM: {input_dtype}"
+        c0 = 256 // elem_bits
         l0_capacity = 65536
         num_l0_stages = 2
         l0_per_stage = l0_capacity // num_l0_stages
-        max_k_a = l0_per_stage // (self.M * elem_bytes)
-        max_k_b = l0_per_stage // (self.N * elem_bytes)
+        max_k_a = l0_per_stage * 8 // (self.M * elem_bits)
+        max_k_b = l0_per_stage * 8 // (self.N * elem_bits)
         max_k = min(max_k_a, max_k_b, self.K)
         tile_k_sub = (max_k // c0) * c0
         assert tile_k_sub > 0, f"Cannot fit any sub-K tile in L0: M={self.M}, N={self.N}, dtype={input_dtype}, L0 capacity={l0_capacity}"

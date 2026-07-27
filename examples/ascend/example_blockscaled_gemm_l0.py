@@ -1,28 +1,42 @@
+"""Ascend explicit-L0 block-scaled GEMM example for MXFP8 and MXFP4."""
+
+import argparse
+
 import tilelang
 import tilelang.language as T
 from tilelang.profiler import do_bench
 
+try:
+    from .example_blockscaled_gemm import FP4_DTYPE, FP8_DTYPE, make_inputs, ref_program
+except ImportError:
+    from example_blockscaled_gemm import FP4_DTYPE, FP8_DTYPE, make_inputs, ref_program
 
-def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="float8_e4m3fn", scale_dtype="uint16", scale_packed=True):
+
+def gemm(
+    M_DIM=8192,
+    K_DIM=8192,
+    N_DIM=8192,
+    dtype=FP8_DTYPE,
+    scale_dtype="uint16",
+    scale_packed=True,
+):
+    """Build a block-scaled GEMM with explicit L1-to-L0 data/SF loads."""
+
     NUM_BLOCKS = 32
+    is_fp4 = dtype == FP4_DTYPE
+    if is_fp4 and (scale_dtype != "uint16" or not scale_packed):
+        raise ValueError("MXFP4 requires pair-packed uint16 scale factors")
+
     TILE_M = 256
     TILE_N = 256
-    TILE_K = 256
-    TILE_K_SUB = 128
+    TILE_K = 512 if is_fp4 else 256
+    TILE_K_SUB = 256 if is_fp4 else 128
     SUB_K = TILE_K // TILE_K_SUB
 
     SF_DIV = 64 if scale_dtype == "uint16" else 32
-    SF_K = K_DIM // SF_DIV  # SF pairs over the full K
-    TILE_SF_K = TILE_K // SF_DIV  # SF pairs per K-tile (L1 SF tile width)
-    SF_SUB_K = TILE_K_SUB // SF_DIV  # SF pairs per sub-K tile (L1->L0 slice)
-    # SF_LOAD_CHUNK_SIZE: number of K-tiles sharing one SF load (chunk).
-    # When >1, the conditional `if kt % sf_int == 0` prevents auto-schedule from
-    # multi-versioning the SF buffer. This results in a single-version
-    # SF buffer while data buffers are multi-versioned — the version/sync
-    # mismatch causes incorrect results or speed degradation.
-    #
-    # Workaround: use a two-level loop instead of `if kt % sf_int == 0`.
-
+    SF_K = K_DIM // SF_DIV
+    TILE_SF_K = TILE_K // SF_DIV
+    SF_SUB_K = TILE_K_SUB // SF_DIV
     SF_LOAD_CHUNK_SIZE = 1
 
     M_TILES = M_DIM // TILE_M
@@ -74,36 +88,61 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="float8_e4m3fn", scale_dtype=
             for tile_idx in T.Persistent([OUT_TILES], NUM_BLOCKS, bx):
                 m_tile, n_tile = aswt_swizzle(tile_idx)
                 for kt in T.Pipelined(K_TILES, num_stages=NUM_STAGES):
-                    T.copy(X[m_tile * TILE_M : (m_tile + 1) * TILE_M, kt * TILE_K : (kt + 1) * TILE_K], x_l1)
-                    T.copy(W[n_tile * TILE_N : (n_tile + 1) * TILE_N, kt * TILE_K : (kt + 1) * TILE_K], w_l1)
+                    T.copy(
+                        X[m_tile * TILE_M : (m_tile + 1) * TILE_M, kt * TILE_K : (kt + 1) * TILE_K],
+                        x_l1,
+                    )
+                    T.copy(
+                        W[n_tile * TILE_N : (n_tile + 1) * TILE_N, kt * TILE_K : (kt + 1) * TILE_K],
+                        w_l1,
+                    )
 
                     if kt % sf_int == 0:
                         if scale_packed:
                             T.copy(
-                                SFX[kt * TILE_SF_K : (kt + sf_int) * TILE_SF_K, m_tile * TILE_M : (m_tile + 1) * TILE_M],
+                                SFX[
+                                    kt * TILE_SF_K : (kt + sf_int) * TILE_SF_K,
+                                    m_tile * TILE_M : (m_tile + 1) * TILE_M,
+                                ],
                                 xsf_l1,
                                 transpose=True,
                             )
                             T.copy(
-                                SFW[kt * TILE_SF_K : (kt + sf_int) * TILE_SF_K, n_tile * TILE_N : (n_tile + 1) * TILE_N],
+                                SFW[
+                                    kt * TILE_SF_K : (kt + sf_int) * TILE_SF_K,
+                                    n_tile * TILE_N : (n_tile + 1) * TILE_N,
+                                ],
                                 wsf_l1,
                                 transpose=True,
                             )
                         else:
-                            T.copy(SFX[m_tile * TILE_M : (m_tile + 1) * TILE_M, kt * TILE_SF_K : (kt + sf_int) * TILE_SF_K], xsf_l1)
-                            T.copy(SFW[n_tile * TILE_N : (n_tile + 1) * TILE_N, kt * TILE_SF_K : (kt + sf_int) * TILE_SF_K], wsf_l1)
+                            T.copy(
+                                SFX[
+                                    m_tile * TILE_M : (m_tile + 1) * TILE_M,
+                                    kt * TILE_SF_K : (kt + sf_int) * TILE_SF_K,
+                                ],
+                                xsf_l1,
+                            )
+                            T.copy(
+                                SFW[
+                                    n_tile * TILE_N : (n_tile + 1) * TILE_N,
+                                    kt * TILE_SF_K : (kt + sf_int) * TILE_SF_K,
+                                ],
+                                wsf_l1,
+                            )
 
                     sf_offset = (kt % sf_int) * TILE_SF_K
                     for sk in T.Pipelined(SUB_K, num_stages=NUM_STAGES):
+                        sf_start = sf_offset + sk * SF_SUB_K
                         T.copy(
                             x_l1[:, sk * TILE_K_SUB : (sk + 1) * TILE_K_SUB],
                             x_l0,
-                            scale=xsf_l1[:, sf_offset + sk * SF_SUB_K : sf_offset + (sk + 1) * SF_SUB_K],
+                            scale=xsf_l1[:, sf_start : sf_start + SF_SUB_K],
                         )
                         T.copy(
                             w_l1[:, sk * TILE_K_SUB : (sk + 1) * TILE_K_SUB],
                             w_l0,
-                            scale=wsf_l1[:, sf_offset + sk * SF_SUB_K : sf_offset + (sk + 1) * SF_SUB_K],
+                            scale=wsf_l1[:, sf_start : sf_start + SF_SUB_K],
                         )
                         T.blockscaled_gemm(
                             x_l0,
@@ -111,73 +150,112 @@ def gemm(M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="float8_e4m3fn", scale_dtype=
                             res,
                             transpose_B=True,
                             clear_accum=(kt == 0 and sk == 0),
-                            unit_flag_ctrl=T.Select(kt == K_TILES - 1 and sk == SUB_K - 1, 3, 2),
+                            unit_flag_ctrl=T.Select(
+                                kt == K_TILES - 1 and sk == SUB_K - 1,
+                                3,
+                                2,
+                            ),
                         )
+
                 T.dual_copy(res, temp, unit_flag_ctrl=3)
-                T.dual_copy(temp, C[m_tile * TILE_M : (m_tile + 1) * TILE_M, n_tile * TILE_N : (n_tile + 1) * TILE_N])
+                T.dual_copy(
+                    temp,
+                    C[
+                        m_tile * TILE_M : (m_tile + 1) * TILE_M,
+                        n_tile * TILE_N : (n_tile + 1) * TILE_N,
+                    ],
+                )
 
     return main
 
 
-def ref_program(x, w, sfx, sfw):
-    import torch
+def run_compile(
+    M=8192,
+    K=8192,
+    N=8192,
+    dtype=FP8_DTYPE,
+    scale_dtype="uint16",
+    scale_packed=True,
+    print_source=False,
+):
+    program = gemm(M, K, N, dtype=dtype, scale_dtype=scale_dtype, scale_packed=scale_packed)
+    kernel = tilelang.compile(program, out_idx=-1)
+    if print_source:
+        print(kernel.get_kernel_source())
+    return kernel
 
-    K = x.shape[1]
-    xf = x.float()
-    wf = w.float()
-    sx = torch.pow(2.0, sfx.float() - 127.0).repeat_interleave(32, dim=1)[:, :K]
-    sw = torch.pow(2.0, sfw.float() - 127.0).repeat_interleave(32, dim=1)[:, :K]
-    return (xf * sx) @ (wf * sw).T
 
-
-if __name__ == "__main__":
+def run_regression(
+    M=8192,
+    K=8192,
+    N=8192,
+    dtype=FP8_DTYPE,
+    scale_dtype="uint16",
+    scale_packed=True,
+    print_source=False,
+    bench=False,
+):
     import torch
 
     device = torch.device("npu")
-    M, K, N = 8192, 8192, 8192
-    scale_dtype = "uint16"  # or "uint8"
-    scale_packed = True  # or False
+    kernel = run_compile(M, K, N, dtype, scale_dtype, scale_packed, print_source)
+    x, w, sfx, sfw, sfx_e8m0, sfw_e8m0 = make_inputs(M, K, N, dtype, device, scale_dtype, scale_packed)
+    result = kernel(x, w, sfx, sfw)
+    torch.npu.synchronize()
 
-    assert scale_dtype != "uint8" or not scale_packed, "uint8 scale must be packed"
+    expected = ref_program(x, w, sfx_e8m0, sfw_e8m0, K)
+    denom = expected.abs().mean().clamp_min(1e-6)
+    rel_mean_diff = (result - expected).abs().mean().div(denom).item()
+    print(f"L0 {dtype}: rel_mean_diff={rel_mean_diff:.2e}")
 
-    for dt, thresh in [("float8_e4m3fn", 1e-1)]:
-        print(f"\n=== L0 {dt} block-scaled GEMM ===")
-        program = gemm(M, K, N, dtype=dt, scale_dtype=scale_dtype, scale_packed=scale_packed)
-        kernel = tilelang.compile(program, out_idx=-1)
+    if bench:
 
-        print(kernel.get_kernel_source())
-        print("Compilation succeeded!")
-
-        x = (torch.randn(M, K, device=device) * 0.1).to(getattr(torch, dt))
-        w = (torch.randn(N, K, device=device) * 0.1).to(getattr(torch, dt))
-
-        sf_k_e8m0 = K // 32  # e8m0 values along K
-        sfx_e8m0 = torch.randint(120, 135, (M, sf_k_e8m0), dtype=torch.uint8, device=device)
-        sfw_e8m0 = torch.randint(120, 135, (N, sf_k_e8m0), dtype=torch.uint8, device=device)
-
-        if scale_packed:
-            sfx_pairs = sfx_e8m0.view(torch.uint16)  # [M, K/64]
-            sfw_pairs = sfw_e8m0.view(torch.uint16)  # [N, K/64]
-            sfx = sfx_pairs.T.contiguous()  # [K/64, M]  (MN-major)
-            sfw = sfw_pairs.T.contiguous()  # [K/64, N]
-        else:
-            sfx = sfx_e8m0.view(getattr(torch, scale_dtype))
-            sfw = sfw_e8m0.view(getattr(torch, scale_dtype))
-
-        c = kernel(x, w, sfx, sfw)
-        torch.npu.synchronize()
-
-        expected = ref_program(x, w, sfx_e8m0, sfw_e8m0)
-        denom = expected.abs().mean().clamp_min(1e-6)
-        max_diff = (torch.abs(c - expected).mean() / denom).item()
-
-        print(f"  {'PASS' if max_diff < thresh else 'FAIL'}  max_diff={max_diff:.2e}")
-
-        NUM_REPEATS = 50
-
-        def run_kernel(kernel=kernel, x=x, w=w, sfx=sfx, sfw=sfw):
+        def run_kernel():
             return kernel(x, w, sfx, sfw)
 
-        latency_ms = do_bench(run_kernel, backend="msprof", _n_warmup=30, _n_repeat=NUM_REPEATS)
+        latency_ms = do_bench(run_kernel, backend="msprof", _n_warmup=30, _n_repeat=50)
         flops = 2.0 * M * N * K
-        print(f"  {latency_ms:.3f} ms/iter  |  {flops / (latency_ms / 1e3) / 1e12:.1f} TFLOPS")
+        print(f"{latency_ms:.3f} ms/iter | {flops / (latency_ms / 1e3) / 1e12:.1f} TFLOPS")
+
+    return rel_mean_diff
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--m", type=int, default=8192)
+    parser.add_argument("--k", type=int, default=8192)
+    parser.add_argument("--n", type=int, default=8192)
+    parser.add_argument("--dtype", choices=[FP8_DTYPE, FP4_DTYPE], default=FP8_DTYPE)
+    parser.add_argument("--scale-dtype", choices=["uint8", "uint16"], default="uint16")
+    parser.add_argument("--scale-unpacked", action="store_true")
+    parser.add_argument("--print-source", action="store_true")
+    parser.add_argument("--bench", action="store_true")
+    parser.add_argument("--compile-only", action="store_true")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = _parse_args()
+    scale_packed = not args.scale_unpacked
+    if args.compile_only:
+        run_compile(
+            args.m,
+            args.k,
+            args.n,
+            args.dtype,
+            args.scale_dtype,
+            scale_packed,
+            args.print_source,
+        )
+        print("Compilation succeeded")
+    else:
+        run_regression(
+            args.m,
+            args.k,
+            args.n,
+            args.dtype,
+            args.scale_dtype,
+            scale_packed,
+            args.print_source,
+            args.bench,
+        )

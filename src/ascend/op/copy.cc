@@ -78,6 +78,45 @@ PrimExpr ComputeFlatOffset(const Buffer &buf, const Array<Range> &range) {
   return offset;
 }
 
+PrimExpr Float4StorageBytes(const PrimExpr &elements, DataType dtype) {
+  ICHECK(dtype.is_float4_e2m1fn());
+  int element_bits = dtype.bits() * dtype.lanes();
+  ICHECK(element_bits % 8 == 0 || 8 % element_bits == 0)
+      << "FP4 element width must be byte-packable, got " << dtype;
+  return FloorDiv(elements * make_const(elements.dtype(), element_bits),
+                  make_const(elements.dtype(), 8));
+}
+
+DataType GetBufferStorageDType(const Buffer &buf) {
+  const auto *ptr_type = buf->data->type_annotation.as<PointerTypeNode>();
+  if (!ptr_type)
+    return buf->dtype;
+  const auto *prim_type = ptr_type->element_type.as<PrimTypeNode>();
+  return prim_type ? prim_type->dtype : buf->dtype;
+}
+
+// T.view may give byte-addressable storage a logical FP4 dtype without
+// changing its data Var. Genuine FP4 storage is rewritten later by
+// RewriteFp4ToFp4x2; normalize byte-backed aliases before issuing the DMA.
+PrimExpr NormalizeFloat4ByteViewPtr(const Buffer &buf,
+                                    const PrimExpr &fallback_ptr,
+                                    const PrimExpr &logical_offset,
+                                    const PrimExpr &logical_extent) {
+  DataType storage_dtype = GetBufferStorageDType(buf);
+  if (!buf->dtype.is_float4_e2m1fn() || storage_dtype.is_float4_e2m1fn()) {
+    return fallback_ptr;
+  }
+
+  int storage_bits = storage_dtype.bits() * storage_dtype.lanes();
+  ICHECK_EQ(storage_bits % 8, 0)
+      << "FP4 view requires byte-addressable storage, got " << storage_dtype;
+  return Call(DataType::Handle(), builtin::tvm_access_ptr(),
+              {TypeAnnotation(DataType::Int(8)), buf->data,
+               Float4StorageBytes(logical_offset, buf->dtype),
+               Float4StorageBytes(logical_extent, buf->dtype),
+               make_const(DataType::Int(32), 1)});
+}
+
 // Row-major element strides of an ND (GM/UB) buffer, derived from its ND
 // (identity) affine layout's output shape: strides[k] = product(shape[k+1..]).
 // Keeps copy parameters layout-driven for the ND side as well.
@@ -117,7 +156,7 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
                   arith::Analyzer *analyzer, DMAPath dma_path) {
   auto I = [](int64_t v) { return make_const(DataType::Int(32), v); };
   auto I64 = [](int64_t v) { return make_const(DataType::Int(64), v); };
-  int elem_bits = op.src->dtype.bits();
+  int elem_bits = op.src->dtype.bits() * op.src->dtype.lanes();
 
   // OOB tail clamping (and the empty-tile has_data guard) is performed before
   // AutoSchedule by the AscendInsertOOBPadding pass, which rewrites this copy's
@@ -302,12 +341,24 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
       valid_n_rows = valid_n_rows * src_range[i]->extent;
     }
 
+    PrimExpr physical_inner_elems = valid_inner_elems;
+    std::string physical_dtype;
+    if (op.src->dtype.is_float4_e2m1fn() && op.dst->dtype.is_float4_e2m1fn()) {
+      // dav-3510 exposes GM->L1 ND2NZ for 8/16/32-bit storage types.  FP4 is
+      // physically packed as two values per byte, so issue the DMA as int8
+      // and express the inner dimension in packed-byte units.
+      physical_inner_elems =
+          Float4StorageBytes(valid_inner_elems, op.src->dtype);
+      physical_dtype = "int8_t";
+      src_ptr =
+          NormalizeFloat4ByteViewPtr(op.src, src_ptr, src_offset, total_elems);
+    }
+
     PrimExpr transpose_flag = I(needs_transpose ? 1 : 0);
     // For dn2nz (transpose), SDK expects nValue=width(cols) and
     // dValue=height(rows), which is the reverse of nd2nz.
-    PrimExpr n_value = needs_transpose ? valid_inner_elems : valid_n_rows;
-    PrimExpr d_value = needs_transpose ? valid_n_rows : valid_inner_elems;
-    std::string physical_dtype;
+    PrimExpr n_value = needs_transpose ? physical_inner_elems : valid_n_rows;
+    PrimExpr d_value = needs_transpose ? valid_n_rows : physical_inner_elems;
     if (has_dst_layout && dst_layout.kind == AscendFractalKind::kSF &&
         op.src->dtype.bits() == 8 && op.dst->dtype.bits() == 8) {
       physical_dtype = "uint16_t";
