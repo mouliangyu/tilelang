@@ -185,11 +185,15 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
         DataType::Handle(), builtin::tvm_access_ptr(),
         {TypeAnnotation(buf->dtype), buf->data, offset, extent, I(rw_mask)});
   };
-  PrimExpr total_elems = inner_elems * n_rows;
+  PrimExpr src_total_elems = inner_elems * n_rows;
+  PrimExpr dst_total_elems = I(1);
+  for (const Range &range : dst_range) {
+    dst_total_elems = dst_total_elems * range->extent;
+  }
   PrimExpr src_offset = ComputeFlatOffset(op.src, src_range);
   PrimExpr dst_offset = ComputeFlatOffset(op.dst, dst_range);
-  PrimExpr src_ptr = make_access_ptr(op.src, src_offset, total_elems, 1);
-  PrimExpr dst_ptr = make_access_ptr(op.dst, dst_offset, total_elems, 2);
+  PrimExpr src_ptr = make_access_ptr(op.src, src_offset, src_total_elems, 1);
+  PrimExpr dst_ptr = make_access_ptr(op.dst, dst_offset, dst_total_elems, 2);
 
   PrimExpr sid = I(0);
   PrimExpr zero = I(0);
@@ -350,8 +354,8 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
       physical_inner_elems =
           Float4StorageBytes(valid_inner_elems, op.src->dtype);
       physical_dtype = "int8_t";
-      src_ptr =
-          NormalizeFloat4ByteViewPtr(op.src, src_ptr, src_offset, total_elems);
+      src_ptr = NormalizeFloat4ByteViewPtr(op.src, src_ptr, src_offset,
+                                           src_total_elems);
     }
 
     PrimExpr transpose_flag = I(needs_transpose ? 1 : 0);

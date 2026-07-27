@@ -87,6 +87,7 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
         mod = ascend_transform.NormalizeMixedKernelSid()(mod)
         mod = tilelang.transform.Simplify()(mod)
 
+    mod = ascend_transform.NormalizeBufferVersion()(mod)
     mod = ascend_transform.AscendSimdVFLowerParallel()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
 
@@ -102,6 +103,7 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.ascend.analysis.VFLocalVarChecker()(mod)
+    mod = ascend_transform.RewriteAscendBufferVersionLayout()(mod)
     mod = tirx.transform.NarrowDataType(32)(mod)
     mod = tilelang.transform.FlattenBuffer()(mod)
     mod = tilelang.transform.ConfigIndexBitwidth()(mod)

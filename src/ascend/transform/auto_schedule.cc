@@ -58,6 +58,7 @@
 #include "ascend/transform/auto_schedule/ir_structure.h"
 #include "auto_schedule.h"
 #include "backend/common/target_utils.h"
+#include "buffer_version.h"
 #include "layout/layout.h"
 #include "op/builtin.h"
 #include "op/copy.h"
@@ -268,20 +269,28 @@ private:
 // Mutator to replace the body of tilelang_root block
 class TilelangRootBodyReplacer : public StmtMutator {
 public:
-  explicit TilelangRootBodyReplacer(Stmt new_body) : new_body_(new_body) {}
+  TilelangRootBodyReplacer(Stmt new_body,
+                           ascend::BufferVersionMap buffer_versions)
+      : new_body_(std::move(new_body)),
+        buffer_versions_(std::move(buffer_versions)) {}
 
   Stmt VisitStmt_(const SBlockNode *op) override {
     if (op->name_hint == "tilelang_root") {
-      // Keep all block attributes but replace the body
+      Map<String, Any> annotations = op->annotations;
+      annotations.erase(ascend::kManualMultiBuffer);
+      if (!buffer_versions_.empty()) {
+        annotations.Set(ascend::kManualMultiBuffer, buffer_versions_);
+      }
       return SBlock(op->iter_vars, op->reads, op->writes, op->name_hint,
                     new_body_, op->init, op->alloc_buffers, op->match_buffers,
-                    op->annotations, op->span);
+                    annotations, op->span);
     }
     return StmtMutator::VisitStmt_(op);
   }
 
 private:
   Stmt new_body_;
+  ascend::BufferVersionMap buffer_versions_;
 };
 
 // Visitor to build IRStructure from TIR statements
@@ -1314,6 +1323,37 @@ static ScheduledKernelResult ScheduleSingleKernel(
   return result;
 }
 
+static void AddBufferVersion(ascend::BufferVersionMap *buffer_versions,
+                             const Var &data, int64_t num_versions) {
+  ICHECK_GT(num_versions, 0);
+  if (num_versions == 1) {
+    return;
+  }
+  if (buffer_versions->count(data)) {
+    const auto *existing = (*buffer_versions)[data].as<IntImmNode>();
+    ICHECK(existing);
+    ICHECK_EQ(existing->value, num_versions)
+        << "Conflicting manual and automatic buffer version counts for storage "
+        << data << ": " << existing->value << " vs " << num_versions;
+    return;
+  }
+  buffer_versions->Set(
+      data, IntImm(DataType::Int(32), static_cast<int64_t>(num_versions)));
+}
+
+static ascend::BufferVersionMap BuildBufferVersionStagingMap(
+    const ManualMultiBufferTable &manual_buffer_versions,
+    const std::vector<MultiVersionBufferInfo> &automatic_buffer_versions) {
+  ascend::BufferVersionMap result;
+  for (const auto &[data_node, num_versions] : manual_buffer_versions) {
+    AddBufferVersion(&result, GetRef<Var>(data_node), num_versions);
+  }
+  for (const MultiVersionBufferInfo &info : automatic_buffer_versions) {
+    AddBufferVersion(&result, info.new_buffer->data, info.num_versions);
+  }
+  return result;
+}
+
 // The main pass function
 tvm::transform::Pass AutoSchedule() {
   using namespace tirx::transform;
@@ -1352,7 +1392,10 @@ tvm::transform::Pass AutoSchedule() {
                                extractor.manual_multi_buffer_versions,
                                extractor.unlimit_memory_scopes, extractor.sid);
 
-      TilelangRootBodyReplacer replacer(kr.scheduled_body);
+      ascend::BufferVersionMap buffer_versions = BuildBufferVersionStagingMap(
+          extractor.manual_multi_buffer_versions, kr.buffer_infos);
+      TilelangRootBodyReplacer replacer(kr.scheduled_body,
+                                        std::move(buffer_versions));
       Stmt final_body = replacer(func->body);
       if (!kr.buffer_infos.empty()) {
         final_body = RewriteAllocBuffers(final_body, kr.buffer_infos);
@@ -1397,7 +1440,10 @@ tvm::transform::Pass AutoSchedule() {
                                extractor.unlimit_memory_scopes, extractor.sid);
       Stmt scheduled_body = result.scheduled_body;
 
-      TilelangRootBodyReplacer replacer(scheduled_body);
+      ascend::BufferVersionMap buffer_versions = BuildBufferVersionStagingMap(
+          extractor.manual_multi_buffer_versions, result.buffer_infos);
+      TilelangRootBodyReplacer replacer(scheduled_body,
+                                        std::move(buffer_versions));
       Stmt scheduled_subtree = replacer(kernel_subtree);
 
       if (!result.buffer_infos.empty()) {

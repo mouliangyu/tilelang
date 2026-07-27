@@ -48,6 +48,9 @@ constexpr const char *pipeline_exec_scope = "pipeline_exec_scope";
 constexpr const char *kAssumeRequiresRuntimeCheck =
     "tl.assume_requires_runtime_check";
 
+// Compiler-internal physical buffer version count.
+constexpr const char *kBufferVersion = "tl.buffer_version";
+
 // Attributes to implement SourceCodeBlock
 constexpr const char *kCodeBlockSource = "code_block_source";
 constexpr const char *kCodeBlockEntryName = "code_block_entry_name";

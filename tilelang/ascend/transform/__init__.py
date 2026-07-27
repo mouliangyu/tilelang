@@ -44,6 +44,16 @@ def AutoSchedule():
     return _ffi_api.AutoSchedule()  # type: ignore
 
 
+def NormalizeBufferVersion():
+    """Lower staged manual/automatic versions to scoped internal attributes."""
+    return _ffi_api.NormalizeBufferVersion()  # type: ignore
+
+
+def RewriteAscendBufferVersionLayout():
+    """Align each physical version of a multi-buffered UB allocation to 32 bytes."""
+    return _ffi_api.RewriteAscendBufferVersionLayout()  # type: ignore
+
+
 def AscendSimdVFLowerParallel():
     """Lower T.Parallel inside SIMD_VF blocks to MicroAPI register-level vector ops."""
     return _ffi_api.AscendSimdVFLowerParallel()  # type: ignore
@@ -121,9 +131,11 @@ __all__ = [
     "InsertNd2Nz",
     "MarkScalarDcacheBypass",
     "MergeUBAllocations",
+    "NormalizeBufferVersion",
     "NormalizeControlFlowForSchedule",
     "NormalizeMixedKernelSid",
     "NormalizeNoConflictHints",
+    "RewriteAscendBufferVersionLayout",
     "RestoreWhileLoops",
     "RewriteFp4ToFp4x2",
     "RewriteFlagToBuf",

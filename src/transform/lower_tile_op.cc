@@ -1436,7 +1436,36 @@ private:
         }
       }
     }
-    return arith::IRMutatorWithAnalyzer::VisitStmt_(op);
+    Stmt stmt = arith::IRMutatorWithAnalyzer::VisitStmt_(op);
+    if (op->attr_key != tl::attr::kBufferVersion) {
+      return stmt;
+    }
+
+    auto versions = op->node.try_cast<Map<Var, PrimExpr>>();
+    ICHECK(versions.has_value())
+        << "'" << tl::attr::kBufferVersion
+        << "' AttrStmt node must be a buffer version map";
+    AttrStmt attr = Downcast<AttrStmt>(std::move(stmt));
+    attr.CopyOnWrite()->node = RemapBufferVersionMap_(versions.value());
+    return attr;
+  }
+
+  Map<Var, PrimExpr>
+  RemapBufferVersionMap_(const Map<Var, PrimExpr> &versions) const {
+    Map<Var, PrimExpr> remapped_versions;
+    for (const auto &[data, version] : versions) {
+      Var remapped_data = data;
+      if (auto remap = var_remap_.find(data); remap != var_remap_.end()) {
+        remapped_data = (*remap).second;
+      }
+      auto existing = remapped_versions.find(remapped_data);
+      ICHECK(existing == remapped_versions.end() ||
+             StructuralEqual()((*existing).second, version))
+          << "Conflicting buffer version counts after storage remapping for "
+          << remapped_data;
+      remapped_versions.Set(std::move(remapped_data), version);
+    }
+    return remapped_versions;
   }
 
   /**
