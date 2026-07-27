@@ -201,6 +201,9 @@ public:
                        make_const(index_dtype, kVersionAlignmentBits - 1),
                    make_const(index_dtype, kVersionAlignmentBits)) *
           make_const(index_dtype, kVersionAlignmentBits));
+      if (layout_analyzer.CanProveEqual(aligned_slot_bits, compact_slot_bits)) {
+        continue;
+      }
       // AutoSchedule accounts for the compact slot size when checking UB
       // capacity. We intentionally do not feed this per-version padding back
       // into that check: unaligned version slots are expected only in small
@@ -339,11 +342,12 @@ private:
     }
     PrimExpr inner =
         indexmod(compact_offset * elem_bits_c - storage_base, compact_slot);
-    ICHECK(analyzer_->CanProve(inner + extent * elem_bits_c <= compact_slot))
-        << "tvm_access_ptr for versioned buffer " << data->name_hint
-        << " may cross a 32-byte-aligned version slot: offset="
-        << compact_offset << ", extent=" << extent
-        << ", compact_slot_bits=" << compact_slot;
+    if (analyzer_->CanProve(inner + extent * elem_bits_c > compact_slot)) {
+      LOG(FATAL) << "tvm_access_ptr for versioned buffer " << data->name_hint
+                 << " crosses a 32-byte-aligned version slot: offset="
+                 << compact_offset << ", extent=" << extent
+                 << ", compact_slot_bits=" << compact_slot;
+    }
   }
 
   static int ElementBits(DataType dtype) {
