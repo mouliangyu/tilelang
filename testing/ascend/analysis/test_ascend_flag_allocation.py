@@ -202,6 +202,52 @@ def _make_inner_loop_program(extent: int):
     return main
 
 
+def _make_single_iteration_nested_loop_program():
+    tile = 64
+    stages = 3
+
+    @T.prim_func
+    def main(A: T.Buffer((8 * tile,), "float32"), C: T.Buffer((8 * tile,), "float32")):
+        with T.Kernel(1):
+            ub = T.alloc_shared((tile,), "float32")
+            T.annotate_buffer_versions({ub: stages})
+
+            for w in T.Pipelined(8, num_stages=stages):
+                for _i in T.serial(1):
+                    offset = w * tile
+                    T.copy(A[offset : offset + tile], ub)
+                    with T.SimdVF():
+                        mask = T.simd.pset(32)
+                        value = T.simd.vld(ub[0])
+                        T.simd.vsts(ub[0], value, mask)
+                    T.copy(ub, C[offset : offset + tile])
+
+    return main
+
+
+def _make_noneligible_single_iteration_nested_loop_program():
+    tile = 64
+    stages = 3
+
+    @T.prim_func
+    def main(A: T.Buffer((16 * tile,), "float32"), C: T.Buffer((8 * tile,), "float32")):
+        with T.Kernel(1):
+            ub = T.alloc_shared((tile,), "float32")
+            T.annotate_buffer_versions({ub: stages})
+
+            for w in T.Pipelined(8, num_stages=stages):
+                T.copy(A[2 * w * tile : (2 * w + 1) * tile], ub)
+                for _i in T.serial(1):
+                    T.copy(A[(2 * w + 1) * tile : (2 * w + 2) * tile], ub)
+                    with T.SimdVF():
+                        mask = T.simd.pset(32)
+                        value = T.simd.vld(ub[0])
+                        T.simd.vsts(ub[0], value, mask)
+                    T.copy(ub, C[w * tile : (w + 1) * tile])
+
+    return main
+
+
 def _make_unavoidable_overflow_program():
     tile = 64
     stages = 2
@@ -306,12 +352,28 @@ def test_same_iter_does_not_reuse_when_within_limit():
 
 
 def test_single_iteration_loop_has_no_reverse_flag():
-    # TODO: need to fix
-    # one_iter_source = lower(_make_inner_loop_program(1), target="ascend").kernel_source
+    one_iter_source = lower(_make_inner_loop_program(1), target="ascend").kernel_source
     many_iter_source = lower(_make_inner_loop_program(4), target="ascend").kernel_source
 
-    # assert "HardEvent::V_MTE2" not in one_iter_source
+    assert "HardEvent::V_MTE2" not in one_iter_source
     assert "HardEvent::V_MTE2" in many_iter_source
+
+
+def test_nested_single_iteration_loop_uses_outer_multi_buffer_versions():
+    artifact = lower(_make_single_iteration_nested_loop_program(), target="ascend")
+    ids = _initial_flag_ids(artifact.kernel_source, "MTE3_MTE2")
+
+    assert ids == {0, 1, 2}
+
+
+def test_nested_single_iteration_loop_does_not_promote_noneligible_buffer():
+    artifact = lower(_make_noneligible_single_iteration_nested_loop_program(), target="ascend")
+    source = artifact.kernel_source
+    dynamic_wait = "WaitFlag<AscendC::HardEvent::MTE3_MTE2>((w % 3))"
+    dynamic_set = "SetFlag<AscendC::HardEvent::MTE3_MTE2>((w % 3))"
+
+    assert source.count(dynamic_wait) == 1
+    assert source.count(dynamic_set) == 1
 
 
 def test_auto_schedule_warns_on_unavoidable_flag_overflow(capfd):

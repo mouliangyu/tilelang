@@ -100,6 +100,7 @@ std::shared_ptr<IRStructure> TaskNode::Clone() const {
   // Copy memory access regions
   new_task->SetReadRegions(GetReadRegions());
   new_task->SetWriteRegions(GetWriteRegions());
+  new_task->outer_ctx = outer_ctx;
   // Copy indirect read sets (propagated through scalar Let bindings)
   new_task->SetIndirectReads(indirect_read_regions_, indirect_read_vars_,
                              indirect_computed_);
@@ -306,12 +307,28 @@ static bool DeclaredNoConflict(const BufferRegion &a_region,
   return false;
 }
 
+static bool
+IsCurrentLoopMultiBufferEligible(const Buffer &buffer,
+                                 const std::vector<For> &loop_stack) {
+  if (loop_stack.empty())
+    return false;
+  auto ann = loop_stack.back()->annotations.Get("multi_buffer_eligible");
+  if (!ann.has_value())
+    return false;
+  for (const auto &eligible : ann.value().cast<Array<Buffer>>()) {
+    if (eligible->data.same_as(buffer->data))
+      return true;
+  }
+  return false;
+}
+
 // Check whether a_region and b_region are provably disjoint under their
-// per-side outer contexts, with an optional constraint relating the innermost
-// loop var across the two sides. `offset`: <0 renames sides and constrains
-// consumer > producer (any later iteration); ==0 same iteration (no rename); >0
-// constrains consumer == producer + offset (exactly that many iterations
-// later).
+// per-side outer contexts. Cross-iteration checks normally relate the
+// innermost loop variable. For a buffer claimed by the current loop's
+// multi_buffer_eligible annotation, they instead relate the flattened complete
+// loop nest so an outer-loop change also counts. `offset`: <0 constrains
+// consumer > producer; ==0 is same iteration; >0 constrains consumer ==
+// producer + offset.
 static bool RegionsMayConflict(const TaskNode *a_task,
                                const BufferRegion &a_region,
                                const TaskNode *b_task,
@@ -344,14 +361,19 @@ static bool RegionsMayConflict(const TaskNode *a_task,
   ConstrSet b_ctx = b_task ? b_task->outer_ctx : ConstrSet();
   ConstrSet loop_ctx;
   if (cross) {
-    Var inner_lv = loop_stack.back()->loop_var;
-    a_ctx = a_ctx.RenameFrom("_p", a_sub, inner_lv);
-    b_ctx = b_ctx.RenameFrom("_c", b_sub, inner_lv);
-    if (a_sub.count(inner_lv) && b_sub.count(inner_lv)) {
-      PrimExpr p = a_sub[inner_lv], c = b_sub[inner_lv];
-      loop_ctx.AddConstr(
-          offset < 0 ? (c > p) : (c == p + IntImm(inner_lv.dtype(), offset)));
-    }
+    bool use_complete_loop_nest =
+        IsCurrentLoopMultiBufferEligible(a_region->buffer, loop_stack);
+    Var pivot_lv = use_complete_loop_nest ? loop_stack.front()->loop_var
+                                          : loop_stack.back()->loop_var;
+    a_ctx = a_ctx.RenameFrom("_p", a_sub, pivot_lv);
+    b_ctx = b_ctx.RenameFrom("_c", b_sub, pivot_lv);
+    PrimExpr iteration = use_complete_loop_nest
+                             ? CalculateIterationCount(loop_stack)
+                             : PrimExpr(loop_stack.back()->loop_var);
+    PrimExpr p = Substitute(iteration, a_sub);
+    PrimExpr c = Substitute(iteration, b_sub);
+    loop_ctx.AddConstr(
+        offset < 0 ? (c > p) : (c == p + IntImm(iteration.dtype(), offset)));
   }
   loop_ctx.Merge(a_ctx).Merge(b_ctx).Populate(ana);
 

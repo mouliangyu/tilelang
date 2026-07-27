@@ -271,8 +271,14 @@ struct ConstrSet {
     return out;
   }
   void Populate(arith::Analyzer &analyzer) const {
+    // Populate all binds (kBindValue/kBindRange) before predicates (kConstr).
     for (const auto &c : constrs_) {
-      c.Populate(analyzer);
+      if (c.kind != Constr::kConstr)
+        c.Populate(analyzer);
+    }
+    for (const auto &c : constrs_) {
+      if (c.kind == Constr::kConstr)
+        c.Populate(analyzer);
     }
   }
   bool CanProve(const PrimExpr &expr) const {

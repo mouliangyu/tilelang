@@ -466,17 +466,39 @@ public:
     indirect_computed_ = computed;
   }
   void SubstituteVar(const Var &old_var, const Var &new_var) override {
-    for (auto &var : read_vars_) {
-      if (var.same_as(old_var)) {
-        var = new_var;
+    Map<Var, PrimExpr> substitution{{old_var, new_var}};
+    auto substitute_vars = [&](std::vector<Var> &vars) {
+      for (auto &var : vars) {
+        if (var.same_as(old_var))
+          var = new_var;
       }
-    }
-    for (auto &var : write_vars_) {
-      if (var.same_as(old_var)) {
-        var = new_var;
+    };
+    std::unordered_map<Buffer, Buffer, ObjectPtrHash, ObjectPtrEqual>
+        buffer_remap;
+    auto substitute_regions = [&](std::vector<BufferRegion> &regions) {
+      for (auto &region : regions) {
+        Buffer buffer = region->buffer;
+        auto buffer_it = buffer_remap.find(buffer);
+        if (buffer_it != buffer_remap.end()) {
+          buffer = buffer_it->second;
+        } else if (buffer->data.same_as(old_var)) {
+          Buffer remapped = buffer;
+          remapped.CopyOnWrite()->data = new_var;
+          buffer_remap.emplace(buffer, remapped);
+          buffer = std::move(remapped);
+        }
+        region = BufferRegion(std::move(buffer),
+                              Substitute(region->region, substitution));
       }
-    }
-    stmt = Substitute(stmt, {{old_var, new_var}});
+    };
+    substitute_vars(read_vars_);
+    substitute_vars(write_vars_);
+    substitute_vars(indirect_read_vars_);
+    substitute_regions(read_regions_);
+    substitute_regions(write_regions_);
+    substitute_regions(indirect_read_regions_);
+    outer_ctx = outer_ctx.Substitute(substitution);
+    stmt = Substitute(stmt, substitution);
     SubstituteVarInGuards(old_var, new_var);
     SubstituteVarInSchedulingMetadata(old_var, new_var);
   }
