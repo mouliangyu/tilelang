@@ -1188,7 +1188,35 @@ class TLPTOSourceWrapper:
 
         raise RuntimeError(f"Cannot find PTODSL function definition for PTO kernel `{kernel_name}`.")
 
+    def get_dynamic_symbolic_set(self, prim_func):
+        # Determine the set of dynamic symbols used in the function
+        dynamic_symbolic_set: dict[str, str] = {}
+
+        def unique_push_back(name: str, dtype: str):
+            if name not in dynamic_symbolic_set:
+                dynamic_symbolic_set[name] = dtype
+            else:
+                assert dtype == dynamic_symbolic_set[name]
+
+        for param in prim_func.params:
+            if param in prim_func.buffer_map:
+                buffer = prim_func.buffer_map[param]
+                for dim in buffer.shape:
+                    if isinstance(dim, tvm.tirx.Var):
+                        unique_push_back(dim.name, str(dim.dtype))
+
+        # Note: In buffer definitions, any dynamic symbols appearing in strides are listed after those in the shape.
+        for param in prim_func.params:
+            if param in prim_func.buffer_map:
+                buffer = prim_func.buffer_map[param]
+                for stride in buffer.strides:
+                    if isinstance(stride, tvm.tirx.Var):
+                        unique_push_back(stride.name, str(stride.dtype))
+
+        return list(dynamic_symbolic_set.items())
+
     def _host_argument_infos(self, func) -> tuple[list[dict[str, str]], dict[str, dict[str, str]]]:
+        dynamic_symbolic_set = self.get_dynamic_symbolic_set(func)
         host_args = []
         arg_by_name = {}
 
@@ -1224,6 +1252,21 @@ class TLPTOSourceWrapper:
             else:
                 raise RuntimeError(f"Unsupported PTO kernel parameter: {param}")
 
+        # Add dynamic symbols as integer arguments
+        existing_names = {arg["name"] for arg in host_args}
+        for dyn_sym, dyn_sym_dtype in dynamic_symbolic_set:
+            if dyn_sym in existing_names:
+                continue
+            c_type = self._lookup_type(dyn_sym_dtype)
+            info = {
+                "name": dyn_sym,
+                "host_type": c_type,
+                "prototype_type": c_type,
+                "call_arg": f"({c_type}){dyn_sym}",
+            }
+            host_args.append(info)
+            add_alias(dyn_sym, info)
+
         if len({arg["name"] for arg in host_args}) != len(host_args):
             names = [arg["name"] for arg in host_args]
             raise RuntimeError(f"Duplicate PTO host argument names: {names}")
@@ -1233,7 +1276,7 @@ class TLPTOSourceWrapper:
     def _generate_host_source(self, func, kernel_name: str, grid_dim: str, dynamic_smem: str) -> str:
         host_args, host_arg_by_name = self._host_argument_infos(func)
         device_arg_names = self._parse_ptodsl_kernel_args(kernel_name)
-        if len(device_arg_names) != len(host_args):
+        if len(device_arg_names) > len(host_args):
             raise RuntimeError(f"PTO kernel `{kernel_name}` argument count mismatch: device={len(device_arg_names)}, host={len(host_args)}")
 
         prototype_args = []

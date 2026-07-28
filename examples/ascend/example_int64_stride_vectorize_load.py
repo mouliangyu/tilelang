@@ -40,7 +40,6 @@ VEC = 2
 THREADS = DIM // VEC  # 64
 
 
-@tilelang.jit
 def repro_kernel() -> object:
     num_slots = T.dynamic("num_slots")
     cache_size = T.dynamic("cache_size")
@@ -81,7 +80,7 @@ if __name__ == "__main__":
     slot_idx = torch.zeros(1, dtype=torch.int32, device=device)
     out = torch.zeros(total_c, DIM, dtype=torch.float32, device=device)
 
-    kernel = repro_kernel()
+    kernel = tilelang.compile(repro_kernel())
     kernel(state_cache, slot_idx, out)
     torch.npu.synchronize()
     print("PASS")

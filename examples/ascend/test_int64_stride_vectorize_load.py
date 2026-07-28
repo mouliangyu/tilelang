@@ -1,11 +1,14 @@
 """pytest test for example_int64_stride_vectorize_load.py."""
 
+import pytest
 import torch
+import tilelang
 
 from example_int64_stride_vectorize_load import DIM, repro_kernel
 
 
-def test_int64_stride_vectorize_load():
+@pytest.mark.parametrize("target", ["ascend", pytest.param("pto", marks=pytest.mark.pto)])
+def test_int64_stride_vectorize_load(target):
     device = torch.device("npu")
 
     num_slots, cache_size, total_c = 2, 32, 4
@@ -13,7 +16,8 @@ def test_int64_stride_vectorize_load():
     slot_idx = torch.zeros(1, dtype=torch.int32, device=device)
     out = torch.zeros(total_c, DIM, dtype=torch.float32, device=device)
 
-    kernel = repro_kernel()
+    kernel = tilelang.compile(repro_kernel(), target=target)
+
     kernel(state_cache, slot_idx, out)
     torch.npu.synchronize()
 
@@ -22,5 +26,7 @@ def test_int64_stride_vectorize_load():
 
 
 if __name__ == "__main__":
-    test_int64_stride_vectorize_load()
-    print("PASS: test_int64_stride_vectorize_load")
+    test_int64_stride_vectorize_load(target="ascend")
+    print("PASS: test_int64_stride_vectorize_load (ascend)")
+    test_int64_stride_vectorize_load(target="pto")
+    print("PASS: test_int64_stride_vectorize_load (pto)")
