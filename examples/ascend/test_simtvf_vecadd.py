@@ -1,14 +1,16 @@
 """pytest test for example_simtvf_vecadd.py — auto-scheduled variant."""
 
+import pytest
 import torch
 import tilelang
 
 from example_simtvf_vecadd import ref_program, vector_add
 
 
-def test_simtvf_vecadd_auto():
+@pytest.mark.parametrize("target", ["ascend", pytest.param("pto", marks=pytest.mark.pto)])
+def test_simtvf_vecadd_auto(target):
     N = 2**30
-    kernel = tilelang.compile(vector_add(N), out_idx=-1)
+    kernel = tilelang.compile(vector_add(N), target=target, out_idx=-1)
     device = torch.device("npu")
     a = torch.randn(N, dtype=torch.float32, device=device)
     b = torch.randn(N, dtype=torch.float32, device=device)
@@ -18,5 +20,7 @@ def test_simtvf_vecadd_auto():
 
 
 if __name__ == "__main__":
-    test_simtvf_vecadd_auto()
-    print("PASS: test_simtvf_vecadd_auto")
+    test_simtvf_vecadd_auto(target="ascend")
+    print("PASS: test_simtvf_vecadd_auto (ascend)")
+    test_simtvf_vecadd_auto(target="pto")
+    print("PASS: test_simtvf_vecadd_auto (pto)")

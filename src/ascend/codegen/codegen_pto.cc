@@ -1534,6 +1534,22 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
     return;
   }
 
+  if (op->op.same_as(tl::ascend_get_buf()) ||
+      op->op.same_as(tl::ascend_rls_buf())) {
+    ICHECK_EQ(op->args.size(), 3U)
+        << "tl.ascend_get_buf/rls_buf expects exactly 3 arguments "
+           "(pipe string, buf_id, mode)";
+    std::string pipe_str = Downcast<StringImm>(op->args[0])->value;
+    std::string buf_id = RemoveOutermostParentheses(PrintExpr_(op->args[1]));
+    std::string mode = RemoveOutermostParentheses(PrintExpr_(op->args[2]));
+    PrintIndent();
+    stream << (op->op.same_as(tl::ascend_get_buf()) ? "pto.get_buf("
+                                                    : "pto.rls_buf(")
+           << "\"" << StripPipePrefix(pipe_str) << "\", " << buf_id
+           << ", mode=" << mode << ")\n";
+    return;
+  }
+
   if (op->op.same_as(tl::simd_pset())) {
     ICHECK_GE(op->args.size(), 1U)
         << "tl.simd.pset expects at least 1 argument (element width)";
