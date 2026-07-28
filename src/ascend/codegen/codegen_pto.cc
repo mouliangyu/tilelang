@@ -7,7 +7,9 @@
 #include "backend/common/codegen/codegen_utils.h"
 #include "op/builtin.h"
 #include "support/check.h"
+#include "tvm/ir/repr.h"
 
+#include <algorithm>
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/tirx/analysis.h>
@@ -38,12 +40,21 @@ std::string PtoTypeName(DataType t) {
     if (t.bits() == 32)
       return "pto.f32";
     if (t.bits() == 16)
-      return "pto.float16";
+      return "pto.f16";
   } else if (t.is_float8_e4m3fn()) {
     return "pto.f8e4m3";
   } else if (t.is_bfloat16()) {
     return "pto.bf16";
-  } else if (t.is_int() || t.is_uint()) {
+  } else if (t.is_uint()) {
+    if (t.bits() == 64)
+      return "pto.ui64";
+    if (t.bits() == 32)
+      return "pto.ui32";
+    if (t.bits() == 16)
+      return "pto.ui16";
+    if (t.bits() == 8)
+      return "pto.ui8";
+  } else if (t.is_int()) {
     if (t.bits() == 64)
       return "pto.i64";
     if (t.bits() == 32)
@@ -56,6 +67,24 @@ std::string PtoTypeName(DataType t) {
       return "pto.i1";
   }
   LOG(FATAL) << "Unsupported PTO type: " << t;
+  return "";
+}
+
+std::string PtoSignedIntegerTypeName(DataType t) {
+  ICHECK(t.is_scalar() && t.is_int())
+      << "PTO signed integer scalar type expected, got " << t;
+  switch (t.bits()) {
+  case 8:
+    return "pto.si8";
+  case 16:
+    return "pto.si16";
+  case 32:
+    return "pto.si32";
+  case 64:
+    return "pto.si64";
+  default:
+    LOG(FATAL) << "Unsupported PTO signed integer type: " << t;
+  }
   return "";
 }
 
@@ -81,6 +110,12 @@ DataType ParsePTODtype(const std::string &dtype_name) {
     return DataType::Int(32);
   if (dtype_name == "int16")
     return DataType::Int(16);
+  if (dtype_name == "uint64")
+    return DataType::UInt(64);
+  if (dtype_name == "uint32")
+    return DataType::UInt(32);
+  if (dtype_name == "uint16")
+    return DataType::UInt(16);
   if (dtype_name == "int8")
     return DataType::Int(8);
   if (dtype_name == "uint8")
@@ -123,6 +158,46 @@ void CheckConstZero(const PrimExpr &expr, const char *name) {
       << " == 0 for tl.ascend_copy_gm_to_ubuf, got " << expr;
 }
 
+std::string PtoStoreL2CacheToken(int64_t value) {
+  switch (value) {
+  case 0:
+    return "nmfv";
+  case 1:
+    return "nmlv";
+  case 2:
+    return "nmprs";
+  case 3:
+    return "nmred";
+  case 4:
+    return "naci";
+  case 5:
+    return "napw";
+  case 6:
+    return "napi";
+  case 7:
+    return "nared";
+  case 8:
+    return "wbhfv";
+  case 9:
+    return "wbhlv";
+  case 10:
+    return "wbhprs";
+  case 11:
+    return "wbhred";
+  case 12:
+    return "wtsfv";
+  case 13:
+    return "wtslv";
+  case 14:
+    return "wtsprs";
+  case 15:
+    return "wtsred";
+  default:
+    LOG(FATAL) << "Unsupported PTO store l2 cache control value: " << value;
+    return "nmfv";
+  }
+}
+
 bool IsOpName(const ObjectRef &op, const std::string &name) {
   if (auto opt_call_op = op.as<Op>()) {
     return opt_call_op.value()->name == name;
@@ -153,8 +228,11 @@ void CheckPTOLocalVarBuffer(const BufferNode *buffer) {
       << buffer->shape[0];
 
   DataType dtype = buffer->dtype;
-  ICHECK_EQ(dtype.lanes(), 1)
-      << "PTO local.var only supports scalar integer values, got " << dtype;
+  if (dtype.lanes() > 1) {
+    // VMI registers are logical vectors; integer, floating-point and
+    // low-precision element types are all valid here.
+    return;
+  }
   ICHECK(dtype.is_int() || dtype.is_uint())
       << "PTO local.var only supports integer scalar values, got " << dtype;
 }
@@ -558,7 +636,7 @@ void CodeGenTileLangPTO::EmitSimtVFFunction(const SBlockNode *op,
   if (total_threads > 0) {
     decl_stream << ", max_threads=" << total_threads;
   }
-  decl_stream << ", max_regs=64)\n";
+  decl_stream << ")\n";
   decl_stream << "def " << helper_name << "(";
   for (size_t i = 0; i < captures.size(); ++i) {
     if (i != 0) {
@@ -848,13 +926,16 @@ std::string CodeGenTileLangPTO::GetAscendCopyUbGmExpr_(const CallNode *op) {
   std::string src = RemoveOutermostParentheses(PrintExpr_(op->args[1]));
   std::string burst_num = RemoveOutermostParentheses(PrintExpr_(op->args[3]));
   std::string burst_len = RemoveOutermostParentheses(PrintExpr_(op->args[4]));
+  int64_t l2_cache_ctrl = 0;
+  ICHECK(TryGetConstInt(op->args[5], &l2_cache_ctrl))
+      << "PTO UB-to-GM copy expects constant l2_cache_ctrl";
   std::string dst_stride = RemoveOutermostParentheses(PrintExpr_(op->args[6]));
   std::string src_stride = RemoveOutermostParentheses(PrintExpr_(op->args[7]));
 
   std::ostringstream os;
   os << "pto.mte_ub_gm(" << src << ", " << dst << ", " << burst_len
      << ", nburst=(" << burst_num << ", " << src_stride << ", " << dst_stride
-     << "))";
+     << "), l2_cache=\"" << PtoStoreL2CacheToken(l2_cache_ctrl) << "\")";
   return os.str();
 }
 
@@ -929,6 +1010,28 @@ std::string CodeGenTileLangPTO::LocalVarID(const VarNode *var) {
 
 bool CodeGenTileLangPTO::IsLocalVarBuffer(const VarNode *var) const {
   return local_var_buffers_.count(var) != 0;
+}
+
+bool CodeGenTileLangPTO::IsVmiLocalRegisterBuffer(
+    const BufferNode *buffer) const {
+  return !inside_simtvf_body_ && ScopeOfBuffer(buffer) == "local" &&
+         buffer->dtype.lanes() > 1;
+}
+
+void CodeGenTileLangPTO::CheckVmiLocalRegisterIndex(
+    const BufferNode *buffer, const PrimExpr &index) const {
+  bool is_constant = true;
+  tirx::PostOrderVisit(index, [&](const ObjectRef &node) {
+    if (node.as<VarNode>()) {
+      is_constant = false;
+    }
+  });
+  ICHECK(is_constant)
+      << "PTO VMI local register buffer `" << buffer->name
+      << "` requires a compile-time constant index. Register arrays cannot "
+         "be accessed inside T.unroll(..., explicit=False) or other runtime "
+         "loops; use T.unroll(..., explicit=True), got "
+      << index;
 }
 
 void CodeGenTileLangPTO::EnsurePTOGemmHelper(const CallNode *op) {
@@ -1147,6 +1250,156 @@ CodeGenTileLangPTO::EmitPTOAllReduceExpr_(const std::string &func_name,
      << ", scale=" << scale << ", thread_offset=" << thread_offset
      << ", scratch=" << scratch << ")";
   return os.str();
+}
+
+std::string
+CodeGenTileLangPTO::PrintVmiAnnotationValue(const std::string &key,
+                                            const ObjectRef &value) {
+  if (key == "to_dtype") {
+    if (const auto *dtype_name = value.as<StringImmNode>()) {
+      return PtoScalarType(ParsePTODtype(dtype_name->value));
+    }
+  }
+
+  if (const auto *expr = value.as<PrimExprNode>()) {
+    return PrintExpr_(GetRef<PrimExpr>(expr));
+  }
+
+  std::ostringstream os;
+  os << value;
+  return os.str();
+}
+
+void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
+                                          std::ostream &os) {
+  auto opt_call_op = op->op.as<Op>();
+  ICHECK(opt_call_op.has_value());
+  std::string op_name = opt_call_op.value()->name;
+  ICHECK(StartsWith(op_name, "tl.vmi."))
+      << "Expected a tl.vmi.* call, got " << op_name;
+
+  std::vector<std::pair<std::string, ObjectRef>> kwargs;
+  kwargs.reserve(op->annotations.size());
+  for (const auto &[key, value] : op->annotations) {
+    std::string key_str = key;
+    if (key_str == "loc" || key_str == "ip") {
+      continue;
+    }
+    kwargs.emplace_back(std::move(key_str), value);
+  }
+  std::sort(kwargs.begin(), kwargs.end(), [](const auto &lhs, const auto &rhs) {
+    return lhs.first < rhs.first;
+  });
+
+  os << "pto." << op_name.substr(3) << "(";
+  bool needs_comma = false;
+
+  auto print_scalar_literal_value = [&](const PrimExpr &arg) {
+    if (const auto *imm = arg.as<IntImmNode>()) {
+      if (imm->dtype == DataType::Bool()) {
+        os << (imm->value ? "True" : "False");
+      } else {
+        os << imm->value;
+      }
+      return;
+    }
+    if (const auto *imm = arg.as<FloatImmNode>()) {
+      os << "float.fromhex('" << FlexibleHexFormat(imm->value) << "')";
+      return;
+    }
+    PrintExpr_(arg, os);
+  };
+
+  // PTODSL vgather/vgatherb/vscatter take a single pointer operand. TileLang
+  // lowers buffer addresses to (ptr, elem_offset); fold them with addptr here.
+  auto print_ptr_with_offset = [&](const PrimExpr &ptr,
+                                   const PrimExpr &offset) {
+    if (is_zero(offset)) {
+      os << PrintExpr_(ptr);
+      return;
+    }
+    os << "pto.addptr(" << PrintExpr_(ptr) << ", "
+       << RemoveOutermostParentheses(PrintExpr_(offset)) << ")";
+  };
+
+  if (op_name == "tl.vmi.vgather" || op_name == "tl.vmi.vgatherb") {
+    ICHECK_EQ(op->args.size(), 4U)
+        << op_name << " expects (ptr, offset, offsets, mask)";
+    print_ptr_with_offset(op->args[0], op->args[1]);
+    os << ", " << PrintExpr_(op->args[2]) << ", " << PrintExpr_(op->args[3]);
+    needs_comma = true;
+  } else if (op_name == "tl.vmi.vscatter") {
+    ICHECK_EQ(op->args.size(), 5U)
+        << op_name << " expects (value, ptr, offset, offsets, mask)";
+    os << PrintExpr_(op->args[0]) << ", ";
+    print_ptr_with_offset(op->args[1], op->args[2]);
+    os << ", " << PrintExpr_(op->args[3]) << ", " << PrintExpr_(op->args[4]);
+    needs_comma = true;
+  } else if (op_name == "tl.vmi.vstore") {
+    auto dist_mode_it = op->annotations.find("dist_mode");
+    ObjectRef dist_mode = dist_mode_it != op->annotations.end()
+                              ? (*dist_mode_it).second
+                              : ObjectRef();
+    const bool is_dintlv_store =
+        dist_mode.defined() && dist_mode.as<StringImmNode>() != nullptr &&
+        Downcast<StringImm>(dist_mode)->value == "dintlv";
+    if (is_dintlv_store) {
+      ICHECK_GE(op->args.size(), 4U)
+          << op_name
+          << " with dist_mode=dintlv expects (even, odd, ptr, offset[, mask])";
+      os << "(" << PrintExpr_(op->args[0]) << ", " << PrintExpr_(op->args[1])
+         << ")";
+      for (size_t i = 2; i < op->args.size(); ++i) {
+        os << ", " << PrintExpr_(op->args[i]);
+      }
+      needs_comma = true;
+    } else {
+      for (size_t i = 0; i < op->args.size(); ++i) {
+        const PrimExpr &arg = op->args[i];
+        if (needs_comma) {
+          os << ", ";
+        }
+        os << PrintExpr_(arg);
+        needs_comma = true;
+      }
+    }
+  } else {
+    for (size_t i = 0; i < op->args.size(); ++i) {
+      const PrimExpr &arg = op->args[i];
+      if (needs_comma) {
+        os << ", ";
+      }
+      const bool is_scalar_literal =
+          arg.as<FloatImmNode>() != nullptr || arg.as<IntImmNode>() != nullptr;
+      const bool should_wrap_typed_literal =
+          (op_name == "tl.vmi.vbrc" || op_name == "tl.vmi.vci") && i == 0 &&
+          is_scalar_literal;
+      if (should_wrap_typed_literal) {
+        // PTODSL needs typed literal scalars for these VMI sources; preserve
+        // the literal dtype instead of assuming every source is f32.
+        os << PtoScalarType(arg.dtype()) << "(";
+        print_scalar_literal_value(arg);
+        os << ")";
+      } else {
+        os << PrintExpr_(arg);
+      }
+      needs_comma = true;
+    }
+  }
+
+  for (const auto &[key, value] : kwargs) {
+    if (needs_comma) {
+      os << ", ";
+    }
+    os << key << "=";
+    if (op_name == "tl.vmi.vcvt" && key == "to_dtype" && op->dtype.is_int()) {
+      os << PtoSignedIntegerTypeName(op->dtype.element_of());
+    } else {
+      os << PrintVmiAnnotationValue(key, value);
+    }
+    needs_comma = true;
+  }
+  os << ")";
 }
 
 void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
@@ -1373,6 +1626,17 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
          << ")";
       return;
     }
+    if (StartsWith(op_name, "tl.vmi.")) {
+      if (op_name == "tl.vmi.pair_get") {
+        ICHECK_EQ(op->args.size(), 2U)
+            << "tl.vmi.pair_get expects exactly 2 arguments";
+        os << "(" << PrintExpr_(op->args[0]) << ")[" << PrintExpr_(op->args[1])
+           << "]";
+        return;
+      }
+      PrintPtoVmiCall_(op, os);
+      return;
+    }
     if (StartsWith(op_name, "tl.")) {
       LOG(FATAL) << "PTO codegen does not support TileLang op `" << op_name
                  << "`. Please add a handler in CodeGenTileLangPTO or lower "
@@ -1479,6 +1743,24 @@ void CodeGenTileLangPTO::VisitStmt_(const BindNode *op) {
 }
 
 void CodeGenTileLangPTO::VisitStmt_(const AllocBufferNode *op) {
+  // VMI/SIMD mutable registers are local.var buffers even for vector-only
+  // kernels (which do not enter the GEMM allocation path).
+  if (GetPtrStorageScope(op->buffer->data) == "local.var") {
+    const Var &buffer_var = op->buffer->data;
+    CheckPTOLocalVarBuffer(op->buffer.get());
+    PrintIndent();
+    local_var_buffers_.insert(buffer_var.get());
+    if (op->buffer->dtype.lanes() > 1) {
+      stream << AllocVarID(buffer_var.get()) << " = pto.vmi.vreg("
+             << op->buffer->dtype.lanes() << ", "
+             << PtoTypeName(op->buffer->dtype.element_of()) << ")\n";
+    } else {
+      stream << AllocVarID(buffer_var.get())
+             << " = pto.const(0, dtype=pto.int64)\n";
+    }
+    RegisterHandleType_(buffer_var.get(), op->buffer->dtype);
+    return;
+  }
   if (!current_function_has_gemm_) {
     EmitPtoBufferAllocation(op->buffer);
     return;
@@ -1504,12 +1786,19 @@ void CodeGenTileLangPTO::VisitStmt_(const AllocBufferNode *op) {
     info.dtype = op->buffer->dtype;
     fragment_info_[buffer_var.get()] = info;
   } else if (scope == "local.var") {
-    // T.alloc_var lowers to a one-element local.var buffer.
+    // Scalar alloc_var is used by GEMM tile mapping; vector alloc_var is a
+    // mutable VMI/SIMD register and is emitted as a PTODSL Vec value.
     CheckPTOLocalVarBuffer(op->buffer.get());
     PrintIndent();
     local_var_buffers_.insert(buffer_var.get());
-    stream << AllocVarID(buffer_var.get())
-           << " = pto.const(0, dtype=pto.int64)\n";
+    if (op->buffer->dtype.lanes() > 1) {
+      stream << AllocVarID(buffer_var.get()) << " = pto.vmi.vreg("
+             << op->buffer->dtype.lanes() << ", "
+             << PtoTypeName(op->buffer->dtype.element_of()) << ")\n";
+    } else {
+      stream << AllocVarID(buffer_var.get())
+             << " = pto.const(0, dtype=pto.int64)\n";
+    }
   }
 
   RegisterHandleType_(buffer_var.get(), op->buffer->dtype);
@@ -1563,10 +1852,7 @@ void CodeGenTileLangPTO::VisitStmt_(const ForNode *op) {
     std::string begin = RemoveOutermostParentheses(PrintExpr_(op->min));
     PrimExpr upper_bound = arith::Analyzer().Simplify(op->extent + op->min);
     std::string end = RemoveOutermostParentheses(PrintExpr_(upper_bound));
-    std::string range_fn =
-        op->kind == tirx::ForKind::kUnrolled ? "pto.static_range" : "range";
-    stream << "for " << vid << " in " << range_fn << "(" << begin << ", " << end
-           << "):\n";
+    stream << "for " << vid << " in range(" << begin << ", " << end << "):\n";
     int for_scope = BeginScope();
     PrintStmt_(op->body);
     EndScope(for_scope);
@@ -1602,6 +1888,17 @@ void CodeGenTileLangPTO::VisitStmt_(const SBlockNode *op) {
     std::string helper_name = "simt_vf_" + std::to_string(vf_idx);
     EmitSimtVFFunction(op, captures, helper_name, thread_x, thread_y, thread_z);
     EmitSimtVFLaunch(captures, helper_name, thread_x, thread_y, thread_z);
+    return;
+  }
+
+  if (op->name_hint == "SIMD_VF") {
+    for (const Buffer &buf : op->alloc_buffers) {
+      EmitPtoBufferAllocation(buf);
+    }
+    if (op->init.defined()) {
+      PrintStmt_(op->init.value());
+    }
+    PrintStmt_(op->body);
     return;
   }
 
@@ -1644,12 +1941,27 @@ void CodeGenTileLangPTO::VisitExpr_(const BufferLoadNode *op,
     // T.alloc_var lowers to local.var[0]. Read it back as the scalar surface
     // value used by GEMM tile mapping, not as a general PTO buffer load.
     CheckPTOLocalVarBuffer(op->buffer.get());
+    if (op->buffer->dtype.lanes() > 1) {
+      os << LocalVarID(op->buffer->data.get());
+      return;
+    }
     ICHECK_EQ(op->indices.size(), 1U)
         << "PTO local.var load expects a scalar buffer";
     int64_t index = 0;
     ICHECK(TryGetConstInt(op->indices[0], &index) && index == 0)
         << "PTO local.var load expects index 0";
     os << LocalVarID(op->buffer->data.get());
+    return;
+  }
+
+  if (IsVmiLocalRegisterBuffer(op->buffer.get())) {
+    ICHECK_EQ(op->indices.size(), 1U)
+        << "PTO VMI local register buffers must be flattened before codegen";
+    ICHECK(!op->predicate.defined())
+        << "PTO VMI local register buffers do not support predicated loads";
+    CheckVmiLocalRegisterIndex(op->buffer.get(), op->indices[0]);
+    os << GetVarID(op->buffer->data.get()) << "["
+       << RemoveOutermostParentheses(PrintExpr_(op->indices[0])) << "]";
     return;
   }
 
@@ -1726,6 +2038,12 @@ void CodeGenTileLangPTO::VisitStmt_(const BufferStoreNode *op) {
     // T.alloc_var lowers to local.var[0]. Store it as a scalar surface value
     // for GEMM tile mapping, not as a general PTO buffer store.
     CheckPTOLocalVarBuffer(op->buffer.get());
+    if (op->buffer->dtype.lanes() > 1) {
+      PrintIndent();
+      stream << LocalVarID(op->buffer->data.get()) << " = "
+             << RemoveOutermostParentheses(PrintExpr_(op->value)) << "\n";
+      return;
+    }
     ICHECK_EQ(op->indices.size(), 1U)
         << "PTO local.var store expects a scalar buffer";
     int64_t index = 0;
@@ -1736,6 +2054,20 @@ void CodeGenTileLangPTO::VisitStmt_(const BufferStoreNode *op) {
            << "_tl_wrap_surface_value(_tl_coerce_i64("
            << RemoveOutermostParentheses(PrintExpr_(op->value))
            << ", context=\"PTO local.var store\"))\n";
+    return;
+  }
+
+  if (IsVmiLocalRegisterBuffer(op->buffer.get())) {
+    ICHECK_EQ(op->indices.size(), 1U)
+        << "PTO VMI local register buffers must be flattened before codegen";
+    ICHECK(!op->predicate.defined())
+        << "PTO VMI local register buffers do not support predicated stores";
+    CheckVmiLocalRegisterIndex(op->buffer.get(), op->indices[0]);
+    PrintIndent();
+    stream << GetVarID(op->buffer->data.get()) << "["
+           << RemoveOutermostParentheses(PrintExpr_(op->indices[0]))
+           << "] = " << RemoveOutermostParentheses(PrintExpr_(op->value))
+           << "\n";
     return;
   }
 

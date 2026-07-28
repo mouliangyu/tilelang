@@ -183,10 +183,38 @@ jobs:
           echo "::group::torch.utils.collect_env"
           uv run --no-project -m -- torch.utils.collect_env
           uv pip install /nfs-hg/prod/deepseek/permanent/shared/caohuanqi/pytorch/dist/torch_npu-2.10.0.post4+git4421109-cp312-cp312-linux_aarch64.whl
-          # Self-contained PTO toolchain (ptodsl + mlir dialects + ptoas CLI, with
-          # bundled LLVM/MLIR shared libs). Replaces the PYTHONPATH/PATH/LD_LIBRARY_PATH
-          # wiring to a PTOAS/LLVM build tree.
-          uv pip install /nfs-hg/prod/deepseek/permanent/shared/xuruifan/ptoas-0.1.1-cp312-cp312-manylinux_2_34_aarch64.whl
+          # Self-contained PTO toolchain from the official hw-native-sys/PTOAS
+          # vmi-v0.1.3 release (ptodsl + MLIR dialects + ptoas CLI).
+          case "${RUNNER_ARCH}" in
+            ARM64)
+              PTOAS_ARCH=aarch64
+              PTOAS_SHA256=b2339469c0bf96a80f8a36fd8415574e738e7dc47cc89f3d43b126df484305d6
+              ;;
+            X64)
+              PTOAS_ARCH=x86_64
+              PTOAS_SHA256=84917c1e9f4b352620876f22ae96430fe08bc8688e8b94e4f3b03590c5c0bbb7
+              ;;
+            *)
+              echo "Unsupported runner architecture: ${RUNNER_ARCH}" >&2
+              exit 1
+              ;;
+          esac
+          PTOAS_CACHE_DIR="${XDG_CACHE_HOME}/ptoas"
+          PTOAS_FILENAME="ptoas_vmi-0.1.3-cp312-cp312-manylinux_2_34_${PTOAS_ARCH}.whl"
+          PTOAS_WHEEL="${PTOAS_CACHE_DIR}/${PTOAS_FILENAME}"
+          mkdir -p "${PTOAS_CACHE_DIR}"
+          if ! [[ -f "${PTOAS_WHEEL}" ]] || \
+             ! printf '%s  %s\n' "${PTOAS_SHA256}" "${PTOAS_WHEEL}" | sha256sum --check --status -; then
+            PTOAS_DOWNLOAD="$(mktemp "${PTOAS_WHEEL}.tmp.XXXXXX")"
+            trap 'rm -f "${PTOAS_DOWNLOAD}"' EXIT
+            curl --fail --location --retry 3 \
+              --output "${PTOAS_DOWNLOAD}" \
+              "https://github.com/hw-native-sys/PTOAS/releases/download/vmi-v0.1.3/${PTOAS_FILENAME}"
+            printf '%s  %s\n' "${PTOAS_SHA256}" "${PTOAS_DOWNLOAD}" | sha256sum --check -
+            mv "${PTOAS_DOWNLOAD}" "${PTOAS_WHEEL}"
+            trap - EXIT
+          fi
+          uv pip install "${PTOAS_WHEEL}"
           echo "::endgroup::"
 
       - name: Clear uv cache for self-hosted runners (if setup failed)

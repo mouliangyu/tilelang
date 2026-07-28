@@ -114,8 +114,14 @@ private:
   void EmitPTOGemmRun(const std::string &a_mat, const std::string &b_mat,
                       const std::string &acc, const std::string &clear_accum,
                       const std::string &unit_flag_ctrl);
+  std::string PrintVmiAnnotationValue(const std::string &key,
+                                      const ObjectRef &value);
+  void PrintPtoVmiCall_(const CallNode *op, std::ostream &os);
   std::string LocalVarID(const VarNode *var);
   bool IsLocalVarBuffer(const VarNode *var) const;
+  bool IsVmiLocalRegisterBuffer(const BufferNode *buffer) const;
+  void CheckVmiLocalRegisterIndex(const BufferNode *buffer,
+                                  const PrimExpr &index) const;
   bool HasAscendGemmL1(const PrimFunc &func) const;
 
   bool current_function_has_gemm_{false};

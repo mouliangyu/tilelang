@@ -63,6 +63,7 @@ _ENTRIES: list[tuple[str, str, dict]] = [
     ("ascend_simdvf_vecadd_lower", "example_simdvf_vecadd_lower.py", {}),
     ("ascend_simtvf_vecadd", "example_simtvf_vecadd.py", {}),
     ("ascend_simtvf_vecadd_mutex", "example_simtvf_vecadd_mutex.py", {}),
+    ("ascend_vmi_vecadd", "example_vmi_vecadd.py", {}),
     ("ascend_simdvf_per_token_cast_to_fp8", "example_simdvf_per_token_cast_to_fp8.py", {}),
     ("ascend_simtvf_per_token_cast_to_fp8", "example_simtvf_per_token_cast_to_fp8.py", {}),
     ("ascend_crosslevel_multibuffer", "example_crosslevel_multibuffer.py", {}),

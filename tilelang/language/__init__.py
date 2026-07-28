@@ -32,6 +32,7 @@ from .vf import (
     SimdVF,  # noqa: F401
     SimdVFFrame,  # noqa: F401
 )
+from . import vmi  # noqa: F401 (exposed as T.vmi.*)
 from .cube import (
     Cube,  # noqa: F401
     CubeFrame,  # noqa: F401

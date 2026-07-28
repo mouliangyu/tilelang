@@ -246,6 +246,7 @@ verbosity_assertions = 3
 filterwarnings = ["always"]
 markers = [
     "perf: benchmark and performance API tests skipped by default",
+    "pto: tests for the PTO backend",
     "slow: long-running correctness sweeps",
 ]
 
