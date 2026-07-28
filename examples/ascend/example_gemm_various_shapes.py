@@ -190,7 +190,7 @@ def gemm(M_DIM, N_DIM, K_DIM):
                 temp1 = T.alloc_shared((TILE_M // 2, TILE_N_HALF), "float32")
                 T.annotate_buffer_versions({a: NUM_STAGES, b0: NUM_STAGES, b1: NUM_STAGES})
 
-                sched = T.AscendTileScheduler("sched", block_m=TILE_M, block_n=TILE_N, num_cores=NUM_BLOCKS, shape_m=M_DIM, shape_n=N_DIM)
+                sched = T.AscendTileScheduler(block_m=TILE_M, block_n=TILE_N, num_cores=NUM_BLOCKS, shape_m=M_DIM, shape_n=N_DIM)
                 sched.init(bx)
                 while sched.valid():
                     m_tile, n_tile = sched.m_idx, sched.n_idx
@@ -226,7 +226,7 @@ def gemm(M_DIM, N_DIM, K_DIM):
                 temp = T.alloc_shared((TILE_M // 2, TILE_N), "float32")
                 T.annotate_buffer_versions({a: NUM_STAGES, b: NUM_STAGES})
 
-                sched = T.AscendTileScheduler("sched", block_m=TILE_M, block_n=TILE_N, num_cores=NUM_BLOCKS, shape_m=M_DIM, shape_n=N_DIM)
+                sched = T.AscendTileScheduler(block_m=TILE_M, block_n=TILE_N, num_cores=NUM_BLOCKS, shape_m=M_DIM, shape_n=N_DIM)
                 sched.init(bx)
                 while sched.valid():
                     m_tile, n_tile = sched.m_idx, sched.n_idx

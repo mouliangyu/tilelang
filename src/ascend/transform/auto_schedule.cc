@@ -915,7 +915,15 @@ static void AssignScalarWarpgroupByDemand(
       if (!n)
         return;
       if (n->IsTask()) {
-        int wg = static_cast<const TaskNode *>(n)->GetWarpgroupId();
+        const auto *task = static_cast<const TaskNode *>(n);
+        // A loop break controls whether the loop continues, so every
+        // warpgroup that receives a clone of the loop must evaluate the break
+        // condition even when the rest of the loop body is scalar-only.
+        if (task->ContainsLoopBreak()) {
+          mask |= kDemandBoth;
+          return;
+        }
+        int wg = task->GetWarpgroupId();
         if (wg == 0)
           mask |= kDemandWg0;
         else if (wg == 1)

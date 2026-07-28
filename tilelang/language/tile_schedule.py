@@ -304,7 +304,7 @@ class AscendBaseTileScheduler(BaseTileScheduler):
     The block index handed out on iteration ``current_iter`` is
     ``current_iter * num_cores + core_id``, mapped to a tile by ``_swizzle``. Usage::
 
-        sched = T.AscendTileScheduler("sched", block_m=BM, block_n=BN,
+        sched = T.AscendTileScheduler(block_m=BM, block_n=BN,
                                 num_cores=NUM_CORES, shape_m=M, shape_n=N)
         sched.init(bx)
         while sched.valid():
@@ -314,8 +314,6 @@ class AscendBaseTileScheduler(BaseTileScheduler):
 
     Parameters
     ----------
-    prefix : str
-        Name prefix for the scheduler's state buffers in the generated IR.
     block_m, block_n : int
         Tile sizes along M and N.
     num_cores : int | PrimExpr
@@ -331,6 +329,9 @@ class AscendBaseTileScheduler(BaseTileScheduler):
     stateful : bool
         If True (default) allocate state and enable ``init`` / ``valid`` /
         ``next_block``. If False expose only the store-free ``coord`` decode.
+    name : str, optional
+        Optional state-buffer name prefix. The default ``None`` uses generic
+        auto-generated names.
 
     Notes
     -----
@@ -340,7 +341,6 @@ class AscendBaseTileScheduler(BaseTileScheduler):
 
     def __init__(
         self,
-        prefix: str,
         *,
         block_m,
         block_n,
@@ -351,8 +351,9 @@ class AscendBaseTileScheduler(BaseTileScheduler):
         xor_n: bool = True,
         snake: bool = True,
         stateful: bool = True,
+        name: str | None = None,
     ):
-        super().__init__(stateful=stateful, name=prefix)
+        super().__init__(stateful=stateful, name=name)
         assert group_m in (4, 8), "group_m must be 4 or 8"
 
         self._block_m = block_m
@@ -523,9 +524,34 @@ class AscendBatchedTileScheduler(AscendBaseTileScheduler):
     Extra parameter ``num_groups`` (= batch count) beyond the base scheduler.
     """
 
-    def __init__(self, prefix: str, *, num_groups: int, **kwargs):
+    def __init__(
+        self,
+        *,
+        block_m,
+        block_n,
+        num_cores,
+        shape_m,
+        shape_n,
+        num_groups: int,
+        group_m: int = 4,
+        xor_n: bool = True,
+        snake: bool = True,
+        stateful: bool = True,
+        name: str | None = None,
+    ):
         self._num_groups = num_groups
-        super().__init__(prefix, **kwargs)
+        super().__init__(
+            block_m=block_m,
+            block_n=block_n,
+            num_cores=num_cores,
+            shape_m=shape_m,
+            shape_n=shape_n,
+            group_m=group_m,
+            xor_n=xor_n,
+            snake=snake,
+            stateful=stateful,
+            name=name,
+        )
 
     def _alloc_state(self):
         self.batch_idx = T.alloc_var(T.int32)
@@ -555,11 +581,38 @@ class AscendMGroupedTileScheduler(AscendBaseTileScheduler):
     buffer), ``num_groups``, ``alignment`` (group-start row alignment, default 256).
     """
 
-    def __init__(self, prefix: str, *, grouped_layout, num_groups: int, alignment: int = 256, **kwargs):
+    def __init__(
+        self,
+        *,
+        block_m,
+        block_n,
+        num_cores,
+        shape_m,
+        shape_n,
+        grouped_layout,
+        num_groups: int,
+        alignment: int = 256,
+        group_m: int = 4,
+        xor_n: bool = True,
+        snake: bool = True,
+        stateful: bool = True,
+        name: str | None = None,
+    ):
         self._grouped_layout = grouped_layout
         self._num_groups = num_groups
         self._alignment = alignment
-        super().__init__(prefix, **kwargs)
+        super().__init__(
+            block_m=block_m,
+            block_n=block_n,
+            num_cores=num_cores,
+            shape_m=shape_m,
+            shape_n=shape_n,
+            group_m=group_m,
+            xor_n=xor_n,
+            snake=snake,
+            stateful=stateful,
+            name=name,
+        )
 
     def _alloc_state(self):
         self.group_idx = T.alloc_var(T.int32)
@@ -582,11 +635,11 @@ class AscendMGroupedTileScheduler(AscendBaseTileScheduler):
         # advance groups until block_idx lands in the current group's block range
         while self.group_idx[0] < self._num_groups:
             if block_idx < (self.m_block_cumsum[0] + self.cur_num_m_blocks[0]) * num_n:
-                break
+                T.loop_break()
             self.group_idx[0] = self.group_idx[0] + 1
             if self.group_idx[0] == self._num_groups:
                 self.valid_flag[0] = 0
-                break
+                T.loop_break()
             self.last_psum_m[0] = T.ceildiv(self.cur_psum_m[0], self._alignment) * self._alignment
             self.cur_psum_m[0] = self._grouped_layout[self.group_idx[0]]
             self.m_block_cumsum[0] = self.m_block_cumsum[0] + self.cur_num_m_blocks[0]
@@ -619,11 +672,38 @@ class AscendKGroupedTileScheduler(AscendBaseTileScheduler):
     # One scale-factor pair covers this many K elements (MX FP hardware constant).
     _MX_SF_DIVISOR = 64
 
-    def __init__(self, prefix: str, *, grouped_layout, num_groups: int, alignment: int = 256, **kwargs):
+    def __init__(
+        self,
+        *,
+        block_m,
+        block_n,
+        num_cores,
+        shape_m,
+        shape_n,
+        grouped_layout,
+        num_groups: int,
+        alignment: int = 256,
+        group_m: int = 4,
+        xor_n: bool = True,
+        snake: bool = True,
+        stateful: bool = True,
+        name: str | None = None,
+    ):
         self._grouped_layout = grouped_layout
         self._num_groups = num_groups
         self._alignment = alignment
-        super().__init__(prefix, **kwargs)
+        super().__init__(
+            block_m=block_m,
+            block_n=block_n,
+            num_cores=num_cores,
+            shape_m=shape_m,
+            shape_n=shape_n,
+            group_m=group_m,
+            xor_n=xor_n,
+            snake=snake,
+            stateful=stateful,
+            name=name,
+        )
 
     def _alloc_state(self):
         self.group_idx = T.alloc_var(T.int32)
@@ -647,11 +727,11 @@ class AscendKGroupedTileScheduler(AscendBaseTileScheduler):
         # all groups share the M x N grid; each spans exactly num_blocks
         while self.group_idx[0] < self._num_groups:
             if self.cur_shape_k[0] > 0 and block_idx < self.k_block_cumsum[0] + self._num_blocks:
-                break
+                T.loop_break()
             self.group_idx[0] = self.group_idx[0] + 1
             if self.group_idx[0] == self._num_groups:
                 self.valid_flag[0] = 0
-                break
+                T.loop_break()
             self.last_psum_k[0] = T.ceildiv(self.cur_psum_k[0], self._alignment) * self._alignment
             self.cur_psum_k[0] = self._grouped_layout[self.group_idx[0]]
             self.sf_k_cumsum[0] = self.last_psum_k[0] // self._MX_SF_DIVISOR
