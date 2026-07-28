@@ -74,22 +74,18 @@ public:
     return 0;
   }
 
-  int GetUnitFlagCtl() const {
+  PrimExpr GetUnitFlagCtl() const {
     if (auto val = annotations.Get("unit_flag_ctrl")) {
-      if (auto int_val = val->as<IntImmNode>()) {
-        return int_val->value;
-      }
+      return Downcast<PrimExpr>(val.value());
     }
-    return 0;
+    return IntImm(DataType::Int(32), 0);
   }
 
-  int GetSubBlockId() const {
+  PrimExpr GetSubBlockId() const {
     if (auto val = annotations.Get("sub_blockid")) {
-      if (auto int_val = val->as<IntImmNode>()) {
-        return int_val->value;
-      }
+      return Downcast<PrimExpr>(val.value());
     }
-    return 0;
+    return IntImm(DataType::Int(32), 0);
   }
 
   int GetTranspose() const {

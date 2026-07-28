@@ -5,9 +5,11 @@
 
 #include "oob_padding.h"
 
+#include "ascend_mte_plan.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -59,46 +61,55 @@ BoundedDMACopyRanges ClampDMACopyTail(const CopyNode &op,
   }
 
   bool need_transpose = op.GetTranspose();
+  std::vector<size_t> src_axes, dst_axes;
+  std::vector<size_t> src_singleton_axes, dst_singleton_axes;
 
-  size_t tail_transpose_axes = 0;
-  if (need_transpose) {
-    ICHECK(op.dst_range.size() >= 2 && op.src_range.size() >= 2)
-        << "Ascend transposed copy requires >= 2D source and "
-        << "destination, got src rank " << op.src_range.size() << ", dst rank "
-        << op.dst_range.size() << ".";
-    tail_transpose_axes = 2;
-  }
+  if (GetDMAPath(op.src, op.dst) == DMAPath::kGMToL1) {
+    StridedLayout src_layout = NormalizeMTE2DLayout(
+        op.src, op.src_range, analyzer, "Ascend GM->L1 OOB handling");
+    StridedLayout dst_layout = NormalizeTrailingMTE2DLayout(
+        op.dst, op.dst_range, analyzer, "Ascend GM->L1 OOB handling");
+    size_t src_inner_axis = static_cast<size_t>(src_layout.modes[0].axis);
+    size_t src_row_axis = static_cast<size_t>(src_layout.modes[1].axis);
+    size_t dst_inner_axis = static_cast<size_t>(dst_layout.modes[0].axis);
+    size_t dst_row_axis = static_cast<size_t>(dst_layout.modes[1].axis);
+    src_axes = {src_row_axis, src_inner_axis};
+    dst_axes = need_transpose
+                   ? std::vector<size_t>{dst_inner_axis, dst_row_axis}
+                   : std::vector<size_t>{dst_row_axis, dst_inner_axis};
 
-  auto collect_non_singleton_axes = [&](const Array<Range> &ranges) {
-    std::vector<size_t> axes, singleton_axes;
-    for (size_t i = 0; i < ranges.size() - tail_transpose_axes; ++i) {
-      if (!is_one(ranges[i]->extent))
-        axes.push_back(i);
-      else
-        singleton_axes.push_back(i);
+    auto collect_other_axes = [](size_t ndim, size_t axis0, size_t axis1) {
+      std::vector<size_t> axes;
+      for (size_t i = 0; i < ndim; ++i) {
+        if (i != axis0 && i != axis1) {
+          axes.push_back(i);
+        }
+      }
+      return axes;
+    };
+    src_singleton_axes =
+        collect_other_axes(op.src_range.size(), src_row_axis, src_inner_axis);
+    dst_singleton_axes =
+        collect_other_axes(op.dst_range.size(), dst_row_axis, dst_inner_axis);
+  } else {
+    auto collect_non_singleton_axes = [](const Array<Range> &ranges) {
+      std::vector<size_t> axes, singleton_axes;
+      for (size_t i = 0; i < ranges.size(); ++i) {
+        if (!is_one(ranges[i]->extent))
+          axes.push_back(i);
+        else
+          singleton_axes.push_back(i);
+      }
+      return std::make_pair(axes, singleton_axes);
+    };
+
+    std::tie(src_axes, src_singleton_axes) =
+        collect_non_singleton_axes(op.src_range);
+    std::tie(dst_axes, dst_singleton_axes) =
+        collect_non_singleton_axes(op.dst_range);
+    if (src_axes.size() != dst_axes.size()) {
+      return result;
     }
-    return std::make_pair(axes, singleton_axes);
-  };
-
-  auto [src_axes, src_singleton_axes] =
-      collect_non_singleton_axes(op.src_range);
-  auto [dst_axes, dst_singleton_axes] =
-      collect_non_singleton_axes(op.dst_range);
-  if (src_axes.size() != dst_axes.size()) {
-    return result;
-  }
-
-  if (need_transpose) {
-    // Only the trailing M/K pair may be non-singleton for a transposed copy;
-    // any non-singleton leading (batch) axis is unsupported here.
-    ICHECK(src_axes.empty() && dst_axes.empty())
-        << "Ascend transposed copy only supports singleton leading axes, got "
-        << src_axes.size() << " non-singleton src leading axes and "
-        << dst_axes.size() << " non-singleton dst leading axes.";
-    src_axes.insert(src_axes.end(),
-                    {op.src_range.size() - 2, op.src_range.size() - 1});
-    dst_axes.insert(dst_axes.end(),
-                    {op.dst_range.size() - 1, op.dst_range.size() - 2});
   }
 
   bool needs_clamp = false;

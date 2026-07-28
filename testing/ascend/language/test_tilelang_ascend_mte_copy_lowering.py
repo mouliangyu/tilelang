@@ -21,6 +21,14 @@ and validate supported layout combinations end-to-end on NPU:
   the physical source row boundary instead of relying on symbolic size ordering.
 * ``test_gm2ub_incompatible_2d_rejected`` — two different physical row boundaries
   are rejected until outer-loop lowering is implemented.
+* ``test_gm_to_l1_fixed_outer_axis_uses_effective_row_stride`` — a fixed
+  batch/group axis contributes to the base pointer but not the matrix row
+  stride.
+* ``test_l0c_to_rank3_gm_uses_effective_row_stride`` — the same rank reduction
+  applies to a grouped L0C-to-GM output copy, while a smaller destination
+  region controls the transferred tail extent.
+* ``test_gm_to_l1_true_nd_rejected`` — a genuine three-dimensional transfer is
+  rejected instead of being silently flattened with the wrong stride.
 * ``test_gm2ub2gm_fp4_copy`` — a packed ``float4_e2m1fn`` GM->UBuf->GM copy
   must use 4-bit-based byte counts (``N`` logical elements => ``N/2`` bytes).
 """
@@ -312,6 +320,131 @@ def test_gm2ub_dynamic_rows_middle_dim():
     torch.npu.synchronize()
 
     torch.testing.assert_close(out, src[:, 0, :])
+
+
+def l0c_to_strided_gm_copy():
+    ldd = T.dynamic("ldd", dtype="int64")
+    m, n, k = 16, 16, 64
+
+    @T.prim_func
+    def kernel(
+        a: T.Buffer((m, k), "bfloat16"),
+        b: T.Buffer((n, k), "bfloat16"),
+        out: T.StridedTensor((m, n), (ldd, 1), "float32"),
+    ):
+        with T.Kernel(1):
+            a_l1 = T.alloc_l1((m, k), "bfloat16")
+            b_l1 = T.alloc_l1((n, k), "bfloat16")
+            acc = T.alloc_l0c((m, n), "float32")
+            T.copy(a, a_l1)
+            T.copy(b, b_l1)
+            T.gemm(
+                a_l1,
+                b_l1,
+                acc,
+                transpose_B=True,
+                clear_accum=True,
+                unit_flag_ctrl=3,
+            )
+            T.copy(acc, out[0, 0], unit_flag_ctrl=3)
+
+    return kernel
+
+
+def test_l0c_to_strided_gm_uses_runtime_row_stride():
+    kernel = tilelang.compile(l0c_to_strided_gm_copy(), target="ascend")
+    source = kernel.get_kernel_source()
+    assert re.search(
+        r"copy_matrix_cc_to_gm\([^;]*,\s*0,\s*16,\s*16,\s*\(\(int32_t\)ldd\),\s*16,",
+        source,
+    ), source
+
+    device = torch.device("npu")
+    a = torch.randn((16, 64), dtype=torch.bfloat16, device=device)
+    b = torch.randn((16, 64), dtype=torch.bfloat16, device=device)
+    storage = torch.empty((16, 32), dtype=torch.float32, device=device)
+    out = storage[:, :16]
+    kernel(a, b, out)
+    torch.npu.synchronize()
+    torch.testing.assert_close(out, a.float() @ b.float().T)
+
+
+def gm_to_l1_fixed_outer_axis_copy():
+    @T.prim_func
+    def kernel(
+        src: T.StridedTensor((4, 16, 64), (2000, 80, 1), "bfloat16"),
+        group: T.Buffer((1,), "int32"),
+    ):
+        with T.Kernel(1):
+            l1 = T.alloc_l1((16, 64), "bfloat16")
+            group_idx = T.int32(group[0])
+            T.copy(src[group_idx, 0:16, 0:64], l1)
+
+    return kernel
+
+
+def test_gm_to_l1_fixed_outer_axis_uses_effective_row_stride():
+    artifact = tilelang.lower(gm_to_l1_fixed_outer_axis_copy(), target="ascend")
+    source = artifact.kernel_source
+
+    # The group stride is 2000 bf16 (4000B), while adjacent matrix rows are
+    # only 80 bf16 (160B) apart. The fixed group axis belongs in the pointer
+    # offset, not the ND2NZ row-stride argument.
+    assert re.search(
+        r"copy_gm_to_cbuf_multi_nd2nz\([^;]*,\s*0,\s*160,\s*0,\s*16,\s*64,",
+        source,
+    ), source
+    assert not re.search(
+        r"copy_gm_to_cbuf_multi_nd2nz\([^;]*,\s*0,\s*4000,\s*0,\s*16,\s*64,",
+        source,
+    ), source
+
+
+def l0c_to_rank3_gm_copy():
+    @T.prim_func
+    def kernel(
+        a: T.Buffer((16, 64), "bfloat16"),
+        b: T.Buffer((16, 64), "bfloat16"),
+        out: T.StridedTensor((4, 16, 16), (1000, 40, 1), "float32"),
+        group: T.Buffer((1,), "int32"),
+    ):
+        with T.Kernel(1):
+            a_l1 = T.alloc_l1((16, 64), "bfloat16")
+            b_l1 = T.alloc_l1((16, 64), "bfloat16")
+            acc = T.alloc_l0c((16, 16), "float32")
+            group_idx = T.int32(group[0])
+            T.copy(a, a_l1)
+            T.copy(b, b_l1)
+            T.gemm(a_l1, b_l1, acc, transpose_B=True, clear_accum=True)
+            T.copy(acc, out[group_idx, 0:8, 0:12], unit_flag_ctrl=3)
+
+    return kernel
+
+
+def test_l0c_to_rank3_gm_uses_effective_row_stride():
+    artifact = tilelang.lower(l0c_to_rank3_gm_copy(), target="ascend")
+    source = artifact.kernel_source
+    assert re.search(
+        r"copy_matrix_cc_to_gm\([^;]*,\s*0,\s*12,\s*8,\s*40,\s*16,",
+        source,
+    ), source
+
+
+def gm_to_l1_true_nd_copy():
+    @T.prim_func
+    def kernel(
+        src: T.StridedTensor((2, 3, 4), (20, 5, 1), "bfloat16"),
+    ):
+        with T.Kernel(1):
+            l1 = T.alloc_l1((6, 4), "bfloat16")
+            T.copy(src, l1)
+
+    return kernel
+
+
+def test_gm_to_l1_true_nd_rejected():
+    with pytest.raises(Exception, match="Outer-loop lowering is not yet implemented"):
+        tilelang.lower(gm_to_l1_true_nd_copy(), target="ascend")
 
 
 INCOMPATIBLE_A = 2

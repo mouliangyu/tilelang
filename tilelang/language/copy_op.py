@@ -149,8 +149,8 @@ def copy(
     loop_layout: Any | None = None,
     transpose: bool = False,
     l2_cache_ctrl: int | str | None = None,
-    unit_flag_ctrl: int = 0,
-    sub_blockid: int = 0,
+    unit_flag_ctrl: int | tirx.PrimExpr | None = None,
+    sub_blockid: int | tirx.PrimExpr | None = None,
     scale: BufferLikeType | None = None,
     pad_value: int | float | tirx.PrimExpr | None = None,
     data_select: bool = False,
@@ -185,6 +185,10 @@ def copy(
             avoid pollution). Defaults to None; Ascend UB→GM store paths use
             default 4, while load paths use default 0.
             Ascend only; ignored on other backends.
+        unit_flag_ctrl (Optional[int | PrimExpr], keyword-only): Ascend unit-flag
+            control. ``None`` omits the annotation and lowers as 0.
+        sub_blockid (Optional[int | PrimExpr], keyword-only): Ascend AIV sub-block
+            selector. ``None`` omits the annotation and lowers as 0.
         scale (Optional[BufferLikeType], keyword-only): Ascend MX scale-factor source
             buffer (in L1/cbuf) for an L1→L0A/L0B copy. When provided, the copy
             additionally loads the per-block scale factors into the L0 MX scale
@@ -267,9 +271,9 @@ def copy(
     # Ascend DMA: L2 cache control for GM↔L1 and UB↔GM paths.
     if l2_cache_ctrl is not None and "l2_cache_ctrl" not in ann:
         ann["l2_cache_ctrl"] = l2_cache_ctrl
-    if unit_flag_ctrl and "unit_flag_ctrl" not in ann:
+    if unit_flag_ctrl is not None and "unit_flag_ctrl" not in ann:
         ann["unit_flag_ctrl"] = unit_flag_ctrl
-    if sub_blockid and "sub_blockid" not in ann:
+    if sub_blockid is not None and "sub_blockid" not in ann:
         ann["sub_blockid"] = sub_blockid
     if pad_value is not None and data_select:
         raise ValueError(
@@ -728,6 +732,15 @@ def _get_shape(buf: BufferLikeType) -> list:
     raise TypeError(f"Cannot get shape from {type(buf)}")
 
 
+def _get_allocation_shape(buf: BufferLikeType) -> list:
+    """Extract the underlying allocation shape rather than region extents."""
+    if isinstance(buf, tirx.Buffer):
+        return list(buf.shape)
+    if isinstance(buf, (tirx.BufferLoad, tirx.BufferRegion)):
+        return list(buf.buffer.shape)
+    raise TypeError(f"Cannot get allocation shape from {type(buf)}")
+
+
 def _is_half(full_dim, half_dim) -> bool:
     """Check whether half_dim is full_dim // 2."""
     if isinstance(full_dim, (int, tirx.IntImm)) and isinstance(half_dim, (int, tirx.IntImm)):
@@ -746,7 +759,7 @@ def dual_copy(
     src: BufferLikeType,
     dst: BufferLikeType,
     *,
-    unit_flag_ctrl: int = 0,
+    unit_flag_ctrl: int | tirx.PrimExpr | None = None,
     l2_cache_ctrl: int | str = 0,
 ) -> tirx.PrimExpr | tirx.Stmt:
     """Copy data between memory regions with dualDst (M-split or N-split across 2 AIVs).
@@ -763,7 +776,8 @@ def dual_copy(
     Args:
         src: Source buffer (L0C ``__cc__`` or UB ``__ubuf__``), shape ``[M, N]``
         dst: Destination buffer (UB ``__ubuf__`` or L1 ``__cbuf__``), shape ``[M/2, N]`` or ``[M, N/2]``
-        unit_flag_ctrl: Unit flag control (0=manual sync, 3=pipelined with mad)
+        unit_flag_ctrl: Unit flag control (0=manual sync, 3=pipelined with mad).
+            ``None`` omits the annotation and lowers as 0.
         l2_cache_ctrl (int | str): Ascend L2 cache control policy for the UB→GM
             store path. Accepts an integer or case-insensitive string name
             (e.g. ``"notalloc_clean"``). Defaults to 0 (``"normal_fv"``).
@@ -783,6 +797,18 @@ def dual_copy(
 
     m_halved = _is_half(src_m, dst_m) or _is_half(dst_m, src_m)
     n_halved = _is_half(src_n, dst_n) or _is_half(dst_n, src_n)
+
+    # Runtime tail regions do not retain a structural 2:1 relationship with
+    # the fixed half-sized destination. Infer the split from the underlying
+    # allocations in that case, while preserving the dynamic region extents
+    # for the actual copy.
+    alloc_src_shape = _get_allocation_shape(src)
+    alloc_dst_shape = _get_allocation_shape(dst)
+    alloc_src_m, alloc_src_n = alloc_src_shape[-2], alloc_src_shape[-1]
+    alloc_dst_m, alloc_dst_n = alloc_dst_shape[-2], alloc_dst_shape[-1]
+    if m_halved == n_halved:
+        m_halved = _is_half(alloc_src_m, alloc_dst_m) or _is_half(alloc_dst_m, alloc_src_m)
+        n_halved = _is_half(alloc_src_n, alloc_dst_n) or _is_half(alloc_dst_n, alloc_src_n)
 
     if m_halved and not n_halved:
         dual_dst_ctl = 1
@@ -811,15 +837,17 @@ def dual_copy(
             "Use a separate copy or cast inside a VF block instead."
         )
 
-    annotations = {
-        "dual_dst_ctl": dual_dst_ctl,
-        "unit_flag_ctrl": unit_flag_ctrl,
-        "l2_cache_ctrl": l2_cache_ctrl,
-    }
-    if _is_half(dst_m, src_m) or _is_half(dst_n, src_n):
+    annotations = {"dual_dst_ctl": dual_dst_ctl}
+    if _is_half(dst_m, src_m) or _is_half(dst_n, src_n) or _is_half(alloc_dst_m, alloc_src_m) or _is_half(alloc_dst_n, alloc_src_n):
         annotations["double"] = True
 
-    return copy(src_region, dst_region, annotations=annotations)
+    return copy(
+        src_region,
+        dst_region,
+        annotations=annotations,
+        unit_flag_ctrl=unit_flag_ctrl,
+        l2_cache_ctrl=l2_cache_ctrl,
+    )
 
 
 def im2col(

@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "arith/ir_mutator_with_analyzer.h"
+#include "ascend/op/ascend_mte_plan.h"
 #include "ascend/op/oob_padding.h"
 #include "layout/layout.h"
 #include "op/builtin.h"
@@ -62,7 +63,7 @@ PrimExpr MakeRegionCall(const Buffer &buffer, const Array<Range> &ranges,
 
 // Returns the destination-base access_ptr for the fill, encoded as a
 // tl.access_ptr(BufferLoad(dst, dst_range mins)) so LowerAccessPtr computes the
-// same flat offset copy.cc used (ComputeFlatOffset over row-major strides).
+// same explicit or compact strides used by copy.cc's StridedLayout.
 PrimExpr MakeFillBasePtr(const CopyNode *copy) {
   auto I = [](int64_t v) { return make_const(DataType::Int(32), v); };
   Array<PrimExpr> dst_mins;
@@ -114,10 +115,12 @@ std::vector<Stmt> MakeL1PaddingStmts(const CopyNode *copy,
   // uninitialized L1.
   if (!bounded.has_data.defined())
     return stmts;
-  const Array<Range> &src_range = bounded.src;
-  size_t src_ndim = src_range.size();
-  PrimExpr valid_src_rows = src_range[src_ndim - 2]->extent;
-  PrimExpr valid_src_cols = src_range[src_ndim - 1]->extent;
+  StridedLayout src_layout = NormalizeMTE2DLayout(
+      copy->src, copy->src_range, analyzer, "Ascend GM->L1 padding");
+  size_t src_inner_axis = static_cast<size_t>(src_layout.modes[0].axis);
+  size_t src_row_axis = static_cast<size_t>(src_layout.modes[1].axis);
+  PrimExpr valid_src_rows = bounded.src[src_row_axis]->extent;
+  PrimExpr valid_src_cols = bounded.src[src_inner_axis]->extent;
 
   bool needs_transpose = copy->GetTranspose();
   PrimExpr dst_n_value = dst_layout.outer1 * dst_layout.row_frac;

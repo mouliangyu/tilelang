@@ -66,18 +66,6 @@ void CollectFragmentLayouts(const PrimExpr &expr,
   });
 }
 
-PrimExpr ComputeFlatOffset(const Buffer &buf, const Array<Range> &range) {
-  PrimExpr offset = make_const(DataType::Int(64), 0);
-  for (size_t i = 0; i < range.size(); ++i) {
-    PrimExpr stride = make_const(DataType::Int(64), 1);
-    for (size_t j = i + 1; j < buf->shape.size(); ++j) {
-      stride = stride * buf->shape[j];
-    }
-    offset = offset + range[i]->min * stride;
-  }
-  return offset;
-}
-
 PrimExpr Float4StorageBytes(const PrimExpr &elements, DataType dtype) {
   ICHECK(dtype.is_float4_e2m1fn());
   int element_bits = dtype.bits() * dtype.lanes();
@@ -117,22 +105,6 @@ PrimExpr NormalizeFloat4ByteViewPtr(const Buffer &buf,
                make_const(DataType::Int(32), 1)});
 }
 
-// Row-major element strides of an ND (GM/UB) buffer, derived from its ND
-// (identity) affine layout's output shape: strides[k] = product(shape[k+1..]).
-// Keeps copy parameters layout-driven for the ND side as well.
-Array<PrimExpr> AscendNDStrides(const Buffer &buf) {
-  Array<PrimExpr> shape = makeAscendNDLayout(buf)->OutputShape();
-  int n = static_cast<int>(shape.size());
-  Array<PrimExpr> strides(static_cast<size_t>(n),
-                          make_const(DataType::Int(32), 1));
-  PrimExpr cur = make_const(DataType::Int(32), 1);
-  for (int i = n - 1; i >= 0; --i) {
-    strides.Set(i, cur);
-    cur = cur * shape[i];
-  }
-  return strides;
-}
-
 // Map float32 source (L0C) + destination dtype → quant_pre hardware mode.
 static int GetCCQuantPre(DataType src_dtype, DataType dst_dtype) {
   if (src_dtype.is_float() && src_dtype.bits() == 32) {
@@ -155,7 +127,6 @@ static int GetCCQuantPre(DataType src_dtype, DataType dst_dtype) {
 Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
                   arith::Analyzer *analyzer, DMAPath dma_path) {
   auto I = [](int64_t v) { return make_const(DataType::Int(32), v); };
-  auto I64 = [](int64_t v) { return make_const(DataType::Int(64), v); };
   int elem_bits = op.src->dtype.bits() * op.src->dtype.lanes();
 
   // OOB tail clamping (and the empty-tile has_data guard) is performed before
@@ -165,48 +136,37 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
   const Array<Range> &src_range = op.src_range;
   const Array<Range> &dst_range = op.dst_range;
 
-  size_t ndim = src_range.size();
-  PrimExpr inner_elems = src_range[ndim - 1]->extent;
-  PrimExpr n_rows = I(1);
-  for (size_t i = 0; i + 1 < ndim; ++i) {
-    n_rows = n_rows * src_range[i]->extent;
-  }
-
-  PrimExpr row_bytes = AscendMTEBytesFromElements(inner_elems, elem_bits);
-
-  // GM/UB row stride from the ND (identity) layout's row-major strides: the
-  // outermost stride is the bytes between consecutive rows.
-  PrimExpr src_row_stride_bytes =
-      AscendMTEBytesFromElements(AscendNDStrides(op.src)[0], elem_bits);
-
   auto make_access_ptr = [&](const Buffer &buf, PrimExpr offset,
                              PrimExpr extent, int rw_mask) -> PrimExpr {
     return Call(
         DataType::Handle(), builtin::tvm_access_ptr(),
         {TypeAnnotation(buf->dtype), buf->data, offset, extent, I(rw_mask)});
   };
-  PrimExpr src_total_elems = inner_elems * n_rows;
-  PrimExpr dst_total_elems = I(1);
-  for (const Range &range : dst_range) {
-    dst_total_elems = dst_total_elems * range->extent;
-  }
-  PrimExpr src_offset = ComputeFlatOffset(op.src, src_range);
-  PrimExpr dst_offset = ComputeFlatOffset(op.dst, dst_range);
-  PrimExpr src_ptr = make_access_ptr(op.src, src_offset, src_total_elems, 1);
-  PrimExpr dst_ptr = make_access_ptr(op.dst, dst_offset, dst_total_elems, 2);
+  auto region_elements = [&](const Array<Range> &ranges) {
+    PrimExpr result = I(1);
+    for (const Range &range : ranges) {
+      result = result * range->extent;
+    }
+    return result;
+  };
+  StridedLayout src_region =
+      StridedLayout::FromBufferRange(op.src, src_range, elem_bits);
+  StridedLayout dst_region = StridedLayout::FromBufferRange(
+      op.dst, dst_range, op.dst->dtype.bits() * op.dst->dtype.lanes());
+  PrimExpr src_region_elements = region_elements(src_range);
+  PrimExpr dst_region_elements = region_elements(dst_range);
+  PrimExpr src_ptr =
+      make_access_ptr(op.src, src_region.offset, src_region_elements, 1);
+  PrimExpr dst_ptr =
+      make_access_ptr(op.dst, dst_region.offset, dst_region_elements, 2);
 
   PrimExpr sid = I(0);
   PrimExpr zero = I(0);
   PrimExpr l2_cache_ctrl = I(op.GetL2CacheCtrl());
 
-  PrimExpr total_bytes = row_bytes * n_rows;
   PrimExpr call;
   if (dma_path == DMAPath::kGMToUB || dma_path == DMAPath::kUBToGM) {
-    auto src_layout =
-        StridedLayout::FromBufferRange(op.src, src_range, elem_bits);
-    auto dst_layout =
-        StridedLayout::FromBufferRange(op.dst, dst_range, elem_bits);
-    auto plan = PlanMTECopy(src_layout, dst_layout, analyzer);
+    MTECopy2D plan = PlanMTECopy(src_region, dst_region, analyzer);
 
     PrimExpr plan_row_bytes =
         AscendMTEBytesFromElements(plan.row_elems, elem_bits);
@@ -298,6 +258,15 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
       }
     }
   } else if (dma_path == DMAPath::kGMToL1) {
+    StridedLayout src_layout =
+        NormalizeMTE2DLayout(op.src, src_range, analyzer, "Ascend GM->L1 copy");
+    StridedLayout dst_region_layout = NormalizeTrailingMTE2DLayout(
+        op.dst, dst_range, analyzer, "Ascend GM->L1 destination");
+    const Mode &src_inner = src_layout.modes[0];
+    const Mode &src_row = src_layout.modes[1];
+    PrimExpr src_row_stride_bytes = AscendMTEBytesFromElements(
+        cast(DataType::Int(32), src_row.stride), elem_bits);
+
     AscendFractalLayoutInfo dst_layout;
     bool has_dst_layout = false;
     if (auto layout = FindLayoutForBuffer(T.layout_map, op.dst)) {
@@ -317,33 +286,31 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
         dst_n_value = dst_layout.outer1 * dst_layout.row_frac;
       }
     } else {
-      size_t dst_ndim = op.dst_range.size();
-      dst_n_value = I(1);
-      for (size_t i = 0; i + 1 < dst_ndim; ++i) {
-        dst_n_value = dst_n_value * op.dst_range[i]->extent;
-      }
+      dst_n_value = dst_region_layout.modes[1].size;
     }
 
-    size_t src_ndim = src_range.size();
-    ICHECK_GE(src_ndim, 2U)
-        << "Ascend GM->L1 copy requires at least a 2D source region for "
-           "buffer "
-        << op.src->name;
-    for (size_t i = 0; i + 2 < src_ndim; ++i) {
-      ICHECK(analyzer->CanProve(
-          op.src_range[i]->min + op.src_range[i]->extent <= op.src->shape[i],
-          arith::ProofStrength::kSymbolicBound))
-          << "Ascend GM->L1 auto padding only supports OOB on the trailing "
-             "two source dimensions, got source ranges "
-          << op.src_range << " for buffer " << op.src->name << " shape "
-          << op.src->shape;
-    }
-
-    PrimExpr valid_inner_elems = src_range[src_ndim - 1]->extent;
-    PrimExpr valid_n_rows = I(1);
-    for (size_t i = 0; i + 1 < src_ndim; ++i) {
-      valid_n_rows = valid_n_rows * src_range[i]->extent;
-    }
+    PrimExpr valid_inner_elems = src_inner.size;
+    PrimExpr valid_n_rows = src_row.size;
+    const Mode &dst_inner = dst_region_layout.modes[0];
+    const Mode &dst_row = dst_region_layout.modes[1];
+    // The source region defines the DMA transfer geometry, while the
+    // destination may be over-allocated to provide a larger NZ pitch. kSF
+    // flips the hardware transpose bit for its packed physical layout; logical
+    // source/destination axis matching still follows the user request.
+    bool geometry_transpose = op.GetTranspose();
+    bool source_exceeds_destination =
+        geometry_transpose
+            ? analyzer->CanProve(src_row.size > dst_inner.size) ||
+                  analyzer->CanProve(src_inner.size > dst_row.size)
+            : analyzer->CanProve(src_row.size > dst_row.size) ||
+                  analyzer->CanProve(src_inner.size > dst_inner.size);
+    ICHECK(!source_exceeds_destination)
+        << "Ascend GM->L1 copy requires the mapped 2D source region to fit "
+           "inside the destination (with axes reversed for transpose), got "
+           "source "
+        << src_row.size << "x" << src_inner.size << " and destination "
+        << dst_row.size << "x" << dst_inner.size
+        << ", transpose=" << geometry_transpose << ".";
 
     PrimExpr physical_inner_elems = valid_inner_elems;
     std::string physical_dtype;
@@ -354,8 +321,8 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
       physical_inner_elems =
           Float4StorageBytes(valid_inner_elems, op.src->dtype);
       physical_dtype = "int8_t";
-      src_ptr = NormalizeFloat4ByteViewPtr(op.src, src_ptr, src_offset,
-                                           src_total_elems);
+      src_ptr = NormalizeFloat4ByteViewPtr(op.src, src_ptr, src_region.offset,
+                                           src_region_elements);
     }
 
     PrimExpr transpose_flag = I(needs_transpose ? 1 : 0);
@@ -377,6 +344,10 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
     // AscendInsertOOBPadding pass, so lowering just emits the DMA call.
 
   } else if (dma_path == DMAPath::kL1ToL0A || dma_path == DMAPath::kL1ToL0B) {
+    NormalizeTrailingMTE2DLayout(op.src, op.src_range, analyzer,
+                                 "Ascend L1->L0 source");
+    NormalizeTrailingMTE2DLayout(op.dst, op.dst_range, analyzer,
+                                 "Ascend L1->L0 destination");
     // M/K positions go through intrinsic args; leading dims (e.g. version)
     // through the pointer offset.  MakeAccessPtrFromRegion splits offset/extent
     // the same way: leading dims → offset, last two (M×K) → extent.
@@ -458,6 +429,8 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
 
     if (op.sf.defined()) {
       const Buffer &sf_buf = op.sf.value();
+      NormalizeTrailingMTE2DLayout(sf_buf, op.sf_range, analyzer,
+                                   "Ascend L1->L0 scale source");
       PrimExpr sf_ptr =
           MakeAccessPtrFromRegion(BufferRegion(sf_buf, op.sf_range), 1, false);
 
@@ -519,8 +492,21 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
     }
     call = Call(DataType::Void(), intrinsic, ld_args);
   } else if (dma_path == DMAPath::kL0CToUB) {
+    StridedLayout src_layout = NormalizeTrailingMTE2DLayout(
+        op.src, src_range, analyzer, "Ascend L0C->UB source");
+    StridedLayout dst_layout = NormalizeMTE2DLayout(
+        op.dst, dst_range, analyzer, "Ascend L0C->UB destination");
+    const Mode &src_inner = src_layout.modes[0];
+    const Mode &src_row = src_layout.modes[1];
+    const Mode &dst_inner = dst_layout.modes[0];
+    const Mode &dst_row = dst_layout.modes[1];
     AscendFractalLayoutInfo info;
-    PrimExpr loop_src_stride = n_rows;
+    PrimExpr loop_src_stride = src_row.size;
+    // The copied N extent may be a runtime tail, while adjacent destination
+    // rows still follow the UB buffer's physical row pitch.  These coincide
+    // for a full tile but differ for a sliced L0C->UB tail copy.  DUAL_N also
+    // has a destination pitch different from the L0C source width.
+    PrimExpr dst_row_stride = cast(DataType::Int(32), dst_row.stride);
 
     if (T.layout_map.count(op.src)) {
       ICHECK(TryExtractAscendFractalLayout(T.layout_map[op.src], op.src, &info))
@@ -529,20 +515,36 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
       loop_src_stride = info.outer1 * info.row_frac;
     }
 
-    PrimExpr dual_dst_ctl_val = I(op.GetDualDstCtl());
-    PrimExpr unit_flag_ctl_val = I(op.GetUnitFlagCtl());
+    int dual_dst_ctl = op.GetDualDstCtl();
+    PrimExpr copy_inner = src_inner.size;
+    PrimExpr copy_rows = src_row.size;
+    if (dual_dst_ctl == 0) {
+      bool destination_exceeds_source =
+          analyzer->CanProve(dst_inner.size > src_inner.size) ||
+          analyzer->CanProve(dst_row.size > src_row.size);
+      ICHECK(!destination_exceeds_source)
+          << "Ascend L0C->UB destination region must fit inside the source "
+             "tile unless dual-destination mode is enabled, got source "
+          << src_row.size << "x" << src_inner.size << " and destination "
+          << dst_row.size << "x" << dst_inner.size << ".";
+      copy_inner = dst_inner.size;
+      copy_rows = dst_row.size;
+    }
+    PrimExpr dual_dst_ctl_val = I(dual_dst_ctl);
+    PrimExpr unit_flag_ctl_val = cast(DataType::Int(32), op.GetUnitFlagCtl());
+    PrimExpr sub_blockid_val = cast(DataType::Int(32), op.GetSubBlockId());
     call = Call(DataType::Void(), ascend_copy_matrix_cc_to_ub(),
                 {dst_ptr,
                  src_ptr,
                  sid,
-                 inner_elems,
-                 n_rows,
-                 inner_elems,
+                 copy_inner,
+                 copy_rows,
+                 dst_row_stride,
                  loop_src_stride,
                  dual_dst_ctl_val,
-                 I(op.GetSubBlockId()), // sub_blockid
-                 zero,                  // clip_relu_pre
-                 unit_flag_ctl_val,     // unit_flag_ctl
+                 sub_blockid_val,   // sub_blockid
+                 zero,              // clip_relu_pre
+                 unit_flag_ctl_val, // unit_flag_ctl
                  I(GetCCQuantPre(op.src->dtype, op.dst->dtype)), // quant_pre
                  zero,                                           // relu_pre
                  zero,                                           // split_en
@@ -564,12 +566,49 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
            "frontend (tilelang/language/copy_op.py); it should never reach "
            "tl.tileop.copy lowering. This indicates the Python bypass was not "
            "taken; check the call site.";
-    PrimExpr n_burst_val = total_bytes / I(32);
+    ICHECK_EQ(op.src->dtype.bits(), op.dst->dtype.bits())
+        << "Ascend raw UB->L1 copy cannot convert element widths, got source "
+        << op.src->dtype << " and destination " << op.dst->dtype << ".";
+    StridedLayout src_layout =
+        StridedLayout::FromBufferRange(op.src, src_range, elem_bits)
+            .Coalesce(analyzer);
+    StridedLayout dst_layout =
+        StridedLayout::FromBufferRange(op.dst, dst_range, op.dst->dtype.bits())
+            .Coalesce(analyzer);
+    ICHECK_EQ(src_layout.modes.size(), 1U)
+        << "Ascend raw UB->L1 copy requires a contiguous source region; got "
+        << src_layout.modes.size() << " modes after coalescing for buffer "
+        << op.src->name << " shape " << op.src->shape << " ranges " << src_range
+        << ". Strided UB->L1 copies are not yet supported.";
+    ICHECK_EQ(dst_layout.modes.size(), 1U)
+        << "Ascend raw UB->L1 copy requires a contiguous destination region; "
+        << "got " << dst_layout.modes.size()
+        << " modes after coalescing for buffer " << op.dst->name << " shape "
+        << op.dst->shape << " ranges " << dst_range
+        << ". Strided UB->L1 copies are not yet supported.";
+    bool element_count_mismatch = analyzer->CanProve(src_layout.modes[0].size !=
+                                                     dst_layout.modes[0].size);
+    ICHECK(!element_count_mismatch)
+        << "Ascend raw UB->L1 copy requires source and destination regions "
+           "with the same element count, got source "
+        << src_layout.modes[0].size << " and destination "
+        << dst_layout.modes[0].size << ".";
+    PrimExpr raw_total_bytes =
+        AscendMTEBytesFromElements(src_layout.modes[0].size, elem_bits);
+    PrimExpr n_burst_val = raw_total_bytes / I(32);
     call = Call(DataType::Void(), ascend_copy_ubuf_to_cbuf(),
                 {dst_ptr, src_ptr, zero, n_burst_val, I(1), zero, zero});
   } else if (dma_path == DMAPath::kL0CToGM) {
+    StridedLayout src_layout = NormalizeTrailingMTE2DLayout(
+        op.src, src_range, analyzer, "Ascend L0C->GM source");
+    StridedLayout dst_layout = NormalizeMTE2DLayout(
+        op.dst, dst_range, analyzer, "Ascend L0C->GM destination");
+    const Mode &src_inner = src_layout.modes[0];
+    const Mode &src_row = src_layout.modes[1];
+    const Mode &dst_inner = dst_layout.modes[0];
+    const Mode &dst_row = dst_layout.modes[1];
     AscendFractalLayoutInfo info;
-    PrimExpr loop_src_stride = n_rows;
+    PrimExpr loop_src_stride = src_row.size;
 
     if (T.layout_map.count(op.src)) {
       ICHECK(TryExtractAscendFractalLayout(T.layout_map[op.src], op.src, &info))
@@ -577,21 +616,31 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
           << op.src->name;
       loop_src_stride = info.outer1 * info.row_frac;
     }
-    // GM dst last-dim from its ND (identity) layout output shape.
-    Array<PrimExpr> dst_nd_shape = makeAscendNDLayout(op.dst)->OutputShape();
-    PrimExpr dst_last_dim = dst_nd_shape[dst_nd_shape.size() - 1];
+    // L0C->GM needs the physical distance between adjacent destination rows,
+    // not the logical last dimension.  They are equal for compact tensors but
+    // differ for padded/runtime StridedTensor outputs.
+    bool destination_exceeds_source =
+        analyzer->CanProve(dst_inner.size > src_inner.size) ||
+        analyzer->CanProve(dst_row.size > src_row.size);
+    ICHECK(!destination_exceeds_source)
+        << "Ascend L0C->GM destination region must fit inside the source tile, "
+           "got source "
+        << src_row.size << "x" << src_inner.size << " and destination "
+        << dst_row.size << "x" << dst_inner.size << ".";
+    PrimExpr dst_row_stride = cast(DataType::Int(32), dst_row.stride);
+    PrimExpr unit_flag_ctl_val = cast(DataType::Int(32), op.GetUnitFlagCtl());
     call =
         Call(DataType::Void(), ascend_copy_matrix_cc_to_gm(),
              {dst_ptr,
               src_ptr,
               sid,
-              inner_elems,
-              n_rows,
-              dst_last_dim,
+              dst_inner.size,
+              dst_row.size,
+              dst_row_stride,
               loop_src_stride,
               I(op.GetL2CacheCtrl()), // [7] l2_cache_ctl
               zero,                   // [8] clip_relu_pre
-              I(op.GetUnitFlagCtl()), // [9] unit_flag_ctl
+              unit_flag_ctl_val,      // [9] unit_flag_ctl
               I(GetCCQuantPre(op.src->dtype, op.dst->dtype)), // [10] quant_pre
               zero,                                           // [11] relu_pre
               zero,                                           // [12] split_en

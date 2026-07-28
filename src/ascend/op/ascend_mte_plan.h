@@ -10,11 +10,15 @@
 #ifndef TVM_TL_ASCEND_OP_ASCEND_MTE_PLAN_H_
 #define TVM_TL_ASCEND_OP_ASCEND_MTE_PLAN_H_
 
+#include "support/check.h"
+
 #include <tvm/arith/analyzer.h>
+#include <tvm/ffi/container/array.h>
 #include <tvm/tirx/buffer.h>
 #include <tvm/tirx/expr.h>
 #include <tvm/tirx/op.h>
 
+#include <string>
 #include <vector>
 
 namespace tvm {
@@ -43,6 +47,7 @@ inline PrimExpr AscendMTEBytesFromElements(PrimExpr elements, int elem_bits) {
 struct Mode {
   PrimExpr size;   ///< Number of elements along this dimension
   PrimExpr stride; ///< Stride in elements between consecutive positions
+  int axis;        ///< Original buffer axis, or -1 for a synthetic mode
 };
 
 /// A simplified layout description: an ordered list of modes (innermost first)
@@ -61,15 +66,26 @@ struct StridedLayout {
   ///   - buf strides (explicit or row-major inferred) become mode strides
   ///
   /// Modes are stored innermost-first (i.e. modes[0] = last dimension).
-  static StridedLayout
-  FromBufferRange(const Buffer &buf, const Array<Range> &range, int elem_bits) {
+  static StridedLayout FromBufferRange(const Buffer &buf,
+                                       const ffi::Array<Range> &range,
+                                       int elem_bits) {
     int ndim = static_cast<int>(range.size());
     auto I = [](int64_t v) { return make_const(DataType::Int(32), v); };
+
+    ICHECK_EQ(range.size(), buf->shape.size())
+        << "Expected one access range per buffer axis, got ranges " << range
+        << " for buffer " << buf->name << " shape " << buf->shape;
+    ICHECK_GT(ndim, 0) << "Cannot build a strided layout for scalar buffer "
+                       << buf->name;
 
     // Compute strides (elements). If buffer has explicit strides, use them;
     // otherwise assume row-major.
     std::vector<PrimExpr> strides(ndim);
     if (!buf->strides.empty()) {
+      ICHECK_EQ(buf->strides.size(), range.size())
+          << "Expected one explicit stride per buffer axis, got strides "
+          << buf->strides << " for buffer " << buf->name << " shape "
+          << buf->shape;
       for (int i = 0; i < ndim; ++i) {
         strides[i] = buf->strides[i];
       }
@@ -91,10 +107,23 @@ struct StridedLayout {
     for (int i = 0; i < ndim; ++i) {
       // Map dimension (ndim-1-i) to modes[i] so modes[0] is innermost
       int dim = ndim - 1 - i;
-      modes[i] = {range[dim]->extent, strides[dim]};
+      modes[i] = {range[dim]->extent, strides[dim], dim};
     }
 
     return StridedLayout{std::move(modes), offset, elem_bits};
+  }
+
+  /// Remove modes whose extent is provably one while preserving their
+  /// contribution to the already-computed base offset.
+  StridedLayout RemoveUnitModes(arith::Analyzer *analyzer) const {
+    std::vector<Mode> result;
+    for (const Mode &mode : modes) {
+      PrimExpr one = make_const(mode.size.dtype(), 1);
+      if (!analyzer->CanProveEqual(mode.size, one)) {
+        result.push_back(mode);
+      }
+    }
+    return StridedLayout{std::move(result), offset, elem_bits};
   }
 
   /// Coalesce adjacent modes where the outer mode's stride equals the inner
@@ -110,18 +139,11 @@ struct StridedLayout {
 
     auto I = [](int64_t v) { return make_const(DataType::Int(32), v); };
 
-    // First, filter out size-1 modes (they don't contribute to data layout)
-    std::vector<Mode> filtered;
-    for (const auto &m : modes) {
-      if (auto *imm = m.size.as<IntImmNode>()) {
-        if (imm->value == 1)
-          continue;
-      }
-      filtered.push_back(m);
-    }
+    // First, filter out size-1 modes (they don't contribute to data layout).
+    std::vector<Mode> filtered = RemoveUnitModes(analyzer).modes;
     // If all modes were size-1, the total is 1 element; return single mode.
     if (filtered.empty()) {
-      return StridedLayout{{Mode{I(1), I(1)}}, offset, elem_bits};
+      return StridedLayout{{Mode{I(1), I(1), -1}}, offset, elem_bits};
     }
 
     // Then coalesce contiguous adjacent modes
@@ -143,12 +165,96 @@ struct StridedLayout {
     }
 
     if (!analyzer->CanProveEqual(result[0].stride, I(1))) {
-      result.insert(result.begin(), Mode{I(1), I(1)});
+      result.insert(result.begin(), Mode{I(1), I(1), -1});
     }
 
     return StridedLayout{std::move(result), offset, elem_bits};
   }
 };
+
+/// Normalize a buffer region to the 2D geometry supported by one MTE copy.
+///
+/// The selected pair contains every non-unit axis, preserves size-one matrix
+/// dimensions when needed, and prefers the trailing pair when several pairs
+/// are equivalent. True ND copies need outer-loop lowering and are rejected.
+inline StridedLayout NormalizeMTE2DLayout(const Buffer &buf,
+                                          const ffi::Array<Range> &range,
+                                          arith::Analyzer *analyzer,
+                                          const std::string &context) {
+  auto I = [](int64_t v) { return make_const(DataType::Int(32), v); };
+
+  ICHECK_EQ(range.size(), buf->shape.size())
+      << context << " requires one access range per buffer axis, got ranges "
+      << range << " for buffer " << buf->name << " shape " << buf->shape;
+  ICHECK_GE(range.size(), 2U)
+      << context << " requires at least a 2D region, got buffer " << buf->name
+      << " shape " << buf->shape << " ranges " << range;
+
+  StridedLayout raw =
+      StridedLayout::FromBufferRange(buf, range, buf->dtype.bits());
+  int ndim = static_cast<int>(range.size());
+  int row_axis = -1;
+  int inner_axis = -1;
+
+  // Search from the trailing axes inward. A candidate is valid when every
+  // other axis is a fixed selector and the inner axis is contiguous.
+  for (int inner = ndim - 1; inner >= 1 && inner_axis < 0; --inner) {
+    const Mode &inner_mode = raw.modes[ndim - 1 - inner];
+    if (!analyzer->CanProveEqual(inner_mode.stride, I(1))) {
+      continue;
+    }
+    for (int row = inner - 1; row >= 0; --row) {
+      bool all_other_axes_are_unit = true;
+      for (int axis = 0; axis < ndim; ++axis) {
+        if (axis == row || axis == inner) {
+          continue;
+        }
+        PrimExpr extent = range[axis]->extent;
+        if (!analyzer->CanProveEqual(extent, make_const(extent.dtype(), 1))) {
+          all_other_axes_are_unit = false;
+          break;
+        }
+      }
+      if (all_other_axes_are_unit) {
+        row_axis = row;
+        inner_axis = inner;
+        break;
+      }
+    }
+  }
+
+  ICHECK_GE(inner_axis, 0)
+      << context
+      << " cannot represent this region with one 2D MTE descriptor: all axes "
+         "outside one row/inner pair must have extent 1, and the inner axis "
+         "must be contiguous. Outer-loop lowering is not yet implemented. "
+         "Buffer "
+      << buf->name << " has shape " << buf->shape << ", strides "
+      << buf->strides << ", and ranges " << range << ".";
+
+  const Mode &inner = raw.modes[ndim - 1 - inner_axis];
+  const Mode &row = raw.modes[ndim - 1 - row_axis];
+  return StridedLayout{{inner, row}, raw.offset, raw.elem_bits};
+}
+
+/// Normalize a region whose hardware layout assigns matrix semantics to the
+/// trailing two axes (L1/L0 buffers). Leading axes may only select one plane.
+inline StridedLayout
+NormalizeTrailingMTE2DLayout(const Buffer &buf, const ffi::Array<Range> &range,
+                             arith::Analyzer *analyzer,
+                             const std::string &context) {
+  StridedLayout layout = NormalizeMTE2DLayout(buf, range, analyzer, context);
+  int ndim = static_cast<int>(range.size());
+  ICHECK_EQ(layout.modes[0].axis, ndim - 1)
+      << context << " requires the contiguous transfer axis to be the last "
+      << "buffer axis. Buffer " << buf->name << " has shape " << buf->shape
+      << " and ranges " << range << ".";
+  ICHECK_EQ(layout.modes[1].axis, ndim - 2)
+      << context << " requires the row transfer axis to be the second-to-last "
+      << "buffer axis. Buffer " << buf->name << " has shape " << buf->shape
+      << " and ranges " << range << ".";
+  return layout;
+}
 
 // ---------------------------------------------------------------------------
 // MTECopy2D: the result of planning a 2D MTE copy.
