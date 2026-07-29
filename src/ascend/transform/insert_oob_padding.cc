@@ -243,6 +243,8 @@ tvm::transform::Pass AscendInsertOOBPadding() {
   auto pass_func = [](PrimFunc func, const IRModule &mod,
                       const PassContext &ctx) {
     arith::Analyzer analyzer;
+    // Dynamic Persistent-loop tail proofs can exceed the default 10k budget.
+    analyzer.z3_prover.SetRLimit(50000);
     PrimFuncNode *write_ptr = func.CopyOnWrite();
     write_ptr->body =
         OOBPaddingInserter::Apply(std::move(write_ptr->body), &analyzer);
