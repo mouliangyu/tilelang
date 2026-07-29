@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from typing import Literal
@@ -34,6 +35,9 @@ def get_msprof_cache_flush_kernel(numel: int, dtype: T.dtype):
                     T.copy(ub, Cache[begin : begin + tile_elems], l2_cache_ctrl="WTS_FV")
 
     return _tilelang_profiler_cache_flush
+
+
+logger = logging.getLogger(__name__)
 
 
 class suppress_stdout_stderr:
@@ -98,6 +102,7 @@ def do_bench(
     return_mode: Literal["min", "max", "mean", "median"] = "mean",
     device: int | torch.device | None = None,
     cache_size: int = 256,
+    early_stop_baseline: float | None = None,
 ) -> float | list[float]:
     """Benchmark the runtime of a PyTorch function with L2 cache management.
 
@@ -150,6 +155,17 @@ def do_bench(
     start_event.synchronize()
     end_event.synchronize()
     estimate_ms = start_event.elapsed_time(end_event) / 5
+
+    # Early stop: skip full benchmark if estimate exceeds baseline
+    if early_stop_baseline is not None and estimate_ms > early_stop_baseline:
+        logger.debug(
+            "Early stop: estimate_ms=%.3fms exceeds baseline=%.3fms, skipping full benchmark.",
+            estimate_ms,
+            early_stop_baseline,
+        )
+        if quantiles is not None:
+            return [estimate_ms] * len(quantiles)
+        return estimate_ms
 
     # Calculate warmup and repeat counts (minimum 1 iteration each)
     n_warmup = _n_warmup if _n_warmup > 0 else max(1, int(warmup / estimate_ms))

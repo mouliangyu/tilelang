@@ -21,26 +21,7 @@ from dataclasses import dataclass
 
 import tilelang.language as T
 from tilelang.layout import make_ascend_nz_layout
-from tilelang.language.simd import (
-    make_ubuf_ptr,
-    mem_bar,
-    pset,
-    vadd,
-    vcadd,
-    vcmax,
-    vcvt,
-    vdiv,
-    vdup,
-    vexpdif,
-    vld,
-    vld2,
-    vmax,
-    vmul,
-    vmuls,
-    vor,
-    vsstb,
-    vsts,
-)
+from tilelang.language import simd as S
 
 
 @dataclass(frozen=True)
@@ -109,72 +90,72 @@ def flash_attention_fwd(
     @T.macro
     def softmax(S_ub, P_nz_ub, m_ub, l_ub, alpha_ub, old_m_ub, row_sum_ub):
         with T.SimdVF(latency=735):
-            softmax_full = pset(32, "PAT_ALL")
-            softmax_one = pset(32, "PAT_VL1")
-            softmax_b16 = pset(16, "PAT_VL128")
-            dst_nz_ptr = make_ubuf_ptr(
+            softmax_full = S.pset(32, "PAT_ALL")
+            softmax_one = S.pset(32, "PAT_VL1")
+            softmax_b16 = S.pset(16, "PAT_VL128")
+            dst_nz_ptr = S.make_ubuf_ptr(
                 T.access_ptr(P_nz_ub[0, 0], "w", ROWS + 1, BC),
                 "bfloat16",
             )
 
-            vsts(old_m_ub[0], vld(m_ub[0], "NORM"), softmax_full, "NORM_B32")
+            S.vsts(old_m_ub[0], S.vld(m_ub[0], "NORM"), softmax_full, "NORM_B32")
 
             for r in range(0, ROWS, 2):
-                s00 = vmuls(vld(S_ub[r, 0], "NORM"), T.float32(scale), softmax_full)
-                s01 = vmuls(vld(S_ub[r, VL], "NORM"), T.float32(scale), softmax_full)
-                s10 = vmuls(vld(S_ub[r + 1, 0], "NORM"), T.float32(scale), softmax_full)
-                s11 = vmuls(vld(S_ub[r + 1, VL], "NORM"), T.float32(scale), softmax_full)
-                vsts(S_ub[r, 0], s00, softmax_full, "NORM_B32")
-                vsts(S_ub[r, VL], s01, softmax_full, "NORM_B32")
-                vsts(S_ub[r + 1, 0], s10, softmax_full, "NORM_B32")
-                vsts(S_ub[r + 1, VL], s11, softmax_full, "NORM_B32")
+                s00 = S.vmuls(S.vld(S_ub[r, 0], "NORM"), T.float32(scale), softmax_full)
+                s01 = S.vmuls(S.vld(S_ub[r, VL], "NORM"), T.float32(scale), softmax_full)
+                s10 = S.vmuls(S.vld(S_ub[r + 1, 0], "NORM"), T.float32(scale), softmax_full)
+                s11 = S.vmuls(S.vld(S_ub[r + 1, VL], "NORM"), T.float32(scale), softmax_full)
+                S.vsts(S_ub[r, 0], s00, softmax_full, "NORM_B32")
+                S.vsts(S_ub[r, VL], s01, softmax_full, "NORM_B32")
+                S.vsts(S_ub[r + 1, 0], s10, softmax_full, "NORM_B32")
+                S.vsts(S_ub[r + 1, VL], s11, softmax_full, "NORM_B32")
 
-                max0 = vcmax(vmax(s00, s01, softmax_full), softmax_full)
-                max1 = vcmax(vmax(s10, s11, softmax_full), softmax_full)
-                vsts(m_ub[r], max0, softmax_one, "ONEPT_B32")
-                vsts(m_ub[r + 1], max1, softmax_one, "ONEPT_B32")
+                max0 = S.vcmax(S.vmax(s00, s01, softmax_full), softmax_full)
+                max1 = S.vcmax(S.vmax(s10, s11, softmax_full), softmax_full)
+                S.vsts(m_ub[r], max0, softmax_one, "ONEPT_B32")
+                S.vsts(m_ub[r + 1], max1, softmax_one, "ONEPT_B32")
 
-            mem_bar("VST_VLD")
-            merged_max = vmax(vld(m_ub[0], "NORM"), vld(old_m_ub[0], "NORM"), softmax_full)
-            vsts(m_ub[0], merged_max, softmax_full, "NORM_B32")
-            mem_bar("VST_VLD")
+            S.mem_bar("VST_VLD")
+            merged_max = S.vmax(S.vld(m_ub[0], "NORM"), S.vld(old_m_ub[0], "NORM"), softmax_full)
+            S.vsts(m_ub[0], merged_max, softmax_full, "NORM_B32")
+            S.mem_bar("VST_VLD")
 
             for r in range(0, ROWS, 2):
-                max0 = vld(m_ub[r], "BRC_B32")
-                max1 = vld(m_ub[r + 1], "BRC_B32")
-                p00, p01 = vld2(S_ub[r, 0], "DINTLV_B32")
-                p10, p11 = vld2(S_ub[r + 1, 0], "DINTLV_B32")
-                e00 = vexpdif(p00, max0, softmax_full, 0)
-                e10 = vexpdif(p10, max1, softmax_full, 0)
-                e01 = vexpdif(p01, max0, softmax_full, 0)
-                e11 = vexpdif(p11, max1, softmax_full, 0)
-                row_sum0 = vcadd(vadd(e00, e01, softmax_full), softmax_full)
-                row_sum1 = vcadd(vadd(e10, e11, softmax_full), softmax_full)
-                vsts(row_sum_ub[r], row_sum0, softmax_one, "ONEPT_B32")
-                vsts(row_sum_ub[r + 1], row_sum1, softmax_one, "ONEPT_B32")
+                max0 = S.vld(m_ub[r], "BRC_B32")
+                max1 = S.vld(m_ub[r + 1], "BRC_B32")
+                p00, p01 = S.vld2(S_ub[r, 0], "DINTLV_B32")
+                p10, p11 = S.vld2(S_ub[r + 1, 0], "DINTLV_B32")
+                e00 = S.vexpdif(p00, max0, softmax_full, 0)
+                e10 = S.vexpdif(p10, max1, softmax_full, 0)
+                e01 = S.vexpdif(p01, max0, softmax_full, 0)
+                e11 = S.vexpdif(p11, max1, softmax_full, 0)
+                row_sum0 = S.vcadd(S.vadd(e00, e01, softmax_full), softmax_full)
+                row_sum1 = S.vcadd(S.vadd(e10, e11, softmax_full), softmax_full)
+                S.vsts(row_sum_ub[r], row_sum0, softmax_one, "ONEPT_B32")
+                S.vsts(row_sum_ub[r + 1], row_sum1, softmax_one, "ONEPT_B32")
 
-                even_bf16_0 = vcvt(e00, "bfloat16", softmax_full, sat=False, part=0)
-                even_bf16_1 = vcvt(e10, "bfloat16", softmax_full, sat=False, part=0)
-                odd_bf16_0 = vcvt(e01, "bfloat16", softmax_full, sat=False, part=1)
-                odd_bf16_1 = vcvt(e11, "bfloat16", softmax_full, sat=False, part=1)
-                merged_bits0 = vor(
+                even_bf16_0 = S.vcvt(e00, "bfloat16", softmax_full, sat=False, part=0)
+                even_bf16_1 = S.vcvt(e10, "bfloat16", softmax_full, sat=False, part=0)
+                odd_bf16_0 = S.vcvt(e01, "bfloat16", softmax_full, sat=False, part=1)
+                odd_bf16_1 = S.vcvt(e11, "bfloat16", softmax_full, sat=False, part=1)
+                merged_bits0 = S.vor(
                     T.reinterpret(even_bf16_0, "uint16x128"),
                     T.reinterpret(odd_bf16_0, "uint16x128"),
                     softmax_b16,
                 )
-                merged_bits1 = vor(
+                merged_bits1 = S.vor(
                     T.reinterpret(even_bf16_1, "uint16x128"),
                     T.reinterpret(odd_bf16_1, "uint16x128"),
                     softmax_b16,
                 )
-                dst_nz_ptr = vsstb(
+                dst_nz_ptr = S.vsstb(
                     T.reinterpret(merged_bits0, "bfloat16x128"),
                     dst_nz_ptr,
                     T.int32(((ROWS + 1) << 16) | 1),
                     softmax_b16,
                     update=True,
                 )
-                dst_nz_ptr = vsstb(
+                dst_nz_ptr = S.vsstb(
                     T.reinterpret(merged_bits1, "bfloat16x128"),
                     dst_nz_ptr,
                     T.int32(((ROWS + 1) << 16) | 1),
@@ -182,12 +163,12 @@ def flash_attention_fwd(
                     update=True,
                 )
 
-            mem_bar("VST_VLD")
-            alpha_reg = vexpdif(vld(old_m_ub[0], "NORM"), vld(m_ub[0], "NORM"), softmax_full, 0)
-            vsts(alpha_ub[0], alpha_reg, softmax_full, "NORM_B32")
-            l_scaled = vmul(vld(l_ub[0], "NORM"), alpha_reg, softmax_full)
-            l_updated = vadd(l_scaled, vld(row_sum_ub[0], "NORM"), softmax_full)
-            vsts(l_ub[0], l_updated, softmax_full, "NORM_B32")
+            S.mem_bar("VST_VLD")
+            alpha_reg = S.vexpdif(S.vld(old_m_ub[0], "NORM"), S.vld(m_ub[0], "NORM"), softmax_full, 0)
+            S.vsts(alpha_ub[0], alpha_reg, softmax_full, "NORM_B32")
+            l_scaled = S.vmul(S.vld(l_ub[0], "NORM"), alpha_reg, softmax_full)
+            l_updated = S.vadd(l_scaled, S.vld(row_sum_ub[0], "NORM"), softmax_full)
+            S.vsts(l_ub[0], l_updated, softmax_full, "NORM_B32")
 
     @T.macro
     def pack_p(P_nz_ub, P_shared):
@@ -204,59 +185,59 @@ def flash_attention_fwd(
     @T.macro
     def accumulate_output(O_tmp_ub, O_ub, alpha_ub):
         with T.SimdVF(latency=318):
-            rescale_mask = pset(32, "PAT_ALL")
+            rescale_mask = S.pset(32, "PAT_ALL")
             for i in range(ROWS):
-                alpha = vld(alpha_ub[i], "BRC_B32")
+                alpha = S.vld(alpha_ub[i], "BRC_B32")
                 for c in range(0, D, VL):
-                    prev = vld(O_ub[i, c], "NORM")
-                    cur = vld(O_tmp_ub[i, c], "NORM")
-                    updated = vadd(vmul(alpha, prev, rescale_mask), cur, rescale_mask)
-                    vsts(O_ub[i, c], updated, rescale_mask, "NORM_B32")
+                    prev = S.vld(O_ub[i, c], "NORM")
+                    cur = S.vld(O_tmp_ub[i, c], "NORM")
+                    updated = S.vadd(S.vmul(alpha, prev, rescale_mask), cur, rescale_mask)
+                    S.vsts(O_ub[i, c], updated, rescale_mask, "NORM_B32")
 
     @T.macro
     def init_m_l(m_ub, l_ub):
         with T.SimdVF(latency=400):
-            init_mask = pset(32, "PAT_ALL")
-            zero = vdup(T.float32(0.0), accum_dtype, init_mask)
-            initial_m = vdup(-T.infinity(accum_dtype), accum_dtype, init_mask)
-            vsts(l_ub[0], zero, init_mask, "NORM_B32")
-            vsts(m_ub[0], initial_m, init_mask, "NORM_B32")
+            init_mask = S.pset(32, "PAT_ALL")
+            zero = S.vdup(T.float32(0.0), accum_dtype, init_mask)
+            initial_m = S.vdup(-T.infinity(accum_dtype), accum_dtype, init_mask)
+            S.vsts(l_ub[0], zero, init_mask, "NORM_B32")
+            S.vsts(m_ub[0], initial_m, init_mask, "NORM_B32")
 
     @T.macro
     def clear_O_ub(O_ub):
         with T.SimdVF(latency=142):
-            clear_mask = pset(32, "PAT_ALL")
-            output_zero = vdup(T.float32(0.0), accum_dtype, clear_mask)
+            clear_mask = S.pset(32, "PAT_ALL")
+            output_zero = S.vdup(T.float32(0.0), accum_dtype, clear_mask)
             for i in range(ROWS):
                 for c in range(0, D, VL):
-                    vsts(O_ub[i, c], output_zero, clear_mask, "NORM_B32")
+                    S.vsts(O_ub[i, c], output_zero, clear_mask, "NORM_B32")
 
     @T.macro
     def finalize_fp32(mt, O, O_ub, l_ub):
         with T.SimdVF(latency=1780):
-            normalize_mask = pset(32, "PAT_ALL")
+            normalize_mask = S.pset(32, "PAT_ALL")
             for i in range(ROWS):
-                denominator = vld(l_ub[i], "BRC_B32")
+                denominator = S.vld(l_ub[i], "BRC_B32")
                 for c in range(0, D, VL):
-                    normalized = vdiv(vld(O_ub[i, c], "NORM"), denominator, normalize_mask)
-                    vsts(O_ub[i, c], normalized, normalize_mask, "NORM_B32")
+                    normalized = S.vdiv(S.vld(O_ub[i, c], "NORM"), denominator, normalize_mask)
+                    S.vsts(O_ub[i, c], normalized, normalize_mask, "NORM_B32")
         T.dual_copy(O_ub[0:ROWS, 0:D], O[mt * BR : (mt + 1) * BR, 0:D])
 
     @T.macro
     def finalize_cast(mt, O, O_ub, O_cast_ub, l_ub):
         with T.SimdVF(latency=1780):
-            normalize_mask = pset(32, "PAT_ALL")
+            normalize_mask = S.pset(32, "PAT_ALL")
             for i in range(ROWS):
-                denominator = vld(l_ub[i], "BRC_B32")
+                denominator = S.vld(l_ub[i], "BRC_B32")
                 for c in range(0, D, VL):
-                    normalized = vdiv(vld(O_ub[i, c], "NORM"), denominator, normalize_mask)
-                    vsts(O_ub[i, c], normalized, normalize_mask, "NORM_B32")
+                    normalized = S.vdiv(S.vld(O_ub[i, c], "NORM"), denominator, normalize_mask)
+                    S.vsts(O_ub[i, c], normalized, normalize_mask, "NORM_B32")
         with T.SimdVF(latency=193):
-            cast_full = pset(32, "PAT_ALL")
+            cast_full = S.pset(32, "PAT_ALL")
             for r in range(ROWS):
                 for c in range(0, D, VL):
-                    ob = vcvt(vld(O_ub[r, c], "NORM"), out_dtype, cast_full)
-                    vsts(O_cast_ub[r, c], ob, cast_full, "PK_B32")
+                    ob = S.vcvt(S.vld(O_ub[r, c], "NORM"), out_dtype, cast_full)
+                    S.vsts(O_cast_ub[r, c], ob, cast_full, "PK_B32")
         T.dual_copy(O_cast_ub[0:ROWS, 0:D], O[mt * BR : (mt + 1) * BR, 0:D])
 
     @T.prim_func

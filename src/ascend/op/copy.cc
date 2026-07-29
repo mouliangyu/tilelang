@@ -36,11 +36,13 @@ bool IsDMACopy(const CopyNode &op) {
 }
 
 bool IsInsideSimtVF(const LowerArgs &T) {
-  if (!T.thread_var.defined()) {
+  // A SimtVF region binds a real threadIdx Var named "simtvf*"; other contexts
+  // pass either a different thread Var or the constant-0 logical index.
+  const auto *var = T.thread_index.as<VarNode>();
+  if (!var) {
     return false;
   }
-  std::string name_hint = T.thread_var->name_hint;
-  return name_hint.rfind("simtvf", 0) == 0;
+  return std::string(var->name_hint).rfind("simtvf", 0) == 0;
 }
 
 void CollectFragmentLayouts(const PrimExpr &expr,
@@ -352,7 +354,8 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
     // through the pointer offset.  MakeAccessPtrFromRegion splits offset/extent
     // the same way: leading dims → offset, last two (M×K) → extent.
     PrimExpr src_base_ptr =
-        MakeAccessPtrFromRegion(BufferRegion(op.src, op.src_range), 1, false);
+        MakeAccessPtrFromRegion(BufferRegion(op.src, op.src_range), 1, false,
+                                /*leading_dims_offset_only=*/true);
 
     AscendFractalLayoutInfo src_info;
     AscendFractalLayoutInfo dst_info;
@@ -432,7 +435,8 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
       NormalizeTrailingMTE2DLayout(sf_buf, op.sf_range, analyzer,
                                    "Ascend L1->L0 scale source");
       PrimExpr sf_ptr =
-          MakeAccessPtrFromRegion(BufferRegion(sf_buf, op.sf_range), 1, false);
+          MakeAccessPtrFromRegion(BufferRegion(sf_buf, op.sf_range), 1, false,
+                                  /*leading_dims_offset_only=*/true);
 
       AscendFractalLayoutInfo sf_info;
       Optional<Layout> sf_layout = FindLayoutForBuffer(T.layout_map, sf_buf);
@@ -472,8 +476,9 @@ Stmt LowerDMACopy(const CopyNode &op, const LowerArgs &T,
 
         // SF pointer: M/K positions go through intrinsic args; leading dims
         // (e.g. pipeline version) go through the pointer offset.
-        sf_ptr = MakeAccessPtrFromRegion(BufferRegion(sf_buf, op.sf_range), 1,
-                                         false);
+        sf_ptr =
+            MakeAccessPtrFromRegion(BufferRegion(sf_buf, op.sf_range), 1, false,
+                                    /*leading_dims_offset_only=*/true);
         sf_m_start = op.sf_range[sf_m_dim]->min / I(16);
         sf_m_step = op.sf_range[sf_m_dim]->extent / I(16);
         sf_k_start = sf_k_dim >= 0 ? op.sf_range[sf_k_dim]->min : I(0);
@@ -685,9 +690,9 @@ Stmt LowerAscendNormalCopy(const CopyNode &op, const LowerArgs &T,
   }
 
   auto loop_layout = par_op->GetLoopLayout();
-  return LowerParallelLoop(par_op->GetRoot(), loop_layout, T.thread_var,
+  return LowerParallelLoop(par_op->GetRoot(), loop_layout, T.thread_index,
                            analyzer, T.layout_map,
-                           par_op->GetPredicate(T.thread_var),
+                           par_op->GetPredicate(T.thread_index),
                            /*parallel_loop=*/true, /*should_vectorize=*/true,
                            par_op->LoopLayoutRequiresPaddingGuard());
 }

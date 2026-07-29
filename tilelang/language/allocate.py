@@ -31,6 +31,21 @@ from .eager.builder import OutTensor
 from .proxy import Tensor, ptr as _ptr_sentinel
 
 
+def _with_span(buffer: Buffer) -> Buffer:
+    """Stamp the buffer with the current user source location.
+
+    The span lets compiler diagnostics (e.g. layout inference failures) and
+    tools (LSP, visualizers) point back to the `T.alloc_*` line. It is a no-op
+    outside eager parsing or when TILELANG_ENABLE_IR_SPAN is disabled.
+    """
+    from .eager.builder import Builder
+
+    builder = Builder.current()
+    if builder is not None:
+        builder.with_buffer_span(buffer)
+    return buffer
+
+
 def _annotate_ascend_major_layout(buf: Buffer, major: Literal["K", "MN", "SF_K"] | None) -> None:
     """Attach an Ascend fractal layout annotation for Cube-side buffers."""
     if major is None:
@@ -68,7 +83,7 @@ def alloc_shared(shape: ShapeType, dtype: DType, scope="shared.dyn") -> Buffer:
             # lei: This is a hack to handle bool type.
             # Because tilelang's merge smem pass cannot merge bool type currently.
             scope = "shared"
-    return T.sblock_alloc_buffer(shape, dtype, scope=scope)
+    return _with_span(T.sblock_alloc_buffer(shape, dtype, scope=scope))
 
 
 def alloc_local(shape: ShapeType, dtype: DType, scope="local") -> Buffer:
@@ -82,7 +97,7 @@ def alloc_local(shape: ShapeType, dtype: DType, scope="local") -> Buffer:
     Returns:
         T.Buffer: A TVM buffer object allocated in local memory
     """
-    return T.sblock_alloc_buffer(shape, dtype, scope=scope)
+    return _with_span(T.sblock_alloc_buffer(shape, dtype, scope=scope))
 
 
 def alloc_fragment(shape: ShapeType, dtype: DType, scope="local.fragment") -> Buffer:
@@ -96,54 +111,7 @@ def alloc_fragment(shape: ShapeType, dtype: DType, scope="local.fragment") -> Bu
     Returns:
         T.Buffer: A TVM buffer object allocated in fragment memory
     """
-    return T.sblock_alloc_buffer(shape, dtype, scope=scope)
-
-
-def alloc_l1(shape: ShapeType, dtype: DType, scope="shared.l1") -> Buffer:
-    """Allocate an L1 buffer (__cbuf__) on Ascend NPU.
-
-    Args:
-        shape: Buffer shape
-        dtype: Data type
-        scope: Memory scope. Defaults to "shared.l1"
-    """
-    return T.sblock_alloc_buffer(shape, dtype, scope=scope)
-
-
-def alloc_l0a(shape: ShapeType, dtype: DType, scope="shared.l0a") -> Buffer:
-    """Allocate an L0A buffer (__ca__) on Ascend NPU.
-
-    Layout is deferred to the consuming gemm operation, which infers K-major
-    or MN-major from its transpose flags.
-    """
-    return T.sblock_alloc_buffer(shape, dtype, scope=scope)
-
-
-def alloc_l0b(shape: ShapeType, dtype: DType, scope="shared.l0b") -> Buffer:
-    """Allocate an L0B buffer (__cb__) on Ascend NPU.
-
-    Layout is deferred to the consuming gemm operation, which infers K-major
-    or MN-major from its transpose flags.
-    """
-    return T.sblock_alloc_buffer(shape, dtype, scope=scope)
-
-
-def alloc_l0c(shape: ShapeType, dtype: DType, scope="shared.l0c", layout: bool = True) -> Buffer:
-    """Allocate an L0C buffer (__cc__) on Ascend NPU.
-
-    Args:
-        shape: Buffer shape
-        dtype: Data type
-        scope: Memory scope. Defaults to "shared.l0c"
-        layout: Whether to annotate the fixed Ascend L0C accumulator layout.
-    """
-    buf = T.sblock_alloc_buffer(shape, dtype, scope=scope)
-    if layout:
-        from tilelang.layout import make_ascend_l0c_layout
-
-        if len(buf.shape) >= 2:
-            sblock_attr({"layout_map": {buf.data: make_ascend_l0c_layout(buf)}})
-    return buf
+    return _with_span(T.sblock_alloc_buffer(shape, dtype, scope=scope))
 
 
 @overload
@@ -205,7 +173,7 @@ def alloc_var(dtype: DType, *args, scope: str = "local.var", init: PrimExpr | in
     if dtype is _ptr_sentinel:
         dtype = _dtypes.int64
 
-    buffer = T.sblock_alloc_buffer([1], dtype, scope=parsed_scope)
+    buffer = _with_span(T.sblock_alloc_buffer([1], dtype, scope=parsed_scope))
     if parsed_init is not None:
         # Always use T.buffer_store for reliable initialisation across all
         # backends.  The sblock_attr("tl.local_var_init") path feeds into the
@@ -240,7 +208,7 @@ def alloc_global(shape: ShapeType, dtype: DType, scope="global") -> Buffer:
         T.Buffer: A TVM buffer object allocated in global memory
     """
 
-    return T.sblock_alloc_buffer(shape, dtype, scope=scope)
+    return _with_span(T.sblock_alloc_buffer(shape, dtype, scope=scope))
 
 
 def alloc_barrier(arrive_count: int | list[int]) -> Buffer:
@@ -262,7 +230,7 @@ def alloc_barrier(arrive_count: int | list[int]) -> Buffer:
         arrive_count = [arrive_count]
     else:
         arrive_count = list(arrive_count)
-    buffer = T.sblock_alloc_buffer((len(arrive_count),), _dtypes.uint64, scope="shared.barrier")
+    buffer = _with_span(T.sblock_alloc_buffer((len(arrive_count),), _dtypes.uint64, scope="shared.barrier"))
     # Convert to TIR IntImm expressions for C++ pass to consume as Map<Var, Array<PrimExpr>>
     # Use buffer.data as key to support multiple barrier buffer allocations
     arrive_count_exprs = [IntImm("int32", c) for c in arrive_count]
@@ -285,7 +253,7 @@ def alloc_cluster_barrier(arrive_count: int | list[int]) -> Buffer:
         arrive_count = [arrive_count]
     else:
         arrive_count = list(arrive_count)
-    buffer = T.sblock_alloc_buffer((len(arrive_count),), _dtypes.uint64, scope="shared.cluster_barrier")
+    buffer = _with_span(T.sblock_alloc_buffer((len(arrive_count),), _dtypes.uint64, scope="shared.cluster_barrier"))
     # Convert to TIR IntImm expressions for C++ pass to consume as Map<Var, Array<PrimExpr>>
     # Use buffer.data as key to support multiple barrier buffer allocations
     arrive_count_exprs = [IntImm("int32", c) for c in arrive_count]
@@ -323,7 +291,7 @@ def alloc_tmem(shape: ShapeType, dtype: DType) -> Buffer:
     """
 
     assert len(shape) == 2, "shape must be a 2D tensor for TMEM allocation"
-    return T.sblock_alloc_buffer(shape, dtype, scope="shared.tmem")
+    return _with_span(T.sblock_alloc_buffer(shape, dtype, scope="shared.tmem"))
 
 
 ReducerOp = Literal["sum", "max", "min"]
@@ -359,7 +327,7 @@ def alloc_reducer(shape: ShapeType, dtype: DType, op: ReducerOp = "sum", replica
         replication = "none"
     assert replication in ["all", "none"]
 
-    reducer = T.sblock_alloc_buffer(shape, dtype, scope="local.fragment")
+    reducer = _with_span(T.sblock_alloc_buffer(shape, dtype, scope="local.fragment"))
     sblock_attr({"reducer_info": {reducer.data: {"rep": replication, "op": op}}})
 
     return reducer
@@ -384,7 +352,7 @@ def alloc_descriptor(
     scope = "local.descriptor." + kind
     # Buffer naming via `name` is not supported by this TVM builder signature;
     # keep parameter for forward-compat, but do not pass it.
-    return T.sblock_alloc_buffer([1], dtype, scope=scope)
+    return _with_span(T.sblock_alloc_buffer([1], dtype, scope=scope))
 
 
 def alloc_wgmma_desc(dtype: DType = _dtypes.uint64) -> Buffer:

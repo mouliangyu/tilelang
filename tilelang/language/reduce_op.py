@@ -3,8 +3,7 @@
 from __future__ import annotations
 from typing import Literal
 from tvm import tirx
-from tilelang.language import copy, macro, alloc_fragment, evaluate
-from tilelang.language.vf import inside_simdvf
+from tilelang.language.common import copy, macro, alloc_fragment, evaluate
 from tilelang.utils.language import to_buffer_region, to_tile_region, retrieve_shape, _get_buffer
 from tilelang.utils.language import is_shared, is_fragment, is_local
 from tvm.script.ir_builder import IRBuilder
@@ -94,6 +93,10 @@ def reduce(
         buf_scope = _get_buffer(buffer).scope()
         out_scope = _get_buffer(out).scope()
         if is_shared(buffer) and is_shared(out):
+            # Deferred: the Ascend dialect package imports tilelang.language.common,
+            # which imports this module, so a module-scope import would cycle.
+            from tilelang.ascend.language.vf import inside_simdvf
+
             if inside_simdvf():
                 # Inside SimdVF: reduce directly on shared buffers (no fragment wrapping)
                 tirx.call_intrin(

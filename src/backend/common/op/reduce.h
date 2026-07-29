@@ -119,6 +119,31 @@ inline bool NeedsWorkspace(int reducing_threads, int scale, Target target) {
   return reducing_threads > 32;
 }
 
+inline void CheckAllReduceWidth(int reducing_threads, int scale,
+                                const char *op_name, Target target = Target()) {
+  ICHECK_GT(reducing_threads, 0)
+      << op_name << ": AllReduce threads must be positive, got "
+      << reducing_threads;
+  ICHECK_GT(scale, 0) << op_name << ": AllReduce scale must be positive, got "
+                      << scale;
+  ICHECK_EQ(reducing_threads % scale, 0)
+      << op_name << ": AllReduce threads (" << reducing_threads
+      << ") must be divisible by scale (" << scale << ")";
+  // The power-of-two requirement is specific to the XOR-butterfly shuffle
+  // reduction. Ascend lowers to tl::AscendAllReduce, which handles arbitrary
+  // widths, so the check would reject valid kernels there.
+  if (target.defined() && target->HasKey("ascend")) {
+    return;
+  }
+  int logical_width = reducing_threads / scale;
+  int shift = 0;
+  ICHECK(tirx::is_const_power_of_two_integer(Integer(logical_width), &shift))
+      << op_name << ": XOR-butterfly AllReduce requires logical_width "
+      << "(threads / scale) to be a positive power of two, got "
+      << logical_width << " (threads=" << reducing_threads
+      << ", scale=" << scale << ")";
+}
+
 inline PrimExpr MakeInitValue(const ReduceOpNode &op, int vsize = 1) {
   auto dst_dtype = op.dst->dtype;
   auto is_int = dst_dtype.is_int();
@@ -894,7 +919,7 @@ template <typename Impl> struct ReduceLowerer {
           body = For(vars[i]->var, 0, vars[i]->dom->extent, ForKind::kParallel,
                      body);
         }
-        body = PartitionLoop(Downcast<For>(body), lower_args.thread_var,
+        body = PartitionLoop(Downcast<For>(body), lower_args.thread_index,
                              analyzer, red_layout);
         body = PragmaUnrollLoop(Downcast<For>(body));
         return body;
@@ -924,6 +949,10 @@ template <typename Impl> struct ReduceLowerer {
 
         for (const auto &thread_step : reduce_plan.thread_steps) {
           int reducing_threads = thread_step.ReducingThreads();
+          reduce::CheckAllReduceWidth(reducing_threads, thread_step.scale,
+                                      "tl.reduce", lower_args.target);
+          int block_threads =
+              static_cast<int>(*as_const_int(lower_args.thread_bounds->extent));
           auto thread_offset = lower_args.thread_bounds->min;
 
           int vsize = Impl::GetPreferedVectorizedSize(clear_buffer->dtype,
@@ -937,7 +966,7 @@ template <typename Impl> struct ReduceLowerer {
                   .value();
           std::string allreduce = Impl::MakeBatchAllReduce(
               reducer, reducing_threads, thread_step.scale, thread_offset,
-              lower_args.thread_bounds->extent, eff_batch, reducing_threads,
+              lower_args.thread_bounds->extent, eff_batch, block_threads,
               lower_args.target);
 
           DataType ws_dtype = can_batch_pack
@@ -947,7 +976,7 @@ template <typename Impl> struct ReduceLowerer {
           bool need_workspace = reduce::NeedsWorkspace(
               reducing_threads, thread_step.scale, lower_args.target);
           if (need_workspace) {
-            int ws_size = reducing_threads * eff_batch;
+            int ws_size = block_threads * eff_batch;
             workspace = lower_args.add_workspace(ws_size, ws_dtype);
           }
 
@@ -1067,8 +1096,16 @@ template <typename Impl> struct ReduceLowerer {
 
           PrimExpr predicate = Bool(true);
           {
+            // The fragment inverse expects a zero-based logical thread
+            // coordinate within the destination layout's thread range, so
+            // normalize the absolute thread index against that range.
+            PrimExpr local_thread_index = lower_args.thread_index;
+            if (dst_layout->ThreadRange().defined()) {
+              local_thread_index =
+                  local_thread_index - dst_layout->ThreadRange()->min;
+            }
             auto dst_th = post_dst_idx;
-            dst_th.push_back(lower_args.thread_var);
+            dst_th.push_back(local_thread_index);
             auto inv = dst_layout->Inverse()->Forward(dst_th);
             inv.pop_back();
             for (int i = 0; i < static_cast<int>(dst_layout->InputDim()); i++) {
@@ -1107,6 +1144,8 @@ template <typename Impl> struct ReduceLowerer {
 
       for (const auto &thread_step : reduce_plan.thread_steps) {
         int reducing_threads = thread_step.ReducingThreads();
+        reduce::CheckAllReduceWidth(reducing_threads, thread_step.scale,
+                                    "tl.reduce", lower_args.target);
         auto thread_offset = lower_args.thread_bounds->min;
         std::string allreduce = Impl::MakeScalarAllReduce(
             reduce::MakeCodegenReducer(op).value(), reducing_threads,
@@ -1129,8 +1168,16 @@ template <typename Impl> struct ReduceLowerer {
 
       PrimExpr predicate = Bool(true);
       {
+        // The fragment inverse expects a zero-based logical thread coordinate
+        // within the destination layout's thread range, so normalize the
+        // absolute thread index against that range.
+        PrimExpr local_thread_index = lower_args.thread_index;
+        if (dst_layout->ThreadRange().defined()) {
+          local_thread_index =
+              local_thread_index - dst_layout->ThreadRange()->min;
+        }
         auto dst_th_indices = dst_indices;
-        dst_th_indices.push_back(lower_args.thread_var);
+        dst_th_indices.push_back(local_thread_index);
         auto inv = dst_layout->Inverse()->Forward(dst_th_indices);
         inv.pop_back();
         for (int i = 0; i < static_cast<int>(dst_layout->InputDim()); i++) {
@@ -1159,11 +1206,11 @@ template <typename Impl> struct ReduceLowerer {
       }
 
       if (dst_layout->InputDim() > 0) {
-        body = PartitionLoop(Downcast<For>(body), lower_args.thread_var,
+        body = PartitionLoop(Downcast<For>(body), lower_args.thread_index,
                              analyzer, red_layout);
         body = PragmaUnrollLoop(Downcast<For>(body));
       } else {
-        auto guard = (lower_args.thread_var == lower_args.thread_bounds->min);
+        auto guard = (lower_args.thread_index == lower_args.thread_bounds->min);
         body = IfThenElse(guard, body);
       }
 

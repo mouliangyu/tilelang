@@ -30,20 +30,7 @@ Performance (float32 scores, 4096 tokens, NPU):
 import tilelang
 import tilelang.language as T
 import torch
-from tilelang.language.simd import (
-    pset,
-    vld,
-    vsts,
-    vmax,
-    vmin,
-    vcmax,
-    vcmin,
-    vci,
-    vcmp,
-    vsel,
-    vdup,
-    vdupv,
-)
+from tilelang.language import simd as S
 from tilelang.profiler import do_bench
 
 
@@ -93,31 +80,31 @@ def topk_gate(num_experts: int, num_topk: int):
                         v = T.simd.alloc_local((4), "float32")
                         r = T.simd.alloc_local((4), "int32")
 
-                        full = pset(32, "PAT_ALL")
-                        one = pset(32, "PAT_VL1")
+                        full = S.pset(32, "PAT_ALL")
+                        one = S.pset(32, "PAT_VL1")
 
-                        neg_inf = vdup(-T.infinity(T.float32), "float32", full)
-                        int_max = vdup(T.max_value(T.int32), "int32", full)
+                        neg_inf = S.vdup(-T.infinity(T.float32), "float32", full)
+                        int_max = S.vdup(T.max_value(T.int32), "int32", full)
 
                         for i in T.Unroll(4, explicit=True):
-                            v[i] = vld(s_ub[i * VL])
-                            r[i] = vci(T.int32(i * VL), "int32")
+                            v[i] = S.vld(s_ub[i * VL])
+                            r[i] = S.vci(T.int32(i * VL), "int32")
 
                         for k in range(num_topk):
                             # Max value across the 4 partial vregs, broadcast.
-                            mx = vdupv(vcmax(vmax(vmax(v[0], v[1], full), vmax(v[2], v[3], full), full), full), full)
+                            mx = S.vdupv(S.vcmax(S.vmax(S.vmax(v[0], v[1], full), S.vmax(v[2], v[3], full), full), full), full)
                             # Per-lane: keep index where value == max, else INT_MAX.
-                            idx0 = vsel(r[0], int_max, vcmp(v[0], mx, full, "eq"))
-                            idx1 = vsel(r[1], int_max, vcmp(v[1], mx, full, "eq"))
-                            idx2 = vsel(r[2], int_max, vcmp(v[2], mx, full, "eq"))
-                            idx3 = vsel(r[3], int_max, vcmp(v[3], mx, full, "eq"))
+                            idx0 = S.vsel(r[0], int_max, S.vcmp(v[0], mx, full, "eq"))
+                            idx1 = S.vsel(r[1], int_max, S.vcmp(v[1], mx, full, "eq"))
+                            idx2 = S.vsel(r[2], int_max, S.vcmp(v[2], mx, full, "eq"))
+                            idx3 = S.vsel(r[3], int_max, S.vcmp(v[3], mx, full, "eq"))
                             # Min-reduce gives the smallest index (tie-break).
-                            idx = vdupv(vcmin(vmin(vmin(idx0, idx1, full), vmin(idx2, idx3, full), full), full), full)
+                            idx = S.vdupv(S.vcmin(S.vmin(S.vmin(idx0, idx1, full), S.vmin(idx2, idx3, full), full), full), full)
                             # Store winner index.
-                            vsts(out_ub[k], idx, one, "ONEPT_B32")
+                            S.vsts(out_ub[k], idx, one, "ONEPT_B32")
                             # Mask out the winner lane in each vreg so the next k picks the next best.
                             for i in T.Unroll(4, explicit=True):
-                                v[i] = vsel(neg_inf, v[i], vcmp(r[i], idx, full, "eq"))
+                                v[i] = S.vsel(neg_inf, v[i], S.vcmp(r[i], idx, full, "eq"))
 
                     T.copy(out_ub[:num_topk], topk_idx[row, :])
 
