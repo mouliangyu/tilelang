@@ -11,6 +11,7 @@
 #include "./ir_structure.h"
 #include "backend/common/target_utils.h"
 #include "op/builtin.h"
+#include <algorithm>
 #include <limits>
 #include <unordered_map>
 #include <unordered_set>
@@ -22,6 +23,75 @@ namespace tl {
 
 using namespace tirx;
 using ffi::String;
+
+struct RegionElementUpperBound {
+  int64_t elements{1};
+  // False only for the last-resort extent=1 heuristic. Constant, analyzer, and
+  // static-buffer-shape bounds are all usable for tightening an equal copy
+  // region from the other side.
+  bool reliable{true};
+};
+
+// Estimate a region's maximum element count under the current task context.
+// A symbolic extent first uses Analyzer bounds, then the corresponding static
+// buffer dimension, and finally the legacy extent=1 heuristic. Static buffer
+// dimensions also cap weak dtype-wide Analyzer bounds.
+inline RegionElementUpperBound
+EstimateRegionElementUpperBound(const Buffer &buffer, const Region &ranges,
+                                arith::Analyzer *analyzer) {
+  RegionElementUpperBound result;
+  for (size_t i = 0; i < ranges.size(); ++i) {
+    const PrimExpr &extent_expr = ranges[i]->extent;
+    int64_t extent = 1;
+    bool extent_reliable = true;
+
+    if (const int64_t *extent_int = as_const_int(extent_expr)) {
+      extent = *extent_int;
+    } else {
+      const int64_t *shape_extent =
+          i < buffer->shape.size() ? as_const_int(buffer->shape[i]) : nullptr;
+      arith::ConstIntBound bound = analyzer->const_int_bound(extent_expr);
+
+      // ConstIntBound reports the dtype range for an unconstrained integer
+      // expression (for example INT32_MAX), which is not a useful tile bound.
+      arith::Analyzer unconstrained_analyzer;
+      Var unconstrained_extent("unconstrained_extent", extent_expr.dtype());
+      int64_t unconstrained_max =
+          unconstrained_analyzer.const_int_bound(unconstrained_extent)
+              ->max_value;
+      bool has_finite_bound = bound->max_value >= 0 &&
+                              bound->max_value != arith::ConstIntBound::kPosInf;
+      bool has_useful_bound =
+          has_finite_bound && bound->max_value < unconstrained_max;
+
+      if (shape_extent != nullptr) {
+        extent = has_finite_bound ? std::min(bound->max_value, *shape_extent)
+                                  : *shape_extent;
+      } else if (has_useful_bound) {
+        extent = bound->max_value;
+      } else {
+        extent_reliable = false;
+      }
+    }
+
+    result.elements *= extent;
+    result.reliable = result.reliable && extent_reliable;
+  }
+  return result;
+}
+
+inline PrimExpr RegionElementCountExpr(const Region &ranges) {
+  PrimExpr elements = make_const(DataType::Int(64), 1);
+  for (const Range &range : ranges) {
+    elements = elements * cast(DataType::Int(64), range->extent);
+  }
+  return elements;
+}
+
+inline int64_t ElementsToBytes(int64_t elements, DataType dtype) {
+  int64_t elem_bits = dtype.bits() * dtype.lanes();
+  return (elements * elem_bits + 7) / 8;
+}
 
 // Latency estimator for GPU with configurable hardware parameters
 class LatencyEstimator {
@@ -560,8 +630,10 @@ public:
 
   // Estimate latency for a TaskNode
   void Estimate(TaskNode *task) {
+    arith::Analyzer analyzer;
+    task->outer_ctx.Populate(analyzer);
     if (is_ascend_) {
-      EstimateAscend(task);
+      EstimateAscend(task, &analyzer);
       return;
     }
     int64_t total_latency = 0;
@@ -578,7 +650,7 @@ public:
     // Estimate latency from memory accesses and track bandwidth usage
     for (const auto &region : task->GetReadRegions()) {
       int64_t region_latency =
-          EstimateMemoryAccessLatency(region, true); // read
+          EstimateMemoryAccessLatency(region, true, &analyzer); // read
       memory_latency += region_latency;
       num_memory_ops++;
 
@@ -586,7 +658,7 @@ public:
       const Buffer &buffer = region->buffer;
       String scope = buffer.scope();
       MemoryType mem_type = GetMemoryTypeFromScope(scope);
-      int64_t access_bytes = CalculateAccessBytes(region);
+      int64_t access_bytes = CalculateAccessBytes(region, &analyzer);
 
       switch (mem_type) {
       case MemoryType::kGlobal:
@@ -609,7 +681,7 @@ public:
 
     for (const auto &region : task->GetWriteRegions()) {
       int64_t region_latency =
-          EstimateMemoryAccessLatency(region, false); // write
+          EstimateMemoryAccessLatency(region, false, &analyzer); // write
       memory_latency += region_latency;
       num_memory_ops++;
 
@@ -617,7 +689,7 @@ public:
       const Buffer &buffer = region->buffer;
       String scope = buffer.scope();
       MemoryType mem_type = GetMemoryTypeFromScope(scope);
-      int64_t access_bytes = CalculateAccessBytes(region);
+      int64_t access_bytes = CalculateAccessBytes(region, &analyzer);
 
       switch (mem_type) {
       case MemoryType::kGlobal:
@@ -1158,7 +1230,7 @@ private:
 
   // The Ascend latency / II estimation entry point. Mirrors the structure
   // of the generic Estimate() but consults the per-path / per-dtype fields.
-  void EstimateAscend(TaskNode *task) {
+  void EstimateAscend(TaskNode *task, arith::Analyzer *analyzer) {
     uint16_t pipe_mask = task->GetPipeMask();
     bool has_mte1 = pipe_mask & static_cast<uint16_t>(ResourcePipe::kMTE1);
     bool has_mte2 = pipe_mask & static_cast<uint16_t>(ResourcePipe::kMTE2);
@@ -1194,7 +1266,7 @@ private:
         const Buffer &buffer = region->buffer;
         String scope = buffer.scope();
         AscendPath path = ClassifyRegion(scope, pipe_mask, is_read);
-        int64_t bytes = CalculateAccessBytes(region);
+        int64_t bytes = CalculateAccessBytes(region, analyzer);
         add_memory_access(path, bytes);
       };
       for (const auto &r : task->GetReadRegions())
@@ -1227,7 +1299,7 @@ private:
           String scope = r->buffer.scope();
           if (scope == "local" || scope == "local.fragment" ||
               scope == "shared" || scope == "shared.dyn") {
-            valu_bytes += CalculateAccessBytes(r);
+            valu_bytes += CalculateAccessBytes(r, analyzer);
           }
         }
         int64_t bw_latency = safe_div_ceil(valu_bytes, params_.valu_bandwidth);
@@ -1733,51 +1805,22 @@ private:
     }
   };
 
-  // Helper function to calculate total bytes accessed in a region
-  int64_t CalculateAccessBytes(const BufferRegion &region) {
-    const Buffer &buffer = region->buffer;
-    const Region &ranges = region->region;
-
-    // Calculate total number of elements
-    int64_t total_elements = 1;
-    for (size_t i = 0; i < ranges.size(); ++i) {
-      const auto &range = ranges[i];
-      // Try to get constant extent if possible
-      if (const auto *extent_int = range->extent.as<IntImmNode>()) {
-        total_elements *= extent_int->value;
-      } else if (i < buffer->shape.size()) {
-        // For symbolic extents, use buffer shape as fallback (more
-        // accurate than assuming extent=1). Loop-context arith bounds
-        // would be even better but require a scope-aware visitor.
-        if (const int64_t *shape_extent = as_const_int(buffer->shape[i])) {
-          total_elements *= *shape_extent;
-        } else {
-          total_elements *= 1;
-        }
-      } else {
-        // For non-constant extents, use a conservative estimate
-        // Assume at least 1 element per dimension
-        // TODO: Better estimation for symbolic extents
-        total_elements *= 1;
-      }
-    }
-
-    // Total size in bytes; bits-based so packed sub-byte dtypes (fp4 = 2
-    // codes/byte) aren't over-counted (dtype.bytes() rounds 4 bits up to 1).
-    DataType dtype(buffer->dtype);
-    int64_t elem_bits = dtype.bits() * dtype.lanes();
-
-    return (total_elements * elem_bits + 7) / 8;
+  // Helper function to calculate total bytes accessed in a region.
+  int64_t CalculateAccessBytes(const BufferRegion &region,
+                               arith::Analyzer *analyzer) {
+    RegionElementUpperBound estimate = EstimateRegionElementUpperBound(
+        region->buffer, region->region, analyzer);
+    return ElementsToBytes(estimate.elements, DataType(region->buffer->dtype));
   }
 
   // Estimate latency for a single memory access
-  int64_t EstimateMemoryAccessLatency(const BufferRegion &region,
-                                      bool is_read) {
+  int64_t EstimateMemoryAccessLatency(const BufferRegion &region, bool is_read,
+                                      arith::Analyzer *analyzer) {
     const Buffer &buffer = region->buffer;
     String scope = buffer.scope();
     MemoryType mem_type = GetMemoryTypeFromScope(scope);
 
-    int64_t access_bytes = CalculateAccessBytes(region);
+    int64_t access_bytes = CalculateAccessBytes(region, analyzer);
 
     switch (mem_type) {
     case MemoryType::kGlobal:

@@ -493,7 +493,7 @@ protected:
   }
 
   // Stamp the current ConstrVisitor stack snapshot onto a freshly-built
-  // TaskNode, so RegionsMayConflict later sees the symbol
+  // TaskNode, so dependency proving and latency estimation see the symbol
   // environment (ancestor For ranges, Let bindings, thread_extents,
   // tilelang_assume, branch guards) the region was written under.
   void StampCtx(TaskNode *task) { task->outer_ctx = GetConstrSet(); }
@@ -508,14 +508,14 @@ protected:
       control_node->task->stmt =
           For(op->loop_var, op->min, op->extent, op->kind, Evaluate(0),
               op->thread_binding, op->annotations, op->step, op->span);
+      // The loop task itself sees the context outside the loop.
+      StampCtx(control_node->task.get());
       AnalyzeResourceUsage(Evaluate(op->min), control_node->task.get(), true);
       AnalyzeResourceUsage(Evaluate(op->extent), control_node->task.get(),
                            true);
       if (op->step.defined())
         AnalyzeResourceUsage(Evaluate(GetRef<PrimExpr>(op->step.get())),
                              control_node->task.get(), true);
-      // Stamp the ctx outside the loop scope onto the loop's own task.
-      StampCtx(control_node->task.get());
 
       // Process the loop body inside the loop scope (push loop_var range).
       {
@@ -532,14 +532,13 @@ protected:
       task_node->stmt = GetRef<Stmt>(op);
 
       // Analyze the loop body for resource usage)
+      StampCtx(task_node.get());
       AnalyzeResourceUsage(op->body, task_node.get());
       AnalyzeResourceUsage(Evaluate(op->min), task_node.get(), true);
       AnalyzeResourceUsage(Evaluate(op->extent), task_node.get(), true);
       if (op->step.defined())
         AnalyzeResourceUsage(Evaluate(GetRef<PrimExpr>(op->step.get())),
                              task_node.get(), true);
-      StampCtx(task_node.get());
-
       result_.push_back(std::move(task_node));
     }
   }
@@ -563,8 +562,8 @@ protected:
     }
 
     // Analyze the expression for resource usage
-    AnalyzeResourceUsage(GetRef<Stmt>(op), task_node.get());
     StampCtx(task_node.get());
+    AnalyzeResourceUsage(GetRef<Stmt>(op), task_node.get());
 
     result_.push_back(std::move(task_node));
   }
@@ -573,8 +572,8 @@ protected:
     auto task_node = std::make_shared<TaskNode>();
     task_node->stmt = GetRef<Stmt>(op);
 
-    AnalyzeResourceUsage(GetRef<Stmt>(op), task_node.get());
     StampCtx(task_node.get());
+    AnalyzeResourceUsage(GetRef<Stmt>(op), task_node.get());
 
     result_.push_back(std::move(task_node));
   }
@@ -655,8 +654,8 @@ protected:
   void VisitStmt_(const BindNode *op) override {
     auto task_node = std::make_shared<TaskNode>();
     task_node->stmt = GetLetDecl(op);
-    AnalyzeResourceUsage(GetLetDecl(op), task_node.get());
     StampCtx(task_node.get());
+    AnalyzeResourceUsage(GetLetDecl(op), task_node.get());
     result_.push_back(std::move(task_node));
   }
 
@@ -766,9 +765,9 @@ protected:
     task_node->stmt = GetRef<Stmt>(op);
 
     // Analyze condition and body for resource usage
+    StampCtx(task_node.get());
     AnalyzeResourceUsage(Evaluate(op->condition), task_node.get());
     AnalyzeResourceUsage(op->body, task_node.get());
-    StampCtx(task_node.get());
 
     result_.push_back(std::move(task_node));
   }
@@ -781,8 +780,8 @@ protected:
     // happen when there's no tilelang_root block
     auto task_node = std::make_shared<TaskNode>();
     task_node->stmt = GetRef<Stmt>(op);
-    AnalyzeResourceUsage(GetRef<Stmt>(op), task_node.get());
     StampCtx(task_node.get());
+    AnalyzeResourceUsage(GetRef<Stmt>(op), task_node.get());
     result_.push_back(std::move(task_node));
   }
 
@@ -823,10 +822,13 @@ private:
       // Target and block_size for GemmInst determination
       Target target;
       int64_t block_size;
+      arith::Analyzer arith_analyzer;
 
       ResourceAnalyzer(TaskNode *node, Target target = Target(),
                        int64_t block_size = 128)
-          : task_node(node), target(target), block_size(block_size) {}
+          : task_node(node), target(target), block_size(block_size) {
+        task_node->outer_ctx.Populate(arith_analyzer);
+      }
 
       static uint16_t GetHbmPortBit(const Buffer &src, const Buffer &dst) {
         bool aiv = (IsGlobalBuffer(src) && IsSharedBuffer(dst)) ||
@@ -840,30 +842,27 @@ private:
         return 0;
       }
 
-      static int64_t CalculateCopyBytes(const CopyNode *copy) {
-        int64_t elements = 1;
-        for (size_t i = 0; i < copy->dst_range.size(); ++i) {
-          const auto &range = copy->dst_range[i];
-          if (const int64_t *extent = as_const_int(range->extent)) {
-            elements *= *extent;
-          } else if (i < copy->dst->shape.size()) {
-            // TODO(ascend): use arith bounds from loop context for symbolic
-            // extents. Buffer shape is a better task-level fallback than 1.
-            if (const int64_t *shape_extent =
-                    as_const_int(copy->dst->shape[i])) {
-              elements *= *shape_extent;
-            } else {
-              elements *= 1;
-            }
-          } else {
-            elements *= 1;
+      int64_t CalculateCopyBytes(const CopyNode *copy) {
+        RegionElementUpperBound src_estimate = EstimateRegionElementUpperBound(
+            copy->src, copy->src_range, &arith_analyzer);
+        RegionElementUpperBound dst_estimate = EstimateRegionElementUpperBound(
+            copy->dst, copy->dst_range, &arith_analyzer);
+
+        int64_t elements = src_estimate.elements;
+        PrimExpr src_elements = RegionElementCountExpr(copy->src_range);
+        PrimExpr dst_elements = RegionElementCountExpr(copy->dst_range);
+        if (arith_analyzer.CanProveEqual(src_elements, dst_elements)) {
+          if (src_estimate.reliable && dst_estimate.reliable) {
+            elements = std::min(src_estimate.elements, dst_estimate.elements);
+          } else if (dst_estimate.reliable) {
+            elements = dst_estimate.elements;
           }
         }
-        // Bits-based ceil so packed sub-byte dtypes (fp4 = 2 codes/byte) aren't
-        // over-counted (dtype.bytes() rounds 4 bits up to 1).
-        DataType dt(copy->dst->dtype);
-        int64_t elem_bits = dt.bits() * dt.lanes();
-        return (elements * elem_bits + 7) / 8;
+
+        // Preserve the existing destination-payload byte convention. When
+        // src/dst region sizes cannot be proven equal, Ascend DMA lowering's
+        // source-derived n_rows/inner_elems remains authoritative.
+        return ElementsToBytes(elements, DataType(copy->dst->dtype));
       }
 
       void VisitExpr_(const CallNode *op) override {
