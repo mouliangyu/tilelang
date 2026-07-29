@@ -964,32 +964,6 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
                  << ">(";
     this->PrintExpr(op->args[1], this->stream);
     this->stream << ");\n";
-  } else if (op->op.same_as(tl::ascend_sync_inter_arrive())) {
-    ICHECK_EQ(op->args.size(), 2)
-        << "tl.ascend_sync_inter_arrive expects exactly 2 arguments "
-           "(pipe string, flag_id)";
-    if (!has_asc_simd_included_) {
-      decl_stream << "#include <c_api/asc_simd.h>\n";
-      has_asc_simd_included_ = true;
-    }
-    std::string pipe_str = Downcast<StringImm>(op->args[0])->value;
-    this->PrintIndent();
-    this->stream << "asc_sync_inter_arrive(" << pipe_str << ", ";
-    this->PrintExpr(op->args[1], this->stream);
-    this->stream << ");\n";
-  } else if (op->op.same_as(tl::ascend_sync_inter_wait())) {
-    ICHECK_EQ(op->args.size(), 2)
-        << "tl.ascend_sync_inter_wait expects exactly 2 arguments "
-           "(pipe string, flag_id)";
-    if (!has_asc_simd_included_) {
-      decl_stream << "#include <c_api/asc_simd.h>\n";
-      has_asc_simd_included_ = true;
-    }
-    std::string pipe_str = Downcast<StringImm>(op->args[0])->value;
-    this->PrintIndent();
-    this->stream << "asc_sync_inter_wait(" << pipe_str << ", ";
-    this->PrintExpr(op->args[1], this->stream);
-    this->stream << ");\n";
   } else if (op->op.same_as(tl::ascend_threadfence())) {
     ICHECK_EQ(op->args.size(), 0)
         << "tl.ascend_threadfence expects 0 arguments";

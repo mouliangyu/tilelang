@@ -48,26 +48,32 @@ void InsertStatementIntoScheduledNode(IRStructure *node, Stmt stmt,
   }
 }
 
-// Check if a TaskNode's operation has unit_flag_ctl/ctrl != 0.
-bool HasUnitFlagCtrl(const TaskNode *task) {
-  if (!task)
-    return false;
-  auto *eval = task->stmt.as<EvaluateNode>();
-  if (!eval)
-    return false;
-  auto *call = eval->value.as<CallNode>();
-  if (!call)
-    return false;
+// Check if any operation in `stmt` has unit_flag_ctl/ctrl != 0. This walks the
+// whole statement rather than shape-matching a bare Evaluate(Call), because a
+// T.PerCoreTask leaf holds a compound body.
+bool HasUnitFlagCtrl(const Stmt &stmt) {
+  class Detector : public StmtExprVisitor {
+  public:
+    bool found{false};
 
-  if (auto ann = call->annotations.Get("unit_flag_ctrl")) {
-    if (auto imm = ann->as<IntImmNode>())
-      return imm->value != 0;
-    return true; // non-IntImm → dynamic → enabled
-  }
-  return false;
+  private:
+    void VisitExpr_(const CallNode *op) final {
+      if (auto ann = op->annotations.Get("unit_flag_ctrl")) {
+        if (const auto *imm = ann->as<IntImmNode>()) {
+          found = imm->value != 0;
+        } else {
+          found = true; // non-IntImm means dynamically enabled
+        }
+      }
+      if (!found)
+        StmtExprVisitor::VisitExpr_(op);
+    }
+  } detector;
+  detector(stmt);
+  return detector.found;
 }
 
-std::string GetPipeName(uint16_t mask) {
+std::string GetResourcePipeName(uint16_t mask) {
   ICHECK((mask & (mask - 1)) == 0) << "Multiple pipes in one pipe: " << mask;
   if (mask & static_cast<uint16_t>(ResourcePipe::kMTE1))
     return "MTE1";
@@ -337,12 +343,12 @@ CollectSyncPoints(const std::vector<IRStructure *> &nodes, int num_wgs,
     }
 
     for (const auto &[ppt, cpt] : dep.task_pairs) {
-      std::string prod_pipe = GetPipeName(ppt.task()->GetPipeMask());
-      std::string cons_pipe = GetPipeName(cpt.task()->GetPipeMask());
+      std::string prod_pipe = GetResourcePipeName(ppt.task()->GetPipeMask());
+      std::string cons_pipe = GetResourcePipeName(cpt.task()->GetPipeMask());
       std::string hard_event = GetHardEvent(prod_pipe, cons_pipe);
-      bool fix_unit_flag =
-          hard_event.find("FIX") != std::string::npos &&
-          (HasUnitFlagCtrl(ppt.task()) || HasUnitFlagCtrl(cpt.task()));
+      bool fix_unit_flag = hard_event.find("FIX") != std::string::npos &&
+                           (HasUnitFlagCtrl(ppt.task()->stmt) ||
+                            HasUnitFlagCtrl(cpt.task()->stmt));
       for (int prod_wg : expand_wgs(ppt.task()->GetWarpgroupId())) {
         for (int cons_wg : expand_wgs(cpt.task()->GetWarpgroupId())) {
           // Intra-core FIX unit-flag syncs are handled by the hardware.
@@ -411,7 +417,7 @@ static void CollectTaskSites(IRStructure *node, int num_wgs,
     BufferAccessPoint pt(0, std::move(task_path));
     auto *task = static_cast<const TaskNode *>(node);
     int wg = task->GetWarpgroupId();
-    std::string pipe = GetPipeName(task->GetPipeMask());
+    std::string pipe = GetResourcePipeName(task->GetPipeMask());
     std::vector<int> wgs;
     if (IsWarpgroupBroadcast(wg)) {
       for (int i = 0; i < num_wgs; ++i)

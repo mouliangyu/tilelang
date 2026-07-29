@@ -76,11 +76,164 @@ namespace tl {
 using namespace tirx;
 using ffi::GetRef;
 
+namespace {
+
+// Specialized issue queues (DMA / Cube / Vector / Fixpipe). On Ascend these are
+// the only pipes a statement can occupy *other than* the scalar (S) unit, which
+// is the default issue queue for everything else.
+constexpr uint16_t kSpecializedPipes =
+    static_cast<uint16_t>(ResourcePipe::kMTE1) |
+    static_cast<uint16_t>(ResourcePipe::kMTE2) |
+    static_cast<uint16_t>(ResourcePipe::kMTE3) |
+    static_cast<uint16_t>(ResourcePipe::kCube) |
+    static_cast<uint16_t>(ResourcePipe::kVector) |
+    static_cast<uint16_t>(ResourcePipe::kFixpipe);
+
+uint16_t ResolvePipe(uint16_t mask) {
+  if ((mask & kSpecializedPipes) == 0)
+    return mask | static_cast<uint16_t>(ResourcePipe::kScalar);
+  return mask;
+}
+
+} // namespace
+
+uint16_t GetAscendCopyPipeMask(const Buffer &src, const Buffer &dst) {
+  if (IsGlobalBuffer(src) && IsSharedBuffer(dst))
+    return static_cast<uint16_t>(ResourcePipe::kMTE2);
+  if (IsGlobalBuffer(src) && IsL1Buffer(dst))
+    return static_cast<uint16_t>(ResourcePipe::kMTE2);
+  if (IsSharedBuffer(src) && IsGlobalBuffer(dst))
+    return static_cast<uint16_t>(ResourcePipe::kMTE3);
+  if (IsL1Buffer(src) && IsL0ABuffer(dst))
+    return static_cast<uint16_t>(ResourcePipe::kMTE1);
+  if (IsL1Buffer(src) && IsL0BBuffer(dst))
+    return static_cast<uint16_t>(ResourcePipe::kMTE1);
+  if (IsL0CBuffer(src) && IsSharedBuffer(dst))
+    return static_cast<uint16_t>(ResourcePipe::kFixpipe);
+  if (IsL0CBuffer(src) && IsGlobalBuffer(dst))
+    return static_cast<uint16_t>(ResourcePipe::kFixpipe);
+  if (IsSharedBuffer(src) && IsL1Buffer(dst))
+    return static_cast<uint16_t>(ResourcePipe::kMTE3);
+  return static_cast<uint16_t>(ResourcePipe::kMTE2);
+}
+
+uint16_t GetAscendCallPipeMask(const Call &call) {
+  static const auto copy_op = Op::Get("tl.tileop.copy");
+  static const auto gemm_op = Op::Get("tl.tileop.gemm");
+  if (call->op.same_as(copy_op)) {
+    Copy copy(call->args, call->annotations);
+    return GetAscendCopyPipeMask(copy->src, copy->dst);
+  }
+  if (call->op.same_as(tl::ascend_nd2nz_scatter()))
+    return static_cast<uint16_t>(ResourcePipe::kVector);
+  if (call->op.same_as(tl::ascend_nd2nz_post_copy()))
+    return static_cast<uint16_t>(ResourcePipe::kMTE3);
+  if (call->op.same_as(tl::ascend_fill_l1()))
+    return static_cast<uint16_t>(ResourcePipe::kMTE2);
+  if (call->op.same_as(gemm_op))
+    return static_cast<uint16_t>(ResourcePipe::kCube);
+  if (call->op.same_as(builtin::call_extern()) && !call->args.empty()) {
+    if (const auto *sym = call->args[0].as<StringImmNode>()) {
+      const std::string &name = sym->value;
+      if (name == "debug_print_msg" || name == "debug_print_var" ||
+          name == "debug_print_buffer_value")
+        return static_cast<uint16_t>(ResourcePipe::kScalar);
+      if (name == "debug_print_buffer_dump") {
+        if (call->args.size() > 3) {
+          if (const auto *scope_call = call->args[3].as<CallNode>()) {
+            if (!scope_call->args.empty()) {
+              if (const auto *load = scope_call->args[0].as<BufferLoadNode>()) {
+                String scope = load->buffer.scope();
+                return static_cast<uint16_t>(scope == "shared" ||
+                                                     scope == "shared.dyn"
+                                                 ? ResourcePipe::kVector
+                                                 : ResourcePipe::kCube);
+              }
+            }
+          }
+        }
+      }
+      if (name == "debug_print_global_buffer_dump")
+        return static_cast<uint16_t>(ResourcePipe::kMTE3);
+    }
+  }
+  return 0;
+}
+
+uint16_t GetAscendStmtPipeMask(const Stmt &stmt) {
+  class PipeAnalyzer : public StmtExprVisitor {
+  public:
+    uint16_t pipe_mask{0};
+
+  private:
+    void VisitExpr_(const CallNode *op) final {
+      pipe_mask |= GetAscendCallPipeMask(GetRef<Call>(op));
+      StmtExprVisitor::VisitExpr_(op);
+    }
+
+    void VisitStmt_(const SBlockNode *op) final {
+      if (op->name_hint == "SIMT_VF" || op->name_hint == "SIMD_VF") {
+        pipe_mask |= static_cast<uint16_t>(ResourcePipe::kVector);
+        return;
+      }
+      StmtExprVisitor::VisitStmt_(op);
+    }
+  } analyzer;
+  analyzer(stmt);
+  return ResolvePipe(analyzer.pipe_mask);
+}
+
 // AttrStmt wrappers that AutoSchedule supports.
 static const AutoScheduleAttrSpec kAutoScheduleAttrs[] = {
     {tirx::attr::tilelang_assume, true},
     {tl::attr::kAssumeRequiresRuntimeCheck, false},
 };
+
+class PerCoreTaskControlValidator : public StmtExprVisitor {
+public:
+  explicit PerCoreTaskControlValidator(uint16_t pipe_mask)
+      : expected_pipe_("PIPE_" + GetResourcePipeName(pipe_mask)) {}
+
+private:
+  void VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(tl::ascend_cross_core_set_flag()) ||
+        op->op.same_as(tl::ascend_cross_core_wait_flag())) {
+      ICHECK_EQ(op->args.size(), 3);
+      const auto *mode = op->args[0].as<IntImmNode>();
+      ICHECK(mode) << "Cross-core synchronization mode must be a constant "
+                      "integer, got "
+                   << op->args[0];
+      ICHECK_EQ(mode->value, 0)
+          << "Cross-core synchronization inside T.PerCoreTask only supports "
+             "mode 0, got "
+          << mode->value;
+      const auto *pipe = op->args[1].as<StringImmNode>();
+      ICHECK(pipe) << "Inter-core synchronization pipe must be a constant "
+                      "string, got "
+                   << op->args[1];
+      ICHECK_EQ(pipe->value, expected_pipe_)
+          << "Inter-core synchronization inside T.PerCoreTask must use its "
+             "inferred pipe "
+          << expected_pipe_ << ", got " << pipe->value;
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  std::string expected_pipe_;
+};
+
+static bool IsPerCoreTaskScalarControl(const TaskNode *task) {
+  if (task->stmt.as<BindNode>())
+    return true;
+  const auto *evaluate = task->stmt.as<EvaluateNode>();
+  if (!evaluate)
+    return false;
+  if (is_zero(evaluate->value))
+    return true;
+  const auto *call = evaluate->value.as<CallNode>();
+  return call && (call->op.same_as(tl::ascend_cross_core_set_flag()) ||
+                  call->op.same_as(tl::ascend_cross_core_wait_flag()));
+}
 
 const AutoScheduleAttrSpec *FindAutoScheduleAttr(const String &key) {
   for (const AutoScheduleAttrSpec &spec : kAutoScheduleAttrs) {
@@ -508,6 +661,75 @@ protected:
   }
 
   void VisitStmt_(const AttrStmtNode *op) override {
+    if (op->attr_key == tl::attr::kAscendPerCoreTask) {
+      uint16_t pipe_mask = 0;
+      std::vector<std::shared_ptr<IRStructure>> body_list = BuildList(op->body);
+      bool has_dependency_stmt = false;
+
+      std::function<void(IRStructure *)> collect_sites;
+      collect_sites = [&](IRStructure *node) {
+        if (!node)
+          return;
+        if (node->IsControl()) {
+          auto *control = static_cast<ControlNode *>(node);
+          for (const auto &child : control->children)
+            collect_sites(child.get());
+          return;
+        }
+
+        auto *task = static_cast<TaskNode *>(node);
+        ICHECK(!task->IsPerCoreTask())
+            << "Nested T.PerCoreTask regions are not supported";
+        const bool has_access =
+            !task->GetReadRegions().empty() || !task->GetWriteRegions().empty();
+        if (!has_access) {
+          ICHECK(IsPerCoreTaskScalarControl(task))
+              << "T.PerCoreTask only permits scalar Bind/condition/loop "
+                 "control and inter-core synchronization in addition to "
+                 "operations on its inferred pipe; got "
+              << task->stmt;
+          return;
+        }
+        uint16_t task_pipe_mask = task->GetPipeMask();
+        ICHECK_NE(task_pipe_mask, 0)
+            << "Cannot infer an Ascend pipe for T.PerCoreTask candidate "
+            << task->stmt;
+        ICHECK_EQ(task_pipe_mask & (task_pipe_mask - 1), 0)
+            << "Each dependency-bearing statement in T.PerCoreTask must use "
+               "exactly one hardware pipe, but statement mask="
+            << task_pipe_mask << ", statement=" << task->stmt;
+        if (pipe_mask == 0) {
+          pipe_mask = task_pipe_mask;
+        } else {
+          ICHECK_EQ(task_pipe_mask, pipe_mask)
+              << "All dependency-bearing statements in T.PerCoreTask must "
+                 "use the same inferred hardware pipe. Inferred mask="
+              << pipe_mask << ", statement mask=" << task_pipe_mask
+              << ", statement=" << task->stmt;
+        }
+        has_dependency_stmt = true;
+      };
+      for (const auto &node : body_list)
+        collect_sites(node.get());
+      ICHECK(has_dependency_stmt)
+          << "T.PerCoreTask must contain at least one dependency-bearing "
+             "statement from which to infer its pipe";
+      ICHECK_NE(pipe_mask, 0) << "Failed to infer T.PerCoreTask hardware pipe";
+      PerCoreTaskControlValidator control_validator(pipe_mask);
+      control_validator(op->body);
+      auto task_node = std::make_shared<TaskNode>();
+      task_node->stmt = op->body;
+      AnalyzeResourceUsage(task_node->stmt, task_node.get());
+      task_node->SetPipeMask(pipe_mask);
+      task_node->SetPerCoreTaskPipeMask(pipe_mask);
+      LatencyEstimator latency_estimator(target_);
+      latency_estimator.EstimateSerialTask(task_node.get(), body_list,
+                                           pipe_mask);
+      StampCtx(task_node.get());
+      result_.push_back(std::move(task_node));
+      return;
+    }
+
     const AutoScheduleAttrSpec *attr_spec = FindAutoScheduleAttr(op->attr_key);
     ICHECK(attr_spec != nullptr)
         << "AutoSchedule IRStructureBuilder only supports AttrStmt "
@@ -606,28 +828,6 @@ private:
                        int64_t block_size = 128)
           : task_node(node), target(target), block_size(block_size) {}
 
-      // Determine Ascend pipe from copy src/dst buffer scopes
-      static uint16_t GetCopyPipeMask(const Buffer &src, const Buffer &dst) {
-        if (IsGlobalBuffer(src) && IsSharedBuffer(dst))
-          return static_cast<uint16_t>(ResourcePipe::kMTE2);
-        if (IsGlobalBuffer(src) && IsL1Buffer(dst))
-          return static_cast<uint16_t>(ResourcePipe::kMTE2);
-        if (IsSharedBuffer(src) && IsGlobalBuffer(dst))
-          return static_cast<uint16_t>(ResourcePipe::kMTE3);
-        if (IsL1Buffer(src) && IsL0ABuffer(dst))
-          return static_cast<uint16_t>(ResourcePipe::kMTE1);
-        if (IsL1Buffer(src) && IsL0BBuffer(dst))
-          return static_cast<uint16_t>(ResourcePipe::kMTE1);
-        if (IsL0CBuffer(src) && IsSharedBuffer(dst))
-          return static_cast<uint16_t>(ResourcePipe::kFixpipe);
-        if (IsL0CBuffer(src) && IsGlobalBuffer(dst))
-          return static_cast<uint16_t>(ResourcePipe::kFixpipe);
-        if (IsSharedBuffer(src) && IsL1Buffer(dst))
-          return static_cast<uint16_t>(ResourcePipe::kMTE3);
-        // Default: treat as MTE2 data movement
-        return static_cast<uint16_t>(ResourcePipe::kMTE2);
-      }
-
       static uint16_t GetHbmPortBit(const Buffer &src, const Buffer &dst) {
         bool aiv = (IsGlobalBuffer(src) && IsSharedBuffer(dst)) ||
                    (IsSharedBuffer(src) && IsGlobalBuffer(dst));
@@ -667,6 +867,7 @@ private:
       }
 
       void VisitExpr_(const CallNode *op) override {
+        pipe_mask |= GetAscendCallPipeMask(GetRef<Call>(op));
         // Check for specific TileLang operations
         static const auto copy_op = Op::Get("tl.tileop.copy");
         static const auto gemm_op = Op::Get("tl.tileop.gemm");
@@ -674,8 +875,7 @@ private:
         if (op->op.same_as(copy_op)) {
           Copy copy_obj(op->args, op->annotations);
           const CopyNode *copy = copy_obj.get();
-          uint16_t copy_pipe = GetCopyPipeMask(copy->src, copy->dst);
-          pipe_mask |= copy_pipe;
+          uint16_t copy_pipe = GetAscendCopyPipeMask(copy->src, copy->dst);
           hbm_mask |= GetHbmPortBit(copy->src, copy->dst);
           // A GM->UB copy with data_select (from pad_value= or an explicit
           // data_select) reads the pad-value register set by a preceding
@@ -689,51 +889,13 @@ private:
           copy_infos.emplace_back(copy->src.scope(), copy->dst.scope(),
                                   DataType(copy->dst->dtype),
                                   CalculateCopyBytes(copy), copy_pipe);
-        } else if (op->op.same_as(tl::ascend_nd2nz_scatter())) {
-          // SimdVF MicroAPI scatter writing into a UB tmp.
-          pipe_mask |= static_cast<uint16_t>(ResourcePipe::kVector);
-        } else if (op->op.same_as(tl::ascend_nd2nz_post_copy())) {
-          // Per-D-group copy_ubuf_to_cbuf: UB -> L1 = MTE3.
-          pipe_mask |= static_cast<uint16_t>(ResourcePipe::kMTE3);
-        } else if (op->op.same_as(tl::ascend_fill_l1())) {
-          // create_cbuf_matrix L1 padding fill runs on the MTE1 pipe, same as
-          // the L1->L0 loads. AscendInsertOOBPadding emits it as a standalone
-          // statement before AutoSchedule so this classification keeps the fill
-          // ordered on the MTE2 queue relative to the loads that read the
-          // buffer.
-          pipe_mask |= static_cast<uint16_t>(ResourcePipe::kMTE2);
         } else if (op->op.same_as(gemm_op)) {
-          pipe_mask |= static_cast<uint16_t>(ResourcePipe::kCube);
-
           int64_t m = op->args[5].as<IntImmNode>()->value;
           int64_t n = op->args[6].as<IntImmNode>()->value;
           int64_t k = op->args[7].as<IntImmNode>()->value;
           Gemm gemm(op->args, op->annotations);
           tensor_core_shapes.emplace_back(m, n, k, gemm->a_->dtype,
                                           gemm->c_->dtype);
-        } else if (op->op.same_as(builtin::call_extern())) {
-          if (auto sym = op->args[0].as<StringImmNode>()) {
-            const std::string &name = sym->value;
-            if (name == "debug_print_msg" || name == "debug_print_var" ||
-                name == "debug_print_buffer_value") {
-              // (AscendC::)printf -> S pipe
-              pipe_mask |= static_cast<uint16_t>(ResourcePipe::kScalar);
-            } else if (name == "debug_print_buffer_dump") {
-              auto scope = op->args[3]
-                               .as<CallNode>()
-                               ->args[0]
-                               .as<BufferLoadNode>()
-                               ->buffer.scope();
-              if (scope == "shared" || scope == "shared.dyn") {
-                pipe_mask |= static_cast<uint16_t>(ResourcePipe::kVector);
-              } else {
-                pipe_mask |= static_cast<uint16_t>(ResourcePipe::kCube);
-              }
-            } else if (name == "debug_print_global_buffer_dump") {
-              // AscendC::DumpTensor(GlobalTensor<T>) reads GM
-              pipe_mask |= static_cast<uint16_t>(ResourcePipe::kMTE3);
-            }
-          }
         }
 
         StmtExprVisitor::VisitExpr_(op);
@@ -746,30 +908,12 @@ private:
       }
     };
 
-    // Specialized issue queues (DMA / Cube / Vector / Fixpipe). On Ascend these
-    // are the only pipes a statement can occupy *other than* the scalar (S)
-    // unit, which is the default issue queue for everything else.
-    constexpr uint16_t kSpecializedPipes =
-        static_cast<uint16_t>(ResourcePipe::kMTE1) |
-        static_cast<uint16_t>(ResourcePipe::kMTE2) |
-        static_cast<uint16_t>(ResourcePipe::kMTE3) |
-        static_cast<uint16_t>(ResourcePipe::kCube) |
-        static_cast<uint16_t>(ResourcePipe::kVector) |
-        static_cast<uint16_t>(ResourcePipe::kFixpipe);
-
-    auto resolve_pipe = [&](uint16_t mask) -> uint16_t {
-      if ((mask & kSpecializedPipes) == 0) {
-        return mask | static_cast<uint16_t>(ResourcePipe::kScalar);
-      }
-      return mask;
-    };
-
     ResourceAnalyzer analyzer(task_node, target_);
     analyzer(stmt);
 
     if (!only_variables) {
       // Set task node pipe mask.
-      task_node->SetPipeMask(resolve_pipe(analyzer.pipe_mask));
+      task_node->SetPipeMask(ResolvePipe(analyzer.pipe_mask));
       task_node->SetHbmMask(analyzer.hbm_mask);
       if (analyzer.reads_pad_value)
         task_node->SetReadsPadValue(true);
@@ -1230,8 +1374,10 @@ static ScheduledKernelResult ScheduleSingleKernel(
   // broadcast, one-sided values are demoted to their single consumer core.
   AssignScalarWarpgroupByDemand(ir_structure);
 
-  // Fallback: pin every unresolved task to a single core: AIC if the kernel has
-  // any concrete Cube-side (wg1) work, otherwise AIV.
+  // Fallback: pin every unresolved task -- plus any still-broadcast
+  // PerCoreTask, which has no core-specific memory placement to demote it -- to
+  // a single core: AIC if the kernel has any concrete Cube-side (wg1) work,
+  // else AIV.
   {
     std::vector<TaskNodeWithContext> all_tasks;
     CollectAllTaskNodesWithContext(ir_structure, all_tasks);
@@ -1241,7 +1387,8 @@ static ScheduledKernelResult ScheduleSingleKernel(
       int wg = task_ctx.task->GetWarpgroupId();
       if (wg == 1)
         has_cube_wg = true;
-      else if (wg == kWarpgroupUnassigned)
+      else if (wg == kWarpgroupUnassigned ||
+               (wg == kWarpgroupBroadcast && task_ctx.task->IsPerCoreTask()))
         unresolved.push_back(task_ctx.task);
     }
     int fallback_wg = has_cube_wg ? 1 : 0;

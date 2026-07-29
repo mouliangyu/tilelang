@@ -51,6 +51,11 @@ constexpr const char *kAssumeRequiresRuntimeCheck =
 // Compiler-internal physical buffer version count.
 constexpr const char *kBufferVersion = "tl.buffer_version";
 
+// A user-authored logical Ascend per-core task whose dependency-bearing
+// statements all issue on one hardware pipe. AutoSchedule schedules it once,
+// then expands synchronization back to its guarded candidate sites.
+constexpr const char *kAscendPerCoreTask = "tl.ascend_per_core_task";
+
 // Attributes to implement SourceCodeBlock
 constexpr const char *kCodeBlockSource = "code_block_source";
 constexpr const char *kCodeBlockEntryName = "code_block_entry_name";

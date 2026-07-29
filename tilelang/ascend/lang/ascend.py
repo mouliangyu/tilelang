@@ -3,6 +3,36 @@
 from __future__ import annotations
 
 from tvm import tirx
+from tvm.tirx.script.builder.ir import attr
+
+
+def PerCoreTask():
+    """Represent one logical per-core task with guarded candidate sites.
+
+    AutoSchedule treats the enclosed control flow as one logical task when it
+    analyzes dependencies, estimates cost, and allocates flags. When
+    synchronization is emitted, the same logical wait/set pair is placed next
+    to every candidate access under its original control-flow guard.
+
+    The compiler infers one hardware pipe from the dependency-bearing TaskNodes;
+    every candidate must use that same single pipe and access the same logical
+    read/write buffers. Candidate sites may be intrinsic
+    statements, scalar buffer stores, or compound statements represented as one
+    schedulable task. Exactly one candidate site must execute on each core in
+    each dynamic invocation of the PerCoreTask; this dynamic property is a user
+    control-flow contract.
+
+    Example
+    -------
+    >>> with T.PerCoreTask():
+    ...     if split_id == 0:
+    ...         T.copy(res, C[...])
+    ...     T.ascend_sync_inter_arrive("PIPE_FIX", 0)
+    ...     T.ascend_sync_inter_wait("PIPE_FIX", 0)
+    ...     if split_id != 0:
+    ...         T.copy(res, C[...])
+    """
+    return attr(tirx.const(0, "int32"), "tl.ascend_per_core_task", tirx.const(1, "int32"))
 
 
 def ascend_pipe_barrier(pipe_t: str) -> None:
@@ -74,7 +104,7 @@ def ascend_wait_flag(hard_event: str, event_id) -> None:
 def ascend_sync_inter_arrive(pipe: str, flag_id) -> None:
     """Signal an Ascend inter-core synchronization event.
 
-    Generates: asc_sync_inter_arrive(pipe, flag_id);
+    Generates: AscendC::CrossCoreSetFlag<0, pipe>(flag_id);
 
     Parameters
     ----------
@@ -87,17 +117,13 @@ def ascend_sync_inter_arrive(pipe: str, flag_id) -> None:
     -------
     >>> T.ascend_sync_inter_arrive("PIPE_FIX", flag_id)
     """
-    if not isinstance(pipe, str):
-        raise TypeError(f"pipe must be a string, got {type(pipe)}")
-    if isinstance(flag_id, int):
-        flag_id = tirx.IntImm("int32", flag_id)
-    return tirx.call_intrin("void", tirx.op.Op.get("tl.ascend_sync_inter_arrive"), pipe, flag_id)
+    return ascend_cross_core_set_flag(0, pipe, flag_id)
 
 
 def ascend_sync_inter_wait(pipe: str, flag_id) -> None:
     """Wait for an Ascend inter-core synchronization event.
 
-    Generates: asc_sync_inter_wait(pipe, flag_id);
+    Generates: AscendC::CrossCoreWaitFlag<0, pipe>(flag_id);
 
     Parameters
     ----------
@@ -110,11 +136,7 @@ def ascend_sync_inter_wait(pipe: str, flag_id) -> None:
     -------
     >>> T.ascend_sync_inter_wait("PIPE_MTE3", flag_id)
     """
-    if not isinstance(pipe, str):
-        raise TypeError(f"pipe must be a string, got {type(pipe)}")
-    if isinstance(flag_id, int):
-        flag_id = tirx.IntImm("int32", flag_id)
-    return tirx.call_intrin("void", tirx.op.Op.get("tl.ascend_sync_inter_wait"), pipe, flag_id)
+    return ascend_cross_core_wait_flag(0, pipe, flag_id)
 
 
 def ascend_threadfence() -> None:
@@ -522,6 +544,7 @@ def set_atomic_none():
 
 
 __all__ = [
+    "PerCoreTask",
     "ascend_pipe_barrier",
     "ascend_set_flag",
     "ascend_wait_flag",

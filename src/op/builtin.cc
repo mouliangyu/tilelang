@@ -786,16 +786,6 @@ TIR_DEFINE_TL_BUILTIN(ascend_wait_flag)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_sync_inter_arrive)
-    .set_num_inputs(2)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kOpaque));
-
-TIR_DEFINE_TL_BUILTIN(ascend_sync_inter_wait)
-    .set_num_inputs(2)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kOpaque));
-
 TIR_DEFINE_TL_BUILTIN(ascend_threadfence)
     .set_num_inputs(0)
     .set_attr<TCallEffectKind>("TCallEffectKind",

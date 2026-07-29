@@ -52,9 +52,9 @@ def test_ascend_sync_inter_arrive_wait():
     artifact = lower(func, target="ascend")
     source = artifact.kernel_source
     print(source)
-    assert source.count("#include <c_api/asc_simd.h>") == 1
-    assert "asc_sync_inter_arrive(PIPE_FIX, 3);" in source
-    assert "asc_sync_inter_wait(PIPE_MTE3, flag_id);" in source
+    assert "#include <c_api/asc_simd.h>" not in source
+    assert "AscendC::CrossCoreSetFlag<0, PIPE_FIX>(3);" in source
+    assert "AscendC::CrossCoreWaitFlag<0, PIPE_MTE3>(flag_id);" in source
 
 
 def test_ascend_threadfence():

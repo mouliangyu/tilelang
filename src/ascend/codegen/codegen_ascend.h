@@ -67,7 +67,6 @@ private:
   bool has_nd2nz_copy_included_{false};
   bool has_simd_ops_{false};
   bool has_simd_inst_included_{false};
-  bool has_asc_simd_included_{false};
   bool has_gm_bypass_dcache_{false};
   bool has_gm_bypass_dcache_included_{false};
   bool has_philox_rng_{false};

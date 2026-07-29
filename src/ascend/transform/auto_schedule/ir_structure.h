@@ -136,6 +136,14 @@ using TaskAccessPredicate = std::function<bool(const TaskNode *task)>;
 
 PrimExpr CalculateIterationCount(const std::vector<For> &loops);
 
+// Infer the specialized Ascend issue pipe(s) used by a statement. Statements
+// with no specialized operation use the scalar pipe. This is shared by
+// IRStructure construction and final PerCoreTask synchronization placement so
+// the two phases classify candidate statements identically.
+uint16_t GetAscendStmtPipeMask(const Stmt &stmt);
+uint16_t GetAscendCallPipeMask(const Call &call);
+uint16_t GetAscendCopyPipeMask(const Buffer &src, const Buffer &dst);
+
 // A wrapper introduced at a node relative to its nearest surviving structural
 // ancestor. Guards are scheduling metadata rather than schedulable tasks.
 class Guard {
@@ -448,6 +456,11 @@ public:
   void SetSpecialWriteMask(uint8_t mask) { special_write_mask_ = mask; }
   void SetReadsPadValue(bool v) { reads_pad_value_ = v; }
   void SetReadsAtomic(bool v) { reads_atomic_ = v; }
+  void SetPerCoreTaskPipeMask(uint16_t mask) {
+    per_core_task_pipe_mask_ = mask;
+  }
+  bool IsPerCoreTask() const { return per_core_task_pipe_mask_ != 0; }
+  uint16_t GetPerCoreTaskPipeMask() const { return per_core_task_pipe_mask_; }
   void AddSpecialWrite(SpecialRegister reg) {
     special_write_mask_ |= static_cast<uint8_t>(reg);
   }
@@ -658,6 +671,10 @@ private:
   // Whether a padded GM->UB copy in this leaf reads the pad-value register.
   bool reads_pad_value_{false};
   bool reads_atomic_{false};
+  // Non-zero for a T.PerCoreTask task. The stmt is scheduled as one logical
+  // group. During final Stmt emission, synchronization attached to this task is
+  // moved beside each enclosed statement that issues on this pipe.
+  uint16_t per_core_task_pipe_mask_{0};
 
   // Memory access regions (collected during analysis)
   std::vector<BufferRegion> read_regions_;

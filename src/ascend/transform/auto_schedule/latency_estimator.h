@@ -11,6 +11,7 @@
 #include "./ir_structure.h"
 #include "backend/common/target_utils.h"
 #include "op/builtin.h"
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -792,7 +793,79 @@ public:
     task->SetII(ii);
   }
 
+  // Estimate a TaskNode that represents a serial composition of analyzed
+  // IRStructure nodes. Leaf costs use the ordinary TaskNode estimator;
+  // sequences add costs and serial loops multiply the complete body cost by
+  // their trip count. A non-zero pipe_filter includes only that exact pipe.
+  // Parallel For and VF blocks must keep using Estimate(TaskNode*) because
+  // their extents describe parallelism rather than serial repetition.
+  void EstimateSerialTask(
+      TaskNode *composite_task,
+      const std::vector<std::shared_ptr<IRStructure>> &body_nodes,
+      uint16_t pipe_filter = 0) {
+    SerialTaskCost cost = AggregateSerialTaskCost(body_nodes, pipe_filter);
+    composite_task->SetLatency(cost.latency);
+    composite_task->SetII(std::max<int64_t>(cost.ii, 1));
+  }
+
 private:
+  struct SerialTaskCost {
+    int64_t latency{0};
+    int64_t ii{0};
+  };
+
+  static int64_t CheckedSerialTaskAdd(int64_t lhs, int64_t rhs,
+                                      const char *field) {
+    ICHECK_GE(lhs, 0) << "Serial task " << field << " must be non-negative";
+    ICHECK_GE(rhs, 0) << "Serial task " << field << " must be non-negative";
+    ICHECK_LE(lhs, std::numeric_limits<int64_t>::max() - rhs)
+        << "Serial task " << field << " overflow while aggregating operations";
+    return lhs + rhs;
+  }
+
+  static int64_t CheckedSerialTaskMultiply(int64_t value, int64_t factor,
+                                           const char *field) {
+    ICHECK_GE(value, 0) << "Serial task " << field << " must be non-negative";
+    ICHECK_GE(factor, 0) << "Serial task trip count must be non-negative";
+    if (value == 0 || factor == 0)
+      return 0;
+    ICHECK_LE(value, std::numeric_limits<int64_t>::max() / factor)
+        << "Serial task " << field << " overflow while multiplying by loop "
+        << "trip count " << factor;
+    return value * factor;
+  }
+
+  SerialTaskCost AggregateSerialTaskCost(
+      const std::vector<std::shared_ptr<IRStructure>> &nodes,
+      uint16_t pipe_filter) {
+    SerialTaskCost result;
+    for (const auto &node : nodes) {
+      if (!node)
+        continue;
+      SerialTaskCost contribution;
+      if (node->IsTask()) {
+        auto *task = static_cast<TaskNode *>(node.get());
+        if (pipe_filter != 0 && task->GetPipeMask() != pipe_filter)
+          continue;
+        Estimate(task);
+        contribution.latency = task->GetLatency();
+        contribution.ii = task->GetII();
+      } else {
+        const auto *control = static_cast<const ControlNode *>(node.get());
+        contribution = AggregateSerialTaskCost(control->children, pipe_filter);
+        int64_t trip_count = control->GetTripCount();
+        contribution.latency = CheckedSerialTaskMultiply(contribution.latency,
+                                                         trip_count, "latency");
+        contribution.ii =
+            CheckedSerialTaskMultiply(contribution.ii, trip_count, "II");
+      }
+      result.latency =
+          CheckedSerialTaskAdd(result.latency, contribution.latency, "latency");
+      result.ii = CheckedSerialTaskAdd(result.ii, contribution.ii, "II");
+    }
+    return result;
+  }
+
   GPUParams params_;
   int64_t thread_count_ = 1; // Default to 1 (no parallelism)
   bool is_ascend_ = false;

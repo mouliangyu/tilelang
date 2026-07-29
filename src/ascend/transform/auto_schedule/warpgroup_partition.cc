@@ -421,6 +421,84 @@ static Stmt GuardWithGuards(Stmt body, const GuardList &guards) {
   return body;
 }
 
+static bool IsPerCoreTaskSyncControl(const EvaluateNode *evaluate) {
+  if (is_zero(evaluate->value))
+    return true;
+  const auto *call = evaluate->value.as<CallNode>();
+  return call && (call->op.same_as(tl::ascend_cross_core_set_flag()) ||
+                  call->op.same_as(tl::ascend_cross_core_wait_flag()));
+}
+
+// PerCoreTask is one scheduler node, but its source control flow may contain
+// several mutually-exclusive statements that issue on that node's pipe. Move
+// the logical task's synchronization next to every such concrete statement at
+// final emission time. No statement identity is retained across scheduling:
+// candidates are reclassified from the final task body using the same Ascend
+// pipe classifier as IRStructureBuilder.
+class PerCoreTaskSyncMigrator : public StmtMutator {
+public:
+  PerCoreTaskSyncMigrator(uint16_t pipe_mask, std::vector<Stmt> before,
+                          std::vector<Stmt> after)
+      : pipe_mask_(pipe_mask), before_(std::move(before)),
+        after_(std::move(after)) {}
+
+  Stmt Rewrite(Stmt body) {
+    Stmt result = VisitStmt(std::move(body));
+    ICHECK_GT(num_candidates_, 0)
+        << "Cannot find a statement using PerCoreTask pipe mask " << pipe_mask_;
+    return result;
+  }
+
+private:
+  static bool IsCandidateBoundary(const Stmt &stmt) {
+    if (stmt.as<EvaluateNode>() || stmt.as<BufferStoreNode>() ||
+        stmt.as<SBlockNode>() || stmt.as<WhileNode>()) {
+      return true;
+    }
+    if (const auto *loop = stmt.as<ForNode>()) {
+      return loop->kind != ForKind::kSerial && loop->kind != ForKind::kUnrolled;
+    }
+    return false;
+  }
+
+  Stmt VisitStmt(const Stmt &stmt) final {
+    if (!IsCandidateBoundary(stmt))
+      return StmtMutator::VisitStmt(stmt);
+    if (const auto *evaluate = stmt.as<EvaluateNode>()) {
+      if (IsPerCoreTaskSyncControl(evaluate))
+        return stmt;
+    }
+    if (GetAscendStmtPipeMask(stmt) != pipe_mask_)
+      return stmt;
+
+    ++num_candidates_;
+    std::vector<Stmt> sequence;
+    sequence.reserve(before_.size() + 1 + after_.size());
+    sequence.insert(sequence.end(), before_.begin(), before_.end());
+    sequence.push_back(stmt);
+    sequence.insert(sequence.end(), after_.begin(), after_.end());
+    return SeqStmt::Flatten(sequence);
+  }
+
+  uint16_t pipe_mask_;
+  std::vector<Stmt> before_;
+  std::vector<Stmt> after_;
+  int num_candidates_{0};
+};
+
+static bool IsPerCoreTaskNode(const IRStructure *node) {
+  return node && node->IsTask() &&
+         static_cast<const TaskNode *>(node)->IsPerCoreTask();
+}
+
+static std::vector<Stmt>
+CollectSchedulingStmts(const std::map<int, std::vector<Stmt>> &by_warpgroup) {
+  std::vector<Stmt> result;
+  for (const auto &[_, stmts] : by_warpgroup)
+    result.insert(result.end(), stmts.begin(), stmts.end());
+  return result;
+}
+
 // Per-warpgroup state for lowering conditional LetDecl tasks.
 struct ConditionalLetDeclCtx {
   std::unordered_map<const TaskNode *, Buffer> buf_of;
@@ -519,15 +597,19 @@ ConvertIRStructureToStmt(const std::vector<std::shared_ptr<IRStructure>> &nodes,
   std::vector<Stmt> stmts;
   for (const auto &child : nodes) {
     auto node = child.get();
-    for (auto &[_, before] : node->before) {
-      for (auto &stmt : before) {
-        stmts.push_back(stmt);
+    if (!IsPerCoreTaskNode(node)) {
+      for (auto &[_, before] : node->before) {
+        for (auto &stmt : before) {
+          stmts.push_back(stmt);
+        }
       }
     }
     stmts.push_back(ConvertIRStructureToStmt(node, sid, ctx));
-    for (auto &[_, after] : node->after) {
-      for (auto &stmt : after) {
-        stmts.push_back(stmt);
+    if (!IsPerCoreTaskNode(node)) {
+      for (auto &[_, after] : node->after) {
+        for (auto &stmt : after) {
+          stmts.push_back(stmt);
+        }
       }
     }
   }
@@ -544,6 +626,12 @@ static Stmt ConvertIRStructureToStmtInner(IRStructure *structure, Var sid,
     auto task = static_cast<TaskNode *>(structure);
     if (!task->stmt.defined()) {
       return Evaluate(0);
+    }
+    if (task->IsPerCoreTask()) {
+      return PerCoreTaskSyncMigrator(task->GetPerCoreTaskPipeMask(),
+                                     CollectSchedulingStmts(task->before),
+                                     CollectSchedulingStmts(task->after))
+          .Rewrite(task->stmt);
     }
     // Check for dual_copy: rewrite to copies with sid-based offset
     {
@@ -765,16 +853,20 @@ static Stmt ConvertIRStructureToStmtInner(IRStructure *structure, Var sid,
         steady.push_back(SeqStmt::Flatten(guarded));
       } else {
         std::vector<Stmt> stmts;
-        for (const auto &[_, before] : node->before) {
-          for (const auto &stmt : before) {
-            stmts.push_back(GuardWithIf(stmt, condition));
+        if (!IsPerCoreTaskNode(node)) {
+          for (const auto &[_, before] : node->before) {
+            for (const auto &stmt : before) {
+              stmts.push_back(GuardWithIf(stmt, condition));
+            }
           }
         }
         stmts.push_back(
             GuardWithIf(ConvertIRStructureToStmt(node, sid, ctx), condition));
-        for (const auto &[_, after] : node->after) {
-          for (const auto &stmt : after) {
-            stmts.push_back(GuardWithIf(stmt, condition));
+        if (!IsPerCoreTaskNode(node)) {
+          for (const auto &[_, after] : node->after) {
+            for (const auto &stmt : after) {
+              stmts.push_back(GuardWithIf(stmt, condition));
+            }
           }
         }
         Stmt stmt = SeqStmt::Flatten(stmts);

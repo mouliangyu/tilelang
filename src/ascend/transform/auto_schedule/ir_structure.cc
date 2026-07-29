@@ -97,6 +97,7 @@ std::shared_ptr<IRStructure> TaskNode::Clone() const {
   new_task->SetSpecialWriteMask(GetSpecialWriteMask());
   new_task->SetReadsPadValue(ReadsPadValueRegister());
   new_task->SetReadsAtomic(ReadsAtomicRegister());
+  new_task->SetPerCoreTaskPipeMask(GetPerCoreTaskPipeMask());
   // Copy memory access regions
   new_task->SetReadRegions(GetReadRegions());
   new_task->SetWriteRegions(GetWriteRegions());

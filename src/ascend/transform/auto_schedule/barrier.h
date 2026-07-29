@@ -44,6 +44,8 @@ struct FlagInfo {
 };
 using FlagInfoList = std::vector<FlagInfo>;
 
+std::string GetResourcePipeName(uint16_t mask);
+
 void AnalyzeAndInsertBarriers(std::vector<std::shared_ptr<IRStructure>> &root,
                               FlagInfoList &flag_infos,
                               std::vector<MultiVersionBufferInfo> &buffer_infos,
