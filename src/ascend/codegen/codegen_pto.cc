@@ -1461,6 +1461,51 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
     }
   }
 
+  bool is_atomic_add = op->op.same_as(tl::atomic_add_elem_op()) ||
+                       op->op.same_as(tl::atomic_add_ret_elem_op());
+  bool is_atomic_max = op->op.same_as(tl::atomic_max_elem_op()) ||
+                       op->op.same_as(tl::atomic_max_ret_elem_op());
+  bool is_atomic_min = op->op.same_as(tl::atomic_min_elem_op()) ||
+                       op->op.same_as(tl::atomic_min_ret_elem_op());
+  if (is_atomic_add || is_atomic_max || is_atomic_min) {
+    ICHECK(inside_simtvf_body_)
+        << "PTO atomic operations must be used inside T.SimtVF";
+    ICHECK(op->args.size() == 2U || op->args.size() == 3U)
+        << "PTO atomic operations expect dst_ptr, value[, memory_order]";
+
+    if (op->args.size() == 3U) {
+      const auto *memory_order = op->args[2].as<IntImmNode>();
+      ICHECK(memory_order)
+          << "PTO atomic memory_order must be a compile-time integer constant";
+      ICHECK_EQ(memory_order->value, 0)
+          << "PTO atomic operations currently support only memory_order="
+             "\"relaxed\" because PTODSL/PTOAS atomic operations do not expose "
+             "memory-order semantics; got memory_order id "
+          << memory_order->value;
+    }
+
+    DataType dtype = GetAnnotatedPointerDtype(op->args[0], op->args[1].dtype());
+    ICHECK(dtype.is_scalar())
+        << "PTO atomic operations support scalar values only";
+    ICHECK((dtype.is_float() && (dtype.bits() == 16 || dtype.bits() == 32)) ||
+           ((dtype.is_int() || dtype.is_uint()) && dtype.bits() == 32))
+        << "PTO atomic operations support float16, float32, int32, and "
+           "uint32, got "
+        << dtype;
+
+    const char *pto_atomic_op =
+        is_atomic_add ? "atomic_add"
+                      : (is_atomic_max ? "atomic_max" : "atomic_min");
+    os << "pto." << pto_atomic_op << "(" << PrintExpr_(op->args[0]) << ", "
+       << PrintExpr_(op->args[1]);
+    if (dtype.is_int() || dtype.is_uint()) {
+      os << ", signedness=\"" << (dtype.is_uint() ? "unsigned" : "signed")
+         << "\"";
+    }
+    os << ")";
+    return;
+  }
+
   if (op->op.same_as(builtin::tvm_storage_sync())) {
     ICHECK_GE(op->args.size(), 1U)
         << "tvm_storage_sync expects at least the storage scope argument";
@@ -1669,6 +1714,17 @@ void CodeGenTileLangPTO::VisitExpr_(const CastNode *op,
   DataType to = op->dtype;
   bool from_integer = from.is_int() || from.is_uint();
   bool to_integer = to.is_int() || to.is_uint();
+  if (inside_simtvf_body_ && from.is_scalar() && to.is_scalar() &&
+      from_integer && to.is_float() && !op->value.as<IntImmNode>()) {
+    // Python float(...) cannot consume a PTODSL runtime SSA value. Use the
+    // explicit SIMT conversion op for dynamic integer-to-float casts.
+    os << "pto.convert(";
+    PrintExpr_(op->value, os);
+    os << ", " << PtoTypeName(to)
+       << ", rounding=\"r\", saturation=\"nosat\", signedness=\""
+       << (from.is_uint() ? "unsigned" : "signed") << "\")";
+    return;
+  }
   if (from_integer && to_integer && from.lanes() == to.lanes() &&
       from.bits() < to.bits()) {
     // Address-index widening casts should not become Python int(...), because
