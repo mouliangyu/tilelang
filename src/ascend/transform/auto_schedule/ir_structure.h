@@ -54,14 +54,39 @@ enum class HbmPort : uint16_t {
 };
 
 // Special scalar "registers" written by config/control intrinsics and read by
-// their consumers.
-enum class SpecialRegister : uint8_t {
+// their consumers. Pipe-order registers model a scalar synchronization call
+// that fences the hardware pipe named by its argument without making the call
+// itself consume that pipe.
+enum class SpecialRegister : uint16_t {
   kNone = 0,
   kHf32Mode = 1 << 0,    // set_hf32_mode      <- read by Cube (MAD) ops
   kPadValue = 1 << 1,    // set_copy_pad_value <- read by padded MTE2 copies
   kLoopControl = 1 << 2, // loop_break         <- read by every sibling (fence)
   kAtomicMode = 1 << 3,  // set_atomic         <- read by GM-store copies
+  kPipeMTE1 = 1 << 4,
+  kPipeMTE2 = 1 << 5,
+  kPipeMTE3 = 1 << 6,
+  kPipeCube = 1 << 7,
+  kPipeVector = 1 << 8,
+  kPipeFixpipe = 1 << 9,
+  kPipeScalar = 1 << 10,
 };
+
+inline uint16_t PipeSpecialRegisterMask(uint16_t pipe_mask) {
+  uint16_t mask = 0;
+  auto add_pipe = [&](ResourcePipe pipe, SpecialRegister reg) {
+    if (pipe_mask & static_cast<uint16_t>(pipe))
+      mask |= static_cast<uint16_t>(reg);
+  };
+  add_pipe(ResourcePipe::kMTE1, SpecialRegister::kPipeMTE1);
+  add_pipe(ResourcePipe::kMTE2, SpecialRegister::kPipeMTE2);
+  add_pipe(ResourcePipe::kMTE3, SpecialRegister::kPipeMTE3);
+  add_pipe(ResourcePipe::kCube, SpecialRegister::kPipeCube);
+  add_pipe(ResourcePipe::kVector, SpecialRegister::kPipeVector);
+  add_pipe(ResourcePipe::kFixpipe, SpecialRegister::kPipeFixpipe);
+  add_pipe(ResourcePipe::kScalar, SpecialRegister::kPipeScalar);
+  return mask;
+}
 
 // Structure to represent a specific access to a buffer (used for ordering
 // accesses). `path` records the chain of IRStructure nodes traversed from the
@@ -352,7 +377,7 @@ public:
 
   // Special scalar registers this node *writes* (bitmask of SpecialRegister).
   // Only leaf config/control intrinsics write; everything else returns 0.
-  virtual uint8_t GetSpecialWriteMask() const { return 0; }
+  virtual uint16_t GetSpecialWriteMask() const { return 0; }
 
   // Special scalar registers this node *reads*:
   //   Cube (MAD)     reads the HF32-mode register (derived from the Cube pipe)
@@ -360,14 +385,15 @@ public:
   //     data_select / pad_value)
   //   loop_break is a fence: every node implicitly reads the loop-control
   //     register, so any loop_break write orders against all siblings.
-  uint8_t GetSpecialReadMask() const {
-    uint8_t mask = static_cast<uint8_t>(SpecialRegister::kLoopControl);
+  uint16_t GetSpecialReadMask() const {
+    uint16_t mask = static_cast<uint16_t>(SpecialRegister::kLoopControl);
     if (UsesPipe(ResourcePipe::kCube))
-      mask |= static_cast<uint8_t>(SpecialRegister::kHf32Mode);
+      mask |= static_cast<uint16_t>(SpecialRegister::kHf32Mode);
     if (ReadsPadValueRegister())
-      mask |= static_cast<uint8_t>(SpecialRegister::kPadValue);
+      mask |= static_cast<uint16_t>(SpecialRegister::kPadValue);
     if (ReadsAtomicRegister())
-      mask |= static_cast<uint8_t>(SpecialRegister::kAtomicMode);
+      mask |= static_cast<uint16_t>(SpecialRegister::kAtomicMode);
+    mask |= PipeSpecialRegisterMask(GetPipeMask());
     return mask;
   }
 
@@ -378,7 +404,7 @@ public:
   virtual bool ReadsAtomicRegister() const { return false; }
 
   bool WritesSpecialRegister(SpecialRegister reg) const {
-    return (GetSpecialWriteMask() & static_cast<uint8_t>(reg)) != 0;
+    return (GetSpecialWriteMask() & static_cast<uint16_t>(reg)) != 0;
   }
 
   // Whether this node is the loop_break marker (writes the loop-control
@@ -415,7 +441,7 @@ public:
   uint16_t GetHbmMask() const override { return hbm_mask_; }
 
   // Special scalar registers written by this leaf (config/control intrinsics).
-  uint8_t GetSpecialWriteMask() const override { return special_write_mask_; }
+  uint16_t GetSpecialWriteMask() const override { return special_write_mask_; }
 
   // A padded GM->UB copy (data_select / pad_value) in this leaf reads the
   // pad-value register.
@@ -453,7 +479,7 @@ public:
   // Setters
   void SetPipeMask(uint16_t mask) { pipe_mask_ = mask; }
   void SetHbmMask(uint16_t mask) { hbm_mask_ = mask; }
-  void SetSpecialWriteMask(uint8_t mask) { special_write_mask_ = mask; }
+  void SetSpecialWriteMask(uint16_t mask) { special_write_mask_ = mask; }
   void SetReadsPadValue(bool v) { reads_pad_value_ = v; }
   void SetReadsAtomic(bool v) { reads_atomic_ = v; }
   void SetPerCoreTaskPipeMask(uint16_t mask) {
@@ -462,7 +488,7 @@ public:
   bool IsPerCoreTask() const { return per_core_task_pipe_mask_ != 0; }
   uint16_t GetPerCoreTaskPipeMask() const { return per_core_task_pipe_mask_; }
   void AddSpecialWrite(SpecialRegister reg) {
-    special_write_mask_ |= static_cast<uint8_t>(reg);
+    special_write_mask_ |= static_cast<uint16_t>(reg);
   }
   void SetReadRegions(const std::vector<BufferRegion> &regions) {
     read_regions_ = regions;
@@ -658,8 +684,7 @@ public:
   }
 
   bool containWarpgroupId(int id) const override {
-    return ContainsLoopBreak() || IsWarpgroupBroadcast(warpgroup_id_) ||
-           warpgroup_id_ == id;
+    return IsWarpgroupBroadcast(warpgroup_id_) || warpgroup_id_ == id;
   }
 
 private:
@@ -667,7 +692,7 @@ private:
   uint16_t pipe_mask_{0};
   uint16_t hbm_mask_{0};
   // Special scalar registers written by this leaf (bitmask of SpecialRegister).
-  uint8_t special_write_mask_{0};
+  uint16_t special_write_mask_{0};
   // Whether a padded GM->UB copy in this leaf reads the pad-value register.
   bool reads_pad_value_{false};
   bool reads_atomic_{false};
@@ -741,6 +766,20 @@ public:
         mask |= child->GetHbmMask();
     }
     return mask;
+  }
+
+  // Special-register writes survive the control boundary and must order
+  // sibling nodes outside the loop. loop_break is the sole exception: it only
+  // controls the loop that directly contains it and must not fence outer
+  // siblings.
+  uint16_t GetSpecialWriteMask() const override {
+    uint16_t mask = task ? task->GetSpecialWriteMask() : 0;
+    for (const auto &child : children) {
+      if (child)
+        mask |= child->GetSpecialWriteMask();
+    }
+    return mask & static_cast<uint16_t>(
+                      ~static_cast<uint16_t>(SpecialRegister::kLoopControl));
   }
 
   // A loop reads the pad-value register if any child (or its own task) contains

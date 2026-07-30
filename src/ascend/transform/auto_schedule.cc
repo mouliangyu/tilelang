@@ -25,6 +25,7 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/container/map.h>
+#include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/function.h>
@@ -40,6 +41,7 @@
 #include <tvm/tirx/transform.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <functional>
 #include <iostream>
@@ -311,6 +313,72 @@ static bool IsAutoScheduleAttrWrapper(const AttrStmtNode *op) {
   return FindAutoScheduleAttr(op->attr_key) != nullptr;
 }
 
+struct CrossCorePipeInfo {
+  SpecialRegister special_register;
+  int warpgroup_id;
+};
+
+static CrossCorePipeInfo GetCrossCorePipeInfo(const PrimExpr &pipe_arg) {
+  const auto *pipe_imm = pipe_arg.as<StringImmNode>();
+  ICHECK(pipe_imm)
+      << "Auto-scheduled cross-core synchronization requires a constant pipe "
+         "string";
+  const String &pipe = pipe_imm->value;
+  if (pipe == "PIPE_S")
+    return {SpecialRegister::kPipeScalar, kWarpgroupUnassigned};
+  if (pipe == "PIPE_V")
+    return {SpecialRegister::kPipeVector, 0};
+  if (pipe == "PIPE_M")
+    return {SpecialRegister::kPipeCube, 1};
+  if (pipe == "PIPE_MTE1")
+    return {SpecialRegister::kPipeMTE1, 1};
+  if (pipe == "PIPE_MTE2")
+    return {SpecialRegister::kPipeMTE2, kWarpgroupUnassigned};
+  if (pipe == "PIPE_MTE3")
+    return {SpecialRegister::kPipeMTE3, 0};
+  if (pipe == "PIPE_FIX")
+    return {SpecialRegister::kPipeFixpipe, 1};
+  LOG(FATAL) << "Ascend AutoSchedule does not support cross-core pipe \""
+             << pipe
+             << "\". Expected one of PIPE_S, PIPE_V, PIPE_M, PIPE_MTE1, "
+                "PIPE_MTE2, PIPE_MTE3, or PIPE_FIX";
+  return {SpecialRegister::kNone, kWarpgroupUnassigned};
+}
+
+static Optional<Call> GetCrossCoreCall(const Call &call) {
+  if (!call->op.same_as(tl::ascend_cross_core_set_flag()) &&
+      !call->op.same_as(tl::ascend_cross_core_wait_flag())) {
+    return std::nullopt;
+  }
+  ICHECK_EQ(call->args.size(), 3)
+      << "ascend_cross_core_set_flag/wait_flag expects exactly 3 arguments";
+  const auto *mode = call->args[0].as<IntImmNode>();
+  ICHECK(mode)
+      << "Ascend AutoSchedule requires cross-core mode_id to be constant 0";
+  ICHECK_EQ(mode->value, 0)
+      << "Ascend AutoSchedule only supports cross-core synchronization with "
+         "mode_id=0; disable AutoSchedule for manually scheduled mode_id="
+      << mode->value;
+  return call;
+}
+
+static std::vector<Call> CollectCrossCoreCalls(const TaskNode *task) {
+  class Collector : public StmtExprVisitor {
+  public:
+    std::vector<Call> calls;
+
+  private:
+    void VisitExpr_(const CallNode *op) final {
+      Call call = GetRef<Call>(op);
+      if (GetCrossCoreCall(call).defined())
+        calls.push_back(call);
+      StmtExprVisitor::VisitExpr_(op);
+    }
+  } collector;
+  collector(task->stmt);
+  return collector.calls;
+}
+
 // Detect multiple kernel launches in the PrimFunc body.
 // In tilelang, when multiple T.Kernel() blocks are used, the IR structure is:
 //   root block body:
@@ -558,6 +626,12 @@ protected:
       } else if (call->op.same_as(tl::ascend_set_atomic()) ||
                  call->op.same_as(tl::ascend_set_atomic_none())) {
         task_node->AddSpecialWrite(SpecialRegister::kAtomicMode);
+      } else if (call->op.same_as(tl::ascend_cross_core_set_flag()) ||
+                 call->op.same_as(tl::ascend_cross_core_wait_flag())) {
+        Call sync_call = GetRef<Call>(call);
+        ICHECK(GetCrossCoreCall(sync_call).defined());
+        task_node->AddSpecialWrite(
+            GetCrossCorePipeInfo(call->args[1]).special_register);
       }
     }
 
@@ -721,6 +795,10 @@ protected:
       AnalyzeResourceUsage(task_node->stmt, task_node.get());
       task_node->SetPipeMask(pipe_mask);
       task_node->SetPerCoreTaskPipeMask(pipe_mask);
+      // Cross-core calls inside PerCoreTask are internal sequencing of this
+      // compound task. They migrate with its concrete candidates at emission
+      // time and intentionally do not expose special-register writes to the
+      // outer scheduler; placement comes from the task's inferred pipe/memory.
       LatencyEstimator latency_estimator(target_);
       latency_estimator.EstimateSerialTask(task_node.get(), body_list,
                                            pipe_mask);
@@ -1002,39 +1080,281 @@ static constexpr uint8_t kDemandWg0 = 0b01;
 static constexpr uint8_t kDemandWg1 = 0b10;
 static constexpr uint8_t kDemandBoth = 0b11;
 
-// Assign every currently-broadcast scalar / LetDecl task to the warpgroup(s)
-// that actually consume its output.
-static void AssignScalarWarpgroupByDemand(
-    const std::vector<std::shared_ptr<IRStructure>> &root) {
-  std::vector<TaskNodeWithContext> all_tasks;
-  CollectAllTaskNodesWithContext(root, all_tasks);
+struct CrossCoreTaskInfo {
+  TaskNode *task;
+  ControlNode *control_node;
+  PrimExpr flag_id;
+  String pipe;
+  int warpgroup_hint;
+};
 
-  std::unordered_map<const VarNode *, uint8_t> var_demand;
-  std::unordered_map<const BufferNode *, uint8_t> buf_demand;
+static void
+AssignCrossCoreWarpgroup(const std::vector<TaskNodeWithContext> &all_tasks) {
+  std::vector<CrossCoreTaskInfo> sync_tasks;
+  sync_tasks.reserve(all_tasks.size());
+  bool has_wg0 = false;
+  bool has_wg1 = false;
+  for (const TaskNodeWithContext &task_ctx : all_tasks) {
+    // PerCoreTask consumes its embedded cross-core synchronization internally.
+    // Keep the warpgroup already inferred from its ordinary operation instead
+    // of merging those calls into an outer synchronization group.
+    if (task_ctx.task->IsPerCoreTask()) {
+      int wg = task_ctx.task->GetWarpgroupId();
+      has_wg0 |= wg == 0;
+      has_wg1 |= wg == 1;
+      continue;
+    }
+    std::vector<Call> calls = CollectCrossCoreCalls(task_ctx.task);
+    if (calls.empty()) {
+      int wg = task_ctx.task->GetWarpgroupId();
+      has_wg0 |= wg == 0;
+      has_wg1 |= wg == 1;
+      continue;
+    }
+    for (const Call &call : calls) {
+      const auto *pipe_imm = call->args[1].as<StringImmNode>();
+      ICHECK(pipe_imm);
+      CrossCorePipeInfo pipe_info = GetCrossCorePipeInfo(call->args[1]);
+      sync_tasks.push_back({task_ctx.task, task_ctx.control_node, call->args[2],
+                            pipe_imm->value, pipe_info.warpgroup_id});
+    }
+  }
+  if (sync_tasks.empty())
+    return;
 
-  auto add_reads_demand = [&](const TaskNode *t, uint8_t mask) -> bool {
+  struct SyncGroup {
+    ControlNode *control_node;
+    PrimExpr flag_id;
+    std::vector<CrossCoreTaskInfo *> tasks;
+    uint8_t warpgroup_hints{0};
+  };
+  std::vector<SyncGroup> groups;
+  ffi::StructuralEqual structural_equal;
+  for (CrossCoreTaskInfo &sync_task : sync_tasks) {
+    SyncGroup *group = nullptr;
+    for (SyncGroup &candidate : groups) {
+      if (candidate.control_node == sync_task.control_node &&
+          structural_equal(candidate.flag_id, sync_task.flag_id)) {
+        group = &candidate;
+        break;
+      }
+    }
+    if (!group) {
+      groups.push_back(
+          {sync_task.control_node, sync_task.flag_id, {}, /*hints=*/0});
+      group = &groups.back();
+    }
+    group->tasks.push_back(&sync_task);
+    if (sync_task.warpgroup_hint == 0)
+      group->warpgroup_hints |= kDemandWg0;
+    else if (sync_task.warpgroup_hint == 1)
+      group->warpgroup_hints |= kDemandWg1;
+  }
+
+  for (const SyncGroup &group : groups) {
+    if (group.warpgroup_hints == kDemandBoth) {
+      std::ostringstream pipes;
+      for (size_t i = 0; i < group.tasks.size(); ++i) {
+        if (i)
+          pipes << ", ";
+        pipes << group.tasks[i]->pipe;
+      }
+      LOG(FATAL) << "Cross-core set/wait group for flag " << group.flag_id
+                 << " resolves to both Vector and Cube warpgroups from pipes "
+                 << pipes.str()
+                 << "; all calls in one synchronization group must run on "
+                    "the same warpgroup";
+    }
+
+    int warpgroup_id = kWarpgroupUnassigned;
+    if (group.warpgroup_hints == kDemandWg0) {
+      warpgroup_id = 0;
+    } else if (group.warpgroup_hints == kDemandWg1) {
+      warpgroup_id = 1;
+    } else if (has_wg0 != has_wg1) {
+      // PIPE_S and PIPE_MTE2 exist on both core types. A pure kernel supplies
+      // the only possible placement when neither side of the pair is pinned.
+      warpgroup_id = has_wg0 ? 0 : 1;
+    } else {
+      LOG(FATAL)
+          << "Cannot infer the warpgroup for cross-core set/wait group with "
+             "flag "
+          << group.flag_id
+          << ": PIPE_S and PIPE_MTE2 are ambiguous in a mixed or empty "
+             "kernel. Use PIPE_V/PIPE_MTE3 for Vector or "
+             "PIPE_M/PIPE_MTE1/PIPE_FIX for Cube on at least one call in "
+             "the group";
+    }
+    for (const CrossCoreTaskInfo *sync_task : group.tasks)
+      sync_task->task->SetWarpgroupId(warpgroup_id);
+  }
+}
+
+static CrossCoreFlagReservation CollectExplicitCrossCoreFlags(
+    const std::vector<TaskNodeWithContext> &all_tasks) {
+  CrossCoreFlagReservation reservation;
+  for (const TaskNodeWithContext &task_ctx : all_tasks) {
+    // PerCoreTask synchronization is isolated for scheduling and placement, but
+    // its explicit hardware flag slots still share the kernel-global namespace.
+    for (const Call &call : CollectCrossCoreCalls(task_ctx.task)) {
+      if (const auto *flag_id = call->args[2].as<IntImmNode>()) {
+        reservation.explicit_ids.insert(flag_id->value);
+      } else {
+        reservation.has_dynamic_id = true;
+      }
+    }
+  }
+  return reservation;
+}
+
+// Assign scalar, register-buffer, and special-register producers to the
+// warpgroup union of their consumers. CrossCore synchronization remains a
+// dedicated side-effecting path and contributes no special-register demand.
+class WarpgroupDemandAnalyzer {
+public:
+  static void Assign(const std::vector<std::shared_ptr<IRStructure>> &root,
+                     const std::vector<TaskNodeWithContext> &all_tasks) {
+    WarpgroupDemandAnalyzer analyzer(root, all_tasks);
+    analyzer.Run_();
+  }
+
+private:
+  static constexpr int kSpecialRegisterBits =
+      std::numeric_limits<uint16_t>::digits;
+  using VarDemandMap =
+      std::unordered_map<Var, uint8_t, ObjectPtrHash, ObjectPtrEqual>;
+  using BufferDemandMap =
+      std::unordered_map<Buffer, uint8_t, ObjectPtrHash, ObjectPtrEqual>;
+  using SpecialRegisterDemandMap =
+      std::unordered_map<const TaskNode *, uint8_t>;
+  using SpecialRegisterReadDemand = std::array<uint8_t, kSpecialRegisterBits>;
+  using SpecialRegisterWriters =
+      std::array<std::vector<TaskNode *>, kSpecialRegisterBits>;
+  struct SpecialRegisterScopeDemand {
+    SpecialRegisterReadDemand readers{};
+    SpecialRegisterWriters writers;
+  };
+
+  WarpgroupDemandAnalyzer(const std::vector<std::shared_ptr<IRStructure>> &root,
+                          const std::vector<TaskNodeWithContext> &all_tasks)
+      : root_(root), all_tasks_(all_tasks) {}
+
+  void Run_() {
+    CollectSpecialRegisterDemand_(root_);
+    AssignSpecialRegisterWriters_();
+    AssignCrossCoreWarpgroup(all_tasks_);
+    for (const auto &node : root_)
+      SeedReads_(node.get(), kDemandBoth);
+    PropagateReadsToFixedPoint_();
+    AssignScalarWriters_();
+  }
+
+  static uint8_t GetConcreteWarpgroupDemand_(const TaskNode *task) {
+    int warpgroup_id = task->GetWarpgroupId();
+    if (warpgroup_id == 0)
+      return kDemandWg0;
+    if (warpgroup_id == 1)
+      return kDemandWg1;
+    return 0;
+  }
+
+  // Special registers have one independent instance per warpgroup. Return both
+  // reader demand and concrete descendant writers so readers in an outer
+  // sibling list can place writers nested under a control node. loop_break is
+  // body-local and is therefore the only register not propagated outward.
+  SpecialRegisterScopeDemand CollectSpecialRegisterDemand_(
+      const std::vector<std::shared_ptr<IRStructure>> &nodes) {
+    SpecialRegisterScopeDemand scope;
+
+    for (const auto &node : nodes) {
+      if (node->IsControl()) {
+        const auto *control = static_cast<const ControlNode *>(node.get());
+        SpecialRegisterScopeDemand child_scope =
+            CollectSpecialRegisterDemand_(control->children);
+        for (int bit_index = 0; bit_index < kSpecialRegisterBits; ++bit_index) {
+          uint16_t bit = static_cast<uint16_t>(1U << bit_index);
+          if (bit == static_cast<uint16_t>(SpecialRegister::kLoopControl))
+            continue;
+          scope.readers[bit_index] |= child_scope.readers[bit_index];
+          scope.writers[bit_index].insert(
+              scope.writers[bit_index].end(),
+              child_scope.writers[bit_index].begin(),
+              child_scope.writers[bit_index].end());
+        }
+      } else {
+        const auto *task = static_cast<const TaskNode *>(node.get());
+        uint8_t warpgroup_demand = GetConcreteWarpgroupDemand_(task);
+        uint16_t read_mask = node->GetSpecialReadMask();
+        for (int bit_index = 0; bit_index < kSpecialRegisterBits; ++bit_index) {
+          uint16_t bit = static_cast<uint16_t>(1U << bit_index);
+          if ((read_mask & bit) != 0)
+            scope.readers[bit_index] |= warpgroup_demand;
+        }
+      }
+
+      if (!node->IsTask())
+        continue;
+      auto *task = static_cast<TaskNode *>(node.get());
+      // CrossCore bits only order their target hardware pipe. The calls are
+      // placed by matching pipe hints in their flag group, not by demand.
+      if (!CollectCrossCoreCalls(task).empty())
+        continue;
+      uint16_t write_mask = task->GetSpecialWriteMask();
+      for (int bit_index = 0; bit_index < kSpecialRegisterBits; ++bit_index) {
+        uint16_t bit = static_cast<uint16_t>(1U << bit_index);
+        if ((write_mask & bit) != 0)
+          scope.writers[bit_index].push_back(task);
+      }
+    }
+
+    for (int bit_index = 0; bit_index < kSpecialRegisterBits; ++bit_index) {
+      for (TaskNode *writer : scope.writers[bit_index])
+        special_writer_demand_[writer] |= scope.readers[bit_index];
+    }
+    return scope;
+  }
+
+  void AssignSpecialRegisterWriters_() {
+    for (const TaskNodeWithContext &task_ctx : all_tasks_) {
+      TaskNode *task = task_ctx.task;
+      // loop_break controls the enclosing loop itself, so it must survive in
+      // every warpgroup clone of that loop even when all concrete work is
+      // nested below another ControlNode and contributes no same-level demand.
+      if (task->ContainsLoopBreak()) {
+        task->SetWarpgroupId(kWarpgroupBroadcast);
+        continue;
+      }
+      auto it = special_writer_demand_.find(task);
+      if (it == special_writer_demand_.end())
+        continue;
+      AssignTaskFromDemand_(task, it->second);
+    }
+  }
+
+  bool AddReadsDemand_(const TaskNode *task, uint8_t mask) {
     if (!mask)
       return false;
     bool grew = false;
-    for (const auto &v : t->GetReadVars()) {
-      uint8_t &d = var_demand[v.get()];
-      if ((d | mask) != d) {
-        d |= mask;
+    for (const Var &var : task->GetReadVars()) {
+      uint8_t &demand = var_demand_[var];
+      if ((demand | mask) != demand) {
+        demand |= mask;
         grew = true;
       }
     }
-    for (const auto &r : t->GetReadRegions()) {
-      if (!IsRegisterRegion(r))
+    for (const BufferRegion &region : task->GetReadRegions()) {
+      if (!IsRegisterRegion(region))
         continue;
-      uint8_t &d = buf_demand[r->buffer.get()];
-      if ((d | mask) != d) {
-        d |= mask;
+      uint8_t &demand = buffer_demand_[region->buffer];
+      if ((demand | mask) != demand) {
+        demand |= mask;
         grew = true;
       }
     }
     return grew;
-  };
-  auto add_guard_demand = [&](const IRStructure *node, uint8_t mask) {
+  }
+
+  void AddGuardDemand_(const IRStructure *node, uint8_t mask) {
     if (!mask)
       return;
     for (const auto &guard : node->GetGuards()) {
@@ -1042,130 +1362,118 @@ static void AssignScalarWarpgroupByDemand(
         continue;
       const auto *condition_guard =
           static_cast<const ConditionGuard *>(guard.get());
-      for (const Var &v : UndefinedVars(condition_guard->condition))
-        var_demand[v.get()] |= mask;
+      for (const Var &var : UndefinedVars(condition_guard->condition))
+        var_demand_[var] |= mask;
     }
-  };
-  // The warpgroup(s) a subtree's compute actually lands on: the union over its
-  // concretely-assigned (wg 0/1) descendant tasks. Unassigned / broadcast
-  // scalars are ignored here so they don't pollute the coverage (a broadcast
-  // node's containWarpgroupId is true for every id). A loop whose body has
-  // compute on both cores is replicated to both; a single-core loop only to
-  // one.
-  auto loop_body_coverage = [&](const IRStructure *node) -> uint8_t {
+  }
+
+  static uint8_t GetLoopBodyCoverage_(const IRStructure *node) {
+    if (!node)
+      return 0;
+    if (node->IsTask()) {
+      const auto *task = static_cast<const TaskNode *>(node);
+      // A loop break controls whether the loop continues, so every warpgroup
+      // that receives a clone of the loop must evaluate the break condition.
+      if (task->ContainsLoopBreak())
+        return kDemandBoth;
+      return GetConcreteWarpgroupDemand_(task);
+    }
     uint8_t mask = 0;
-    std::function<void(const IRStructure *)> walk = [&](const IRStructure *n) {
-      if (!n)
-        return;
-      if (n->IsTask()) {
-        const auto *task = static_cast<const TaskNode *>(n);
-        // A loop break controls whether the loop continues, so every
-        // warpgroup that receives a clone of the loop must evaluate the break
-        // condition even when the rest of the loop body is scalar-only.
-        if (task->ContainsLoopBreak()) {
-          mask |= kDemandBoth;
-          return;
-        }
-        int wg = task->GetWarpgroupId();
-        if (wg == 0)
-          mask |= kDemandWg0;
-        else if (wg == 1)
-          mask |= kDemandWg1;
-      } else if (n->IsControl()) {
-        auto *c = static_cast<const ControlNode *>(n);
-        for (const auto &child : c->children)
-          walk(child.get());
+    const auto *control = static_cast<const ControlNode *>(node);
+    for (const auto &child : control->children)
+      mask |= GetLoopBodyCoverage_(child.get());
+    return mask;
+  }
+
+  void SeedReads_(const IRStructure *node, uint8_t enclosing) {
+    if (!node)
+      return;
+    if (node->IsTask()) {
+      const auto *task = static_cast<const TaskNode *>(node);
+      int warpgroup_id = task->GetWarpgroupId();
+      uint8_t mask = (warpgroup_id == 0)   ? kDemandWg0
+                     : (warpgroup_id == 1) ? kDemandWg1
+                                           : enclosing;
+      AddGuardDemand_(task, mask);
+      AddReadsDemand_(task, mask);
+      return;
+    }
+
+    const auto *control = static_cast<const ControlNode *>(node);
+    uint8_t coverage = GetLoopBodyCoverage_(node);
+    AddGuardDemand_(control, coverage);
+    if (control->task)
+      AddReadsDemand_(control->task.get(), coverage);
+    for (const auto &child : control->children)
+      SeedReads_(child.get(), coverage);
+  }
+
+  uint8_t GetWriteDemand_(const TaskNode *task) const {
+    uint8_t mask = 0;
+    auto special_it = special_writer_demand_.find(task);
+    if (special_it != special_writer_demand_.end())
+      mask |= special_it->second;
+    for (const Var &var : task->GetWriteVars()) {
+      auto it = var_demand_.find(var);
+      if (it != var_demand_.end())
+        mask |= it->second;
+    }
+    for (const BufferRegion &region : task->GetWriteRegions()) {
+      if (!IsRegisterRegion(region))
+        continue;
+      auto it = buffer_demand_.find(region->buffer);
+      if (it != buffer_demand_.end())
+        mask |= it->second;
+    }
+    return mask;
+  }
+
+  void PropagateReadsToFixedPoint_() {
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (const TaskNodeWithContext &task_ctx : all_tasks_) {
+        TaskNode *task = task_ctx.task;
+        if (!task->UsesPipe(ResourcePipe::kScalar) && !IsLetDeclTask(task))
+          continue;
+        if (AddReadsDemand_(task, GetWriteDemand_(task)))
+          changed = true;
       }
-    };
-    walk(node);
-    return mask;
-  };
-
-  // Seed phase: each concretely-assigned compute/MTE task demands its reads on
-  // its own warpgroup; a still-broadcast task (true serves-both scalar, or an
-  // `m==0` task) demands on both. Loop headers and guards demand on whichever
-  // cores the enclosing structure runs.
-  std::function<void(const IRStructure *, uint8_t)> seed =
-      [&](const IRStructure *node, uint8_t enclosing) {
-        if (!node)
-          return;
-        if (node->IsTask()) {
-          const auto *t = static_cast<const TaskNode *>(node);
-          int wg = t->GetWarpgroupId();
-          uint8_t mask = (wg == 0)   ? kDemandWg0
-                         : (wg == 1) ? kDemandWg1
-                                     : enclosing; // broadcast / unassigned
-          // The task's guard runs on exactly the cores the task runs on.
-          add_guard_demand(t, mask);
-          add_reads_demand(t, mask);
-        } else if (node->IsControl()) {
-          auto *c = static_cast<const ControlNode *>(node);
-          uint8_t cover = loop_body_coverage(node);
-          // The loop's guard and header (bound: min/extent/step) are replicated
-          // to exactly the cores the body runs on.
-          add_guard_demand(c, cover);
-          if (c->task)
-            add_reads_demand(c->task.get(), cover);
-          for (const auto &child : c->children)
-            seed(child.get(), cover);
-        }
-      };
-  for (const auto &node : root)
-    seed(node.get(), kDemandBoth);
-
-  // Backward fixpoint: a scalar / LetDecl producer whose output is demanded on
-  // some cores demands its own (direct) reads on those same cores. Iterating to
-  // a fixpoint closes the demand over the whole producer chain
-  // (guard/extent <- advance <- init) and through scalar Let chains, so no
-  // precomputed indirect-read closure is needed here.
-  auto write_demand = [&](const TaskNode *t) -> uint8_t {
-    uint8_t mask = 0;
-    for (const auto &v : t->GetWriteVars()) {
-      auto it = var_demand.find(v.get());
-      if (it != var_demand.end())
-        mask |= it->second;
-    }
-    for (const auto &r : t->GetWriteRegions()) {
-      if (!IsRegisterRegion(r))
-        continue;
-      auto it = buf_demand.find(r->buffer.get());
-      if (it != buf_demand.end())
-        mask |= it->second;
-    }
-    return mask;
-  };
-  bool changed = true;
-  while (changed) {
-    changed = false;
-    for (auto &task_ctx : all_tasks) {
-      TaskNode *t = task_ctx.task;
-      if (!t->UsesPipe(ResourcePipe::kScalar) && !IsLetDeclTask(t))
-        continue;
-      uint8_t mask = write_demand(t);
-      if (add_reads_demand(t, mask))
-        changed = true;
     }
   }
 
-  // Write-back phase: place each broadcast scalar / LetDecl into its consumer
-  // warpgroup union. A value with no consumer keeps broadcast (harmless: a dead
-  // LetDecl is DCE'd per warpgroup, a dead store is a no-op on both).
-  for (auto &task_ctx : all_tasks) {
-    TaskNode *t = task_ctx.task;
-    if (!IsWarpgroupBroadcast(t->GetWarpgroupId()))
-      continue;
-    if (!t->UsesPipe(ResourcePipe::kScalar) && !IsLetDeclTask(t))
-      continue;
-    uint8_t mask = write_demand(t);
-    if (mask == kDemandWg0)
-      t->SetWarpgroupId(0);
-    else if (mask == kDemandWg1)
-      t->SetWarpgroupId(1);
-    else if (mask == 0)
-      t->SetWarpgroupId(kWarpgroupUnassigned);
-    // kDemandBoth: leave broadcast.
+  static void AssignTaskFromDemand_(TaskNode *task, uint8_t demand) {
+    if (demand == kDemandWg0)
+      task->SetWarpgroupId(0);
+    else if (demand == kDemandWg1)
+      task->SetWarpgroupId(1);
+    else if (demand == kDemandBoth)
+      task->SetWarpgroupId(kWarpgroupBroadcast);
   }
-}
+
+  void AssignScalarWriters_() {
+    for (const TaskNodeWithContext &task_ctx : all_tasks_) {
+      TaskNode *task = task_ctx.task;
+      if (task->ContainsLoopBreak())
+        continue; // Assigned broadcast above; never demote from local demand.
+      if (!IsWarpgroupBroadcast(task->GetWarpgroupId()))
+        continue;
+      if (!task->UsesPipe(ResourcePipe::kScalar) && !IsLetDeclTask(task))
+        continue;
+      uint8_t demand = GetWriteDemand_(task);
+      if (demand == 0)
+        task->SetWarpgroupId(kWarpgroupUnassigned);
+      else
+        AssignTaskFromDemand_(task, demand);
+    }
+  }
+
+  const std::vector<std::shared_ptr<IRStructure>> &root_;
+  const std::vector<TaskNodeWithContext> &all_tasks_;
+  VarDemandMap var_demand_;
+  BufferDemandMap buffer_demand_;
+  SpecialRegisterDemandMap special_writer_demand_;
+};
 
 // Local enumerator for PropagateReadRegions. IRStructureBuilder emits BindNode
 // and tl.assume AttrStmt as ordinary TaskNodes.
@@ -1290,10 +1598,14 @@ static ScheduledKernelResult ScheduleSingleKernel(
   {
     std::vector<TaskNodeWithContext> all_tasks;
     CollectAllTaskNodesWithContext(ir_structure, all_tasks);
-    std::vector<TaskNode *> atomic_writers;
-    uint8_t store_wg_mask = 0;
     for (auto &task_ctx : all_tasks) {
       auto *t = task_ctx.task;
+      // Special-register writers are placed from their concrete use sites
+      // after ordinary compute and data-movement tasks have been pinned.
+      if (t->GetSpecialWriteMask() != 0) {
+        t->SetWarpgroupId(kWarpgroupUnassigned);
+        continue;
+      }
       uint16_t m = t->GetPipeMask();
       if (m & static_cast<uint16_t>(ResourcePipe::kCube)) {
         t->SetWarpgroupId(1);
@@ -1313,15 +1625,6 @@ static ScheduledKernelResult ScheduleSingleKernel(
           }
         }
         t->SetWarpgroupId(to_l1 ? 1 : 0);
-      } else if (t->WritesSpecialRegister(SpecialRegister::kHf32Mode)) {
-        // HF32 mode configures the Cube (AIC) unit.
-        t->SetWarpgroupId(1);
-      } else if (t->WritesSpecialRegister(SpecialRegister::kPadValue)) {
-        // set_copy_pad_value runs on the vector core (AIV).
-        t->SetWarpgroupId(0);
-      } else if (t->WritesSpecialRegister(SpecialRegister::kAtomicMode)) {
-        // Pinned below, once every store's warpgroup is known.
-        atomic_writers.push_back(t);
       } else if (t->UsesPipe(ResourcePipe::kScalar) || m == 0) {
         // A scalar / mask-0 task issues on the S pipe, but its warpgroup is
         // still fixed by the on-chip memory it touches: UB is AIV-side (wg0),
@@ -1346,32 +1649,10 @@ static ScheduledKernelResult ScheduleSingleKernel(
           t->SetWarpgroupId(kWarpgroupBroadcast);
         }
       }
-      // A store reads the atomic register; record which core it lands on. Its
-      // warpgroup is set above (fixpipe/MTE3 branches), so it is final here.
-      if (t->ReadsAtomicRegister()) {
-        int wg = t->GetWarpgroupId();
-        if (wg == 0)
-          store_wg_mask |= kDemandWg0;
-        else if (wg == 1)
-          store_wg_mask |= kDemandWg1;
-      }
     }
 
-    // Pin each set_atomic to the storing warpgroup: one core -> that core;
-    // both -> broadcast (arms on each; a no-op on a unit that does not store).
-    if (!atomic_writers.empty() && store_wg_mask != 0) {
-      int atomic_wg = (store_wg_mask == kDemandWg0)   ? 0
-                      : (store_wg_mask == kDemandWg1) ? 1
-                                                      : kWarpgroupBroadcast;
-      for (auto *t : atomic_writers)
-        t->SetWarpgroupId(atomic_wg);
-    }
+    WarpgroupDemandAnalyzer::Assign(ir_structure, all_tasks);
   }
-
-  // Assign each broadcast scalar / LetDecl to the warpgroup(s) that consume its
-  // output (a {0}/{1}/{0,1} demand lattice); values needed on both cores stay
-  // broadcast, one-sided values are demoted to their single consumer core.
-  AssignScalarWarpgroupByDemand(ir_structure);
 
   // Fallback: pin every unresolved task -- plus any still-broadcast
   // PerCoreTask, which has no core-specific memory placement to demote it -- to
@@ -1395,10 +1676,16 @@ static ScheduledKernelResult ScheduleSingleKernel(
       t->SetWarpgroupId(fallback_wg);
   }
 
+  std::vector<TaskNodeWithContext> explicit_cross_core_tasks;
+  CollectAllTaskNodesWithContext(ir_structure, explicit_cross_core_tasks);
+  CrossCoreFlagReservation cross_core_flag_reservation =
+      CollectExplicitCrossCoreFlags(explicit_cross_core_tasks);
+
   FlagInfoList flag_infos;
   MultiVersionBufferMap buffer_info_map;
   AnalyzeAndInsertBarriers(ir_structure, flag_infos, result.buffer_infos,
-                           buffer_info_map, manual_multi_buffer_versions);
+                           buffer_info_map, manual_multi_buffer_versions,
+                           cross_core_flag_reservation);
 
   Var sid;
   if (external_sid.has_value()) {

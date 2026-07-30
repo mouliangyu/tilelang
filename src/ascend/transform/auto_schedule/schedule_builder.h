@@ -112,11 +112,12 @@ public:
       }
 
       // Special-register ordering: a node writing register R must be ordered
-      // against every node reading R (RAW forward, WAR backward), preserving
-      // program order. loop_break writes kLoopControl, which every node reads,
-      // so it fences against all siblings; hf32/pad match only their consumers.
+      // against every node reading R (RAW forward, WAR backward) and every
+      // other writer of R (WAW), preserving program order. loop_break writes
+      // kLoopControl, which every node reads, so it fences against all
+      // siblings; hf32/pad match only their consumers.
       for (size_t i = 0; i < n; ++i) {
-        uint8_t wmask = nodes[i]->GetSpecialWriteMask();
+        uint16_t wmask = nodes[i]->GetSpecialWriteMask();
         if (wmask == 0)
           continue;
         for (size_t j = 0; j < n; ++j) {
@@ -127,6 +128,10 @@ public:
           } else {
             data_deps.emplace_back(j, i, 0);
           }
+        }
+        for (size_t j = i + 1; j < n; ++j) {
+          if ((wmask & nodes[j]->GetSpecialWriteMask()) != 0)
+            data_deps.emplace_back(i, j, latencies[i]);
         }
       }
 
@@ -455,12 +460,13 @@ public:
     }
 
     // Special-register ordering: a node writing register R must be ordered
-    // against every node reading R (RAW forward, WAR backward), preserving
-    // program order. loop_break writes kLoopControl, which every node reads,
-    // so it fences against all siblings; hf32/pad match only their consumers.
-    // The distance bit encodes intra-iter (0) vs next-iter (1) direction.
+    // against every node reading R (RAW forward, WAR backward) and every other
+    // writer of R (WAW), preserving program order. loop_break writes
+    // kLoopControl, which every node reads, so it fences against all siblings;
+    // hf32/pad match only their consumers. The distance bit encodes intra-iter
+    // (0) vs next-iter (1) direction.
     for (size_t i = 0; i < n; ++i) {
-      uint8_t wmask = nodes[i]->GetSpecialWriteMask();
+      uint16_t wmask = nodes[i]->GetSpecialWriteMask();
       if (wmask == 0)
         continue;
       for (size_t j = 0; j < n; ++j) {
@@ -473,6 +479,12 @@ public:
           data_deps.emplace_back(i, j, 1, latencies[i]);
           data_deps.emplace_back(j, i, 0, 0);
         }
+      }
+      for (size_t j = i + 1; j < n; ++j) {
+        if ((wmask & nodes[j]->GetSpecialWriteMask()) == 0)
+          continue;
+        data_deps.emplace_back(i, j, 0, latencies[i]);
+        data_deps.emplace_back(j, i, 1, latencies[j]);
       }
     }
 

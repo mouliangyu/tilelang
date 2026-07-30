@@ -6,6 +6,7 @@
 #include "op/utils.h"
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <map>
 #include <optional>
@@ -643,18 +644,49 @@ static void RecordReusablePairs(
   }
 }
 
-static std::vector<FlagAllocation>
-PlanFlagAllocations(std::vector<SyncPoint> &sync_points,
-                    const std::set<std::pair<size_t, size_t>> &reusable_pairs) {
+static std::vector<FlagAllocation> PlanFlagAllocations(
+    std::vector<SyncPoint> &sync_points,
+    const std::set<std::pair<size_t, size_t>> &reusable_pairs,
+    const CrossCoreFlagReservation &cross_core_flag_reservation) {
   std::vector<FlagAllocation> allocations;
   std::map<std::string, int> required_ids;
   std::map<std::string, int> next_id;
+  bool needs_cross_core_flag = false;
   for (const auto &sp : sync_points) {
     if (!UsesFlag(sp))
       continue;
     std::string domain = FlagDomain(sp);
     required_ids[domain] += sp.num_versions;
+    needs_cross_core_flag |= IsCrossCore(sp);
   }
+
+  ICHECK(!needs_cross_core_flag || !cross_core_flag_reservation.has_dynamic_id)
+      << "Ascend AutoSchedule cannot safely allocate cross-core flag IDs when "
+         "an explicit mode-0 CrossCoreSetFlag/WaitFlag uses a dynamic flag_id; "
+         "use a constant flag_id or disable AutoSchedule";
+
+  // Mode-4 synchronization addresses the same 16 base slots as mode 0. The
+  // generated Cube side may additionally address slot + 16 for the second
+  // Vector core, so normalize explicit IDs and reserve only the actual slots.
+  std::array<bool, kCrossCoreFlagLimit> cross_core_slots{};
+  for (int64_t explicit_id : cross_core_flag_reservation.explicit_ids) {
+    int normalized_id = static_cast<int>(explicit_id % kCrossCoreFlagLimit);
+    if (normalized_id < 0)
+      normalized_id += kCrossCoreFlagLimit;
+    cross_core_slots[normalized_id] = true;
+  }
+  const int explicit_cross_core_slots =
+      std::count(cross_core_slots.begin(), cross_core_slots.end(), true);
+  auto find_cross_core_range = [&](int width) {
+    for (int base = 0; base + width <= kCrossCoreFlagLimit; ++base) {
+      bool available = true;
+      for (int offset = 0; offset < width; ++offset)
+        available &= !cross_core_slots[base + offset];
+      if (available)
+        return base;
+    }
+    return -1;
+  };
 
   for (bool cross_iter : {true, false}) {
     std::vector<size_t> candidates;
@@ -674,7 +706,14 @@ PlanFlagAllocations(std::vector<SyncPoint> &sync_points,
       bool compatible = false;
       std::string domain = FlagDomain(sp);
       int limit = IsCrossCore(sp) ? kCrossCoreFlagLimit : kIntraCoreFlagLimit;
-      if (required_ids[domain] > limit) {
+      int cross_core_base =
+          IsCrossCore(sp) ? find_cross_core_range(sp.num_versions) : -1;
+      bool needs_reuse =
+          IsCrossCore(sp) ? required_ids[domain] + explicit_cross_core_slots >
+                                    kCrossCoreFlagLimit ||
+                                cross_core_base < 0
+                          : required_ids[domain] > limit;
+      if (needs_reuse) {
         for (size_t allocation_index = 0; allocation_index < allocations.size();
              ++allocation_index) {
           FlagAllocation &allocation = allocations[allocation_index];
@@ -702,9 +741,19 @@ PlanFlagAllocations(std::vector<SyncPoint> &sync_points,
         continue;
       sp.allocation_index = allocations.size();
       int base_id = next_id[domain];
+      if (IsCrossCore(sp)) {
+        ICHECK_GE(cross_core_base, 0)
+            << "Ascend AutoSchedule cannot allocate " << sp.num_versions
+            << " contiguous cross-core flag slots without overlapping explicit "
+               "mode-0 flags or safely reusable auto-scheduled flags";
+        base_id = cross_core_base;
+        for (int offset = 0; offset < sp.num_versions; ++offset)
+          cross_core_slots[base_id + offset] = true;
+      }
       allocations.emplace_back(index, sp.num_versions, cross_iter, base_id);
-      next_id[domain] += sp.num_versions;
-      if (base_id <= limit && next_id[domain] > limit) {
+      if (!IsCrossCore(sp))
+        next_id[domain] += sp.num_versions;
+      if (!IsCrossCore(sp) && base_id <= limit && next_id[domain] > limit) {
         LOG(WARNING) << "Ascend auto-schedule allocated " << next_id[domain]
                      << " flag ids for " << domain << " after safe reuse, "
                      << "exceeding the dav-3510 limit of " << limit << ".";
@@ -1006,11 +1055,12 @@ AnalyzeNode(IRStructure *node, std::vector<SyncPoint> &sync_points,
   return {};
 }
 
-void AnalyzeAndInsertBarriers(std::vector<std::shared_ptr<IRStructure>> &root,
-                              FlagInfoList &flag_infos,
-                              std::vector<MultiVersionBufferInfo> &buffer_infos,
-                              MultiVersionBufferMap &buffer_info_map,
-                              const ManualMultiBufferTable &manual) {
+void AnalyzeAndInsertBarriers(
+    std::vector<std::shared_ptr<IRStructure>> &root, FlagInfoList &flag_infos,
+    std::vector<MultiVersionBufferInfo> &buffer_infos,
+    MultiVersionBufferMap &buffer_info_map,
+    const ManualMultiBufferTable &manual,
+    const CrossCoreFlagReservation &cross_core_flag_reservation) {
   std::vector<SyncPoint> sync_points;
   std::set<std::pair<size_t, size_t>> reusable_pairs;
   std::vector<For> loop_stack;
@@ -1021,8 +1071,8 @@ void AnalyzeAndInsertBarriers(std::vector<std::shared_ptr<IRStructure>> &root,
   AnalyzeNodeList(nodes, sync_points, reusable_pairs, loop_stack, buffer_infos,
                   buffer_info_map, manual, /*is_loop_body=*/false, {},
                   visible_sync_points);
-  std::vector<FlagAllocation> allocations =
-      PlanFlagAllocations(sync_points, reusable_pairs);
+  std::vector<FlagAllocation> allocations = PlanFlagAllocations(
+      sync_points, reusable_pairs, cross_core_flag_reservation);
   InsertSyncPoints(sync_points, allocations, flag_infos);
 }
 

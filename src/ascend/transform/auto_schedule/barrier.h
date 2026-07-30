@@ -11,6 +11,8 @@
 #include "./ir_structure.h"
 #include "op/builtin.h"
 #include <cstddef>
+#include <cstdint>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -44,13 +46,19 @@ struct FlagInfo {
 };
 using FlagInfoList = std::vector<FlagInfo>;
 
+struct CrossCoreFlagReservation {
+  std::set<int64_t> explicit_ids;
+  bool has_dynamic_id{false};
+};
+
 std::string GetResourcePipeName(uint16_t mask);
 
-void AnalyzeAndInsertBarriers(std::vector<std::shared_ptr<IRStructure>> &root,
-                              FlagInfoList &flag_infos,
-                              std::vector<MultiVersionBufferInfo> &buffer_infos,
-                              MultiVersionBufferMap &buffer_info_map,
-                              const ManualMultiBufferTable &manual = {});
+void AnalyzeAndInsertBarriers(
+    std::vector<std::shared_ptr<IRStructure>> &root, FlagInfoList &flag_infos,
+    std::vector<MultiVersionBufferInfo> &buffer_infos,
+    MultiVersionBufferMap &buffer_info_map,
+    const ManualMultiBufferTable &manual = {},
+    const CrossCoreFlagReservation &cross_core_flag_reservation = {});
 
 inline Stmt MakeAscendSetFlag(const std::string &hard_event,
                               PrimExpr event_id) {
