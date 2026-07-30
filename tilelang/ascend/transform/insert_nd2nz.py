@@ -80,7 +80,7 @@ def _collect_nz_l1_vars(body) -> set:
 
 def _collect_prepacked_nz_ub_vars(body) -> set:
     """buffer.data Vars of pre-packed padded-NZ UB buffers."""
-    from tilelang.layout import make_ascend_nz_layout
+    from tilelang.layout import make_ascend_compact_nz_layout, make_ascend_nz_layout
 
     nz_source_vars = set()
 
@@ -90,7 +90,16 @@ def _collect_prepacked_nz_ub_vars(body) -> set:
             if lm is None:
                 return
             for buf, layout in lm.items():
-                if buf.scope() in _UB_SCOPES and layout.is_equal(make_ascend_nz_layout(buf)):
+                if buf.scope() not in _UB_SCOPES:
+                    continue
+                is_canonical_nz = layout.is_equal(make_ascend_nz_layout(buf))
+                try:
+                    is_compact_nz = layout.is_equal(make_ascend_compact_nz_layout(buf))
+                except ValueError:
+                    # An unrelated annotated UB may not meet compact-NZ's
+                    # static shape/alignment requirements.
+                    is_compact_nz = False
+                if is_canonical_nz or is_compact_nz:
                     nz_source_vars.add(buf.data)
 
     post_order_visit(body, visit)

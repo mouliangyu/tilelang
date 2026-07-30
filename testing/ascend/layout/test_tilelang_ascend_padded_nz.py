@@ -8,7 +8,8 @@ pack yields ``output == x`` -- and the two packing paths must agree.
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang.layout import make_ascend_nz_layout
+from tvm import tirx
+from tilelang.layout import make_ascend_compact_nz_layout
 
 ROWS = 64
 PADDED_ROWS = ROWS + 1
@@ -40,8 +41,8 @@ def _matmul_auto_scatter():
     return main
 
 
-def _matmul_direct_dual_copy():
-    """Pre-packed padded-NZ UB -> L1: InsertNd2Nz emits post_copy only."""
+def _matmul_direct_compact_dual_copy():
+    """Pre-packed compact padded-NZ UB -> L1: emit post_copy only."""
 
     @T.prim_func
     def main(
@@ -54,7 +55,7 @@ def _matmul_direct_dual_copy():
             x_l1 = T.alloc_l1((ROWS * 2, COLS), "bfloat16")
             output_l0c = T.alloc_l0c((ROWS * 2, COLS), "float32")
             x_nz_ub = T.alloc_shared((PADDED_ROWS, COLS), "bfloat16")
-            T.annotate_layout({x_nz_ub: make_ascend_nz_layout(x_nz_ub)})
+            T.annotate_layout({x_nz_ub: make_ascend_compact_nz_layout(x_nz_ub)})
 
             T.dual_copy(x_nz, x_nz_ub)
             T.dual_copy(x_nz_ub[0:ROWS, 0:COLS], x_l1)
@@ -65,7 +66,16 @@ def _matmul_direct_dual_copy():
     return main
 
 
-def test_scatter_matches_direct_padded_nz_dual_copy():
+def test_compact_nz_layout_keeps_stages_tightly_packed():
+    buffer = tirx.decl_buffer((2, PADDED_ROWS, 256), "float32", name="A", scope="shared")
+    layout = make_ascend_compact_nz_layout(buffer)
+    mapped = layout.map_forward_index([tirx.IntImm("int32", value) for value in (1, PADDED_ROWS - 1, 255)])
+
+    assert [int(value) for value in layout.get_output_shape()] == [64, PADDED_ROWS, 8]
+    assert [int(value) for value in mapped] == [63, PADDED_ROWS - 1, 7]
+
+
+def test_scatter_matches_direct_compact_nz_dual_copy():
     import torch
 
     identity = torch.eye(COLS, dtype=torch.bfloat16, device="npu")
@@ -76,7 +86,7 @@ def test_scatter_matches_direct_padded_nz_dual_copy():
     x_nz = x_nz.reshape(PADDED_ROWS * 2, COLS)
 
     out_auto = tilelang.compile(_matmul_auto_scatter(), out_idx=-1)(identity, x)
-    out_direct = tilelang.compile(_matmul_direct_dual_copy(), out_idx=-1)(identity, x_nz)
+    out_direct = tilelang.compile(_matmul_direct_compact_dual_copy(), out_idx=-1)(identity, x_nz)
     torch.npu.synchronize()
 
     torch.testing.assert_close(out_auto, out_direct, rtol=0, atol=0)

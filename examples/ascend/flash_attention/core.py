@@ -20,7 +20,7 @@ import math
 from dataclasses import dataclass
 
 import tilelang.language as T
-from tilelang.layout import make_ascend_nz_layout
+from tilelang.layout import make_ascend_compact_nz_layout
 from tilelang.language import simd as S
 
 
@@ -262,7 +262,7 @@ def flash_attention_fwd(
 
             S_ub = T.alloc_shared((ROWS, BC), accum_dtype)
             P_nz_ub = T.alloc_shared((ROWS + 1, BC), dtype)
-            T.annotate_layout({P_nz_ub: make_ascend_nz_layout(P_nz_ub)})
+            T.annotate_layout({P_nz_ub: make_ascend_compact_nz_layout(P_nz_ub)})
             O_tmp_ub = T.alloc_shared((ROWS, D), accum_dtype)
             O_ub = T.alloc_shared((ROWS, D), accum_dtype)
             m_ub = T.alloc_shared((ROWS,), accum_dtype)

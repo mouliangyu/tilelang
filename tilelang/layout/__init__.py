@@ -18,6 +18,7 @@ from .swizzle import (
 )
 from .ascend import (
     make_ascend_nz_layout,  # noqa: F401
+    make_ascend_compact_nz_layout,  # noqa: F401
     make_ascend_major_k_layout,  # noqa: F401
     make_ascend_major_mn_layout,  # noqa: F401
     make_ascend_l0c_layout,  # noqa: F401

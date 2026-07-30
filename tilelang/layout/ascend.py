@@ -36,6 +36,52 @@ def make_ascend_nz_layout(buffer: BufferLikeType):
     return _ffi_api.make_ascend_nz_layout(buf)
 
 
+def make_ascend_compact_nz_layout(buffer: BufferLikeType):
+    """Create a compact staged-NZ layout for a pre-packed UB buffer.
+
+    Unlike :func:`make_ascend_nz_layout`, this layout does not round the row
+    extent of every leading stage up to 16.  A logical
+    ``[..., rows, cols]`` buffer is stored as consecutive
+    ``[C0-group, rows, C0]`` blocks, with all leading dimensions flattened
+    into the C0-group axis.  Consequently, a padded ``rows = tile_rows + 1``
+    stage has exactly the source pitch expected by
+    ``ascend_nd2nz_post_copy``.
+
+    This layout is intended for UB data that is produced directly in NZ order
+    (for example with ``vsstb``) and then copied to L1.  It is not an L1 Cube
+    operand layout.
+    """
+
+    buf, shape, _ = _get_buffer_info(buffer)
+    if len(shape) < 2:
+        raise ValueError(f"Compact Ascend NZ layout expects rank >= 2, got rank={len(shape)}")
+
+    element_bits = int(buf.dtype.bits)
+    if element_bits <= 0 or 256 % element_bits != 0:
+        raise ValueError(f"Compact Ascend NZ layout does not support dtype {buf.dtype}")
+    c0 = 256 // element_bits
+
+    cols = shape[-1]
+    cols_value = getattr(cols, "value", None)
+    if cols_value is None:
+        raise ValueError(f"Compact Ascend NZ layout requires a static column extent, got {cols}")
+    if int(cols_value) % c0 != 0:
+        raise ValueError(f"Compact Ascend NZ layout requires columns divisible by C0={c0}, got {cols_value}")
+
+    leading_shape = list(shape[:-2])
+    c0_groups = cols // c0
+
+    def forward(*indices):
+        leading = indices[:-2]
+        row, col = indices[-2:]
+        stage = 0
+        for index, extent in zip(leading, leading_shape):
+            stage = stage * extent + index
+        return [stage * c0_groups + col // c0, row, col % c0]
+
+    return Layout(shape, forward)
+
+
 def make_ascend_major_k_layout(buffer: BufferLikeType, k_align: int = 1):
     """
     Create an Ascend fractal layout for logical ``[.., MN, K]`` tiles.
