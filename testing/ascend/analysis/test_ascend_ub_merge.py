@@ -98,5 +98,20 @@ def test_ub_merge_wait_alias_distinct_offset():
     assert len(offsets) >= 2, f"z_ub / val_ub wrongly aliased by MergeUBAllocations; offsets={offsets}"
 
 
+def _unused_ub_program():
+    @T.prim_func
+    def main(A: T.Tensor((1,), "int32"), O: T.Tensor((1,), "int32")):
+        with T.Kernel(1):
+            _dead_ub = T.alloc_shared((128,), "float32")
+            O[0] = A[0]
+
+    return main
+
+
+def test_ub_merge_removes_single_unused_allocation():
+    artifact = lower(_unused_ub_program(), target="ascend")
+    assert "dead_ub" not in artifact.kernel_source
+
+
 if __name__ == "__main__":
     tilelang.testing.main()

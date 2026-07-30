@@ -35,6 +35,7 @@
 
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include "arith/const_fold.h"
@@ -84,12 +85,68 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 
 TVM_REGISTER_PASS_CONFIG_OPTION("tl.AscendRemoveNoOp", AscendRemoveNoOpConfig);
 
+using VarSet = std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
+
+// Track storage Vars that are allocated and actually used. Allocation and
+// declaration metadata do not by themselves make the storage live.
+class AllocationUsageCollector : public StmtExprVisitor {
+public:
+  static VarSet FindDeadAllocations(const Stmt &stmt) {
+    AllocationUsageCollector collector;
+    collector(stmt);
+
+    VarSet dead;
+    for (const Var &var : collector.allocated_) {
+      if (!collector.used_.count(var)) {
+        dead.insert(var);
+      }
+    }
+    return dead;
+  }
+
+private:
+  void VisitStmt_(const AllocBufferNode *op) final {
+    allocated_.insert(op->buffer->data);
+  }
+
+  void VisitStmt_(const DeclBufferNode *) final {}
+
+  void VisitExpr_(const VarNode *op) final {
+    used_.insert(ffi::GetRef<Var>(op));
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+    used_.insert(op->buffer->data);
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    used_.insert(op->buffer->data);
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(builtin::tvm_access_ptr()) && op->args.size() == 5) {
+      if (const auto *var = op->args[1].as<VarNode>()) {
+        used_.insert(ffi::GetRef<Var>(var));
+      }
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  VarSet allocated_;
+  VarSet used_;
+};
+
 class AscendNoOpRemover : public arith::IRMutatorWithAnalyzer {
 public:
   static Stmt Apply(Stmt stmt, arith::Analyzer *analyzer,
                     std::optional<ControlFlowGraph> touch_pattern,
                     const StmtNode *context) {
-    AscendNoOpRemover visitor(analyzer, std::move(touch_pattern), context);
+    VarSet dead_allocations =
+        AllocationUsageCollector::FindDeadAllocations(stmt);
+    AscendNoOpRemover visitor(analyzer, std::move(touch_pattern), context,
+                              std::move(dead_allocations));
     return visitor(std::move(stmt));
   }
 
@@ -100,9 +157,9 @@ private:
 
   AscendNoOpRemover(arith::Analyzer *analyzer,
                     std::optional<ControlFlowGraph> touch_pattern,
-                    const StmtNode *context)
+                    const StmtNode *context, VarSet dead_allocations)
       : Parent(analyzer), touch_pattern_(std::move(touch_pattern)),
-        context_(context) {}
+        context_(context), dead_allocations_(std::move(dead_allocations)) {}
 
   Stmt VisitStmt_(const BindNode *op) final {
     // Unused Bind elimination requires a separate two-pass analysis.
@@ -176,6 +233,9 @@ private:
   }
 
   Stmt VisitStmt_(const AllocBufferNode *op) final {
+    if (dead_allocations_.count(op->buffer->data)) {
+      return Evaluate(0);
+    }
     return StmtMutator::VisitStmt_(op);
   }
 
@@ -232,6 +292,9 @@ private:
   }
 
   Stmt VisitStmt_(const DeclBufferNode *op) final {
+    if (dead_allocations_.count(op->buffer->data)) {
+      return Evaluate(0);
+    }
     return StmtMutator::VisitStmt_(op);
   }
 
@@ -276,6 +339,7 @@ private:
   std::unordered_map<const VarNode *, arith::IntSet> var_range_map_;
   std::optional<ControlFlowGraph> touch_pattern_;
   const StmtNode *context_;
+  VarSet dead_allocations_;
 };
 
 tvm::transform::Pass AscendRemoveNoOp() {

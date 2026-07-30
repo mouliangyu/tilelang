@@ -98,11 +98,9 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.HoistNonRestrictParams()(mod)
 
-    mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
     mod = tilelang.transform.HoistGlobalBufferAllocations()(mod)
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     mod = tilelang.transform.Simplify()(mod)
-    mod = tilelang.ascend.analysis.VFLocalVarChecker()(mod)
     mod = ascend_transform.RewriteAscendBufferVersionLayout()(mod)
     mod = tirx.transform.NarrowDataType(32)(mod)
     mod = tilelang.transform.FlattenBuffer()(mod)

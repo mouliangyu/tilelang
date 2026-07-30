@@ -32,11 +32,16 @@
 #include <tvm/tirx/var.h>
 
 #include "../op/utils.h"
-
-#include <deque>
-#include <string_view>
-
 #include "tir/transforms/ir_utils.h"
+
+// Forward-declare tir's var-level LCA helper which has no public header.
+namespace tvm {
+namespace tirx {
+using namespace ffi;
+
+Map<Var, Optional<Stmt>> DetectBufferVarAccessLCA(const PrimFunc &func);
+} // namespace tirx
+} // namespace tvm
 
 namespace tvm {
 namespace tl {
@@ -47,166 +52,7 @@ using namespace tirx::transform;
 using tirx::SBlockNode;
 using tirx::SBlockRealizeNode;
 
-namespace {
-
-/*!
- * \brief Buffer/var access LCA detector used by
- *        PlanAndUpdateBufferAllocationLocation.
- */
-class TLAccessLCADetector : public StmtExprVisitor {
-public:
-  struct Result {
-    ffi::Map<Buffer, ffi::Optional<Stmt>> buffer_lca;
-    ffi::Map<Var, ffi::Optional<Stmt>> var_lca;
-  };
-
-  static Result Detect(const PrimFunc &func) {
-    TLAccessLCADetector d;
-    d.arena_.emplace_back();
-    d.scopes_.push_back(&d.arena_.front());
-    for (const auto &kv : func->buffer_map) {
-      d.UpdateBuffer(kv.second, d.scopes_.back());
-    }
-    d(func->body);
-    return d.Finalize();
-  }
-
-private:
-  enum class RegionKind { kNone, kSimtSimdVF, kCubeVector };
-
-  struct ScopeInfo {
-    const ScopeInfo *parent = nullptr;
-    const StmtNode *stmt = nullptr;
-    int depth = 0;
-    RegionKind region = RegionKind::kNone;
-  };
-
-  void PushScope(const StmtNode *stmt, RegionKind region) {
-    arena_.emplace_back();
-    auto *s = &arena_.back();
-    s->parent = scopes_.back();
-    s->stmt = stmt;
-    s->depth = static_cast<int>(scopes_.size());
-    s->region = region;
-    scopes_.push_back(s);
-  }
-  void PopScope() { scopes_.pop_back(); }
-
-  void VisitStmt_(const ForNode *op) final {
-    PushScope(op, RegionKind::kNone);
-    StmtExprVisitor::VisitStmt_(op);
-    PopScope();
-  }
-
-  void VisitStmt_(const SBlockNode *op) final {
-    RegionKind kind = RegionKind::kNone;
-    if (op->name_hint == "SIMT_VF" || op->name_hint == "SIMD_VF") {
-      kind = RegionKind::kSimtSimdVF;
-    } else if (op->name_hint == "CUBE" || op->name_hint == "VECTOR") {
-      kind = RegionKind::kCubeVector;
-    }
-    PushScope(op, kind);
-    for (const auto &match : op->match_buffers) {
-      UpdateBuffer(match->source->buffer, scopes_.back());
-    }
-    StmtExprVisitor::VisitStmt_(op);
-    PopScope();
-  }
-
-  void VisitExpr_(const BufferLoadNode *op) final {
-    UpdateBuffer(op->buffer, scopes_.back());
-    StmtExprVisitor::VisitExpr_(op);
-  }
-
-  void VisitStmt_(const BufferStoreNode *op) final {
-    UpdateBuffer(op->buffer, scopes_.back());
-    StmtExprVisitor::VisitStmt_(op);
-  }
-
-  void VisitExpr_(const VarNode *op) final {
-    UpdateVar(op, scopes_.back());
-    StmtExprVisitor::VisitExpr_(op);
-  }
-
-  // Snap a candidate access scope up past any enclosing region block
-  // that is incompatible with the buffer's memory scope.
-  static const ScopeInfo *EffectiveScope(const Buffer &buf,
-                                         const ScopeInfo *scope) {
-    auto s = buf.scope();
-    std::string_view sv(s.data(), s.size());
-    bool is_local = sv.size() >= 5 && std::string_view(sv.data(), 5) == "local";
-    bool is_shared =
-        sv.size() >= 6 && std::string_view(sv.data(), 6) == "shared";
-    if (is_local)
-      return scope;
-    // shared / global: never live inside SIMT_VF / SIMD_VF.
-    while (scope && scope->region == RegionKind::kSimtSimdVF) {
-      scope = scope->parent;
-    }
-    if (is_shared) {
-      // shared additionally never lives inside CUBE / VECTOR.
-      while (scope && scope->region == RegionKind::kCubeVector) {
-        scope = scope->parent;
-      }
-    }
-    return scope;
-  }
-
-  void UpdateBuffer(const Buffer &buf, const ScopeInfo *scope) {
-    const ScopeInfo *eff = EffectiveScope(buf, scope);
-    const ScopeInfo *&blca = buffer_lca_[buf.get()];
-    blca = LCA(blca, eff);
-    const ScopeInfo *&vlca = var_lca_[buf->data.get()];
-    vlca = LCA(vlca, eff);
-  }
-
-  void UpdateVar(const VarNode *var, const ScopeInfo *scope) {
-    const ScopeInfo *&vlca = var_lca_[var];
-    vlca = LCA(vlca, scope);
-  }
-
-  static const ScopeInfo *LCA(const ScopeInfo *a, const ScopeInfo *b) {
-    if (a == nullptr)
-      return b;
-    if (b == nullptr)
-      return a;
-    while (a->depth > b->depth)
-      a = a->parent;
-    while (b->depth > a->depth)
-      b = b->parent;
-    while (a != b) {
-      if (!a || !b)
-        return nullptr;
-      a = a->parent;
-      b = b->parent;
-    }
-    return a;
-  }
-
-  Result Finalize() const {
-    Result r;
-    for (const auto &kv : buffer_lca_) {
-      ffi::Optional<Stmt> s;
-      if (kv.second && kv.second->stmt)
-        s = ffi::GetRef<Stmt>(kv.second->stmt);
-      r.buffer_lca.Set(ffi::GetRef<Buffer>(kv.first), s);
-    }
-    for (const auto &kv : var_lca_) {
-      ffi::Optional<Stmt> s;
-      if (kv.second && kv.second->stmt)
-        s = ffi::GetRef<Stmt>(kv.second->stmt);
-      r.var_lca.Set(ffi::GetRef<Var>(kv.first), s);
-    }
-    return r;
-  }
-
-  std::deque<ScopeInfo> arena_;
-  std::vector<const ScopeInfo *> scopes_;
-  std::unordered_map<const BufferNode *, const ScopeInfo *> buffer_lca_;
-  std::unordered_map<const VarNode *, const ScopeInfo *> var_lca_;
-};
-
-} // namespace
+// Use TVM's tir analysis API for LCA detection.
 
 class CollectManagedAllocations : public StmtExprVisitor {
 public:
@@ -347,10 +193,9 @@ private:
 class BufferAllocationLocator : public StmtExprMutator {
 public:
   explicit BufferAllocationLocator(const PrimFunc &func) {
-    // Region-aware LCA detection
-    TLAccessLCADetector::Result lca_result = TLAccessLCADetector::Detect(func);
-    Map<Buffer, Optional<Stmt>> &buffer_lca = lca_result.buffer_lca;
-    Map<Var, Optional<Stmt>> &var_lca = lca_result.var_lca;
+    // Use TVM's tir LCA detection implementation
+    Map<Buffer, Optional<Stmt>> buffer_lca = tirx::DetectBufferAccessLCA(func);
+    Map<Var, Optional<Stmt>> var_lca = tirx::DetectBufferVarAccessLCA(func);
 
     // The buffer_alloc_recorder Array is used to keep the buffer allocation
     // order since the buffer_lca Map is unordered.
@@ -397,9 +242,13 @@ public:
         if (arg_buffer_vars.count(buffer->data.get())) {
           continue;
         }
+        // Only allocate managed allocations (a.k.a ignore the ones that are not
+        // allocated outside of the block)
         if (managed_allocations_.count(buffer->data.get())) {
           alloc_buffers_[stmt].push_back(buffer);
         }
+        // Do not push binding here. Bindings should reflect scope accurately,
+        // and will be pushed/popped when visiting the owning stmt.
       }
     }
   }
@@ -497,28 +346,6 @@ private:
     }
 
     return node;
-  }
-
-  Stmt VisitStmt_(const IfThenElseNode *op) final {
-    auto it = alloc_buffers_.find(op);
-    if (it == alloc_buffers_.end()) {
-      return StmtMutator::VisitStmt_(op);
-    }
-    for (const Buffer &buf : it->second) {
-      PushBinding(buf->data, buf);
-    }
-    Stmt new_stmt = StmtMutator::VisitStmt_(op);
-    ffi::Array<Buffer> new_block_alloc_bufs;
-    for (const Buffer &buf : it->second) {
-      if (managed_allocations_.count(buf->data.get())) {
-        PopBinding(buf->data);
-        new_block_alloc_bufs.push_back(buf);
-      }
-    }
-    if (!new_block_alloc_bufs.empty()) {
-      return InjectOpaqueBlock(new_stmt, new_block_alloc_bufs);
-    }
-    return new_stmt;
   }
 
   Stmt VisitStmt_(const SBlockNode *op) final {

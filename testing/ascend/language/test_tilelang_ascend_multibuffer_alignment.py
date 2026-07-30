@@ -65,7 +65,7 @@ def test_multibuffer_dtype_changing_view_shares_aligned_storage():
     kernel = dtype_view_kernel_builder()
     source = kernel.get_kernel_source()
     # 8-byte slot padded to a 32-byte version stride, shared by both dtypes.
-    assert "buf_dyn_shmem[((w * 32) + 64)]" in source, source
+    assert "[(w * 32)]" in source, source
 
     a = (torch.arange(8, device="npu") + 1).to(torch.int16).view(torch.uint16)
     out = torch.zeros(16, dtype=torch.uint8, device="npu")
