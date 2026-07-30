@@ -19,7 +19,7 @@ def blockscaled_gemm(
     transpose_A: bool = False,
     transpose_B: bool = False,
     clear_accum: bool = False,
-    unit_flag_ctrl: int = 0,
+    unit_flag_ctrl: int | tirx.PrimExpr | None = None,
 ) -> tirx.PrimExpr:
     """Ascend block-scaled MXFP8 GEMM.
 
@@ -27,7 +27,9 @@ def blockscaled_gemm(
     are expected to have been loaded by the preceding ``T.copy(..., scale=...)``.
     """
 
-    ann = {"unit_flag_ctrl": unit_flag_ctrl, "blockscaled": 1}
+    ann = {"blockscaled": 1}
+    if unit_flag_ctrl is not None:
+        ann["unit_flag_ctrl"] = unit_flag_ctrl
     return _gemm_impl(
         "tl.tileop.gemm",
         A,

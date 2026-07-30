@@ -73,7 +73,7 @@ def run_case(case: Case):
 
 
 def default_cases():
-    shapes = [(15, 15, 15), (32, 32, 32), (100, 100, 100)]
+    shapes = [(1, 64, 64), (15, 15, 15), (32, 32, 32), (100, 100, 100)]
     cases = []
     for dtype, atol, rtol in [
         ("bfloat16", 1e-2, 1e-2),

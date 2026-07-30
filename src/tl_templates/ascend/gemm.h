@@ -100,7 +100,7 @@ ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
 
     mad(cc_ptr, (__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)),
         (__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), M, TILE_K_SUB, N, uf_ctrl,
-        0, 0, clear_accum && is_first);
+        true, false, clear_accum && is_first);
     rls_buf(PIPE_M, buf_offset + (sk & 1), false);
   }
 }
@@ -233,7 +233,7 @@ __aicore__ inline void ascend_blockscaled_gemm_l1(
 
     mad_mx(cc_ptr, (__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)),
            (__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), M, TILE_K_SUB, N,
-           uf_ctrl, false, false, clear_accum && is_first);
+           uf_ctrl, true, false, clear_accum && is_first);
 
     rls_buf(PIPE_M, buf_offset + (sk & 1), false);
   }

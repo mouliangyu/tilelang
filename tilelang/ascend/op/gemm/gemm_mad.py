@@ -200,7 +200,7 @@ class GemmMAD(GemmBase):
             _to_int32(self.K),
             _to_int32(self.N),
             _to_int32(self.unit_flag_ctrl),
-            _to_int32(0),  # gemv_ctrl
+            _to_int32(1),  # gemv_ctrl: 1 disables the specialized GEMV mode
             _to_int32(0),  # BTbuf_ctrl
             self.clear_accum,
         )
@@ -230,7 +230,7 @@ class GemmMAD(GemmBase):
             _to_int32(self.K),
             _to_int32(self.N),
             _to_int32(self.unit_flag_ctrl),
-            _to_int32(0),  # gemv_ctrl
+            _to_int32(1),  # gemv_ctrl: 1 disables the specialized GEMV mode
             _to_int32(0),  # BTbuf_ctrl
             self.clear_accum,
         )

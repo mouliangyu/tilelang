@@ -76,9 +76,14 @@ def _gemm_impl(
     A_stride = retrieve_stride(A_region)
     B_stride = retrieve_stride(B_region)
 
-    assert len(C_shape) == 2, "current only support C as a 2D tensor"
+    assert len(C_shape) >= 2, "current only support C as a 2D or higher-order tensor"
     assert len(A_shape) >= 2, "current only support A as a 2D or higher-order tensor"
     assert len(B_shape) >= 2, "current only support B as a 2D or higher-order tensor"
+    if len(C_shape) > 2:
+        for i in range(len(C_shape) - 2):
+            assert C_shape[i] == 1, (
+                "current only support C as a 2D or higher-order tensor with the last two dimensions being the matrix dimensions"
+            )
     if len(A_shape) > 2:
         for i in range(len(A_shape) - 2):
             assert A_shape[i] == 1, (
@@ -89,8 +94,12 @@ def _gemm_impl(
             assert B_shape[i] == 1, (
                 "current only support B as a 2D or higher-order tensor with the last two dimensions being the matrix dimensions"
             )
+    if len(C_shape) > 2:
+        assert C_region.buffer.scope() in ("shared.l0c", "shared.l0c.dyn"), (
+            "higher-order C regions are only supported for Ascend L0C buffers"
+        )
 
-    M, N = C_shape
+    M, N = C_shape[-2:]
     M_A = A_shape[-1] if transpose_A else A_shape[-2]
     K = A_shape[-2] if transpose_A else A_shape[-1]
     N_B = B_shape[-2] if transpose_B else B_shape[-1]
@@ -159,8 +168,8 @@ def _gemm_impl(
         k_pack,
         wg_wait,
         mbar_arg,
-        C_coords[0],
-        C_coords[1],
+        C_coords[-2],
+        C_coords[-1],
         *extra_args,
         annotations=annotations,
     )
@@ -176,7 +185,7 @@ def gemm(
     clear_accum: bool = False,
     k_pack: int = 1,
     mbar: BarrierType | None = None,
-    unit_flag_ctrl: int = 0,
+    unit_flag_ctrl: int | tirx.PrimExpr | None = None,
 ) -> tirx.PrimExpr:
     """TileLang GEMM operator.
 
@@ -200,13 +209,16 @@ def gemm(
         k_pack (int): Numbers of packed matrix cores, for ROCm only. Defaults to 1.
         mbar (BarrierType, i.e. Buffer | BufferLoad, or Var, optional): Mbarrier in Blackwell.
             Required when this GEMM lowers to TCGEN5MMA. Defaults to None.
-        unit_flag_ctrl (int): Unit flag control for the instruction. Defaults to 0.
+        unit_flag_ctrl (int | tirx.PrimExpr, optional): Unit flag control for the
+            instruction. ``None`` omits the annotation and lowers as 0.
 
     Returns:
         tirx.Call: A handle to the GEMM operation.
     """
 
-    ann = {"unit_flag_ctrl": unit_flag_ctrl}
+    ann = {}
+    if unit_flag_ctrl is not None:
+        ann["unit_flag_ctrl"] = unit_flag_ctrl
     return _gemm_impl(
         "tl.tileop.gemm",
         A,

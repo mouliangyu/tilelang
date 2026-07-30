@@ -120,6 +120,7 @@ def run_case(case: Case):
 
 def default_cases():
     return [
+        Case(1, 128, 15, "uint16", True, 2e-1),
         Case(15, 128, 15, "uint16", True, 2e-1),
         Case(32, 128, 32, "uint16", True, 2e-1),
         Case(100, 128, 100, "uint16", True, 2e-1),
