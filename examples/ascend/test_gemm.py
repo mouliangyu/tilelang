@@ -19,10 +19,10 @@ def _test(dtype, thresh, out_dtype="float32"):
     assert max_diff < thresh, f"{dtype} max_diff={max_diff:.2e}"
 
 
-def _test_pto(dtype, thresh, out_dtype="float32"):
+def _test_pto(dtype, thresh, out_dtype="float32", hf32=None):
     M, K, N = 8192, 8192, 8192
     kernel = tilelang.compile(
-        gemm(M, K, N, dtype=dtype, out_dtype=out_dtype, MIXED=False),
+        gemm(M, K, N, dtype=dtype, out_dtype=out_dtype, MIXED=False, hf32=hf32),
         target="pto",
         out_idx=-1,
     )
@@ -48,11 +48,23 @@ def test_gemm_auto_bf16():
 @pytest.mark.pto
 def test_gemm_auto_bf16_pto():
     _test_pto("bfloat16", 1e-2)
+    _test_pto("bfloat16", 1e-2, out_dtype="bfloat16")
 
 
 @pytest.mark.pto
 def test_gemm_auto_fp8_pto():
     _test_pto("float8_e4m3fn", 1e-1)
+
+
+@pytest.mark.pto
+def test_gemm_auto_fp32_pto():
+    _test_pto("float32", 5e-3)
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("hf32", ["nearest_zero", "nearest_even"])
+def test_gemm_auto_fp32_hf32_pto(hf32):
+    _test_pto("float32", 2e-1, hf32=hf32)
 
 
 def test_gemm_auto_fp32():

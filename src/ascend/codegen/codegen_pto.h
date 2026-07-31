@@ -113,7 +113,7 @@ private:
   void EmitAscendCopyMatrixCcToGm(const CallNode *op);
   void EmitPTOGemmRun(const std::string &a_mat, const std::string &b_mat,
                       const std::string &acc, const std::string &clear_accum,
-                      const std::string &unit_flag_ctrl);
+                      const std::string &unit_flag_ctrl, int64_t hf32_mode);
   std::string PrintVmiAnnotationValue(const std::string &key,
                                       const ObjectRef &value);
   void PrintPtoVmiCall_(const CallNode *op, std::ostream &os);
@@ -128,6 +128,8 @@ private:
   bool has_gemm_l1_{false};
   std::unordered_map<const VarNode *, FragmentInfo> fragment_info_;
   std::unordered_set<const VarNode *> local_var_buffers_;
+  std::unordered_map<Call, int64_t, ObjectPtrHash, ObjectPtrEqual>
+      hf32_mode_by_gemm_;
   PTOGemmEmitContext gemm_emit_ctx_;
   std::pair<std::string, std::string>
   ParseHardEventPair(const std::string &hard_event) const;

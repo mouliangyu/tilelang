@@ -212,6 +212,7 @@ class PTOGemmL1Template:
         sk: int,
         use_mad: bool,
         unit_flag,
+        tf32_mode,
     ):
         stage = sk & 1
         if use_mad:
@@ -223,6 +224,7 @@ class PTOGemmL1Template:
                 self.tile_n,
                 self.base_k,
                 unit_flag=unit_flag,
+                tf32_mode=tf32_mode,
             )
             return
         pto.mad_acc(
@@ -233,6 +235,7 @@ class PTOGemmL1Template:
             self.tile_n,
             self.base_k,
             unit_flag=unit_flag,
+            tf32_mode=tf32_mode,
         )
 
     def _emit_mad_with_unit_flag(
@@ -243,6 +246,7 @@ class PTOGemmL1Template:
         sk: int,
         use_mad: bool,
         unit_flag_ctrl,
+        tf32_mode,
     ):
         is_last_sub_k = sk == self.sub_k_tiles - 1
         if self._is_static_int(unit_flag_ctrl):
@@ -253,6 +257,7 @@ class PTOGemmL1Template:
                 sk,
                 use_mad,
                 self._mad_unit_flag(unit_flag_ctrl, is_last_sub_k),
+                tf32_mode,
             )
             return
         if isinstance(unit_flag_ctrl, bool):
@@ -260,7 +265,7 @@ class PTOGemmL1Template:
 
         with pto.if_(unit_flag_ctrl == 0) as uf_zero:
             with uf_zero.then_:
-                self._emit_mad_op(a_l0_0, b_l0_0, acc, sk, use_mad, None)
+                self._emit_mad_op(a_l0_0, b_l0_0, acc, sk, use_mad, None, tf32_mode)
             with uf_zero.else_, pto.if_(unit_flag_ctrl == 3) as uf_set:
                 with uf_set.then_:
                     self._emit_mad_op(
@@ -270,6 +275,7 @@ class PTOGemmL1Template:
                         sk,
                         use_mad,
                         pto.MadUnitFlagMode.CHECK_AND_SET if is_last_sub_k else pto.MadUnitFlagMode.CHECK_ONLY,
+                        tf32_mode,
                     )
                 with uf_set.else_:
                     self._emit_mad_op(
@@ -279,6 +285,7 @@ class PTOGemmL1Template:
                         sk,
                         use_mad,
                         pto.MadUnitFlagMode.CHECK_ONLY,
+                        tf32_mode,
                     )
 
     def _emit_mad_static(
@@ -289,18 +296,19 @@ class PTOGemmL1Template:
         sk: int,
         clear_accum,
         unit_flag_ctrl,
+        tf32_mode,
     ):
         stage = sk & 1
         pto.wait_flag("MTE1", "M", event_id=stage)
         if sk == 0 and not isinstance(clear_accum, bool):
             with pto.if_(clear_accum) as clear_br:
                 with clear_br.then_:
-                    self._emit_mad_with_unit_flag(a_l0_0, b_l0_0, acc, sk, True, unit_flag_ctrl)
+                    self._emit_mad_with_unit_flag(a_l0_0, b_l0_0, acc, sk, True, unit_flag_ctrl, tf32_mode)
                 with clear_br.else_:
-                    self._emit_mad_with_unit_flag(a_l0_0, b_l0_0, acc, sk, False, unit_flag_ctrl)
+                    self._emit_mad_with_unit_flag(a_l0_0, b_l0_0, acc, sk, False, unit_flag_ctrl, tf32_mode)
         else:
             use_mad = sk == 0 and bool(clear_accum)
-            self._emit_mad_with_unit_flag(a_l0_0, b_l0_0, acc, sk, use_mad, unit_flag_ctrl)
+            self._emit_mad_with_unit_flag(a_l0_0, b_l0_0, acc, sk, use_mad, unit_flag_ctrl, tf32_mode)
         pto.set_flag("M", "MTE1", event_id=stage)
 
     def _emit_pipeline_init(self):
@@ -362,6 +370,7 @@ class PTOGemmL1Template:
         *,
         clear_accum,
         unit_flag_ctrl=0,
+        tf32_mode=None,
     ):
         """Emit GEMM for one L1 A/B tile into ``acc``."""
 
@@ -369,12 +378,12 @@ class PTOGemmL1Template:
 
         self._emit_l1_to_l0_static(a_mat, b_mat, a_l0_0, b_l0_0, 0)
         if self.sub_k_tiles == 1:
-            self._emit_mad_static(a_l0_0, b_l0_0, acc, 0, clear_accum, unit_flag_ctrl)
+            self._emit_mad_static(a_l0_0, b_l0_0, acc, 0, clear_accum, unit_flag_ctrl, tf32_mode)
             self._emit_pipeline_drain_for_tile(unit_flag_ctrl)
             return
 
         self._emit_l1_to_l0_static(a_mat, b_mat, a_l0_0, b_l0_0, 1)
-        self._emit_mad_static(a_l0_0, b_l0_0, acc, 0, clear_accum, unit_flag_ctrl)
+        self._emit_mad_static(a_l0_0, b_l0_0, acc, 0, clear_accum, unit_flag_ctrl, tf32_mode)
         with pto.for_(2, self.sub_k_tiles, step=1) as sk:
             l0_stage = sk % 2
             l0_stage_i64 = _coerce_i64(l0_stage, context="L0 stage index")
@@ -418,6 +427,7 @@ class PTOGemmL1Template:
                     self.tile_n,
                     self.base_k,
                     unit_flag=self._mad_unit_flag(unit_flag_ctrl, False),
+                    tf32_mode=tf32_mode,
                 )
             elif isinstance(unit_flag_ctrl, bool):
                 raise TypeError("unit_flag_ctrl must be 0, 2, or 3, not bool")
@@ -431,6 +441,7 @@ class PTOGemmL1Template:
                             self.tile_m,
                             self.tile_n,
                             self.base_k,
+                            tf32_mode=tf32_mode,
                         )
                     with loop_uf_zero.else_:
                         pto.mad_acc(
@@ -441,6 +452,7 @@ class PTOGemmL1Template:
                             self.tile_n,
                             self.base_k,
                             unit_flag=pto.MadUnitFlagMode.CHECK_ONLY,
+                            tf32_mode=tf32_mode,
                         )
             pto.set_flag("M", "MTE1", event_id=prev_stage)
 
@@ -451,5 +463,6 @@ class PTOGemmL1Template:
             self.sub_k_tiles - 1,
             False,
             unit_flag_ctrl,
+            tf32_mode,
         )
         self._emit_pipeline_drain_for_tile(unit_flag_ctrl)

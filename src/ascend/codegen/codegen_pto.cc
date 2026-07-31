@@ -280,12 +280,12 @@ std::string AccStoreUnitFlagArg(int64_t unit_flag_ctrl) {
 }
 
 bool IsSupportedPTOGemmInputDtype(DataType dtype) {
-  return dtype.is_bfloat16() || dtype.is_float8_e4m3fn();
+  return IsFloat32(dtype) || dtype.is_bfloat16() || dtype.is_float8_e4m3fn();
 }
 
 int64_t PTOGemmInputC0(DataType dtype) {
   ICHECK(IsSupportedPTOGemmInputDtype(dtype))
-      << "PTO GEMM L1 helper currently only supports bfloat16 and "
+      << "PTO GEMM L1 helper currently only supports float32, bfloat16, and "
          "float8_e4m3fn inputs, got "
       << dtype;
   int64_t elem_bytes = dtype.bytes();
@@ -355,6 +355,147 @@ bool GetAddressOfIndex(const PrimExpr &expr, PrimExpr *index,
   return false;
 }
 
+class PTOHf32ModeAnalyzer : public StmtFunctor<uint8_t(const Stmt &, uint8_t)> {
+public:
+  using ModeMap =
+      std::unordered_map<Call, int64_t, ObjectPtrHash, ObjectPtrEqual>;
+
+  static ModeMap Analyze(const PrimFunc &func) {
+    PTOHf32ModeAnalyzer analyzer;
+    analyzer.VisitStmt(func->body, kDisabled);
+
+    ModeMap result;
+    for (const auto &[call, modes] : analyzer.gemm_modes_) {
+      ICHECK_NE(modes, 0);
+      ICHECK_EQ(modes & (modes - 1), 0)
+          << "PTO HF32 mode is control-flow dependent for GEMM " << call
+          << "; set one deterministic HF32 mode before this GEMM";
+      result.emplace(call, ModeFromMask(modes));
+    }
+    return result;
+  }
+
+private:
+  static constexpr int64_t kModeCount = 3;
+  static constexpr int kMaxLoopAnalysisIterations = 1 << kModeCount;
+  static constexpr uint8_t kDisabled = 1U << 0;
+  static constexpr uint8_t kNearestZero = 1U << 1;
+  static constexpr uint8_t kNearestEven = 1U << 2;
+
+  static uint8_t MaskFromMode(int64_t mode) {
+    ICHECK_GE(mode, 0);
+    ICHECK_LT(mode, kModeCount);
+    return 1U << mode;
+  }
+
+  static int64_t ModeFromMask(uint8_t mask) {
+    if (mask == kDisabled)
+      return 0;
+    if (mask == kNearestZero)
+      return 1;
+    ICHECK_EQ(mask, kNearestEven);
+    return 2;
+  }
+
+  uint8_t AnalyzeLoop(const Stmt &body, uint8_t incoming, bool must_execute) {
+    uint8_t header = incoming;
+    for (int i = 0; i < kMaxLoopAnalysisIterations; ++i) {
+      uint8_t body_out = VisitStmt(body, header);
+      uint8_t next = incoming | body_out;
+      if (next == header)
+        return must_execute ? body_out : header;
+      header = next;
+    }
+    LOG(FATAL) << "PTO HF32 loop analysis failed to converge for body " << body;
+    return incoming;
+  }
+
+  uint8_t VisitStmt_(const BindNode *op, uint8_t state) final { return state; }
+
+  uint8_t VisitStmt_(const AttrStmtNode *op, uint8_t state) final {
+    return VisitStmt(op->body, state);
+  }
+
+  uint8_t VisitStmt_(const IfThenElseNode *op, uint8_t state) final {
+    uint8_t then_out = VisitStmt(op->then_case, state);
+    uint8_t else_out =
+        op->else_case ? VisitStmt(op->else_case.value(), state) : state;
+    return then_out | else_out;
+  }
+
+  uint8_t VisitStmt_(const ForNode *op, uint8_t state) final {
+    return AnalyzeLoop(op->body, state, analyzer_.CanProve(op->extent > 0));
+  }
+
+  uint8_t VisitStmt_(const WhileNode *op, uint8_t state) final {
+    return AnalyzeLoop(op->body, state, false);
+  }
+
+  uint8_t VisitStmt_(const AllocBufferNode *op, uint8_t state) final {
+    return state;
+  }
+
+  uint8_t VisitStmt_(const DeclBufferNode *op, uint8_t state) final {
+    return state;
+  }
+
+  uint8_t VisitStmt_(const BufferStoreNode *op, uint8_t state) final {
+    return state;
+  }
+
+  uint8_t VisitStmt_(const AssertStmtNode *op, uint8_t state) final {
+    return state;
+  }
+
+  uint8_t VisitStmt_(const SeqStmtNode *op, uint8_t state) final {
+    for (const Stmt &stmt : op->seq) {
+      state = VisitStmt(stmt, state);
+    }
+    return state;
+  }
+
+  uint8_t VisitStmt_(const EvaluateNode *op, uint8_t state) final {
+    const auto *call = op->value.as<CallNode>();
+    if (call == nullptr)
+      return state;
+
+    if (call->op.same_as(tl::ascend_set_hf32_mode())) {
+      ICHECK_EQ(call->args.size(), 1U)
+          << "tl.ascend_set_hf32_mode expects exactly 1 argument";
+      int64_t mode = 0;
+      ICHECK(TryGetConstInt(call->args[0], &mode) && mode >= 0 && mode <= 2)
+          << "PTO HF32 mode must be a constant in {0, 1, 2}, got "
+          << call->args[0];
+      return MaskFromMode(mode);
+    }
+
+    if (call->op.same_as(tl::ascend_gemm_l1())) {
+      ICHECK_GT(call->args.size(), 9U);
+      const auto *dtype_name = call->args[9].as<StringImmNode>();
+      ICHECK(dtype_name) << "PTO GEMM requires a constant input dtype string";
+      if (IsFloat32(ParsePTODtype(dtype_name->value))) {
+        gemm_modes_[GetRef<Call>(call)] |= state;
+      }
+    }
+    return state;
+  }
+
+  uint8_t VisitStmt_(const SBlockNode *op, uint8_t state) final {
+    if (op->init) {
+      state |= VisitStmt(op->init.value(), state);
+    }
+    return VisitStmt(op->body, state);
+  }
+
+  uint8_t VisitStmt_(const SBlockRealizeNode *op, uint8_t state) final {
+    uint8_t block_out = VisitStmt(op->block, state);
+    return is_one(op->predicate) ? block_out : state | block_out;
+  }
+
+  std::unordered_map<Call, uint8_t, ObjectPtrHash, ObjectPtrEqual> gemm_modes_;
+  arith::Analyzer analyzer_;
+};
+
 } // namespace
 
 void CodeGenTileLangPTO::AddFunction(const GlobalVar &gvar,
@@ -366,6 +507,7 @@ void CodeGenTileLangPTO::AddFunction(const GlobalVar &gvar,
   fragment_info_.clear();
   local_var_buffers_.clear();
   gemm_emit_ctx_ = PTOGemmEmitContext();
+  hf32_mode_by_gemm_ = PTOHf32ModeAnalyzer::Analyze(func);
   current_function_has_gemm_ = HasAscendGemmL1(func);
   has_gemm_l1_ = has_gemm_l1_ || current_function_has_gemm_;
 
@@ -1050,7 +1192,7 @@ void CodeGenTileLangPTO::EnsurePTOGemmHelper(const CallNode *op) {
                         "string at tl.ascend_gemm_l1 arg 9";
   DataType input_dtype = ParsePTODtype(dtype_name->value);
   ICHECK(IsSupportedPTOGemmInputDtype(input_dtype))
-      << "PTO GEMM L1 helper currently only supports bfloat16 and "
+      << "PTO GEMM L1 helper currently only supports float32, bfloat16, and "
          "float8_e4m3fn inputs, got "
       << input_dtype;
 
@@ -1158,13 +1300,22 @@ void CodeGenTileLangPTO::EmitPTOGemmRun(const std::string &a_mat,
                                         const std::string &b_mat,
                                         const std::string &acc,
                                         const std::string &clear_accum,
-                                        const std::string &unit_flag_ctrl) {
+                                        const std::string &unit_flag_ctrl,
+                                        int64_t hf32_mode) {
   PrintIndent();
   stream << gemm_emit_ctx_.helper_name << ".run_l1_tile(" << a_mat << ", "
          << b_mat << ", " << gemm_emit_ctx_.a_l0_name << ", "
          << gemm_emit_ctx_.b_l0_name << ", " << acc
          << ", clear_accum=" << clear_accum
-         << ", unit_flag_ctrl=" << unit_flag_ctrl << ")\n";
+         << ", unit_flag_ctrl=" << unit_flag_ctrl;
+  if (IsFloat32(gemm_emit_ctx_.input_dtype) && hf32_mode != 0) {
+    // PTO names the hardware bit-47 mode ROUND_AWAY; CANN names the same
+    // setting HF32TransMode::NEAREST_ZERO.
+    stream << ", tf32_mode="
+           << (hf32_mode == 1 ? "pto.Tf32Mode.ROUND_AWAY"
+                              : "pto.Tf32Mode.ROUND_EVEN");
+  }
+  stream << ")\n";
 }
 
 void CodeGenTileLangPTO::EmitAscendGemmL1(const CallNode *op) {
@@ -1175,9 +1326,16 @@ void CodeGenTileLangPTO::EmitAscendGemmL1(const CallNode *op) {
   std::string b_mat =
       GetPtoLocalPtrExpr(op->args[2], "mat", gemm_emit_ctx_.input_dtype);
 
-  EmitPTOGemmRun(a_mat, b_mat, acc,
-                 RemoveOutermostParentheses(PrintExpr_(op->args[8])),
-                 RemoveOutermostParentheses(PrintExpr_(op->args[11])));
+  int64_t hf32_mode = 0;
+  if (IsFloat32(gemm_emit_ctx_.input_dtype)) {
+    auto it = hf32_mode_by_gemm_.find(GetRef<Call>(op));
+    ICHECK(it != hf32_mode_by_gemm_.end())
+        << "PTO codegen did not analyze HF32 mode for FP32 GEMM";
+    hf32_mode = it->second;
+  }
+  EmitPTOGemmRun(
+      a_mat, b_mat, acc, RemoveOutermostParentheses(PrintExpr_(op->args[8])),
+      RemoveOutermostParentheses(PrintExpr_(op->args[11])), hf32_mode);
 }
 
 void CodeGenTileLangPTO::EmitAscendCopyMatrixCcToGm(const CallNode *op) {
@@ -1196,6 +1354,34 @@ void CodeGenTileLangPTO::EmitAscendCopyMatrixCcToGm(const CallNode *op) {
   int64_t unit_flag_ctrl = 0;
   ICHECK(TryGetConstInt(op->args[9], &unit_flag_ctrl))
       << "PTO L0C-to-GM expects constant unit_flag_ctrl";
+  int64_t quant_pre = 0;
+  ICHECK(TryGetConstInt(op->args[10], &quant_pre) &&
+         (quant_pre == 0 || quant_pre == 16))
+      << "PTO L0C-to-GM currently supports quant_pre 0 (no conversion) or "
+         "16 (float32-to-bfloat16), got "
+      << op->args[10];
+
+  auto check_const = [&](size_t index, int64_t expected, const char *name) {
+    int64_t value = 0;
+    ICHECK(TryGetConstInt(op->args[index], &value) && value == expected)
+        << "PTO L0C-to-GM currently requires " << name << " == " << expected
+        << ", got " << op->args[index];
+  };
+  check_const(8, 0, "clip_relu_pre");
+  check_const(11, 0, "relu_pre");
+  check_const(12, 0, "split_en");
+  check_const(13, 1, "NZ2ND_en");
+  check_const(14, 0, "quant_post");
+  check_const(15, 0, "relu_post");
+  check_const(16, 0, "clip_relu_post");
+  check_const(17, 0, "loop_enhance_en");
+  check_const(18, 0, "eltwise_op");
+  check_const(19, 0, "eltwise_antq_en");
+  check_const(20, 0, "loop_enhance_merge_en");
+  check_const(21, 0, "C0_pad_en");
+  check_const(22, 0, "wino_post_en");
+  check_const(23, 0, "broadcast_en");
+  check_const(24, 0, "NZ2DN_en");
 
   PrintIndent();
   stream << "pto.mte_l0c_gm(" << src << ", " << dst << ", " << m_size << ", "
@@ -1203,6 +1389,9 @@ void CodeGenTileLangPTO::EmitAscendCopyMatrixCcToGm(const CallNode *op) {
          << ", " << l2_cache_ctrl;
   if (unit_flag_ctrl != 0) {
     stream << ", unit_flag=" << AccStoreUnitFlagArg(unit_flag_ctrl);
+  }
+  if (quant_pre == 16) {
+    stream << ", pre_quant=(pto.bf16(1.0), \"f32_bf16\")";
   }
   stream << ", layout=\"nz2nd\")\n";
 }
@@ -1541,6 +1730,12 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
 
   if (op->op.same_as(tl::ascend_gemm_l1())) {
     EmitAscendGemmL1(op);
+    return;
+  }
+
+  if (op->op.same_as(tl::ascend_set_hf32_mode())) {
+    // PTO represents HF32 as a per-MAD attribute. The mode analysis binds
+    // each stateful TileLang setting to the GEMMs it reaches.
     return;
   }
 
