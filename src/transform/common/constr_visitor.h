@@ -163,7 +163,10 @@ struct Constr {
     // then Bind.
     switch (kind) {
     case kConstr:
-      analyzer.EnterConstraint(value, is_assume);
+      // Bindings are populated before predicates by ConstrSet::Populate.
+      // Simplify here so a normalized branch condition represented by a
+      // bound boolean Var is expanded back into the predicate it guards.
+      analyzer.EnterConstraint(analyzer.Simplify(value), is_assume);
       break;
     case kBindValue:
       analyzer.Bind(var, FreshenMutableReads()(value));

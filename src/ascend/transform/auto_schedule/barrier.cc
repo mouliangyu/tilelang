@@ -660,20 +660,31 @@ static std::vector<FlagAllocation> PlanFlagAllocations(
     needs_cross_core_flag |= IsCrossCore(sp);
   }
 
-  ICHECK(!needs_cross_core_flag || !cross_core_flag_reservation.has_dynamic_id)
+  ICHECK(!needs_cross_core_flag ||
+         !cross_core_flag_reservation.has_unbounded_id)
       << "Ascend AutoSchedule cannot safely allocate cross-core flag IDs when "
-         "an explicit mode-0 CrossCoreSetFlag/WaitFlag uses a dynamic flag_id; "
-         "use a constant flag_id or disable AutoSchedule";
+         "an explicit mode-0 CrossCoreSetFlag/WaitFlag uses a flag_id whose "
+         "integer range cannot be bounded; constrain the flag_id with a "
+         "constant-range loop or disable AutoSchedule";
 
   // Mode-4 synchronization addresses the same 16 base slots as mode 0. The
   // generated Cube side may additionally address slot + 16 for the second
   // Vector core, so normalize explicit IDs and reserve only the actual slots.
   std::array<bool, kCrossCoreFlagLimit> cross_core_slots{};
-  for (int64_t explicit_id : cross_core_flag_reservation.explicit_ids) {
-    int normalized_id = static_cast<int>(explicit_id % kCrossCoreFlagLimit);
-    if (normalized_id < 0)
-      normalized_id += kCrossCoreFlagLimit;
-    cross_core_slots[normalized_id] = true;
+  for (const auto &[lo, hi] : cross_core_flag_reservation.explicit_id_ranges) {
+    ICHECK_LE(lo, hi);
+    uint64_t span = static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo);
+    if (span >= static_cast<uint64_t>(kCrossCoreFlagLimit - 1)) {
+      cross_core_slots.fill(true);
+      continue;
+    }
+    for (uint64_t offset = 0; offset <= span; ++offset) {
+      int64_t explicit_id = lo + static_cast<int64_t>(offset);
+      int normalized_id = static_cast<int>(explicit_id % kCrossCoreFlagLimit);
+      if (normalized_id < 0)
+        normalized_id += kCrossCoreFlagLimit;
+      cross_core_slots[normalized_id] = true;
+    }
   }
   const int explicit_cross_core_slots =
       std::count(cross_core_slots.begin(), cross_core_slots.end(), true);

@@ -2,6 +2,8 @@ import re
 
 import tilelang.language as T
 import tilelang.testing
+import tvm
+from tilelang.ascend import transform as ascend_transform
 from tilelang.engine.lower import lower
 
 
@@ -301,6 +303,36 @@ def _make_unavoidable_overflow_program():
                 T.copy(ub4, C[base + 4 * tile : base + 5 * tile])
 
     return main
+
+
+def _make_bound_flag_spill_program():
+    @T.prim_func
+    def main():
+        with T.Kernel(1):
+            for outer in T.Serial(2):
+                for inner in T.Serial(2):
+                    event_id = T.bind(outer * 2 + inner)
+                    T.ascend_set_flag("MTE2_V", event_id)
+                    T.ascend_wait_flag("MTE2_V", event_id)
+            T.ascend_set_flag("MTE2_V", 8)
+            T.ascend_wait_flag("MTE2_V", 8)
+            T.ascend_set_flag("MTE2_V", 10)
+            T.ascend_wait_flag("MTE2_V", 10)
+            T.ascend_set_flag("MTE2_V", 12)
+            T.ascend_wait_flag("MTE2_V", 12)
+            T.ascend_set_flag("MTE2_V", 14)
+            T.ascend_wait_flag("MTE2_V", 14)
+            T.ascend_set_flag("MTE2_V", 16)
+            T.ascend_wait_flag("MTE2_V", 16)
+
+    return main
+
+
+def test_rewrite_flag_to_buf_tracks_bind_context():
+    mod = tvm.IRModule({"main": _make_bound_flag_spill_program()})
+    rewritten = ascend_transform.RewriteFlagToBuf()(mod)
+
+    assert "T.ascend_get_buf" in rewritten["main"].script()
 
 
 def _constant_flag_ids(source: str, hard_event: str) -> set[int]:

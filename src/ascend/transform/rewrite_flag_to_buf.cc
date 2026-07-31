@@ -43,6 +43,7 @@
 #include <vector>
 
 #include "op/builtin.h"
+#include "transform/common/constr_visitor.h"
 
 namespace tvm {
 namespace tl {
@@ -105,12 +106,18 @@ struct BlockAssign {
   int64_t delta;
 };
 
-// Bind enclosing loop var ranges so const_int_bound resolves dynamic event_ids
-// of the form indexmod(iter, nv) + base to [base, base+nv-1].
-std::pair<int64_t, int64_t> EventIdRange(arith::Analyzer *ana,
-                                         const std::string &he,
-                                         const PrimExpr &event_id) {
-  arith::ConstIntBound bound = ana->const_int_bound(event_id);
+using EventIdBounds = std::pair<int64_t, int64_t>;
+using FlagCallRanges =
+    std::unordered_map<const CallNode *, std::vector<EventIdBounds>>;
+
+// Populate the complete lexical context so const_int_bound resolves dynamic
+// event_ids through enclosing loops, flat Bind declarations, branch guards,
+// and assumptions.
+EventIdBounds EventIdRange(const ConstrSet &constraints, const std::string &he,
+                           const PrimExpr &event_id) {
+  arith::Analyzer analyzer;
+  constraints.Populate(analyzer);
+  arith::ConstIntBound bound = analyzer.const_int_bound(event_id);
   ICHECK(bound->min_value != arith::ConstIntBound::kNegInf &&
          bound->max_value != arith::ConstIntBound::kPosInf)
       << "RewriteFlagToBuf: cannot bound event_id for hard_event '" << he
@@ -123,22 +130,20 @@ std::pair<int64_t, int64_t> EventIdRange(arith::Analyzer *ana,
 // Phase A: collect, per hard_event, the raw event_id ranges of every flag call.
 // Also tracks the highest buf_id reserved by gemm_l1 intrinsics so spilled
 // flags can start allocating past them.
-class FlagUsageCollector : public StmtExprVisitor {
+class FlagUsageCollector : public ConstrVisitor {
 public:
-  std::unordered_map<std::string, std::vector<std::pair<int64_t, int64_t>>>
-      ranges;
+  std::unordered_map<std::string, std::vector<EventIdBounds>> ranges;
   std::vector<std::string> order; // first-encounter order
+  // Preserve the exact range proven at each call site so Phase B does not
+  // repeat the analysis in a different traversal context.
+  FlagCallRanges call_ranges;
   // Highest buf_id reserved by gemm_l1 + 1 (0 if no gemm_l1 present).
   int64_t reserved_hwm = 0;
 
-  void VisitStmt_(const ForNode *op) final {
-    analyzer_.Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent));
-    StmtExprVisitor::VisitStmt_(op);
-  }
-
   void VisitExpr_(const CallNode *op) final {
     if (std::optional<std::string> he = GetFlagHardEvent(op)) {
-      auto range = EventIdRange(&analyzer_, *he, op->args[1]);
+      EventIdBounds range = EventIdRange(GetConstrSet(), *he, op->args[1]);
+      call_ranges[op].push_back(range);
       auto it = ranges.find(*he);
       if (it == ranges.end()) {
         order.push_back(*he);
@@ -149,7 +154,7 @@ public:
     } else {
       ReserveGemmL1Bufs(op);
     }
-    StmtExprVisitor::VisitExpr_(op);
+    ConstrVisitor::VisitExpr_(op);
   }
 
 private:
@@ -169,8 +174,6 @@ private:
     ICHECK(off) << "RewriteFlagToBuf: gemm_l1 buf_offset must be a constant";
     reserved_hwm = std::max(reserved_hwm, off->value + kGemmL1BufSlots);
   }
-
-  arith::Analyzer analyzer_;
 };
 
 // Coalesce raw ranges into sync-point blocks: merge only overlapping/contained
@@ -231,13 +234,9 @@ std::vector<bool> KnapsackKeep(const std::vector<Block> &blocks) {
 class FlagToBufRewriter : public StmtExprMutator {
 public:
   explicit FlagToBufRewriter(
-      std::unordered_map<std::string, std::vector<BlockAssign>> assign)
-      : assign_(std::move(assign)) {}
-
-  Stmt VisitStmt_(const ForNode *op) final {
-    analyzer_.Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent));
-    return StmtExprMutator::VisitStmt_(op);
-  }
+      std::unordered_map<std::string, std::vector<BlockAssign>> assign,
+      FlagCallRanges call_ranges)
+      : assign_(std::move(assign)), call_ranges_(std::move(call_ranges)) {}
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
     const auto *call = op->value.as<CallNode>();
@@ -255,7 +254,13 @@ public:
       return StmtExprMutator::VisitStmt_(op);
 
     PrimExpr event_id = call->args[1];
-    auto range = EventIdRange(&analyzer_, he, event_id);
+    auto range_it = call_ranges_.find(call);
+    ICHECK(range_it != call_ranges_.end())
+        << "RewriteFlagToBuf: missing collected range for flag call";
+    size_t &range_index = call_range_indices_[call];
+    ICHECK_LT(range_index, range_it->second.size())
+        << "RewriteFlagToBuf: exhausted collected ranges for flag call";
+    const EventIdBounds &range = range_it->second[range_index++];
     const BlockAssign *b = nullptr;
     for (const auto &ba : it->second) {
       if (ba.lo <= range.first && range.second <= ba.hi) {
@@ -293,7 +298,8 @@ private:
   }
 
   std::unordered_map<std::string, std::vector<BlockAssign>> assign_;
-  arith::Analyzer analyzer_;
+  FlagCallRanges call_ranges_;
+  std::unordered_map<const CallNode *, size_t> call_range_indices_;
 };
 
 PrimFunc RewriteFlagToBufFn(PrimFunc f) {
@@ -340,7 +346,8 @@ PrimFunc RewriteFlagToBufFn(PrimFunc f) {
       << "RewriteFlagToBuf: total spilled mutex slots (" << mutex_running
       << ") exceed the shared pool of " << kMaxBufId << "." << layout.str();
 
-  FlagToBufRewriter rewriter(std::move(assign));
+  FlagToBufRewriter rewriter(std::move(assign),
+                             std::move(collector.call_ranges));
   f.CopyOnWrite()->body = rewriter(f->body);
   return f;
 }

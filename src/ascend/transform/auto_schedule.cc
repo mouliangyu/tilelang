@@ -1190,21 +1190,56 @@ AssignCrossCoreWarpgroup(const std::vector<TaskNodeWithContext> &all_tasks) {
   }
 }
 
-static CrossCoreFlagReservation CollectExplicitCrossCoreFlags(
-    const std::vector<TaskNodeWithContext> &all_tasks) {
-  CrossCoreFlagReservation reservation;
-  for (const TaskNodeWithContext &task_ctx : all_tasks) {
-    // PerCoreTask synchronization is isolated for scheduling and placement, but
-    // its explicit hardware flag slots still share the kernel-global namespace.
-    for (const Call &call : CollectCrossCoreCalls(task_ctx.task)) {
-      if (const auto *flag_id = call->args[2].as<IntImmNode>()) {
-        reservation.explicit_ids.insert(flag_id->value);
+// Collect every mode-0 CrossCore flag range used explicitly by the source
+// kernel. Track enclosing loops, flat Bind declarations, branch guards, and
+// assumptions so ConstIntBound can resolve expressions such as
+// indexmod(iter, num_versions) + base. PerCoreTask bodies are visited as
+// ordinary statements because their explicit flags still share the
+// kernel-global hardware namespace.
+class ExplicitCrossCoreFlagCollector : public ConstrVisitor {
+public:
+  CrossCoreFlagReservation Collect(const Stmt &stmt) {
+    operator()(stmt);
+    return std::move(reservation_);
+  }
+
+private:
+  void VisitExpr_(const CallNode *op) final {
+    Call call = GetRef<Call>(op);
+    if (GetCrossCoreCall(call).defined()) {
+      const PrimExpr &flag_id = call->args[2];
+      arith::Analyzer analyzer;
+      GetConstrSet().Populate(analyzer);
+      arith::ConstIntBound bound = analyzer.const_int_bound(flag_id);
+      arith::Analyzer unconstrained_analyzer;
+      Var unconstrained_flag_id("unconstrained_cross_core_flag_id",
+                                flag_id.dtype());
+      arith::ConstIntBound unconstrained_bound =
+          unconstrained_analyzer.const_int_bound(unconstrained_flag_id);
+      if (bound->min_value == arith::ConstIntBound::kNegInf ||
+          bound->max_value == arith::ConstIntBound::kPosInf ||
+          (bound->min_value == unconstrained_bound->min_value &&
+           bound->max_value == unconstrained_bound->max_value)) {
+        reservation_.has_unbounded_id = true;
       } else {
-        reservation.has_dynamic_id = true;
+        ICHECK_LE(bound->min_value, bound->max_value)
+            << "Ascend AutoSchedule inferred an invalid explicit cross-core "
+               "flag range ["
+            << bound->min_value << ", " << bound->max_value << "]";
+        reservation_.explicit_id_ranges.emplace_back(bound->min_value,
+                                                     bound->max_value);
       }
     }
+    ConstrVisitor::VisitExpr_(op);
   }
-  return reservation;
+
+  CrossCoreFlagReservation reservation_;
+};
+
+static CrossCoreFlagReservation
+CollectExplicitCrossCoreFlags(const Stmt &kernel_body) {
+  ExplicitCrossCoreFlagCollector collector;
+  return collector.Collect(kernel_body);
 }
 
 // Assign scalar, register-buffer, and special-register producers to the
@@ -1676,10 +1711,8 @@ static ScheduledKernelResult ScheduleSingleKernel(
       t->SetWarpgroupId(fallback_wg);
   }
 
-  std::vector<TaskNodeWithContext> explicit_cross_core_tasks;
-  CollectAllTaskNodesWithContext(ir_structure, explicit_cross_core_tasks);
   CrossCoreFlagReservation cross_core_flag_reservation =
-      CollectExplicitCrossCoreFlags(explicit_cross_core_tasks);
+      CollectExplicitCrossCoreFlags(kernel_body);
 
   FlagInfoList flag_infos;
   MultiVersionBufferMap buffer_info_map;

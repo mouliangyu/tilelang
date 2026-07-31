@@ -12,7 +12,6 @@
 #include "op/builtin.h"
 #include <cstddef>
 #include <cstdint>
-#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -47,8 +46,11 @@ struct FlagInfo {
 using FlagInfoList = std::vector<FlagInfo>;
 
 struct CrossCoreFlagReservation {
-  std::set<int64_t> explicit_ids;
-  bool has_dynamic_id{false};
+  // Inclusive ranges of mode-0 flag IDs used explicitly by the source kernel.
+  // Dynamic expressions contribute the ConstIntBound inferred from their
+  // enclosing loops.
+  std::vector<std::pair<int64_t, int64_t>> explicit_id_ranges;
+  bool has_unbounded_id{false};
 };
 
 std::string GetResourcePipeName(uint16_t mask);
