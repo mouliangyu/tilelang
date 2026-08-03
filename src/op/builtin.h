@@ -855,6 +855,7 @@ TVM_DLL const Op &simd_vmax();
 TVM_DLL const Op &simd_vmin();
 TVM_DLL const Op &simd_vand();
 TVM_DLL const Op &simd_vor();
+TVM_DLL const Op &simd_vxor();
 TVM_DLL const Op &simd_vshl();
 TVM_DLL const Op &simd_vshr();
 
@@ -865,12 +866,14 @@ TVM_DLL const Op &simd_vsqrt();
 TVM_DLL const Op &simd_vabs();
 TVM_DLL const Op &simd_vneg();
 TVM_DLL const Op &simd_vrelu();
+TVM_DLL const Op &simd_vnot();
 
 // -- Broadcast
 TVM_DLL const Op &simd_vdup();
 TVM_DLL const Op &simd_vdupv(); // 5-arg vector→vector lane-N broadcast
 
 // -- Cross-lane reduction
+TVM_DLL const Op &simd_vcpadd();
 TVM_DLL const Op &simd_vcadd();
 TVM_DLL const Op &simd_vcmax();
 TVM_DLL const Op &simd_vcmin();

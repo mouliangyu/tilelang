@@ -153,6 +153,7 @@ def test_ascend_simd_3510_intrinsics_codegen():
                 )
                 b = T.simd.vexpdif(a, b, pred)
                 b = T.simd.vadd(b, T.simd.vdupv(T.simd.vcmax(a, pred), pred), pred)
+                b = T.simd.vadd(b, T.simd.vcpadd(a, pred), pred)
                 b = T.simd.vadd(b, T.simd.vcadd(a, pred), pred)
                 b = T.simd.vadd(b, T.simd.vcmin(a, pred), pred)
                 b = T.simd.vadd(b, T.simd.vcgadd(a, pred), pred)
@@ -200,6 +201,8 @@ def test_ascend_simd_3510_intrinsics_codegen():
                 b = T.simd.vdup(T.int32(1), "int32", pred)
                 a = T.simd.vand(a, T.simd.vci(T.int32(0), "int32"), pred)
                 a = T.simd.vor(a, b, pred)
+                a = T.simd.vxor(a, b, pred)
+                a = T.simd.vnot(a, pred)
                 a = T.simd.vshl(a, b, pred)
                 a = T.simd.vshr(a, b, pred)
                 a = T.simd.vselr(a, T.simd.vci(T.uint32(0), "uint32"))
@@ -219,6 +222,9 @@ def test_ascend_simd_3510_intrinsics_codegen():
     artifact = lower(func, target="ascend")
     source = artifact.kernel_source
     print(source)
+    assert "simd_inst::vcpadd(" in source
+    assert "simd_inst::vxor(" in source
+    assert "simd_inst::vnot(" in source
 
 
 def test_ascend_simd_vsstb_threads_pointer_state():

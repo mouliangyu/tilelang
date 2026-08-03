@@ -1704,9 +1704,12 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     os << ")";
   }
   // --- SimdVF bitwise: (src0, src1, mask, mode) ---
-  else if (op->op.same_as(tl::simd_vand()) || op->op.same_as(tl::simd_vor())) {
+  else if (op->op.same_as(tl::simd_vand()) || op->op.same_as(tl::simd_vor()) ||
+           op->op.same_as(tl::simd_vxor())) {
     ICHECK_EQ(op->args.size(), 4);
-    const char *name = op->op.same_as(tl::simd_vand()) ? "vand" : "vor";
+    const char *name = op->op.same_as(tl::simd_vand())  ? "vand"
+                       : op->op.same_as(tl::simd_vor()) ? "vor"
+                                                        : "vxor";
     os << "simd_inst::" << name << "(";
     PrintExpr(op->args[0], os); // src0
     os << ", ";
@@ -1733,7 +1736,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   else if (op->op.same_as(tl::simd_vexp()) || op->op.same_as(tl::simd_vln()) ||
            op->op.same_as(tl::simd_vsqrt()) ||
            op->op.same_as(tl::simd_vabs()) || op->op.same_as(tl::simd_vneg()) ||
-           op->op.same_as(tl::simd_vrelu())) {
+           op->op.same_as(tl::simd_vrelu()) ||
+           op->op.same_as(tl::simd_vnot())) {
     ICHECK_EQ(op->args.size(), 3);
     const char *name = nullptr;
     if (op->op.same_as(tl::simd_vexp()))
@@ -1746,6 +1750,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       name = "vabs";
     else if (op->op.same_as(tl::simd_vrelu()))
       name = "vrelu";
+    else if (op->op.same_as(tl::simd_vnot()))
+      name = "vnot";
     else
       name = "vneg";
     os << "simd_inst::" << name << "(";
@@ -1756,7 +1762,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     os << ")";
   }
   // --- SimdVF cross-lane reduce/permutation ---
-  else if (op->op.same_as(tl::simd_vcmax()) ||
+  else if (op->op.same_as(tl::simd_vcpadd()) ||
+           op->op.same_as(tl::simd_vcmax()) ||
            op->op.same_as(tl::simd_vcmin()) ||
            op->op.same_as(tl::simd_vcadd()) ||
            op->op.same_as(tl::simd_vcgadd()) ||
@@ -1764,7 +1771,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
            op->op.same_as(tl::simd_vcgmin()) ||
            op->op.same_as(tl::simd_vsqz())) {
     ICHECK_EQ(op->args.size(), 3);
-    const char *name = op->op.same_as(tl::simd_vcmax())    ? "vcmax"
+    const char *name = op->op.same_as(tl::simd_vcpadd())   ? "vcpadd"
+                       : op->op.same_as(tl::simd_vcmax())  ? "vcmax"
                        : op->op.same_as(tl::simd_vcmin())  ? "vcmin"
                        : op->op.same_as(tl::simd_vcgadd()) ? "vcgadd"
                        : op->op.same_as(tl::simd_vcgmax()) ? "vcgmax"

@@ -423,6 +423,12 @@ def vor(src0, src1, mask=None, mode="MODE_ZEROING"):  # codespell:ignore
     return tirx.call_intrin(str(src0.dtype), _Op("tl.simd.vor"), src0, src1, mask, mode)  # codespell:ignore
 
 
+def vxor(src0, src1, mask=None, mode="MODE_ZEROING"):
+    if mask is None:
+        mask = _default_mask(src0.dtype)
+    return tirx.call_intrin(str(src0.dtype), _Op("tl.simd.vxor"), src0, src1, mask, mode)
+
+
 def vshl(src0, src1, mask=None, mode="MODE_ZEROING"):
     if mask is None:
         mask = _default_mask(src0.dtype)
@@ -474,6 +480,12 @@ def vrelu(src, mask=None, mode="MODE_ZEROING"):
     return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vrelu"), src, mask, mode)
 
 
+def vnot(src, mask=None, mode="MODE_ZEROING"):
+    if mask is None:
+        mask = _default_mask(src.dtype)
+    return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vnot"), src, mask, mode)
+
+
 # -- Broadcast --------------------------------------------------------------------
 
 
@@ -499,6 +511,17 @@ def vdupv(src, mask=None, pos="POS_LOWEST", mode="MODE_ZEROING"):
 
 
 # -- Cross-lane reduction ---------------------------------------------------------
+
+
+def vcpadd(src, mask=None, mode="MODE_ZEROING"):
+    """Pairwise adjacent-lane add.
+
+    The sums of adjacent source lanes are packed into the low half of the
+    result vector. Supported types: float32, float16.
+    """
+    if mask is None:
+        mask = _default_mask(src.dtype)
+    return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vcpadd"), src, mask, mode)
 
 
 def vcadd(src, mask=None, mode="MODE_ZEROING"):

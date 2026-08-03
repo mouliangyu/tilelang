@@ -406,6 +406,14 @@ __simd_callee__ inline SrcVec vor(SrcVec src_0, SrcVec src_1, vector_bool mask,
   return dst;
 }
 
+template <typename SrcVec, typename Mode>
+__simd_callee__ inline SrcVec vxor(SrcVec src_0, SrcVec src_1, vector_bool mask,
+                                   Mode mode) {
+  SrcVec dst;
+  ::vxor(dst, src_0, src_1, mask, mode);
+  return dst;
+}
+
 template <typename SrcVec, typename ShiftVec, typename Mode>
 __simd_callee__ inline SrcVec vshl(SrcVec src_0, ShiftVec src_1,
                                    vector_bool mask, Mode mode) {
@@ -461,6 +469,13 @@ __simd_callee__ inline SrcVec vrelu(SrcVec src, vector_bool mask, Mode mode) {
 }
 
 template <typename SrcVec, typename Mode>
+__simd_callee__ inline SrcVec vnot(SrcVec src, vector_bool mask, Mode mode) {
+  SrcVec dst;
+  ::vnot(dst, src, mask, mode);
+  return dst;
+}
+
+template <typename SrcVec, typename Mode>
 __simd_callee__ inline SrcVec vexp(SrcVec src, vector_bool mask, Mode mode) {
   SrcVec dst;
   ::vexp(dst, src, mask, mode);
@@ -469,6 +484,13 @@ __simd_callee__ inline SrcVec vexp(SrcVec src, vector_bool mask, Mode mode) {
 
 // -- Cross-lane reductions
 // ------------------------------------------------------
+template <typename SrcVec, typename Mode>
+__simd_callee__ inline SrcVec vcpadd(SrcVec src, vector_bool mask, Mode mode) {
+  SrcVec dst;
+  ::vcpadd(dst, src, mask, mode);
+  return dst;
+}
+
 template <typename SrcVec, typename Mode>
 __simd_callee__ inline widen_vec_t<SrcVec> vcadd(SrcVec src, vector_bool mask,
                                                  Mode mode) {
