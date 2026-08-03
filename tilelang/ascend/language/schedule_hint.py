@@ -1,12 +1,13 @@
 """Auto-schedule hints: user-declared facts the dependency analyzer cannot
-prove on its own (`assume_no_conflict`, `PerCoreTask`; more may be added here)."""
+prove on its own (`assume_no_conflict`, `PerCoreTask`, `Task`; more
+may be added here)."""
 
 from tilelang.utils.language import to_tile_region
 from tvm import tirx
 from tvm.tirx import Buffer, IntImm, StringImm, call_intrin, op
 from tvm.tirx.script.builder.ir import attr
 
-__all__ = ["assume_no_conflict", "PerCoreTask"]
+__all__ = ["assume_no_conflict", "PerCoreTask", "Task"]
 
 
 def PerCoreTask():
@@ -17,25 +18,72 @@ def PerCoreTask():
     synchronization is emitted, the same logical wait/set pair is placed next
     to every candidate access under its original control-flow guard.
 
-    The compiler infers one hardware pipe from the dependency-bearing TaskNodes;
-    every candidate must use that same single pipe and access the same logical
-    read/write buffers. Candidate sites may be intrinsic
-    statements, scalar buffer stores, or compound statements represented as one
-    schedulable task. Exactly one candidate site must execute on each core in
-    each dynamic invocation of the PerCoreTask; this dynamic property is a user
-    control-flow contract.
+    The compiler preserves explicit ``T.Task()`` candidates and infers markers
+    for the remaining supported dependency-bearing candidate boundaries.
+    Explicit and inferred candidates may therefore be mixed in one region.
+    Every candidate must use the same single hardware pipe and access the same
+    logical read/write buffers. Exactly one candidate must execute on each core
+    in each dynamic invocation of the PerCoreTask; this dynamic property is a
+    user control-flow contract.
+
+    Scalar bindings may remain outside candidate markers when they do not
+    access buffers and therefore cannot form buffer dependencies with statements
+    outside the PerCoreTask. External synchronization is emitted only at
+    ``T.Task`` candidate sites, so put any buffer access in a supported
+    single-pipe candidate rather than an unmarked scalar binding.
+
+    Explicit candidates also define the latency model. Statements inside one
+    ``T.Task`` are serial, candidates before the same inter-core wait
+    form one parallel phase whose cost is their maximum, and phases separated by
+    waits are serial. The compiler wraps each unmarked inferred
+    dependency-bearing leaf in an equivalent internal marker before applying
+    the same latency and synchronization model.
 
     Example
     -------
     >>> with T.PerCoreTask():
     ...     if split_id == 0:
-    ...         T.copy(res, C[...])
+    ...         with T.Task():
+    ...             T.copy(res, C[...])
     ...     T.ascend_sync_inter_arrive("PIPE_FIX", 0)
     ...     T.ascend_sync_inter_wait("PIPE_FIX", 0)
     ...     if split_id != 0:
-    ...         T.copy(res, C[...])
+    ...         with T.Task():
+    ...             T.copy(res, C[...])
     """
     return attr(tirx.const(0, "int32"), "tl.ascend_per_core_task", tirx.const(1, "int32"))
+
+
+def Task():
+    """Group one or more serial statements into one scheduler task.
+
+    AutoSchedule creates exactly one TaskNode for the complete marker body.
+    Statements issue in source order without internal synchronization, so each
+    preceding statement contributes its II and only the final statement exposes
+    its latency. All statements must use one Ascend hardware pipe and one AIC/AIV
+    warpgroup affinity; split cross-pipe or cross-warpgroup sequences into
+    separate tasks. A ``dual_copy`` is supported only when it remains the sole
+    top-level, single-pipe statement after preprocessing. The marker does not
+    select or launch a core by itself.
+
+    Inside ``T.PerCoreTask()``, the same marker also denotes one concrete
+    per-core candidate. Put the control flow that selects a core outside this
+    scope so automatic synchronization remains under the same guard. Explicit
+    markers may be mixed with unmarked candidates; the compiler infers markers
+    for the remaining supported candidate boundaries.
+
+    Example
+    -------
+    >>> with T.Task():
+    ...     T.copy(A, a_l1)
+    ...     T.copy(B, b_l1)
+    ...
+    >>> with T.PerCoreTask():
+    ...     if split_id == 0:
+    ...         with T.Task():
+    ...             T.copy(res, C[...])
+    """
+    return attr(tirx.const(0, "int32"), "tl.ascend_task", tirx.const(1, "int32"))
 
 
 def assume_no_conflict(a, b=None, *, level=None, cross=None, group=None):

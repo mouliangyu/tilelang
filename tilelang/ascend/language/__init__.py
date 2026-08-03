@@ -13,7 +13,7 @@ from .annotations import (  # noqa: F401
 from .copy_op import dual_copy  # noqa: F401
 from .gemm_op import blockscaled_gemm  # noqa: F401
 from .kernel import MixedKernel  # noqa: F401
-from .schedule_hint import PerCoreTask, assume_no_conflict  # noqa: F401
+from .schedule_hint import PerCoreTask, Task, assume_no_conflict  # noqa: F401
 from .tile_schedule import (  # noqa: F401
     AscendBaseTileScheduler,
     AscendBatchedTileScheduler,
@@ -54,6 +54,7 @@ _ASCEND_API_ALL = (
     "CubeFrame",
     "MixedKernel",
     "PerCoreTask",
+    "Task",
     "SimdVF",
     "SimdVFFrame",
     "SimtVF",

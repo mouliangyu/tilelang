@@ -162,29 +162,6 @@ uint16_t GetAscendCallPipeMask(const Call &call) {
   return 0;
 }
 
-uint16_t GetAscendStmtPipeMask(const Stmt &stmt) {
-  class PipeAnalyzer : public StmtExprVisitor {
-  public:
-    uint16_t pipe_mask{0};
-
-  private:
-    void VisitExpr_(const CallNode *op) final {
-      pipe_mask |= GetAscendCallPipeMask(GetRef<Call>(op));
-      StmtExprVisitor::VisitExpr_(op);
-    }
-
-    void VisitStmt_(const SBlockNode *op) final {
-      if (op->name_hint == "SIMT_VF" || op->name_hint == "SIMD_VF") {
-        pipe_mask |= static_cast<uint16_t>(ResourcePipe::kVector);
-        return;
-      }
-      StmtExprVisitor::VisitStmt_(op);
-    }
-  } analyzer;
-  analyzer(stmt);
-  return ResolvePipe(analyzer.pipe_mask);
-}
-
 // AttrStmt wrappers that AutoSchedule supports.
 static const AutoScheduleAttrSpec kAutoScheduleAttrs[] = {
     {tirx::attr::tilelang_assume, true},
@@ -222,6 +199,36 @@ private:
   }
 
   std::string expected_pipe_;
+};
+
+class TaskMarkerControlValidator : public StmtExprVisitor {
+public:
+  explicit TaskMarkerControlValidator(bool reject_candidate_selection)
+      : reject_candidate_selection_(reject_candidate_selection) {}
+
+private:
+  void VisitStmt_(const AttrStmtNode *op) final {
+    ICHECK_NE(op->attr_key, tl::attr::kAscendTask)
+        << "Nested T.Task regions are not supported";
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const IfThenElseNode *op) final {
+    ICHECK(!reject_candidate_selection_)
+        << "Control flow selecting a T.Task candidate must be outside the "
+           "T.Task scope";
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    ICHECK(!op->op.same_as(tl::ascend_cross_core_set_flag()) &&
+           !op->op.same_as(tl::ascend_cross_core_wait_flag()))
+        << "Inter-core synchronization must be outside T.Task so it "
+           "can delimit PerCoreTask latency phases";
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  bool reject_candidate_selection_;
 };
 
 static bool IsPerCoreTaskScalarControl(const TaskNode *task) {
@@ -377,6 +384,61 @@ static std::vector<Call> CollectCrossCoreCalls(const TaskNode *task) {
   } collector;
   collector(task->stmt);
   return collector.calls;
+}
+
+static uint16_t CollectSpecialRegisterWrites(const Stmt &stmt) {
+  class Collector : public StmtExprVisitor {
+  public:
+    uint16_t mask{0};
+
+  private:
+    void VisitExpr_(const CallNode *op) final {
+      if (op->op.same_as(tl::loop_break())) {
+        mask |= static_cast<uint16_t>(SpecialRegister::kLoopControl);
+      } else if (op->op.same_as(tl::ascend_set_hf32_mode())) {
+        mask |= static_cast<uint16_t>(SpecialRegister::kHf32Mode);
+      } else if (op->op.same_as(tl::ascend_set_copy_pad_value())) {
+        mask |= static_cast<uint16_t>(SpecialRegister::kPadValue);
+      } else if (op->op.same_as(tl::ascend_set_atomic()) ||
+                 op->op.same_as(tl::ascend_set_atomic_none())) {
+        mask |= static_cast<uint16_t>(SpecialRegister::kAtomicMode);
+      } else if (op->op.same_as(tl::ascend_cross_core_set_flag()) ||
+                 op->op.same_as(tl::ascend_cross_core_wait_flag())) {
+        Call call = GetRef<Call>(op);
+        ICHECK(GetCrossCoreCall(call).defined());
+        mask |= static_cast<uint16_t>(
+            GetCrossCorePipeInfo(op->args[1]).special_register);
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+  } collector;
+  collector(stmt);
+  return collector.mask;
+}
+
+static bool ContainsDualCopy(const Stmt &stmt) {
+  class Detector : public StmtExprVisitor {
+  public:
+    bool found{false};
+
+  private:
+    void VisitExpr_(const CallNode *op) final {
+      if (found)
+        return;
+      static const auto copy_op = Op::Get("tl.tileop.copy");
+      if (op->op.same_as(copy_op)) {
+        Copy copy(op->args, op->annotations);
+        found = copy->GetDualDstCtl() != 0;
+      } else if (op->op.same_as(tl::ascend_nd2nz_post_copy()) &&
+                 op->args.size() == 8) {
+        found = true;
+      }
+      if (!found)
+        StmtExprVisitor::VisitExpr_(op);
+    }
+  } detector;
+  detector(stmt);
+  return detector.found;
 }
 
 // Detect multiple kernel launches in the PrimFunc body.
@@ -615,25 +677,8 @@ protected:
     // Evaluate statement (usually a Call) -> TaskNode
     auto task_node = std::make_shared<TaskNode>();
     task_node->stmt = GetRef<Stmt>(op);
-
-    if (const auto *call = op->value.as<CallNode>()) {
-      if (call->op.same_as(tl::loop_break())) {
-        task_node->AddSpecialWrite(SpecialRegister::kLoopControl);
-      } else if (call->op.same_as(tl::ascend_set_hf32_mode())) {
-        task_node->AddSpecialWrite(SpecialRegister::kHf32Mode);
-      } else if (call->op.same_as(tl::ascend_set_copy_pad_value())) {
-        task_node->AddSpecialWrite(SpecialRegister::kPadValue);
-      } else if (call->op.same_as(tl::ascend_set_atomic()) ||
-                 call->op.same_as(tl::ascend_set_atomic_none())) {
-        task_node->AddSpecialWrite(SpecialRegister::kAtomicMode);
-      } else if (call->op.same_as(tl::ascend_cross_core_set_flag()) ||
-                 call->op.same_as(tl::ascend_cross_core_wait_flag())) {
-        Call sync_call = GetRef<Call>(call);
-        ICHECK(GetCrossCoreCall(sync_call).defined());
-        task_node->AddSpecialWrite(
-            GetCrossCorePipeInfo(call->args[1]).special_register);
-      }
-    }
+    task_node->SetSpecialWriteMask(
+        CollectSpecialRegisterWrites(task_node->stmt));
 
     // Analyze the expression for resource usage
     StampCtx(task_node.get());
@@ -734,9 +779,83 @@ protected:
   }
 
   void VisitStmt_(const AttrStmtNode *op) override {
+    if (op->attr_key == tl::attr::kAscendTask) {
+      ICHECK_EQ(explicit_task_depth_, 0)
+          << "Nested T.Task regions are not supported";
+
+      ++explicit_task_depth_;
+      bool inside_per_core_task = per_core_task_depth_ > 0;
+      TaskMarkerControlValidator task_control_validator(inside_per_core_task);
+      task_control_validator(op->body);
+      --explicit_task_depth_;
+
+      TVM_FFI_CHECK(op->body.as<EvaluateNode>() || !ContainsDualCopy(op->body),
+                    ValueError)
+          << "T.Task does not support dual_copy after it is combined with "
+             "other statements or expanded into a multi-statement body; keep "
+             "dual_copy as a standalone single-pipe task. Body="
+          << op->body;
+
+      auto task_node = std::make_shared<TaskNode>();
+      task_node->stmt = op->body;
+      StampCtx(task_node.get());
+      task_node->SetSpecialWriteMask(
+          CollectSpecialRegisterWrites(task_node->stmt));
+      AnalyzeResourceUsage(task_node->stmt, task_node.get());
+      uint16_t issue_pipe_mask = task_node->GetPipeMask();
+      if (task_node->GetSpecialWriteMask() != 0) {
+        issue_pipe_mask |= static_cast<uint16_t>(ResourcePipe::kScalar);
+      }
+      TVM_FFI_CHECK((issue_pipe_mask & (issue_pipe_mask - 1)) == 0, ValueError)
+          << "T.Task supports exactly one Ascend hardware pipe, but its body "
+             "uses multiple pipes (mask="
+          << issue_pipe_mask
+          << "). Split the statements into separate T.Task regions. Body="
+          << task_node->stmt;
+      uint16_t hbm_mask = task_node->GetHbmMask();
+      TVM_FFI_CHECK((hbm_mask & (hbm_mask - 1)) == 0, ValueError)
+          << "T.Task requires one Ascend warpgroup affinity, but its body uses "
+             "both AIC and AIV HBM paths. Split GM-to-L1 and GM-to-UB "
+             "operations into separate T.Task regions. Body="
+          << task_node->stmt;
+      LatencyEstimator latency_estimator(target_);
+      latency_estimator.EstimateComposedTask(
+          task_node.get(), [this](const Stmt &leaf_stmt, TaskNode *leaf_task) {
+            AnalyzeResourceUsage(leaf_stmt, leaf_task,
+                                 /*only_variables=*/false,
+                                 /*estimate_latency=*/false);
+          });
+      if (inside_per_core_task) {
+        per_core_task_candidates_.push_back({GetRef<Stmt>(op), task_node});
+      }
+      result_.push_back(std::move(task_node));
+      return;
+    }
+
     if (op->attr_key == tl::attr::kAscendPerCoreTask) {
+      ICHECK_EQ(per_core_task_depth_, 0)
+          << "Nested T.PerCoreTask regions are not supported";
+
+      Stmt per_core_body = op->body;
+      std::vector<PerCoreTaskCandidate> saved_task_candidates;
+      saved_task_candidates.swap(per_core_task_candidates_);
+      ++per_core_task_depth_;
+      std::vector<std::shared_ptr<IRStructure>> body_list =
+          BuildList(per_core_body);
+      --per_core_task_depth_;
+      std::vector<PerCoreTaskCandidate> task_candidates;
+      task_candidates.swap(per_core_task_candidates_);
+      per_core_task_candidates_.swap(saved_task_candidates);
+      ICHECK(!task_candidates.empty())
+          << "T.PerCoreTask must be normalized by NormalizePerCoreTask before "
+             "AutoSchedule";
+      std::unordered_set<const TaskNode *> candidate_tasks;
+      for (const PerCoreTaskCandidate &candidate : task_candidates) {
+        ICHECK(candidate.task);
+        ICHECK(candidate_tasks.insert(candidate.task.get()).second)
+            << "Duplicate T.Task candidate TaskNode";
+      }
       uint16_t pipe_mask = 0;
-      std::vector<std::shared_ptr<IRStructure>> body_list = BuildList(op->body);
       bool has_dependency_stmt = false;
 
       std::function<void(IRStructure *)> collect_sites;
@@ -763,6 +882,10 @@ protected:
               << task->stmt;
           return;
         }
+        ICHECK(candidate_tasks.count(task))
+            << "NormalizePerCoreTask did not assign a T.Task candidate marker "
+               "to a dependency-bearing statement in T.PerCoreTask; got "
+            << task->stmt;
         uint16_t task_pipe_mask = task->GetPipeMask();
         ICHECK_NE(task_pipe_mask, 0)
             << "Cannot infer an Ascend pipe for T.PerCoreTask candidate "
@@ -788,10 +911,11 @@ protected:
           << "T.PerCoreTask must contain at least one dependency-bearing "
              "statement from which to infer its pipe";
       ICHECK_NE(pipe_mask, 0) << "Failed to infer T.PerCoreTask hardware pipe";
+
       PerCoreTaskControlValidator control_validator(pipe_mask);
-      control_validator(op->body);
+      control_validator(per_core_body);
       auto task_node = std::make_shared<TaskNode>();
-      task_node->stmt = op->body;
+      task_node->stmt = per_core_body;
       AnalyzeResourceUsage(task_node->stmt, task_node.get());
       task_node->SetPipeMask(pipe_mask);
       task_node->SetPerCoreTaskPipeMask(pipe_mask);
@@ -799,10 +923,10 @@ protected:
       // compound task. They migrate with its concrete candidates at emission
       // time and intentionally do not expose special-register writes to the
       // outer scheduler; placement comes from the task's inferred pipe/memory.
-      LatencyEstimator latency_estimator(target_);
-      latency_estimator.EstimateSerialTask(task_node.get(), body_list,
-                                           pipe_mask);
       StampCtx(task_node.get());
+      LatencyEstimator latency_estimator(target_);
+      latency_estimator.EstimatePerCoreTask(task_node.get(), per_core_body,
+                                            task_candidates);
       result_.push_back(std::move(task_node));
       return;
     }
@@ -866,9 +990,13 @@ protected:
 private:
   std::vector<std::shared_ptr<IRStructure>> result_;
   Target target_;
+  int per_core_task_depth_{0};
+  int explicit_task_depth_{0};
+  std::vector<PerCoreTaskCandidate> per_core_task_candidates_;
 
   void AnalyzeResourceUsage(const Stmt &stmt, TaskNode *task_node,
-                            bool only_variables = false) {
+                            bool only_variables = false,
+                            bool estimate_latency = true) {
     // Recursively analyze statements to determine resource usage (Ascend pipe
     // model)
     struct ResourceAnalyzer : public StmtExprVisitor {
@@ -1034,9 +1162,10 @@ private:
       task_node->AddWriteVar(var);
     }
 
-    // Estimate latency and initiation interval for this task
-    LatencyEstimator latency_estimator(target_);
-    latency_estimator.Estimate(task_node);
+    if (estimate_latency) {
+      LatencyEstimator latency_estimator(target_);
+      latency_estimator.Estimate(task_node);
+    }
   }
 };
 

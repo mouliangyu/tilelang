@@ -12,7 +12,9 @@
 #include "backend/common/target_utils.h"
 #include "op/builtin.h"
 #include <algorithm>
+#include <functional>
 #include <limits>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -30,6 +32,11 @@ struct RegionElementUpperBound {
   // static-buffer-shape bounds are all usable for tightening an equal copy
   // region from the other side.
   bool reliable{true};
+};
+
+struct PerCoreTaskCandidate {
+  Stmt marker;
+  std::shared_ptr<TaskNode> task;
 };
 
 // Estimate a region's maximum element count under the current task context.
@@ -865,20 +872,22 @@ public:
     task->SetII(ii);
   }
 
-  // Estimate a TaskNode that represents a serial composition of analyzed
-  // IRStructure nodes. Leaf costs use the ordinary TaskNode estimator;
-  // sequences add costs and serial loops multiply the complete body cost by
-  // their trip count. A non-zero pipe_filter includes only that exact pipe.
-  // Parallel For and VF blocks must keep using Estimate(TaskNode*) because
-  // their extents describe parallelism rather than serial repetition.
-  void EstimateSerialTask(
-      TaskNode *composite_task,
-      const std::vector<std::shared_ptr<IRStructure>> &body_nodes,
-      uint16_t pipe_filter = 0) {
-    SerialTaskCost cost = AggregateSerialTaskCost(body_nodes, pipe_filter);
-    composite_task->SetLatency(cost.latency);
-    composite_task->SetII(std::max<int64_t>(cost.ii, 1));
-  }
+  using LeafTaskAnalyzer = std::function<void(const Stmt &, TaskNode *)>;
+
+  // Estimate one explicit Task marker from its statement structure.
+  // Sequential statements add, mutually-exclusive branches take their
+  // maximum. Unsynchronized sequencing exposes each preceding statement's II
+  // and keeps the latest completion time across all statements; serial loops
+  // apply the same rule across iterations. Parallel loops and VF blocks remain
+  // atomic and use Estimate(TaskNode*) directly.
+  void EstimateComposedTask(TaskNode *task,
+                            const LeafTaskAnalyzer &analyze_leaf);
+
+  // Estimate a PerCoreTask from canonical Task candidate markers.
+  // Candidate bodies are serial, candidates within one inter-core phase run in
+  // parallel across cores, and mode-0 cross-core waits delimit serial phases.
+  void EstimatePerCoreTask(TaskNode *per_core_task, const Stmt &body,
+                           const std::vector<PerCoreTaskCandidate> &candidates);
 
 private:
   struct SerialTaskCost {
@@ -907,36 +916,11 @@ private:
     return value * factor;
   }
 
-  SerialTaskCost AggregateSerialTaskCost(
-      const std::vector<std::shared_ptr<IRStructure>> &nodes,
-      uint16_t pipe_filter) {
-    SerialTaskCost result;
-    for (const auto &node : nodes) {
-      if (!node)
-        continue;
-      SerialTaskCost contribution;
-      if (node->IsTask()) {
-        auto *task = static_cast<TaskNode *>(node.get());
-        if (pipe_filter != 0 && task->GetPipeMask() != pipe_filter)
-          continue;
-        Estimate(task);
-        contribution.latency = task->GetLatency();
-        contribution.ii = task->GetII();
-      } else {
-        const auto *control = static_cast<const ControlNode *>(node.get());
-        contribution = AggregateSerialTaskCost(control->children, pipe_filter);
-        int64_t trip_count = control->GetTripCount();
-        contribution.latency = CheckedSerialTaskMultiply(contribution.latency,
-                                                         trip_count, "latency");
-        contribution.ii =
-            CheckedSerialTaskMultiply(contribution.ii, trip_count, "II");
-      }
-      result.latency =
-          CheckedSerialTaskAdd(result.latency, contribution.latency, "latency");
-      result.ii = CheckedSerialTaskAdd(result.ii, contribution.ii, "II");
-    }
-    return result;
-  }
+  SerialTaskCost EstimateStmtCost(const Stmt &stmt, const ConstrSet &outer_ctx,
+                                  const LeafTaskAnalyzer &analyze_leaf);
+  SerialTaskCost EstimateLeafTaskCost(const Stmt &stmt,
+                                      const ConstrSet &outer_ctx,
+                                      const LeafTaskAnalyzer &analyze_leaf);
 
   GPUParams params_;
   int64_t thread_count_ = 1; // Default to 1 (no parallelism)

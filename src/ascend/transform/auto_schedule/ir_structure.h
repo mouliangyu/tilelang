@@ -161,11 +161,45 @@ using TaskAccessPredicate = std::function<bool(const TaskNode *task)>;
 
 PrimExpr CalculateIterationCount(const std::vector<For> &loops);
 
-// Infer the specialized Ascend issue pipe(s) used by a statement. Statements
-// with no specialized operation use the scalar pipe. This is shared by
-// IRStructure construction and final PerCoreTask synchronization placement so
-// the two phases classify candidate statements identically.
-uint16_t GetAscendStmtPipeMask(const Stmt &stmt);
+constexpr int64_t kDynamicSerialTripCountFallback = 100;
+
+inline int64_t GetSerialTripCount(const For &loop,
+                                  arith::Analyzer *analyzer = nullptr) {
+  arith::Analyzer local_analyzer;
+  if (analyzer == nullptr)
+    analyzer = &local_analyzer;
+
+  auto upper_bound_or = [&](const PrimExpr &expr, int64_t fallback) {
+    if (const int64_t *value = as_const_int(expr))
+      return *value;
+
+    arith::ConstIntBound bound = analyzer->const_int_bound(expr);
+    arith::Analyzer unconstrained_analyzer;
+    Var unconstrained("unconstrained_trip_count", expr.dtype());
+    int64_t unconstrained_max =
+        unconstrained_analyzer.const_int_bound(unconstrained)->max_value;
+    bool has_useful_bound = bound->max_value >= 0 &&
+                            bound->max_value != arith::ConstIntBound::kPosInf &&
+                            bound->max_value < unconstrained_max;
+    return has_useful_bound ? bound->max_value : fallback;
+  };
+
+  PrimExpr step = loop->step.has_value() ? loop->step.value()
+                                         : IntImm(DataType::Int(32), 1);
+  int64_t extent =
+      upper_bound_or(loop->extent, kDynamicSerialTripCountFallback);
+  // A trip-count upper bound needs a lower bound for a symbolic positive
+  // step.  Use one when the step is not constant; using its upper bound would
+  // underestimate the number of serial iterations.
+  const int64_t *constant_step = as_const_int(step);
+  int64_t step_value = constant_step ? *constant_step : 1;
+  if (extent <= 0)
+    return 0;
+  if (step_value <= 0)
+    return extent;
+  return extent / step_value + (extent % step_value != 0);
+}
+
 uint16_t GetAscendCallPipeMask(const Call &call);
 uint16_t GetAscendCopyPipeMask(const Buffer &src, const Buffer &dst);
 
@@ -420,7 +454,9 @@ private:
   int64_t start_time_{0};
 };
 
-// Task node: contains a single statement
+// Task node: one atomic scheduler node. Ordinary tasks contain one statement;
+// an explicit Task marker may group a structured sequence into this one
+// node while scheduling and dependency analysis keep it atomic.
 class TaskNode : public IRStructure {
 public:
   Stmt stmt;
@@ -698,7 +734,7 @@ private:
   bool reads_atomic_{false};
   // Non-zero for a T.PerCoreTask task. The stmt is scheduled as one logical
   // group. During final Stmt emission, synchronization attached to this task is
-  // moved beside each enclosed statement that issues on this pipe.
+  // moved beside each inferred or explicitly marked candidate.
   uint16_t per_core_task_pipe_mask_{0};
 
   // Memory access regions (collected during analysis)
@@ -940,31 +976,10 @@ public:
   }
 
   int64_t GetTripCount() const {
-    PrimExpr loop_extent = control->extent;
-    PrimExpr loop_step = control->step.has_value()
-                             ? control->step.value()
-                             : IntImm(DataType::Int(32), 1);
-    // Try to convert loop_extent and loop_step to int64_t
-    if (const int64_t *extent_ptr = as_const_int(loop_extent)) {
-      if (const int64_t *step_ptr = as_const_int(loop_step)) {
-        // Calculate ceil(extent / step)
-        int64_t extent = *extent_ptr;
-        int64_t step = *step_ptr;
-        if (step > 0) {
-          // ceil(extent / step) = (extent + step - 1) / step
-          return (extent + step - 1) / step;
-        } else {
-          // Invalid step, use extent as fallback
-          return extent;
-        }
-      } else {
-        // Step is not constant, use 100 as default
-        return 100;
-      }
-    } else {
-      // Extent is not constant, use 100 as default
-      return 100;
-    }
+    arith::Analyzer analyzer;
+    if (task)
+      task->outer_ctx.Populate(analyzer);
+    return GetSerialTripCount(control, &analyzer);
   }
 
 private:

@@ -34,6 +34,11 @@ def NormalizeNoConflictHints():
     return _ffi_api.NormalizeNoConflictHints()  # type: ignore
 
 
+def NormalizePerCoreTask():
+    """Wrap unmarked inferred PerCoreTask leaves in canonical Task markers."""
+    return _ffi_api.NormalizePerCoreTask()  # type: ignore
+
+
 def AscendRemoveNoOp():
     """Remove no-op statements using equality-safe store analysis."""
     return _ffi_api.AscendRemoveNoOp()  # type: ignore
@@ -141,6 +146,7 @@ __all__ = [
     "NormalizeControlFlowForSchedule",
     "NormalizeMixedKernelSid",
     "NormalizeNoConflictHints",
+    "NormalizePerCoreTask",
     "RewriteAscendBufferVersionLayout",
     "RestoreWhileLoops",
     "RewriteFp4ToFp4x2",

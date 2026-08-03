@@ -86,6 +86,7 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
         mod = ascend_transform.NormalizeControlFlowForSchedule()(mod)
         mod = ascend_transform.AnnotateMultiBufferEligible()(mod)
         mod = ascend_transform.NormalizeNoConflictHints()(mod)
+        mod = ascend_transform.NormalizePerCoreTask()(mod)
         mod = ascend_transform.AutoSchedule()(mod)
         mod = ascend_transform.RestoreWhileLoops()(mod)
         mod = ascend_transform.NormalizeMixedKernelSid()(mod)

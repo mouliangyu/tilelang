@@ -16,6 +16,8 @@
 #include <utility>
 #include <vector>
 
+#include "support/check.h"
+
 namespace tvm {
 namespace tl {
 
