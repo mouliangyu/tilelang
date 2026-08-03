@@ -6,20 +6,27 @@
  * For every For tagged with the `synthetic_while` annotation, rewrite
  *   `for w in range(0, W): BODY`
  * back into
- *   `while(true): BODY[w := 0]`
+ *   `while(true): BODY[w := counter]`
  * The real termination test is the `if (not cond): loop_break()` guard that
  * NormalizeControlFlowForSchedule placed at the top of BODY; it is preserved.
  *
- * Substituting w:=0 is safe because the synthetic for is never itself
- * pipelined (num_stages unset), so no buffer is multi-versioned at the w level;
- * w appears in version/flag subscripts only through the inner Pipelined loops,
- * where its coefficient (M_inner * W, W = lcm(1..max_num_stages)) is divisible
- * by every num_versions and thus already dropped out under Simplify. Any
- * residual `w` term is a multiple of num_versions, so w:=0 preserves the
- * version ring index.
+ * Most synthetic loop variables simplify away from version and flag ring
+ * indices because the synthetic for is not itself pipelined. If w occurs,
+ * simplify the body before checking for residual uses so those terms do not
+ * create unnecessary counters. A frontend buffer-version override can
+ * nevertheless make a write-first while-local buffer multi-versioned at this
+ * level. When the simplified body still uses w, retain a monotonically
+ * increasing local counter so version and flag ring indices survive while
+ * restoration.
  */
 
+#include <string>
+#include <utility>
+
+#include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/buffer.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt.h>
 #include <tvm/tirx/stmt_functor.h>
@@ -30,6 +37,22 @@ namespace tl {
 
 using namespace tirx;
 using namespace ffi;
+
+class ExpressionSimplifier : public StmtExprMutator {
+public:
+  static Stmt Simplify(Stmt stmt) {
+    ExpressionSimplifier simplifier;
+    return simplifier(std::move(stmt));
+  }
+
+private:
+  PrimExpr VisitExpr(const PrimExpr &expr) final {
+    PrimExpr visited = StmtExprMutator::VisitExpr(expr);
+    return analyzer_.Simplify(visited);
+  }
+
+  arith::Analyzer analyzer_;
+};
 
 class WhileLoopRestorer : public StmtExprMutator {
 public:
@@ -49,11 +72,35 @@ private:
     if (!tag.has_value()) {
       return for_node;
     }
-    Stmt body = tirx::Substitute(
-        for_node->body,
-        Map<Var, PrimExpr>{
-            {for_node->loop_var, IntImm(for_node->loop_var.dtype(), 0)}});
-    return While(IntImm(DataType::Bool(), 1), body);
+    Var loop_var = for_node->loop_var;
+    auto uses_loop_var = [loop_var](const Stmt &stmt) {
+      return tirx::UsesVar(stmt, [loop_var](const VarNode *var) {
+        return loop_var.same_as(GetRef<Var>(var));
+      });
+    };
+    Stmt body = for_node->body;
+    if (!uses_loop_var(body)) {
+      return While(IntImm(DataType::Bool(), 1), body);
+    }
+    body = ExpressionSimplifier::Simplify(std::move(body));
+    if (!uses_loop_var(body)) {
+      return While(IntImm(DataType::Bool(), 1), body);
+    }
+
+    PrimExpr zero_index = IntImm(DataType::Int(32), 0);
+    Buffer counter =
+        decl_buffer({IntImm(DataType::Int(32), 1)}, loop_var.dtype(),
+                    loop_var->name_hint + "_counter", "local.var");
+    PrimExpr counter_value = BufferLoad(counter, {zero_index});
+    body = tirx::Substitute(std::move(body),
+                            Map<Var, PrimExpr>{{loop_var, counter_value}});
+    PrimExpr next_value = counter_value + make_const(loop_var.dtype(), 1);
+    Stmt increment = BufferStore(counter, next_value, {zero_index});
+    Stmt loop = While(IntImm(DataType::Bool(), 1),
+                      SeqStmt({body, std::move(increment)}));
+    Stmt initialize = BufferStore(counter, for_node->min, {zero_index});
+    return SeqStmt(
+        {AllocBuffer(counter), std::move(initialize), std::move(loop)});
   }
 };
 
