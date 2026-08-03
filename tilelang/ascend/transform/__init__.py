@@ -39,6 +39,11 @@ def AscendRemoveNoOp():
     return _ffi_api.AscendRemoveNoOp()  # type: ignore
 
 
+def LegalizeSimdMerging():
+    """Lower MODE_MERGING SIMD assignments to explicit read-write calls."""
+    return _ffi_api.LegalizeSimdMerging()  # type: ignore
+
+
 def AutoSchedule():
     """Auto schedule for high-level operations"""
     return _ffi_api.AutoSchedule()  # type: ignore
@@ -129,6 +134,7 @@ __all__ = [
     "AutoSchedule",
     "IfConditionExtract",
     "InsertNd2Nz",
+    "LegalizeSimdMerging",
     "MarkScalarDcacheBypass",
     "MergeUBAllocations",
     "NormalizeBufferVersion",

@@ -26,12 +26,36 @@ namespace codegen {
 
 namespace {
 
+constexpr const char *kModeMerging = "MODE_MERGING";
+constexpr const char *kSimdOpPrefix = "tl.simd.";
+
 bool IsVmiOp(const CallNode *op, std::string *op_name = nullptr) {
   if (auto opt_call_op = op->op.as<Op>()) {
     const std::string &name = opt_call_op.value()->name;
     if (name.rfind("tl.vmi.", 0) == 0) {
       if (op_name != nullptr) {
         *op_name = name;
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+bool IsSimdMergingCall(const CallNode *op,
+                       std::string *intrinsic_name = nullptr) {
+  if (!op->dtype.is_void() || op->args.empty()) {
+    return false;
+  }
+  const auto *mode = op->args.back().as<StringImmNode>();
+  if (mode == nullptr || mode->value != kModeMerging) {
+    return false;
+  }
+  if (auto call_op = op->op.as<Op>()) {
+    const std::string &op_name = call_op.value()->name;
+    if (op_name.rfind(kSimdOpPrefix, 0) == 0) {
+      if (intrinsic_name != nullptr) {
+        *intrinsic_name = op_name.substr(std::string(kSimdOpPrefix).size());
       }
       return true;
     }
@@ -927,7 +951,47 @@ void CodeGenTileLangAscend::VisitExpr_(const BroadcastNode *op,
   os << ')';
 }
 
+bool CodeGenTileLangAscend::EmitSimdMergingCall(const CallNode *op,
+                                                std::ostream &os) {
+  std::string intrinsic_name;
+  if (!IsSimdMergingCall(op, &intrinsic_name)) {
+    return false;
+  }
+
+  ICHECK_GE(op->args.size(), 3)
+      << "Legalized MODE_MERGING call must contain a destination, operands, "
+         "and mode";
+  ICHECK(op->args[0].dtype().is_handle())
+      << "Legalized MODE_MERGING destination must be a pointer";
+
+  if (intrinsic_name == "vdupv") {
+    intrinsic_name = "vdup";
+  }
+
+  const DataType result_dtype = op->args[1].dtype();
+  const bool use_precise_div = intrinsic_name == "vdiv" && !enable_fast_math_ &&
+                               result_dtype.is_float() &&
+                               result_dtype.bits() == 32;
+  os << (use_precise_div ? "simd_inst::vdiv_precise" : "::" + intrinsic_name)
+     << "(*(";
+  PrintExpr(op->args[0], os);
+  os << ")";
+  for (size_t i = 1; i < op->args.size(); ++i) {
+    os << ", ";
+    if (const auto *string_arg = op->args[i].as<StringImmNode>()) {
+      os << string_arg->value;
+    } else {
+      PrintExpr(op->args[i], os);
+    }
+  }
+  os << ")";
+  return true;
+}
+
 void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
+  if (EmitSimdMergingCall(op, os)) {
+    return;
+  }
   if (op->op.same_as(tl::device_assert())) {
     ICHECK_EQ(op->args.size(), 1)
         << "tl.device_assert expects exactly 1 argument (condition)";

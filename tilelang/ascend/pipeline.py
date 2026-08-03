@@ -57,6 +57,10 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     if should_enable_race_check(pass_ctx=pass_ctx):
         mod = tilelang.transform.VerifyParallelLoop()(mod)
     mod = tilelang.transform.InjectAssumes()(mod)
+    # MODE_MERGING preserves inactive destination lanes, so it is a
+    # read-modify-write operation rather than a pure value expression. Expose
+    # the destination as an rw access before scheduling and dependency analysis.
+    mod = ascend_transform.LegalizeSimdMerging()(mod)
     mod = tilelang.transform.Simplify()(mod)
 
     mod = tilelang.transform.LayoutReducer()(mod)

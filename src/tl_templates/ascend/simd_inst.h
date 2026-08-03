@@ -363,6 +363,17 @@ __simd_callee__ inline vector_f32 vdiv_precise(vector_f32 src0, vector_f32 src1,
   return dst;
 }
 
+template <typename Mode>
+__simd_callee__ inline void vdiv_precise(vector_f32 &dst, vector_f32 src0,
+                                         vector_f32 src1, vector_bool mask,
+                                         Mode mode) {
+  (void)mode;
+  // The in-place overload implements MODE_MERGING: update active lanes while
+  // preserving the old destination value for inactive lanes.
+  vector_f32 result = vdiv_precise(src0, src1, mask, MODE_ZEROING);
+  ::vsel(dst, result, dst, mask);
+}
+
 template <typename SrcVec, typename Mode>
 __simd_callee__ inline SrcVec vmax(SrcVec src_0, SrcVec src_1, vector_bool mask,
                                    Mode mode) {
