@@ -3,6 +3,7 @@
 import torch
 import tilelang
 import tilelang.testing
+from tilelang import tvm
 from tilelang import language as T
 
 
@@ -146,6 +147,69 @@ def make_bf16_gemm_oob_kernel(m: int, n: int, k: int):
             )
 
     return kernel
+
+
+def make_dynamic_guard_multibuffer_kernel():
+    @T.prim_func
+    def kernel(
+        src: T.Buffer((4, 16, 64), "float32"),
+        out: T.Buffer((4, 16, 64), "float32"),
+        meta: T.Buffer((2,), "int32"),
+    ):
+        with T.Kernel(1):
+            ub = T.alloc_shared((16, 64), "float32")
+            group = T.int32(meta[0])
+            rows = T.max(T.min(T.int32(meta[1]), 16), 0)
+            for _ in T.serial(2):
+                T.copy(src[group, 0:rows, :], ub[0:rows, :])
+                T.copy(ub[0:rows, :], out[group, 0:rows, :])
+
+    return kernel
+
+
+def test_copy_oob_guards_are_lowered_after_auto_schedule() -> None:
+    snapshots = {}
+    wanted = {
+        "tl.AscendInsertOOBPadding",
+        "tl.AnnotateMultiBufferEligible",
+        "tl.AutoSchedule",
+        "tl.LowerTileOp",
+    }
+
+    @tvm.ir.instrument.pass_instrument
+    class CapturePassIR:
+        def run_after_pass(self, mod, info):
+            if info.name in wanted:
+                snapshots[info.name] = mod.script()
+
+    with tvm.transform.PassContext(opt_level=3, instruments=[CapturePassIR()]):
+        tilelang.lower(make_dynamic_guard_multibuffer_kernel(), target="ascend")
+
+    assert snapshots.keys() >= wanted
+
+    def generated_guard_lines(pass_name):
+        return [
+            line.strip()
+            for line in snapshots[pass_name].splitlines()
+            if line.lstrip().startswith("if ") and ("group" in line or "rows" in line)
+        ]
+
+    # Neither the empty `rows` tile nor the fixed-axis `group` bounds check may
+    # turn the first UB write into a conditional write before eligibility and
+    # scheduling have run.
+    assert not generated_guard_lines("tl.AscendInsertOOBPadding")
+    assert not generated_guard_lines("tl.AnnotateMultiBufferEligible")
+    assert not generated_guard_lines("tl.AutoSchedule")
+    scheduled = snapshots["tl.AutoSchedule"]
+    assert "T.ascend_set_flag" in scheduled
+    assert "T.ascend_wait_flag" in scheduled
+    annotation_lines = [line for line in snapshots["tl.AnnotateMultiBufferEligible"].splitlines() if "multi_buffer_eligible" in line]
+    assert any("ub" in line for line in annotation_lines), annotation_lines
+
+    # LowerTileOp reconstructs one runtime predicate from the clamped semantic
+    # extents. It must cover both reasons for an empty DMA.
+    lowered_guards = generated_guard_lines("tl.LowerTileOp")
+    assert any("group" in line and "rows" in line for line in lowered_guards), lowered_guards
 
 
 def test_copy_oob_1d_tail() -> None:

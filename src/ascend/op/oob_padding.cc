@@ -54,17 +54,19 @@ Optional<Layout> FindLayoutForBuffer(const LayoutMap &layout_map,
 
 BoundedDMACopyRanges ClampDMACopyTail(const CopyNode &op,
                                       arith::Analyzer *analyzer) {
-  BoundedDMACopyRanges result{op.src_range, op.dst_range, std::nullopt};
+  BoundedDMACopyRanges result{op.src_range, op.dst_range, false};
   if (op.src_range.size() != op.src->shape.size() ||
       op.dst_range.size() != op.dst->shape.size()) {
     return result;
   }
 
   bool need_transpose = op.GetTranspose();
+  DMAPath dma_path = GetDMAPath(op.src, op.dst);
+  bool preserve_l0c_source_geometry = dma_path == DMAPath::kL0CToGM;
   std::vector<size_t> src_axes, dst_axes;
   std::vector<size_t> src_singleton_axes, dst_singleton_axes;
 
-  if (GetDMAPath(op.src, op.dst) == DMAPath::kGMToL1) {
+  if (dma_path == DMAPath::kGMToL1) {
     StridedLayout src_layout = NormalizeMTE2DLayout(
         op.src, op.src_range, analyzer, "Ascend GM->L1 OOB handling");
     StridedLayout dst_layout = NormalizeTrailingMTE2DLayout(
@@ -133,7 +135,6 @@ BoundedDMACopyRanges ClampDMACopyTail(const CopyNode &op,
     }
   }
 
-  PrimExpr singleton_guard = const_true();
   auto analyze_singleton_axes = [&](const Array<Range> &ranges,
                                     const Array<PrimExpr> &shape,
                                     const std::vector<size_t> &singleton_axes) {
@@ -144,17 +145,6 @@ BoundedDMACopyRanges ClampDMACopyTail(const CopyNode &op,
                               arith::ProofStrength::kSymbolicBound)) {
         needs_clamp = true;
       }
-
-      DataType dtype = range->extent.dtype();
-      auto cast_to_dtype = [dtype](PrimExpr value) {
-        return value.dtype() == dtype ? value : cast(dtype, value);
-      };
-      PrimExpr zero = make_zero(dtype);
-      PrimExpr remaining = cast_to_dtype(shape[i]) - cast_to_dtype(range->min);
-      PrimExpr valid_extent =
-          Min(cast_to_dtype(range->extent), Max(remaining, zero));
-      singleton_guard =
-          singleton_guard && (analyzer->Simplify(valid_extent) > zero);
     }
   };
   analyze_singleton_axes(op.src_range, op.src->shape, src_singleton_axes);
@@ -165,7 +155,6 @@ BoundedDMACopyRanges ClampDMACopyTail(const CopyNode &op,
 
   Array<Range> src_range = op.src_range;
   Array<Range> dst_range = op.dst_range;
-  PrimExpr has_data = const_true();
 
   for (size_t i = 0; i < src_axes.size(); ++i) {
     size_t src_axis = src_axes[i];
@@ -180,29 +169,54 @@ BoundedDMACopyRanges ClampDMACopyTail(const CopyNode &op,
                              cast_to_dtype(op.src_range[src_axis]->min);
     PrimExpr dst_remaining = cast_to_dtype(op.dst->shape[dst_axis]) -
                              cast_to_dtype(op.dst_range[dst_axis]->min);
-    PrimExpr valid_extent =
-        Min(extent, Min(Max(src_remaining, zero), Max(dst_remaining, zero)));
+    PrimExpr src_valid_extent = Min(extent, Max(src_remaining, zero));
+    PrimExpr dst_valid_extent = Min(extent, Max(dst_remaining, zero));
+    PrimExpr valid_extent = Min(src_valid_extent, dst_valid_extent);
+    src_valid_extent = analyzer->Simplify(src_valid_extent);
     valid_extent = analyzer->Simplify(valid_extent);
 
-    // Keep a possibly empty unit axis coalescible by guarding it with
-    // `has_data` instead of exposing a symbolic extent to PlanMTECopy.
-    PrimExpr layout_extent = valid_extent;
-    if (analyzer->CanProve(valid_extent <= make_const(dtype, 1),
-                           arith::ProofStrength::kSymbolicBound)) {
-      layout_extent = make_const(dtype, 1);
-    }
+    // A destination OOB tail only reduces the L0C->GM transfer count. It must
+    // not rewrite the producer's L0C matrix geometry: lowering uses the source
+    // region to recover the compact FIX source pitch. Keep the independently
+    // in-bounds source extent while the destination carries valid_extent.
+    PrimExpr src_transfer_extent =
+        preserve_l0c_source_geometry ? src_valid_extent : valid_extent;
     src_range.Set(src_axis, Range::FromMinExtent(op.src_range[src_axis]->min,
-                                                 layout_extent));
+                                                 src_transfer_extent));
     dst_range.Set(dst_axis, Range::FromMinExtent(op.dst_range[dst_axis]->min,
-                                                 layout_extent));
-    has_data = has_data && (valid_extent > zero);
+                                                 valid_extent));
   }
 
-  has_data = has_data && singleton_guard;
+  // Keep fixed/singleton-axis validity in the rewritten regions as a semantic
+  // 0/1 extent. LowerDMACopy consumes that information to build the final
+  // in-bounds guard after AutoSchedule, then normalizes a possibly-empty unit
+  // axis to extent 1 only for hardware DMA geometry.
+  auto clamp_singleton_axes =
+      [&](const Array<Range> &original, const Array<PrimExpr> &shape,
+          const std::vector<size_t> &axes, Array<Range> *clamped) {
+        for (size_t axis : axes) {
+          const Range &range = original[axis];
+          DataType dtype = range->extent.dtype();
+          auto cast_to_dtype = [dtype](PrimExpr value) {
+            return value.dtype() == dtype ? value : cast(dtype, value);
+          };
+          PrimExpr zero = make_zero(dtype);
+          PrimExpr remaining =
+              cast_to_dtype(shape[axis]) - cast_to_dtype(range->min);
+          PrimExpr valid_extent =
+              Min(cast_to_dtype(range->extent), Max(remaining, zero));
+          clamped->Set(axis, Range::FromMinExtent(
+                                 range->min, analyzer->Simplify(valid_extent)));
+        }
+      };
+  clamp_singleton_axes(op.src_range, op.src->shape, src_singleton_axes,
+                       &src_range);
+  clamp_singleton_axes(op.dst_range, op.dst->shape, dst_singleton_axes,
+                       &dst_range);
 
   result.src = std::move(src_range);
   result.dst = std::move(dst_range);
-  result.has_data = analyzer->Simplify(has_data);
+  result.clamped = true;
   return result;
 }
 

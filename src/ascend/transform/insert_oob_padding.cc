@@ -3,19 +3,25 @@
  * \brief Handle Ascend DMA copy out-of-bounds tails and GM->L1 padding before
  *        AutoSchedule.
  *
- * For every DMA `tl.tileop.copy` (GM<->UB, GM->L1, L0C->GM) this pass clamps
- * the out-of-bounds tail: it rewrites the copy's region args to the in-bounds
- * ranges and wraps the copy in the has_data guard (dropping statically-empty
- * tiles). For a padded GM->L1 copy it also appends the create_cbuf_matrix
- * padding fill(s) as standalone ascend_fill_l1 statements.
+ * For GM-facing `tl.tileop.copy` paths that can cross a tensor boundary
+ * (GM<->UB, GM->L1, L0C->GM), this pass clamps the out-of-bounds tail by
+ * rewriting the copy's region args to semantic in-bounds ranges. It does not
+ * insert copy control flow: LowerDMACopy derives both empty-tile and
+ * fixed/singleton-axis in-bounds guards from the clamped ranges after
+ * AutoSchedule. For a padded GM->L1 copy it appends the
+ * create_cbuf_matrix padding fill(s) as standalone ascend_fill_l1 statements.
+ * For FP8 L1 data
+ * consumed by an MX scale-bearing L1->L0 copy, it automatically emits
+ * DeepGEMM-compatible K-tail fills after the paired data loads. AutoSchedule
+ * keeps those MTE2 fills ordered before L1->L0 consumes the buffers.
  *
  * Doing this before AutoSchedule (rather than inside copy.cc's LowerTileOp
  * lowering, which runs after AutoSchedule) makes the fill visible to
- * pipe/barrier analysis: it is scheduled as its own MTE1 task (see
- * auto_schedule.cc's ResourceAnalyzer) and ordered against the L1->L0 loads
- * that read the padded buffer. copy.cc lowering consumes the already-clamped
- * ranges and no longer performs any OOB/padding handling. Both this pass and
- * (historically) copy.cc share the clamp/fill helpers in oob_padding.h.
+ * pipe/barrier analysis: it is scheduled as its own MTE2 task (see
+ * auto_schedule.cc's ResourceAnalyzer) and participates in the dependency
+ * before the MTE1 L1->L0 loads that read the padded buffer. copy.cc lowering
+ * consumes the already-clamped ranges and inserts the final copy guard.
+ * Both stages share the clamp/fill helpers in oob_padding.h.
  */
 
 #include <tvm/arith/analyzer.h>
@@ -26,6 +32,8 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
+#include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include "arith/ir_mutator_with_analyzer.h"
@@ -34,6 +42,7 @@
 #include "layout/layout.h"
 #include "op/builtin.h"
 #include "op/copy.h"
+#include "op/gemm.h"
 #include "op/utils.h"
 
 namespace tvm {
@@ -109,11 +118,11 @@ std::vector<Stmt> MakeL1PaddingStmts(const CopyNode *copy,
   // Only pad the tail that an out-of-bounds clamp actually cut off. A copy
   // whose destination L1 buffer is merely over-allocated (larger than the valid
   // source region, but the source itself is fully in bounds) is left untouched:
-  // its extra columns/rows are not clamped, so has_data stays undefined and no
-  // fill is emitted. When the source *is* clamped (OOB), we pad every tail
+  // its extra columns/rows are not clamped, so no fill is emitted. When the
+  // source *is* clamped (OOB), we pad every tail
   // dimension (M/N and the K reduction axis) so the gemm never reads
   // uninitialized L1.
-  if (!bounded.has_data.defined())
+  if (!bounded.clamped)
     return stmts;
   StridedLayout src_layout = NormalizeMTE2DLayout(
       copy->src, copy->src_range, analyzer, "Ascend GM->L1 padding");
@@ -142,6 +151,199 @@ std::vector<Stmt> MakeL1PaddingStmts(const CopyNode *copy,
   return stmts;
 }
 
+using VarAxisMap =
+    std::unordered_map<Var, LogicalAxis, ObjectPtrHash, ObjectPtrEqual>;
+
+void SetKAxis(VarAxisMap *axes, const Buffer &buffer, LogicalAxis axis) {
+  auto [it, inserted] = axes->emplace(buffer->data, axis);
+  ICHECK(inserted || it->second == axis)
+      << "Conflicting MX K-axis uses for buffer " << buffer->name;
+}
+
+// First recover the semantic K axis of each blockscaled GEMM operand. This is
+// deliberately independent of the inferred layout tag: a physical [K, MN]
+// buffer can carry the same 2-D map tag as a [MN, K] buffer while the GEMM
+// transpose flag gives the unambiguous operand meaning.
+class MxOperandKAxisCollector : public StmtExprVisitor {
+public:
+  static VarAxisMap Collect(const Stmt &stmt) {
+    MxOperandKAxisCollector collector;
+    collector(stmt);
+    return std::move(collector.result_);
+  }
+
+private:
+  void VisitExpr_(const CallNode *op) final {
+    static const Op &gemm_op = Op::Get("tl.tileop.gemm");
+    if (op->op.same_as(gemm_op)) {
+      Gemm gemm(op->args, op->annotations);
+      bool is_blockscaled = false;
+      if (auto value = gemm->annotations_.Get("blockscaled")) {
+        if (const auto *imm = value.value().as<IntImmNode>())
+          is_blockscaled = imm->value != 0;
+      }
+      if (is_blockscaled) {
+        SetKAxis(&result_, gemm->a_,
+                 gemm->transA_ ? LogicalAxis::kRow : LogicalAxis::kCol);
+        SetKAxis(&result_, gemm->b_,
+                 gemm->transB_ ? LogicalAxis::kCol : LogicalAxis::kRow);
+      }
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  VarAxisMap result_;
+};
+
+// Then propagate the GEMM K axis backwards through scale-bearing L1->L0
+// copies. A user-requested L1->L0 transpose swaps the source axis. Any earlier
+// GM->L1 transpose is already reflected in the L1 destination region.
+class MxL1KAxisCollector : public StmtExprVisitor {
+public:
+  static VarAxisMap Collect(const Stmt &stmt) {
+    VarAxisMap operand_axes = MxOperandKAxisCollector::Collect(stmt);
+    MxL1KAxisCollector collector(operand_axes);
+    collector(stmt);
+    return std::move(collector.result_);
+  }
+
+private:
+  explicit MxL1KAxisCollector(const VarAxisMap &operand_axes)
+      : operand_axes_(operand_axes) {}
+
+  void VisitExpr_(const CallNode *op) final {
+    static const Op &copy_op = Op::Get("tl.tileop.copy");
+    static const Op &gemm_op = Op::Get("tl.tileop.gemm");
+    if (op->op.same_as(copy_op)) {
+      Copy copy(op->args, op->annotations);
+      auto it = operand_axes_.find(copy->dst->data);
+      if (copy->sf.defined() && IsL1Buffer(copy->src) &&
+          (IsL0ABuffer(copy->dst) || IsL0BBuffer(copy->dst)) &&
+          it != operand_axes_.end()) {
+        LogicalAxis src_k_axis = it->second;
+        if (copy->GetTranspose() != 0) {
+          src_k_axis = src_k_axis == LogicalAxis::kRow ? LogicalAxis::kCol
+                                                       : LogicalAxis::kRow;
+        }
+        SetKAxis(&result_, copy->src, src_k_axis);
+      }
+    } else if (op->op.same_as(gemm_op)) {
+      Gemm gemm(op->args, op->annotations);
+      if (IsL1Buffer(gemm->a_)) {
+        auto it = operand_axes_.find(gemm->a_->data);
+        if (it != operand_axes_.end())
+          SetKAxis(&result_, gemm->a_, it->second);
+      }
+      if (IsL1Buffer(gemm->b_)) {
+        auto it = operand_axes_.find(gemm->b_->data);
+        if (it != operand_axes_.end())
+          SetKAxis(&result_, gemm->b_, it->second);
+      }
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  const VarAxisMap &operand_axes_;
+  VarAxisMap result_;
+};
+
+struct MxKTailFill {
+  Stmt stmt;
+  PrimExpr condition;
+};
+
+// Build DeepGEMM's fill_tail_block for an actual-sized FP8 GM->L1 copy. The
+// destination allocation retains the full static tile geometry while the copy
+// ranges carry actual_mn/actual_k. LayoutInference has already tagged the L1
+// buffer as MajorK or MajorMN, so the physical fill can be selected without
+// exposing layout details on the Python surface.
+std::optional<MxKTailFill> MakeMxKTailFill(const Copy &copy,
+                                           LogicalAxis semantic_k_axis,
+                                           const LayoutMap &layout_map,
+                                           arith::Analyzer *analyzer) {
+  if (!IsGlobalBuffer(copy->src) || !IsL1Buffer(copy->dst)) {
+    return std::nullopt;
+  }
+  // FP4 has a different logical-K-to-byte mapping. Keep this automatic path
+  // scoped to dense FP8; existing full-region OOB padding still handles FP4.
+  // Fill geometry is defined entirely by the destination L1 region and its
+  // semantic K axis, so a GM->L1 transpose does not change it.
+  if (copy->dst->dtype.lanes() != 1 || !copy->dst->dtype.is_float8() ||
+      copy->dst_range.size() != copy->dst->shape.size() ||
+      copy->dst_range.size() < 2) {
+    return std::nullopt;
+  }
+
+  Optional<Layout> layout = ascend::FindLayoutForBuffer(layout_map, copy->dst);
+  if (!layout.defined())
+    return std::nullopt;
+  AscendFractalLayoutInfo info;
+  if (!TryExtractAscendFractalLayout(layout.value(), copy->dst, &info) ||
+      !IsAscendMajorKind(info.kind)) {
+    return std::nullopt;
+  }
+
+  size_t ndim = copy->dst_range.size();
+  size_t k_axis = semantic_k_axis == LogicalAxis::kRow ? ndim - 2 : ndim - 1;
+  size_t mn_axis = semantic_k_axis == LogicalAxis::kRow ? ndim - 1 : ndim - 2;
+  PrimExpr zero = make_zero(copy->dst_range[k_axis]->extent.dtype());
+  if (!analyzer->CanProveEqual(copy->dst_range[k_axis]->min, zero) ||
+      !analyzer->CanProveEqual(copy->dst_range[mn_axis]->min, zero)) {
+    return std::nullopt;
+  }
+
+  PrimExpr actual_k = analyzer->Simplify(copy->dst_range[k_axis]->extent);
+  PrimExpr shape_k = copy->dst->shape[k_axis];
+  PrimExpr shape_mn = copy->dst->shape[mn_axis];
+  auto C = [&](int64_t value) { return make_const(actual_k.dtype(), value); };
+  PrimExpr k64 = analyzer->Simplify(FloorDiv(actual_k + C(63), C(64)) * C(64));
+  ICHECK(analyzer->CanProveEqual(FloorMod(shape_k, C(64)), C(0)))
+      << "Ascend MX FP8 K-tail fill requires the L1 K allocation extent to "
+         "be divisible by 64, got "
+      << shape_k << " for buffer " << copy->dst->name << " with shape "
+      << copy->dst->shape << " and layout kind " << static_cast<int>(info.kind);
+
+  bool is_k_major = semantic_k_axis == info.c0_axis;
+
+  PrimExpr byte_offset;
+  PrimExpr repeat_times;
+  PrimExpr block_num_32b;
+  PrimExpr dst_gap_32b;
+  PrimExpr needs_fill;
+  if (is_k_major) {
+    PrimExpr nz32 =
+        analyzer->Simplify(FloorDiv(actual_k + C(31), C(32)) * C(32));
+    needs_fill = analyzer->Simplify(nz32 < k64);
+    byte_offset = FloorDiv(nz32, C(32)) * shape_mn * C(32);
+    repeat_times = C(1);
+    block_num_32b = shape_mn;
+    dst_gap_32b = C(0);
+  } else {
+    ICHECK(analyzer->CanProveEqual(FloorMod(shape_mn, info.c0), C(0)))
+        << "Ascend MX FP8 K-tail fill requires a MajorMN extent divisible by "
+           "the FP8 C0 width, got MN="
+        << shape_mn << " and C0=" << info.c0;
+    PrimExpr tail_k = analyzer->Simplify(k64 - actual_k);
+    needs_fill = analyzer->Simplify(actual_k < k64);
+    byte_offset = actual_k * C(32);
+    repeat_times = FloorDiv(shape_mn, info.c0);
+    block_num_32b = tail_k;
+    dst_gap_32b = shape_k - tail_k;
+  }
+
+  if (is_zero(needs_fill) || analyzer->CanProve(Not(needs_fill)))
+    return std::nullopt;
+
+  PrimExpr base_ptr = MakeFillBasePtr(copy.get());
+  auto [fill_pattern, fill_word_bits] = ascend::MakeL1FillPattern(*copy.get());
+  Stmt fill = Evaluate(
+      Call(DataType::Void(), ascend_fill_l1(),
+           {base_ptr, analyzer->Simplify(byte_offset), fill_pattern,
+            analyzer->Simplify(repeat_times), analyzer->Simplify(block_num_32b),
+            analyzer->Simplify(dst_gap_32b), C(fill_word_bits)}));
+  return MxKTailFill{fill, needs_fill};
+}
+
 class OOBPaddingInserter : public arith::IRMutatorWithAnalyzer {
 public:
   static Stmt Apply(Stmt stmt, arith::Analyzer *analyzer) {
@@ -153,17 +355,109 @@ private:
   using Parent = arith::IRMutatorWithAnalyzer;
   explicit OOBPaddingInserter(arith::Analyzer *analyzer) : Parent(analyzer) {}
 
+  bool IsMxL1Data(const Buffer &buffer) const {
+    return mx_l1_k_axes_.count(buffer->data) != 0;
+  }
+
+  LogicalAxis GetMxKAxis(const Buffer &buffer) const {
+    auto it = mx_l1_k_axes_.find(buffer->data);
+    ICHECK(it != mx_l1_k_axes_.end())
+        << "Missing collected MX K axis for L1 buffer " << buffer->name;
+    return it->second;
+  }
+
+  Optional<Copy> AsMxGMToL1Copy(const Stmt &stmt) const {
+    static const Op &copy_op = Op::Get("tl.tileop.copy");
+    const auto *evaluate = stmt.as<EvaluateNode>();
+    if (!evaluate)
+      return std::nullopt;
+    const auto *call = evaluate->value.as<CallNode>();
+    if (!call || !call->op.same_as(copy_op))
+      return std::nullopt;
+    Copy copy(call->args, call->annotations);
+    if (!IsGlobalBuffer(copy->src) || !IsL1Buffer(copy->dst) ||
+        !IsMxL1Data(copy->dst)) {
+      return std::nullopt;
+    }
+    return copy;
+  }
+
+  void FlushMxKTailFills(Array<Stmt> *seq, std::vector<MxKTailFill> *pending) {
+    if (pending->empty())
+      return;
+
+    // These fill predicates are the only control flow intentionally created by
+    // this pre-AutoSchedule pass. They guard standalone MTE2 fill tasks, not
+    // copies. Each affected L1 buffer has already received its unconditional
+    // GM->L1 write in `seq`, so the predicates cannot change its write-first
+    // classification. Keep them visible here so AutoSchedule can order each
+    // possible fill against the later L1 consumer.
+    PrimExpr any_fill = const_false();
+    for (const MxKTailFill &fill : *pending) {
+      any_fill = analyzer_->Simplify(Or(any_fill, fill.condition));
+    }
+
+    Array<Stmt> body;
+    for (const MxKTailFill &fill : *pending) {
+      Stmt fill_stmt = fill.stmt;
+      if (!analyzer_->CanProveEqual(fill.condition, any_fill)) {
+        fill_stmt = IfThenElse(fill.condition, fill_stmt);
+      }
+      body.push_back(fill_stmt);
+    }
+    Stmt fill_group = body.size() == 1 ? body[0] : Stmt(SeqStmt(body));
+    if (!is_one(any_fill) && !analyzer_->CanProve(any_fill)) {
+      fill_group = IfThenElse(any_fill, fill_group);
+    }
+    seq->push_back(fill_group);
+    pending->clear();
+  }
+
   Stmt VisitStmt_(const SBlockNode *op) final {
     LayoutMap saved = layout_map_;
+    VarAxisMap saved_mx_l1_k_axes = mx_l1_k_axes_;
     if (auto layout_map_ref = op->annotations.Get(attr::kLayoutMap)) {
       if (auto map = layout_map_ref.value().as<Map<Buffer, Layout>>()) {
         layout_map_ = map.value();
       }
     }
+    VarAxisMap local_mx_l1_k_axes = MxL1KAxisCollector::Collect(op->body);
+    for (const auto &[data, axis] : local_mx_l1_k_axes) {
+      auto [it, inserted] = mx_l1_k_axes_.emplace(data, axis);
+      ICHECK(inserted || it->second == axis)
+          << "Conflicting nested MX K-axis uses for L1 buffer data";
+    }
     // Parent binds this block's iter vars into the analyzer before recursing.
     Stmt stmt = Parent::VisitStmt_(op);
     layout_map_ = saved;
+    mx_l1_k_axes_ = std::move(saved_mx_l1_k_axes);
     return stmt;
+  }
+
+  Stmt VisitStmt_(const SeqStmtNode *op) final {
+    Array<Stmt> seq;
+    std::vector<MxKTailFill> pending;
+    for (const Stmt &original : op->seq) {
+      Optional<Copy> mx_copy = AsMxGMToL1Copy(original);
+      if (!mx_copy.defined()) {
+        FlushMxKTailFills(&seq, &pending);
+        seq.push_back(Parent::VisitStmt(original));
+        continue;
+      }
+
+      bool saved_defer = defer_mx_fill_;
+      defer_mx_fill_ = true;
+      seq.push_back(Parent::VisitStmt(original));
+      defer_mx_fill_ = saved_defer;
+      Copy mx_copy_value = mx_copy.value();
+      std::optional<MxKTailFill> fill =
+          MakeMxKTailFill(mx_copy_value, GetMxKAxis(mx_copy_value->dst),
+                          layout_map_, analyzer_);
+      if (fill.has_value())
+        pending.push_back(std::move(fill.value()));
+    }
+    FlushMxKTailFills(&seq, &pending);
+    return SeqStmt(seq, op->span);
   }
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
@@ -177,7 +471,8 @@ private:
     const CopyNode *copy = copy_obj.get();
 
     ascend::DMAPath dma_path = ascend::GetDMAPath(copy->src, copy->dst);
-    // Only DMA paths that copy.cc used to clamp participate in OOB handling.
+    // Only GM-facing paths need semantic range clamping. All DMA paths receive
+    // their empty-tile guard later in LowerDMACopy.
     bool clampable = dma_path == ascend::DMAPath::kGMToUB ||
                      dma_path == ascend::DMAPath::kUBToGM ||
                      dma_path == ascend::DMAPath::kGMToL1 ||
@@ -186,15 +481,15 @@ private:
       return Parent::VisitStmt_(op);
     }
 
-    // Clamp the copy's tail to the in-bounds region. The traversal analyzer has
-    // the enclosing loop / thread / block-iter ranges bound (via
+    // Clamp the copy's tail to the in-bounds region. The traversal analyzer
+    // has the enclosing loop / thread / block-iter ranges bound (via
     // IRMutatorWithAnalyzer), matching copy.cc's lowering-time analyzer.
     ascend::BoundedDMACopyRanges bounded =
         ascend::ClampDMACopyTail(*copy, analyzer_);
 
     // Rebuild the copy call with clamped ranges when clamping shrank them.
     Stmt copy_stmt = GetRef<Stmt>(op);
-    if (bounded.has_data.defined()) {
+    if (bounded.clamped) {
       int src_mask = NormalizeToAccessRegion(call->args[0]).access_mask;
       int dst_mask = NormalizeToAccessRegion(call->args[1]).access_mask;
       Array<PrimExpr> new_args = call->args;
@@ -202,39 +497,36 @@ private:
       new_args.Set(1, MakeRegionCall(copy->dst, bounded.dst, dst_mask));
       copy_stmt =
           Evaluate(Call(call->dtype, call->op, new_args, call->annotations));
-
-      PrimExpr has_data = bounded.has_data.value();
-      if (is_zero(has_data)) {
-        // Fully out of bounds: no copy and no fill of valid data. (A padded
-        // buffer whose entire valid region is empty still gets its fill below.)
-        copy_stmt = Evaluate(0);
-      } else if (!is_one(has_data)) {
-        // The enclosing loop/thread/if constraints (e.g. the Persistent wave
-        // guard `w*64+bx < ceildiv(num_tokens,32)`) may already guarantee at
-        // least one valid element. When provable, keep the clamped copy
-        // UNCONDITIONAL: the tail guard is redundant, and an unconditional
-        // write keeps the dst buffer write-first so multi-buffer eligibility /
-        // annotate_buffer_versions apply.
-        if (!analyzer_->CanProve(has_data)) {
-          copy_stmt = IfThenElse(has_data, copy_stmt);
-        }
-      }
     }
 
-    // Emit the standalone padding fill(s) for a padded GM->L1 copy.
+    // Emit standalone padding fills for a padded GM->L1 copy. MX K-tail fills
+    // are grouped by VisitStmt_(SeqStmtNode*) so paired A/B loads are followed
+    // by both fills. create_cbuf_matrix runs on MTE2, so AutoSchedule orders
+    // the fills before the MTE1 consumers without an explicit pipe barrier.
+    // The fallback here handles a copy that is not inside a SeqStmt.
     std::vector<Stmt> fills = MakeL1PaddingStmts(copy, layout_map_, analyzer_);
+    std::vector<MxKTailFill> mx_fills;
+    if (!defer_mx_fill_ && IsMxL1Data(copy->dst)) {
+      std::optional<MxKTailFill> mx_fill = MakeMxKTailFill(
+          copy_obj, GetMxKAxis(copy->dst), layout_map_, analyzer_);
+      if (mx_fill.has_value())
+        mx_fills.push_back(std::move(mx_fill.value()));
+    }
 
-    if (fills.empty()) {
+    if (fills.empty() && mx_fills.empty()) {
       return copy_stmt;
     }
     Array<Stmt> seq;
     seq.push_back(copy_stmt);
     for (auto &f : fills)
       seq.push_back(f);
+    FlushMxKTailFills(&seq, &mx_fills);
     return SeqStmt(seq);
   }
 
   LayoutMap layout_map_;
+  VarAxisMap mx_l1_k_axes_;
+  bool defer_mx_fill_{false};
 };
 
 } // namespace

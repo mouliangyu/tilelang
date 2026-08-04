@@ -27,6 +27,10 @@ and validate supported layout combinations end-to-end on NPU:
 * ``test_l0c_to_rank3_gm_uses_effective_row_stride`` — the same rank reduction
   applies to a grouped L0C-to-GM output copy, while a smaller destination
   region controls the transferred tail extent.
+* ``test_l0c_to_oob_gm_preserves_source_geometry`` — clamping an OOB GM output
+  tail reduces the transfer extent without changing the producer's L0C pitch.
+* ``test_compact_l0_regions_drive_load_mad_and_store_geometry`` — an L0 region
+  smaller than its allocation consistently controls MTE1, MAD, and FIX pitch.
 * ``test_gm_to_l1_true_nd_rejected`` — a genuine three-dimensional transfer is
   rejected instead of being silently flattened with the wrong stride.
 * ``test_gm2ub2gm_fp4_copy`` — a packed ``float4_e2m1fn`` GM->UBuf->GM copy
@@ -369,6 +373,109 @@ def test_l0c_to_strided_gm_uses_runtime_row_stride():
     torch.testing.assert_close(out, a.float() @ b.float().T)
 
 
+def compact_l0_region_copy():
+    alloc_m, alloc_n, alloc_k = 64, 64, 64
+    tile_m, tile_n, tile_k = 17, 19, 18
+
+    @T.prim_func
+    def kernel(
+        a: T.Buffer((alloc_m, alloc_k), "bfloat16"),
+        b: T.Buffer((alloc_n, alloc_k), "bfloat16"),
+        out: T.Buffer((tile_m, tile_n), "float32"),
+    ):
+        with T.Kernel(1):
+            a_l1 = T.alloc_l1((alloc_m, alloc_k), "bfloat16")
+            b_l1 = T.alloc_l1((alloc_n, alloc_k), "bfloat16")
+            a_l0 = T.alloc_l0a((alloc_m, alloc_k), "bfloat16")
+            b_l0 = T.alloc_l0b((alloc_n, alloc_k), "bfloat16")
+            acc = T.alloc_l0c((alloc_m, alloc_n), "float32")
+            T.copy(a, a_l1)
+            T.copy(b, b_l1)
+            T.copy(a_l1[0:tile_m, 0:tile_k], a_l0[0:tile_m, 0:tile_k])
+            T.copy(b_l1[0:tile_n, 0:tile_k], b_l0[0:tile_n, 0:tile_k])
+            T.gemm(
+                a_l0[0:tile_m, 0:tile_k],
+                b_l0[0:tile_n, 0:tile_k],
+                acc[0:tile_m, 0:tile_n],
+                transpose_B=True,
+                clear_accum=True,
+            )
+            T.copy(acc[0:tile_m, 0:tile_n], out, unit_flag_ctrl=3)
+
+    return kernel
+
+
+def test_compact_l0_regions_drive_load_mad_and_store_geometry():
+    artifact = tilelang.lower(compact_l0_region_copy(), target="ascend")
+    source = artifact.kernel_source
+
+    # The L1 allocation keeps its 64-row / 4-fractal pitch, while each compact
+    # L0 operand uses the 17/19-row region pitch (two fractals).
+    assert re.search(r"load_cbuf_to_ca\([^;]*,\s*0,\s*0,\s*2,\s*2,\s*4,\s*2,\s*0\);", source), source
+    assert re.search(r"load_cbuf_to_cb\([^;]*,\s*0,\s*0,\s*2,\s*2,\s*4,\s*2,\s*0\);", source), source
+    assert re.search(r"mad\([^;]*,\s*17,\s*18,\s*19,", source), source
+    assert re.search(r"copy_matrix_cc_to_gm\([^;]*,\s*0,\s*19,\s*17,\s*19,\s*32,", source), source
+
+
+def dynamic_compact_l0_region_copy():
+    alloc = 64
+
+    @T.prim_func
+    def kernel(
+        a: T.Buffer((alloc, alloc), "bfloat16"),
+        b: T.Buffer((alloc, alloc), "bfloat16"),
+        out: T.Buffer((alloc, alloc), "float32"),
+        sizes: T.Buffer((3,), "int32"),
+    ):
+        with T.Kernel(1):
+            a_l1 = T.alloc_l1((alloc, alloc), "bfloat16")
+            b_l1 = T.alloc_l1((alloc, alloc), "bfloat16")
+            a_l0 = T.alloc_l0a((alloc, alloc), "bfloat16")
+            b_l0 = T.alloc_l0b((alloc, alloc), "bfloat16")
+            acc = T.alloc_l0c((alloc, alloc), "float32")
+            m = T.max(T.min(T.int32(sizes[0]), alloc), 0)
+            n = T.max(T.min(T.int32(sizes[1]), alloc), 0)
+            k = T.max(T.min(T.int32(sizes[2]), alloc), 0)
+            T.copy(a, a_l1)
+            T.copy(b, b_l1)
+            T.copy(a_l1[0:m, 0:k], a_l0[0:m, 0:k])
+            T.copy(b_l1[0:n, 0:k], b_l0[0:n, 0:k])
+            T.gemm(
+                a_l0[0:m, 0:k],
+                b_l0[0:n, 0:k],
+                acc[0:m, 0:n],
+                transpose_B=True,
+                clear_accum=True,
+            )
+            T.copy(acc[0:m, 0:n], out[0:m, 0:n], unit_flag_ctrl=3)
+
+    return kernel
+
+
+def test_dynamic_compact_l0_region_uses_symbolic_geometry():
+    artifact = tilelang.lower(dynamic_compact_l0_region_copy(), target="ascend")
+    source = artifact.kernel_source
+    m_blocks = r"\(\(\(m - 1\) >> 4\) \+ 1\)"
+    n_blocks = r"\(\(\(n - 1\) >> 4\) \+ 1\)"
+    k_blocks = r"\(\(\(k - 1\) >> 4\) \+ 1\)"
+    assert re.search(
+        rf"if \(\(0 < m\) && \(0 < k\)\) \{{\s*"
+        rf"load_cbuf_to_ca\([^;]*,\s*0,\s*0,\s*{m_blocks},\s*{k_blocks},\s*4,\s*{m_blocks},\s*0\);",
+        source,
+    ), source
+    assert re.search(
+        rf"if \(\(0 < n\) && \(0 < k\)\) \{{\s*"
+        rf"load_cbuf_to_cb\([^;]*,\s*0,\s*0,\s*{n_blocks},\s*{k_blocks},\s*4,\s*{n_blocks},\s*0\);",
+        source,
+    ), source
+    assert re.search(r"mad\([^;]*,\s*m,\s*k,\s*n,", source), source
+    assert re.search(
+        r"copy_matrix_cc_to_gm\([^;]*,\s*0,\s*min\(n, 64\),\s*min\(m, 64\),\s*64,"
+        r"\s*\(\(\(\(min\(m, 64\) - 1\) >> 4\) \* 16\) \+ 16\),",
+        source,
+    ), source
+
+
 def gm_to_l1_fixed_outer_axis_copy():
     @T.prim_func
     def kernel(
@@ -428,6 +535,48 @@ def test_l0c_to_rank3_gm_uses_effective_row_stride():
         r"copy_matrix_cc_to_gm\([^;]*,\s*0,\s*12,\s*8,\s*40,\s*16,",
         source,
     ), source
+
+
+def l0c_to_oob_gm_copy():
+    m, n, k, tile_m = 200, 16, 16, 128
+
+    @T.prim_func
+    def kernel(
+        a: T.Buffer((tile_m, k), "bfloat16"),
+        b: T.Buffer((n, k), "bfloat16"),
+        out: T.Buffer((m, n), "float32"),
+    ):
+        with T.Kernel(2) as block:
+            a_l1 = T.alloc_l1((tile_m, k), "bfloat16")
+            b_l1 = T.alloc_l1((n, k), "bfloat16")
+            acc = T.alloc_l0c((tile_m, n), "float32")
+            T.copy(a, a_l1)
+            T.copy(b, b_l1)
+            T.gemm(
+                a_l1,
+                b_l1,
+                acc,
+                transpose_B=True,
+                clear_accum=True,
+                unit_flag_ctrl=3,
+            )
+            T.copy(
+                acc,
+                out[block * tile_m : (block + 1) * tile_m, :],
+                unit_flag_ctrl=3,
+            )
+
+    return kernel
+
+
+def test_l0c_to_oob_gm_preserves_source_geometry():
+    artifact = tilelang.lower(l0c_to_oob_gm_copy(), target="ascend")
+    source = artifact.kernel_source
+    copy = re.search(r"copy_matrix_cc_to_gm\([^;]+\);", source)
+    assert copy is not None, source
+    args = copy.group(0)
+    assert re.search(r",\s*0,\s*16,\s*min\(128,", args), args
+    assert re.search(r",\s*16,\s*128,\s*0,\s*0,", args), args
 
 
 def gm_to_l1_true_nd_copy():

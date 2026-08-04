@@ -78,7 +78,7 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
 
     # Clamp DMA copy OOB tails and emit GM->L1 padding fills (create_cbuf_matrix)
     # as standalone statements so AutoSchedule schedules each fill as its own
-    # MTE1 task and orders it against the L1->L0 loads that read the padded
+    # MTE2 task and orders it against the L1->L0 loads that read the padded
     # buffer. Must run before AutoSchedule.
     mod = ascend_transform.AscendInsertOOBPadding()(mod)
 

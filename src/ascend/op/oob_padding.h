@@ -59,25 +59,28 @@ Optional<Layout> FindLayoutForBuffer(const LayoutMap &layout_map,
 /*!
  * \brief Result of clamping a DMA copy's ranges to stay in bounds.
  *
- * `src` / `dst` are the (possibly shrunk) copy ranges. `has_data` is an
- * optional runtime guard predicate: when defined and not trivially true, the
- * copy must be guarded by `if (has_data)`; when it is provably false the copy
- * should be dropped entirely.
+ * `src` / `dst` are the (possibly shrunk) semantic copy ranges, whose extents
+ * may be zero. A zero extent carries both an empty transfer and an invalid
+ * fixed/singleton-axis index (for example, `src[group, ...]` with an out-of-
+ * range `group`). `clamped` reports whether the helper rewrote those ranges.
+ * Runtime guards are deliberately not part of this result; DMA lowering
+ * derives them from the final ranges after scheduling.
  */
 struct BoundedDMACopyRanges {
   Array<Range> src;
   Array<Range> dst;
-  Optional<PrimExpr> has_data;
+  bool clamped;
 };
 
 /*!
  * \brief Clamp a copy's trailing tail to the valid in-bounds region.
  *
  * Pairs non-singleton axes between src and dst (swapping the trailing two for a
- * transposed copy), shrinks any axis whose range exceeds the buffer shape, and
- * builds a `has_data` guard for dynamically-empty tiles. Returns the original
- * ranges unchanged (has_data == nullopt) when no clamp is needed or the shape
- * structure is unsupported.
+ * transposed copy) and shrinks any axis whose range exceeds the buffer shape.
+ * The clamped ranges preserve possibly-zero semantic extents, including a 0/1
+ * extent that carries fixed/singleton-axis validity to DMA lowering. Returns
+ * the original ranges with `clamped == false` when no clamp is needed or the
+ * shape structure is unsupported.
  */
 BoundedDMACopyRanges ClampDMACopyTail(const CopyNode &op,
                                       arith::Analyzer *analyzer);

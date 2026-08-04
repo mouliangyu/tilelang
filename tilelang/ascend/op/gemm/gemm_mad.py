@@ -109,8 +109,9 @@ class GemmMAD(GemmBase):
         self._check_blockscaled_k_alignment()
         layouts = {}
         # Choose K-major vs MN-major so that each operand's reduce-K axis lands
-        # on the C0 axis.  Blockscaled GEMM always uses K-major; non-blockscaled
-        # uses trans flags to pick the major:
+        # on the C0 axis. Both regular and blockscaled GEMM use the transpose
+        # flags to pick the major; blockscaled layouts additionally require
+        # K-alignment for the MX scale groups:
         #   A: trans_A=False -> K-major; trans_A=True -> MN-major
         #   B: trans_B=True  -> K-major; trans_B=False -> MN-major
         k_align = 64 if self.is_blockscaled else 1
@@ -165,6 +166,37 @@ class GemmMAD(GemmBase):
     def _is_l0_input(self):
         return self.A.scope() == "shared.l0a" and self.B.scope() == "shared.l0b"
 
+    def _l0_operation_extents(self):
+        """Return the logical MAD M/N/K carried by the three L0 regions."""
+        analyzer = arith.Analyzer()
+
+        def prove_equal(lhs, rhs) -> bool:
+            return analyzer.can_prove_equal(lhs, rhs)
+
+        def require_zero_origin(name, region) -> None:
+            for axis, rng in enumerate(region.region[-2:], start=-2):
+                assert prove_equal(rng.min, tirx.const(0, rng.min.dtype)), (
+                    f"Ascend compact L0 region {name} requires zero origin on "
+                    f"trailing axis {axis}, got min={rng.min}. Split/non-zero-"
+                    "origin L0 tiles are not supported."
+                )
+
+        require_zero_origin("A", self.ARegion)
+        require_zero_origin("B", self.BRegion)
+        require_zero_origin("C", self.CRegion)
+
+        m = self.CRegion.region[-2].extent
+        n = self.CRegion.region[-1].extent
+        a_m = self.ARegion.region[-1].extent if self.trans_A else self.ARegion.region[-2].extent
+        k = self.ARegion.region[-2].extent if self.trans_A else self.ARegion.region[-1].extent
+        b_n = self.BRegion.region[-2].extent if self.trans_B else self.BRegion.region[-1].extent
+        b_k = self.BRegion.region[-1].extent if self.trans_B else self.BRegion.region[-2].extent
+
+        assert prove_equal(a_m, m), f"Ascend L0 GEMM M-region mismatch: A={a_m}, C={m}"
+        assert prove_equal(b_n, n), f"Ascend L0 GEMM N-region mismatch: B={b_n}, C={n}"
+        assert prove_equal(b_k, k), f"Ascend L0 GEMM K-region mismatch: A={k}, B={b_k}"
+        return m, n, k
+
     def _input_dtype(self):
         return str(self.a_dtype)
 
@@ -187,6 +219,7 @@ class GemmMAD(GemmBase):
         return tile_k_sub
 
     def _lower_l0(self):
+        m, n, k = self._l0_operation_extents()
         c_ptr = _make_access_ptr(self.CRegion.buffer, self.CRegion, 2)
         a_ptr = _make_access_ptr(self.ARegion.buffer, self.ARegion, 1)
         b_ptr = _make_access_ptr(self.BRegion.buffer, self.BRegion, 1)
@@ -196,9 +229,9 @@ class GemmMAD(GemmBase):
             c_ptr,
             a_ptr,
             b_ptr,
-            _to_int32(self.M),
-            _to_int32(self.K),
-            _to_int32(self.N),
+            _to_int32(m),
+            _to_int32(k),
+            _to_int32(n),
             _to_int32(self.unit_flag_ctrl),
             _to_int32(1),  # gemv_ctrl: 1 disables the specialized GEMV mode
             _to_int32(0),  # BTbuf_ctrl
@@ -217,6 +250,7 @@ class GemmMAD(GemmBase):
         # T.copy(l1_data, l0, sf=l1_sf)); mad_mx then applies them. The call
         # signature matches tl.ascend_mad — the scaling is implicit in the
         # hardware MX registers, so no SF pointer is passed here.
+        m, n, k = self._l0_operation_extents()
         c_ptr = _make_access_ptr(self.CRegion.buffer, self.CRegion, 2)
         a_ptr = _make_access_ptr(self.ARegion.buffer, self.ARegion, 1)
         b_ptr = _make_access_ptr(self.BRegion.buffer, self.BRegion, 1)
@@ -226,9 +260,9 @@ class GemmMAD(GemmBase):
             c_ptr,
             a_ptr,
             b_ptr,
-            _to_int32(self.M),
-            _to_int32(self.K),
-            _to_int32(self.N),
+            _to_int32(m),
+            _to_int32(k),
+            _to_int32(n),
             _to_int32(self.unit_flag_ctrl),
             _to_int32(1),  # gemv_ctrl: 1 disables the specialized GEMV mode
             _to_int32(0),  # BTbuf_ctrl

@@ -113,6 +113,19 @@ def _gemm_impl(
     else:
         assert prove_equal(N_B, N), f"T.gemm N shape check failed: N_B = {N_B}, N_C = {N}"
 
+    # Ascend L0 regions describe one operation-local compact MAD tile.  Keep
+    # the positional M/N/K fields static because GemmNode and the non-Ascend
+    # instruction selectors use them as compile-time tile metadata; the
+    # Ascend L0 lowering reads the actual (possibly symbolic) geometry from the
+    # three BufferRegions instead.
+    is_ascend_l0_gemm = (
+        A_region.buffer.scope() == "shared.l0a" and B_region.buffer.scope() == "shared.l0b" and C_region.buffer.scope() == "shared.l0c"
+    )
+    node_M, node_N, node_K = M, N, K
+    if is_ascend_l0_gemm:
+        node_M, node_N = C_region.buffer.shape[-2:]
+        node_K = A_region.buffer.shape[-2] if transpose_A else A_region.buffer.shape[-1]
+
     stride_a = A_stride[-2]
     stride_b = B_stride[-2]
 
@@ -156,9 +169,9 @@ def _gemm_impl(
         C_arg,
         transpose_A,
         transpose_B,
-        M,
-        N,
-        K,
+        node_M,
+        node_N,
+        node_K,
         policy,
         clear_accum,
         stride_a,
