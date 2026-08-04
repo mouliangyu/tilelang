@@ -2302,6 +2302,23 @@ public:
    * \brief Plan memory reuse using sync-graph-based liveness analysis.
    */
   void PlanReuse(const Stmt &stmt) {
+    std::unordered_map<const VarNode *, const AllocBufferNode *>
+        constant_allocs;
+    std::vector<const VarNode *> constant_order;
+    std::vector<const VarNode *> dynamic_order;
+    for (const VarNode *var : alloc_order_) {
+      auto it = shmem_allocs_.find(var);
+      if (it == shmem_allocs_.end())
+        continue;
+      const AllocBufferNode *alloc = it->second;
+      if (GetRef<AllocBuffer>(alloc).ConstantAllocationSize().has_value()) {
+        constant_allocs.emplace(var, alloc);
+        constant_order.push_back(var);
+      } else {
+        dynamic_order.push_back(var);
+      }
+    }
+
     // Step 1: Linearize TIR with sync detection.
     SyncAwareLinearizer linearizer(target_scope_);
     linearizer(stmt);
@@ -2317,18 +2334,32 @@ public:
 
     // Step 3: Build buffer DAG and compute SCCs.
     BufferDAG buf_dag;
-    buf_dag.Build(hb, shmem_allocs_, alloc_order_);
+    BufferDAG::PackResult pack_result{};
+    if (!constant_allocs.empty()) {
+      buf_dag.Build(hb, constant_allocs, constant_order);
 
-    // Step 4: Pack buffers using SCC DAG.
-    auto pack_result = buf_dag.Pack(shmem_allocs_, align_bytes_);
-
-    // Store results.
-    for (const auto &kv : pack_result.byte_offsets) {
-      buffer_byte_offsets_[kv.first] =
-          make_const(DataType::Int(32), static_cast<int64_t>(kv.second));
+      // Step 4: Pack constant-size buffers using the SCC DAG.
+      pack_result = buf_dag.Pack(constant_allocs, align_bytes_);
+      for (const auto &kv : pack_result.byte_offsets) {
+        buffer_byte_offsets_[kv.first] =
+            make_const(DataType::Int(32), static_cast<int64_t>(kv.second));
+      }
     }
-    merged_alloc_size_ = make_const(
-        DataType::Int(64), static_cast<int64_t>(pack_result.total_size));
+
+    // Symbolic-size buffers do not participate in lifetime-based reuse. Place
+    // them sequentially after the constant-size reuse arena so their offsets
+    // and the final launch size remain valid runtime expressions.
+    DataType offset_dtype = DataType::Int(64);
+    PrimExpr cursor =
+        make_const(offset_dtype, static_cast<int64_t>(pack_result.total_size));
+    for (const VarNode *var : dynamic_order) {
+      const AllocBufferNode *alloc = shmem_allocs_.at(var);
+      int alignment = std::max(align_bytes_, AscendScopeAlignBytes(alloc));
+      cursor = AlignPrimExpr(cursor, alignment);
+      buffer_byte_offsets_[var] = cursor;
+      cursor = cursor + GetBufferSizeBytes(alloc, offset_dtype);
+    }
+    merged_alloc_size_ = AlignPrimExpr(cursor, align_bytes_);
 
     if (verbose_) {
       LOG(DEBUG) << "Sync-graph Memory Allocation Plan for Ascend UB:";
@@ -2392,6 +2423,33 @@ private:
     return indexdiv(value + adjust, align_expr) * align_expr;
   }
 
+  PrimExpr GetBufferSizeBytes(const AllocBufferNode *alloc,
+                              DataType result_dtype) const {
+    DataType size_dtype = DataType::Int(32);
+    if (!alloc->buffer->shape.empty()) {
+      size_dtype = alloc->buffer->shape[0].dtype();
+    }
+    if (!size_dtype.is_int() && !size_dtype.is_uint()) {
+      size_dtype = DataType::Int(32);
+    }
+
+    PrimExpr total_elems = make_const(size_dtype, 1);
+    for (const PrimExpr &extent : alloc->buffer->shape) {
+      PrimExpr normalized_extent = extent;
+      if (normalized_extent.dtype() != size_dtype) {
+        normalized_extent = cast(size_dtype, normalized_extent);
+      }
+      total_elems = total_elems * normalized_extent;
+    }
+
+    int elem_bits = alloc->buffer->dtype.bits() * alloc->buffer->dtype.lanes();
+    PrimExpr size_bytes = PackedBytesFromElems(total_elems, elem_bits);
+    if (size_bytes.dtype() != result_dtype) {
+      size_bytes = cast(result_dtype, size_bytes);
+    }
+    return size_bytes;
+  }
+
   void PlanSequentialLayout() {
     buffer_byte_offsets_.clear();
 
@@ -2417,29 +2475,7 @@ private:
 
     for (const VarNode *var : sorted_vars) {
       const AllocBufferNode *alloc = shmem_allocs_.at(var);
-      // Bits-based sizing so packed sub-byte dtypes (fp4 = 2 codes/byte) get
-      // the correct byte count instead of dtype.bytes() rounding 4 bits up
-      // to 1.
-      int elem_bits =
-          alloc->buffer->dtype.bits() * alloc->buffer->dtype.lanes();
-
-      DataType size_dtype = DataType::Int(32);
-      if (!alloc->buffer->shape.empty()) {
-        size_dtype = alloc->buffer->shape[0].dtype();
-      }
-      if (!size_dtype.is_int() && !size_dtype.is_uint()) {
-        size_dtype = DataType::Int(32);
-      }
-
-      PrimExpr total_elems = make_const(size_dtype, 1);
-      for (const PrimExpr &extent : alloc->buffer->shape) {
-        PrimExpr e = extent;
-        if (e.dtype() != size_dtype) {
-          e = cast(size_dtype, e);
-        }
-        total_elems = total_elems * e;
-      }
-      PrimExpr size_expr = PackedBytesFromElems(total_elems, elem_bits);
+      PrimExpr size_expr = GetBufferSizeBytes(alloc, offset_dtype);
 
       int alignment = align_bytes_;
       // Scope-derived fractal / MicroAPI alignment, mirroring Pack's
@@ -2448,9 +2484,6 @@ private:
       alignment = std::max(alignment, AscendScopeAlignBytes(alloc));
 
       cursor = AlignPrimExpr(cursor, alignment);
-      if (size_expr.dtype() != offset_dtype) {
-        size_expr = cast(offset_dtype, size_expr);
-      }
       buffer_byte_offsets_[var] = cursor;
       PrimExpr buf_end = cursor + size_expr;
       total_size = max(total_size, buf_end);
