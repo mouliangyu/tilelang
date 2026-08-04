@@ -102,6 +102,7 @@ schedule candidates.
 */
 void ScheduleBuilder::ScheduleList(
     std::vector<std::shared_ptr<IRStructure>> &children) {
+  dependency_cache_.clear();
   std::vector<For> loop_stack;
   std::vector<std::shared_ptr<IRStructure>> origin_children = children;
   for (size_t i = 0; i < origin_children.size(); ++i) {

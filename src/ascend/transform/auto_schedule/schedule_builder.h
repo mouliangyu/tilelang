@@ -139,8 +139,8 @@ public:
       }
 
       // Buffer-region data dependencies
-      auto deps =
-          AnalyzeDependencies(nodes, /*loop_stack=*/{}, manual_multi_buffer_);
+      auto deps = AnalyzeDependencies(nodes, /*loop_stack=*/{},
+                                      manual_multi_buffer_, &dependency_cache_);
       std::unordered_map<IRStructure *, size_t> node_idx;
       for (size_t i = 0; i < n; ++i) {
         node_idx[nodes[i]] = i;
@@ -495,7 +495,8 @@ public:
     std::vector<For> current_loop_stack = loop_stack;
     current_loop_stack.push_back(ctrl->control);
     auto deps =
-        AnalyzeDependencies(nodes, current_loop_stack, manual_multi_buffer_);
+        AnalyzeDependencies(nodes, current_loop_stack, manual_multi_buffer_,
+                            &dependency_cache_, ctrl);
     std::unordered_map<IRStructure *, size_t> node_idx;
     for (size_t i = 0; i < n; ++i) {
       node_idx[nodes[i]] = i;
@@ -851,12 +852,14 @@ public:
   // cross-iteration distances are solved per access pair.
   void SetManualMultiBuffer(const ManualMultiBufferTable &manual) {
     manual_multi_buffer_ = manual;
+    dependency_cache_.clear();
   }
 
 private:
   std::map<std::string, int64_t> memory_limits_ = {{"shared", 48 * 1024}};
   BufferVersionOverrideMap buffer_versions_overrides_;
   ManualMultiBufferTable manual_multi_buffer_;
+  DependencyCache dependency_cache_;
 };
 
 } // namespace tl

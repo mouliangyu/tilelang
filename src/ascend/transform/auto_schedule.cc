@@ -1867,11 +1867,11 @@ static ScheduledKernelResult ScheduleSingleKernel(
   CrossCoreFlagReservation cross_core_flag_reservation =
       CollectExplicitCrossCoreFlags(kernel_body);
 
-  FlagInfoList flag_infos;
-  MultiVersionBufferMap buffer_info_map;
-  AnalyzeAndInsertBarriers(ir_structure, flag_infos, result.buffer_infos,
-                           buffer_info_map, manual_multi_buffer_versions,
-                           cross_core_flag_reservation);
+  BarrierBuilder barrier_builder(manual_multi_buffer_versions,
+                                 std::move(cross_core_flag_reservation));
+  barrier_builder.Build(ir_structure);
+  const FlagInfoList &flag_infos = barrier_builder.GetFlagInfos();
+  result.buffer_infos = barrier_builder.GetBufferInfos();
   WarnOnUnappliedBufferVersionOverrides(buffer_versions_overrides,
                                         result.buffer_infos);
 

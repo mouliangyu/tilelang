@@ -400,10 +400,16 @@ static bool RegionsMayConflict(const TaskNode *a_task,
            ana.z3_prover.CanProve(any_dim_disjoint));
 }
 
-std::vector<DepInfo>
-AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
-                    const std::vector<For> &loop_stack,
-                    const ManualMultiBufferTable &manual) {
+static std::vector<DepInfo> AnalyzeDependenciesImpl(
+    const std::vector<IRStructure *> &nodes, const std::vector<For> &loop_stack,
+    const ManualMultiBufferTable &manual, DependencyCache &dependency_cache,
+    const ControlNode *cache_key) {
+  if (cache_key) {
+    auto cache_it = dependency_cache.find(cache_key);
+    if (cache_it != dependency_cache.end())
+      return cache_it->second;
+  }
+
   const size_t n = nodes.size();
   std::vector<DepInfo> deps;
 
@@ -424,7 +430,6 @@ AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
 
   using CoveredKey =
       std::tuple<const VarNode *, const TaskNode *, const TaskNode *>;
-  std::map<IRStructure *, std::set<CoveredKey>> covered_cache;
   std::function<void(IRStructure *, std::vector<For> &, std::set<CoveredKey> &)>
       collect_subtree_deps = [&](IRStructure *node, std::vector<For> &stack,
                                  std::set<CoveredKey> &out) {
@@ -435,7 +440,9 @@ AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
         for (const auto &child : ctrl->children)
           children.push_back(child.get());
         stack.push_back(ctrl->control);
-        for (const auto &cdep : AnalyzeDependencies(children, stack, manual)) {
+        auto child_deps = AnalyzeDependenciesImpl(children, stack, manual,
+                                                  dependency_cache, ctrl);
+        for (const auto &cdep : child_deps) {
           const VarNode *ckey = StorageKey(cdep.buffer);
           for (const auto &[cprod, ccons] : cdep.task_pairs) {
             out.emplace(ckey, cprod.task(), ccons.task());
@@ -445,15 +452,11 @@ AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
           collect_subtree_deps(child, stack, out);
         stack.pop_back();
       };
-  auto subtree_covered =
-      [&](IRStructure *node) -> const std::set<CoveredKey> & {
-    auto cache_it = covered_cache.find(node);
-    if (cache_it != covered_cache.end())
-      return cache_it->second;
+  auto subtree_covered = [&](IRStructure *node) {
     std::set<CoveredKey> covered;
     std::vector<For> stack = loop_stack;
     collect_subtree_deps(node, stack, covered);
-    return covered_cache.emplace(node, std::move(covered)).first->second;
+    return covered;
   };
 
   for (const auto *storage_key : storage_keys) {
@@ -576,7 +579,18 @@ AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
       }
     }
   }
+  if (cache_key)
+    dependency_cache.emplace(cache_key, deps);
   return deps;
+}
+
+std::vector<DepInfo> AnalyzeDependencies(
+    const std::vector<IRStructure *> &nodes, const std::vector<For> &loop_stack,
+    const ManualMultiBufferTable &manual, DependencyCache *dependency_cache,
+    const ControlNode *cache_key) {
+  DependencyCache local_cache;
+  DependencyCache &cache = dependency_cache ? *dependency_cache : local_cache;
+  return AnalyzeDependenciesImpl(nodes, loop_stack, manual, cache, cache_key);
 }
 
 } // namespace tl

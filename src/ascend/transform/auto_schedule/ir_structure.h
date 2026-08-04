@@ -1071,18 +1071,26 @@ struct DepInfo {
 // distance) and the barrier pass.
 using ManualMultiBufferTable = std::unordered_map<const VarNode *, int64_t>;
 
+// Per-phase dependency-analysis cache. A ControlNode key represents the
+// dependency result for its ordered child list at that phase.
+using DependencyCache = std::map<const ControlNode *, std::vector<DepInfo>>;
+
 // Analyze data dependencies among scheduled TaskNode/ControlNode nodes.
 // `loop_stack` is the full enclosing serial loop stack at this level
 // (outermost-first). Empty means root/list level. Non-empty means the last loop
 // is the current loop body, enabling cross-iteration dependencies.
 // `manual` maps user-declared manual multi-buffer data Vars to their version
 // count; empty means no manual buffers.
+// `dependency_cache` is shared for one scheduling or barrier phase. A non-null
+// `cache_key` identifies `nodes` as that ControlNode's ordered child list.
 // An `i == j` control-node self-dependency whose producer→consumer pairs are
 // already established anywhere inside that node's own subtree is dropped.
 std::vector<DepInfo>
 AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
                     const std::vector<For> &loop_stack,
-                    const ManualMultiBufferTable &manual = {});
+                    const ManualMultiBufferTable &manual = {},
+                    DependencyCache *dependency_cache = nullptr,
+                    const ControlNode *cache_key = nullptr);
 
 // Helper function to print BufferRegion details
 inline void PrintBufferRegion(const BufferRegion &region,

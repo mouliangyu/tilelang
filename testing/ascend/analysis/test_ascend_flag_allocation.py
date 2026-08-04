@@ -1,5 +1,6 @@
 import re
 
+import pytest
 import tilelang.language as T
 import tilelang.testing
 import tvm
@@ -372,6 +373,56 @@ def test_rewrite_flag_to_buf_tracks_bind_context():
     assert "T.ascend_get_buf" in rewritten["main"].script()
 
 
+def _make_cross_core_reuse_program(
+    versions: int,
+    add_vector_stage: bool = False,
+    reserve_last_slot: bool = False,
+):
+    tile_m = 128
+    tile_n = 128
+    tile_k = 64
+    tiles = 8
+
+    @T.prim_func
+    def main(
+        A: T.Buffer((tiles * tile_m, tile_k), "bfloat16"),
+        B: T.Buffer((tile_n, tile_k), "bfloat16"),
+        C: T.Buffer((tiles * tile_m, tile_n), "float32"),
+    ):
+        with T.Kernel(1) as bx:
+            a_l1 = T.alloc_l1((tile_m, tile_k), "bfloat16")
+            b_l1 = T.alloc_l1((tile_n, tile_k), "bfloat16")
+            accum = T.alloc_l0c((tile_m, tile_n), "float32")
+            output = T.alloc_shared((tile_m // 2, tile_n), "float32")
+            T.annotate_buffer_versions({output: versions})
+
+            for tile in T.Persistent([tiles], 1, bx):
+                T.copy(A[tile * tile_m : (tile + 1) * tile_m, :], a_l1)
+                T.copy(B[:, :], b_l1)
+                T.gemm(
+                    a_l1,
+                    b_l1,
+                    accum,
+                    transpose_B=True,
+                    clear_accum=True,
+                    unit_flag_ctrl=3,
+                )
+                if reserve_last_slot:
+                    with T.PerCoreTask():
+                        T.dual_copy(accum, output, unit_flag_ctrl=3)
+                        T.ascend_sync_inter_arrive("PIPE_FIX", 15)
+                        T.ascend_sync_inter_wait("PIPE_FIX", 15)
+                else:
+                    T.dual_copy(accum, output, unit_flag_ctrl=3)
+                if add_vector_stage:
+                    with T.SimdVF():
+                        for i, j in T.Parallel(tile_m // 2, tile_n):
+                            output[i, j] = output[i, j] + 1.0
+                T.dual_copy(output, C[tile * tile_m : (tile + 1) * tile_m, :])
+
+    return main
+
+
 def _constant_flag_ids(source: str, hard_event: str) -> set[int]:
     pattern = re.compile(rf"AscendC::(?:SetFlag|WaitFlag)<AscendC::HardEvent::{hard_event}>\((\d+)\)")
     return {int(value) for value in pattern.findall(source)}
@@ -381,6 +432,11 @@ def _initial_flag_ids(source: str, hard_event: str) -> set[int]:
     kernel_body = source.split("__global__", maxsplit=1)[1]
     prologue = kernel_body.split("for (", maxsplit=1)[0]
     return _constant_flag_ids(prologue, hard_event)
+
+
+def _constant_cross_core_flag_ids(source: str) -> set[int]:
+    pattern = re.compile(r"CrossCore(?:Set|Wait)Flag<4, PIPE_[A-Z0-9]+>\((\d+)\)")
+    return {int(value) for value in pattern.findall(source)}
 
 
 def test_auto_schedule_keeps_distinct_flags_within_limit():
@@ -418,6 +474,57 @@ def test_same_iter_does_not_reuse_when_within_limit():
 
     # The two allocations stay independent because they already fit.
     assert ids == {0, 1}
+
+
+@pytest.mark.parametrize("versions", [4, 8])
+def test_cross_core_handshake_does_not_reuse_within_limit(versions):
+    artifact = lower(_make_cross_core_reuse_program(versions), target="ascend")
+    source = artifact.kernel_source
+
+    ids = _constant_cross_core_flag_ids(source)
+    assert {event_id % 16 for event_id in ids} == set(range(versions))
+
+    dynamic_calls = "\n".join(line for line in source.splitlines() if "CrossCore" in line and re.search(r"\bw(?:_\d+)?\b", line))
+    assert "PIPE_FIX" in dynamic_calls
+    assert "PIPE_MTE3" in dynamic_calls
+    assert re.search(rf"\+ (?:{versions}|{versions + 16})\)", dynamic_calls)
+
+
+def test_cross_core_handshake_reuses_when_over_limit():
+    versions = 15
+    artifact = lower(_make_cross_core_reuse_program(versions), target="ascend")
+    source = artifact.kernel_source
+
+    ids = _constant_cross_core_flag_ids(source)
+    assert {event_id % 16 for event_id in ids} == set(range(versions))
+
+    dynamic_calls = "\n".join(line for line in source.splitlines() if "CrossCore" in line and re.search(r"\bw(?:_\d+)?\b", line))
+    assert "PIPE_FIX" in dynamic_calls
+    assert "PIPE_MTE3" in dynamic_calls
+    assert not re.search(rf"\+ (?:{versions}|{versions + 16})\)", dynamic_calls)
+
+
+def test_cross_core_handshake_with_different_pipes_reuses_when_over_limit():
+    versions = 8
+    artifact = lower(
+        _make_cross_core_reuse_program(
+            versions,
+            add_vector_stage=True,
+            reserve_last_slot=True,
+        ),
+        target="ascend",
+    )
+    source = artifact.kernel_source
+
+    assert "AscendC::CrossCoreSetFlag<0, PIPE_FIX>(15);" in source
+    ids = _constant_cross_core_flag_ids(source)
+    assert {event_id % 16 for event_id in ids} == set(range(versions))
+
+    dynamic_calls = "\n".join(line for line in source.splitlines() if "CrossCore" in line and re.search(r"\bw(?:_\d+)?\b", line))
+    assert "PIPE_FIX" in dynamic_calls
+    assert "PIPE_V" in dynamic_calls
+    assert "PIPE_MTE3" in dynamic_calls
+    assert not re.search(rf"\+ (?:{versions}|{versions + 16})\)", dynamic_calls)
 
 
 def test_single_iteration_loop_has_no_reverse_flag():
