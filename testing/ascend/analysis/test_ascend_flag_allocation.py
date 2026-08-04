@@ -305,6 +305,43 @@ def _make_unavoidable_overflow_program():
     return main
 
 
+def _make_unapplied_buffer_version_annotation_program():
+    tile = 64
+
+    @T.prim_func
+    def main(A: T.Buffer((tile,), "float32"), C: T.Buffer((4 * tile,), "float32")):
+        with T.Kernel(1):
+            ub = T.alloc_shared((tile,), "float32")
+            T.annotate_buffer_versions({ub: 2})
+
+            T.copy(A, ub)
+            for w in T.Pipelined(4, num_stages=2):
+                T.copy(ub, C[w * tile : (w + 1) * tile])
+
+    return main
+
+
+def _make_same_name_buffer_version_annotation_program():
+    tile = 64
+
+    @T.prim_func
+    def main(A: T.Buffer((8 * tile,), "float32"), C: T.Buffer((8 * tile,), "float32")):
+        with T.Kernel(1):
+            ub = T.alloc_shared((tile,), "float32")
+            T.annotate_buffer_versions({ub: 2})
+
+            T.copy(A[:tile], ub)
+            for w in T.Pipelined(4, num_stages=2):
+                T.copy(ub, C[w * tile : (w + 1) * tile])
+
+            ub = T.alloc_shared((tile,), "float32")
+            for w in T.Pipelined(4, num_stages=2):
+                T.copy(A[(w + 4) * tile : (w + 5) * tile], ub)
+                T.copy(ub, C[(w + 4) * tile : (w + 5) * tile])
+
+    return main
+
+
 def _make_bound_flag_spill_program():
     @T.prim_func
     def main():
@@ -413,6 +450,20 @@ def test_auto_schedule_warns_on_unavoidable_flag_overflow(capfd):
     stderr = capfd.readouterr().err
 
     assert re.search(r"allocated 10 flag ids.*limit of 8", stderr)
+
+
+def test_auto_schedule_warns_on_unapplied_buffer_version_annotation(capfd):
+    lower(_make_unapplied_buffer_version_annotation_program(), target="ascend")
+    stderr = capfd.readouterr().err
+
+    assert re.search(r'did not enable multi-buffering for buffer "ub".*requested 2 versions', stderr)
+
+
+def test_auto_schedule_distinguishes_same_name_buffer_version_annotations(capfd):
+    lower(_make_same_name_buffer_version_annotation_program(), target="ascend")
+    stderr = capfd.readouterr().err
+
+    assert re.search(r'did not enable multi-buffering for buffer "ub".*requested 2 versions', stderr)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,9 @@ namespace tl {
 
 using namespace tirx;
 
+using BufferVersionOverrideMap =
+    std::unordered_map<Var, int64_t, ObjectPtrHash, ObjectPtrEqual>;
+
 // Check if two variables are the same
 bool SameVar(const Var &a, const Var &b);
 
@@ -403,7 +406,7 @@ public:
         // an access point.
         // Check if this buffer has a manually annotated version count
         auto override_it =
-            buffer_versions_overrides_.find(storage_key->name_hint);
+            buffer_versions_overrides_.find(ffi::GetRef<Var>(storage_key));
         if (override_it != buffer_versions_overrides_.end()) {
           int64_t override_val = override_it->second;
           for (const auto &alias : buffers) {
@@ -838,9 +841,8 @@ public:
   }
 
   // Set manual buffer version overrides (from annotate_buffer_versions).
-  // Keys are buffer data variable names, values are fixed num_versions.
-  void
-  SetBufferVersionsOverride(const std::map<std::string, int64_t> &overrides) {
+  // Keys are buffer data variables, values are fixed num_versions.
+  void SetBufferVersionsOverride(const BufferVersionOverrideMap &overrides) {
     buffer_versions_overrides_ = overrides;
   }
 
@@ -853,7 +855,7 @@ public:
 
 private:
   std::map<std::string, int64_t> memory_limits_ = {{"shared", 48 * 1024}};
-  std::map<std::string, int64_t> buffer_versions_overrides_;
+  BufferVersionOverrideMap buffer_versions_overrides_;
   ManualMultiBufferTable manual_multi_buffer_;
 };
 

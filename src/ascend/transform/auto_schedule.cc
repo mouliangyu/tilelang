@@ -257,7 +257,7 @@ const AutoScheduleAttrSpec *FindAutoScheduleAttr(const String &key) {
 class TilelangRootBodyExtractor : public StmtVisitor {
 public:
   Stmt body;
-  std::map<std::string, int64_t> buffer_versions_overrides;
+  BufferVersionOverrideMap buffer_versions_overrides;
   ManualMultiBufferTable manual_multi_buffer_versions;
   std::set<std::string> unlimit_memory_scopes;
   Optional<Var> sid;
@@ -272,7 +272,7 @@ public:
           for (const auto &it : *map_obj) {
             if (auto *var = it.first.as<VarNode>()) {
               if (auto imm = it.second.as<int>()) {
-                buffer_versions_overrides[var->name_hint] = imm.value();
+                buffer_versions_overrides[GetRef<Var>(var)] = imm.value();
               }
             }
           }
@@ -1177,6 +1177,30 @@ struct ScheduledKernelResult {
   std::vector<MultiVersionBufferInfo> buffer_infos;
 };
 
+static void WarnOnUnappliedBufferVersionOverrides(
+    const BufferVersionOverrideMap &buffer_versions_overrides,
+    const std::vector<MultiVersionBufferInfo> &buffer_infos) {
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>
+      multi_buffered_storages;
+  for (const MultiVersionBufferInfo &info : buffer_infos) {
+    if (info.num_versions > 1) {
+      multi_buffered_storages.insert(info.buffer->data);
+    }
+  }
+
+  for (const auto &[buffer_var, num_versions] : buffer_versions_overrides) {
+    if (num_versions > 1 && !multi_buffered_storages.count(buffer_var)) {
+      LOG(WARNING) << "Ascend AutoSchedule did not enable multi-buffering for "
+                      "buffer \""
+                   << buffer_var->name_hint
+                   << "\" although T.annotate_buffer_versions "
+                   << "requested " << num_versions
+                   << " versions. The buffer must be eligible in a scheduled "
+                      "serial loop and written before it is read.";
+    }
+  }
+}
+
 // Recursively check if any TaskNode has the given warpgroup_id.
 static bool HasWarpgroupId(IRStructure *node, int wg_id) {
   if (!node)
@@ -1722,7 +1746,7 @@ PropagateReadRegions(const std::vector<std::shared_ptr<IRStructure>> &root) {
 // and Stmt conversion.
 static ScheduledKernelResult ScheduleSingleKernel(
     const Stmt &kernel_body, Target target,
-    const std::map<std::string, int64_t> &buffer_versions_overrides = {},
+    const BufferVersionOverrideMap &buffer_versions_overrides = {},
     const ManualMultiBufferTable &manual_multi_buffer_versions = {},
     const std::set<std::string> &unlimit_memory_scopes = {},
     Optional<Var> external_sid = {}) {
@@ -1848,6 +1872,8 @@ static ScheduledKernelResult ScheduleSingleKernel(
   AnalyzeAndInsertBarriers(ir_structure, flag_infos, result.buffer_infos,
                            buffer_info_map, manual_multi_buffer_versions,
                            cross_core_flag_reservation);
+  WarnOnUnappliedBufferVersionOverrides(buffer_versions_overrides,
+                                        result.buffer_infos);
 
   Var sid;
   if (external_sid.has_value()) {
