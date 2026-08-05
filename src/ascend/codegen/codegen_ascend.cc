@@ -478,6 +478,7 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   auto global_symbol = f->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol);
   ICHECK(global_symbol) << "CodeGenTileLangAscend: Expect PrimFunc to have the "
                            "global_symbol attribute";
+  current_function_name_ = global_symbol.value();
   bool no_alias = f->HasNonzeroAttr(tirx::attr::kNoAlias);
 
   this->PrintFuncPrefix(stream);
@@ -727,7 +728,8 @@ void CodeGenTileLangAscend::VisitStmt_(const SBlockNode *op) {
         }
       }
     }
-    std::string helper_name = "simd_vf_" + std::to_string(vf_idx);
+    std::string helper_name =
+        current_function_name_ + "_simd_vf_" + std::to_string(vf_idx);
     EmitVFFunction(op, captures, helper_name, "__simd_vf__ inline void",
                    inside_simdvf_body_);
 
@@ -779,7 +781,8 @@ void CodeGenTileLangAscend::VisitStmt_(const SBlockNode *op) {
         }
       }
     }
-    std::string helper_name = "simt_vf_" + std::to_string(vf_idx);
+    std::string helper_name =
+        current_function_name_ + "_simt_vf_" + std::to_string(vf_idx);
 
     int64_t total_threads = thread_x * thread_y * thread_z;
     std::string func_attrs = "__simt_vf__ ";

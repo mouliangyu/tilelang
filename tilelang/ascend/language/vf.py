@@ -7,6 +7,21 @@ from tvm.tirx.script.builder.frame import TIRFrame
 from tilelang import _ffi_api
 
 
+def _next_vf_source_index(kind: str) -> int:
+    from tilelang.language.eager.builder import Builder
+
+    builder = Builder.current()
+    if builder is None:
+        # A detached frame can be constructed for inspection without being
+        # attached to IR. Normal lowering always constructs it under a Builder.
+        return 0
+
+    counter_attr = f"_ascend_{kind}_source_counter"
+    source_index = getattr(builder, counter_attr, 0)
+    setattr(builder, counter_attr, source_index + 1)
+    return source_index
+
+
 @register_object("tl.SimtVFFrame")
 class SimtVFFrame(TIRFrame):
     """Frame for SimtVF (SIMT Vector Fixed) region.
@@ -71,7 +86,10 @@ def SimtVF(threads: int | list[int] | tuple = 128, latency: int = 0) -> SimtVFFr
     if any(t <= 0 for t in normalized):
         raise ValueError("SimtVF requires all thread dimensions > 0")
 
-    return _ffi_api.SimtVF(normalized, int(latency))  # type: ignore[attr-defined] # pylint: disable=no-member
+    source_index = _next_vf_source_index("simtvf")
+    return _ffi_api.SimtVF(  # type: ignore[attr-defined] # pylint: disable=no-member
+        normalized, int(latency), source_index
+    )
 
 
 @register_object("tl.SimdVFFrame")
@@ -128,4 +146,7 @@ def SimdVF(latency: int = 0) -> SimdVFFrame:
     res : SimdVFFrame
         The SimdVFFrame used to denote a SimdVF region.
     """
-    return _ffi_api.SimdVF(int(latency))  # type: ignore[attr-defined] # pylint: disable=no-member
+    source_index = _next_vf_source_index("simdvf")
+    return _ffi_api.SimdVF(  # type: ignore[attr-defined] # pylint: disable=no-member
+        int(latency), source_index
+    )

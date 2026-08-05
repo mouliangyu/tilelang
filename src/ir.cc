@@ -26,9 +26,6 @@ using namespace ffi;
 class SimtVFFrameNode;
 class SimtVFFrame;
 
-static int simtvf_source_counter_ = 0;
-static int simdvf_source_counter_ = 0;
-
 // Build a ForFrame that emits a target-neutral kThreadBinding loop for one
 // kernel-launch dimension. The launch nest is materialized into the
 // target-specific form (thread_extent AttrStmt on GPU, serial For on CPU) by
@@ -102,8 +99,8 @@ ForFrame ParallelFor(const Array<PrimExpr> &extents,
   return ForFrame(n);
 }
 
-SimtVFFrame SimtVF(const Array<PrimExpr> &thread_extents,
-                   int64_t vf_latency = 0);
+SimtVFFrame SimtVF(const Array<PrimExpr> &thread_extents, int64_t vf_latency,
+                   int64_t source_index);
 
 ForFrame PipelinedFor(PrimExpr start, const PrimExpr &stop, int num_stages,
                       const Array<PrimExpr> &order,
@@ -287,8 +284,6 @@ public:
 
 public:
   TVM_DLL void EnterWithScope() final {
-    simtvf_source_counter_ = 0;
-    simdvf_source_counter_ = 0;
     for (auto frame = frames.begin(); frame != frames.end(); ++frame)
       (*frame)->EnterWithScope();
   }
@@ -453,6 +448,7 @@ public:
   Array<Var> thread_vars;
   size_t parent_alloc_count_{0};
   int64_t vf_latency_{0};
+  int64_t source_index_{0};
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
@@ -505,7 +501,7 @@ public:
 
     ffi::Map<ffi::String, ffi::Any> simtvf_annotations;
     simtvf_annotations.Set("tl.vf_source_index",
-                           IntImm(DataType::Int(64), simtvf_source_counter_++));
+                           IntImm(DataType::Int(64), source_index_));
     if (vf_latency_ > 0) {
       simtvf_annotations.Set("tl.vf_latency",
                              IntImm(DataType::Int(64), vf_latency_));
@@ -540,7 +536,8 @@ public:
                                                 SimtVFFrameNode);
 };
 
-SimtVFFrame SimtVF(const Array<PrimExpr> &thread_extents, int64_t vf_latency) {
+SimtVFFrame SimtVF(const Array<PrimExpr> &thread_extents, int64_t vf_latency,
+                   int64_t source_index) {
   ICHECK_EQ(thread_extents.size(), 3)
       << "SimtVF requires exactly 3 thread extents [tx, ty, tz]";
   ObjectPtr<SimtVFFrameNode> n = tvm::ffi::make_object<SimtVFFrameNode>();
@@ -552,6 +549,7 @@ SimtVFFrame SimtVF(const Array<PrimExpr> &thread_extents, int64_t vf_latency) {
       Var("simtvf_tz", dtype),
   };
   n->vf_latency_ = vf_latency;
+  n->source_index_ = source_index;
   return SimtVFFrame(n);
 }
 
@@ -559,6 +557,7 @@ class SimdVFFrameNode : public TIRFrameNode {
 public:
   size_t parent_alloc_count_{0};
   int64_t vf_latency_{0};
+  int64_t source_index_{0};
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
@@ -591,7 +590,7 @@ public:
 
     ffi::Map<ffi::String, ffi::Any> simdvf_annotations;
     simdvf_annotations.Set("tl.vf_source_index",
-                           IntImm(DataType::Int(64), simdvf_source_counter_++));
+                           IntImm(DataType::Int(64), source_index_));
     if (vf_latency_ > 0) {
       simdvf_annotations.Set("tl.vf_latency",
                              IntImm(DataType::Int(64), vf_latency_));
@@ -626,9 +625,10 @@ public:
                                                 SimdVFFrameNode);
 };
 
-SimdVFFrame SimdVF(int64_t vf_latency = 0) {
+SimdVFFrame SimdVF(int64_t vf_latency, int64_t source_index) {
   ObjectPtr<SimdVFFrameNode> n = tvm::ffi::make_object<SimdVFFrameNode>();
   n->vf_latency_ = vf_latency;
+  n->source_index_ = source_index;
   return SimdVFFrame(n);
 }
 

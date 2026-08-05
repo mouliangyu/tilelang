@@ -46,7 +46,7 @@ def main():
         "Two-VF kernel should keep '__global__ __vector__ <ret> <name>' signature order"
     )
     assert source_two.count("__simt_vf__ __launch_bounds__(") >= 2, "Two-VF source should emit two SimtVF helper functions"
-    assert source_two.count("asc_vf_call<simt_vf_") >= 2, "Two-VF source should emit two asc_vf_call invocations"
+    assert source_two.count("_simt_vf_") >= 4, "Two-VF source should emit namespaced helpers and asc_vf_call invocations"
     assert "__launch_bounds__(64)" in source_two and "__launch_bounds__(128)" in source_two, (
         "Two-VF source should preserve per-region thread bounds"
     )

@@ -55,6 +55,7 @@ protected:
                         PrimExpr rhs, std::ostream &os) final;
 
 private:
+  std::string current_function_name_;
   int simtvf_helper_counter_{0};
   bool inside_simtvf_body_{false};
   int simdvf_helper_counter_{0};
