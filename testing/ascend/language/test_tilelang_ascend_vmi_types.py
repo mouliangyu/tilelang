@@ -353,10 +353,6 @@ def test_vmi_bufferload_addresses_lower_to_explicit_ptr_offset_args():
             "does not support rounding",
         ),
         (
-            lambda value, mask: T.vmi.vinterpret_cast(value, "float32"),
-            "requires source and target element widths to match",
-        ),
-        (
             lambda value, mask: T.vmi.create_mask(8, size=15, group=4),
             "requires size to be divisible by group",
         ),
@@ -405,6 +401,31 @@ def test_vmi_wrappers_reject_invalid_mode_combinations(monkeypatch, call, messag
 
     with pytest.raises((TypeError, ValueError), match=message):
         call(value, mask)
+
+
+def test_vmi_vinterpret_cast_width_changing_bit_totals(monkeypatch):
+    """Same-width keeps lanes; width change requires matching bit totals (ASC vintlv)."""
+    monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
+    calls = []
+    monkeypatch.setattr(
+        T.vmi,
+        "_call_vmi",
+        lambda op, result_dtype, *args, **kwargs: calls.append((op, str(result_dtype))) or "ok",
+    )
+
+    T.vmi.vinterpret_cast(SimpleNamespace(dtype="float32x64"), "uint32")
+    assert calls[-1] == ("vinterpret_cast", "uint32x64")
+
+    # ASC vintlv half-split: 128xbf16 → 64xf32
+    T.vmi.vinterpret_cast(SimpleNamespace(dtype="bfloat16x128"), "float32")
+    assert calls[-1] == ("vinterpret_cast", "float32x64")
+
+    # float16x16 → float32 is legal (256-bit total → float32x8)
+    T.vmi.vinterpret_cast(SimpleNamespace(dtype="float16x16"), "float32")
+    assert calls[-1] == ("vinterpret_cast", "float32x8")
+
+    with pytest.raises(TypeError, match="bit totals"):
+        T.vmi.vinterpret_cast(SimpleNamespace(dtype="float16x15"), "float32")
 
 
 def test_vmi_wrappers_reject_invalid_operand_contracts(monkeypatch):

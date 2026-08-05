@@ -687,11 +687,23 @@ def vinterpret_cast(source, to_dtype=None, *, loc=None, ip=None):
         raise TypeError("T.vmi.vinterpret_cast(...) requires to_dtype")
     source_dt = _element_dtype_of(source)
     target_dt = _scalar_dtype(to_dtype, context="T.vmi.vinterpret_cast(..., to_dtype=...)")
-    if getattr(source_dt, "bits", None) != getattr(target_dt, "bits", None):
-        raise TypeError("T.vmi.vinterpret_cast(...) requires source and target element widths to match")
+    src_bits = getattr(source_dt, "bits", None)
+    tgt_bits = getattr(target_dt, "bits", None)
+    src_lanes = _lanes_of(source)
+    if src_bits is None or tgt_bits is None:
+        raise TypeError("T.vmi.vinterpret_cast(...) requires sized element dtypes")
+    # Same element width keeps lane count; otherwise require bit-total match
+    # (ASC vintlv pack: 128xbf16 → 64xf32).
+    if src_bits == tgt_bits:
+        out_lanes = src_lanes
+    else:
+        total = src_lanes * src_bits
+        if total % tgt_bits != 0:
+            raise TypeError("T.vmi.vinterpret_cast(...) requires source/target bit totals to match")
+        out_lanes = total // tgt_bits
     return _call_vmi(
         "vinterpret_cast",
-        vreg(_lanes_of(source), to_dtype),
+        vreg(out_lanes, to_dtype),
         source,
         to_dtype=str(target_dt),
         loc=loc,
