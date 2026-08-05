@@ -393,10 +393,20 @@ def vaxpy(dst, src, scalar, mask=None, mode="MODE_ZEROING"):
     return tirx.call_intrin("void", _Op("tl.simd.vaxpy"), dst, src, scalar, mask, mode)
 
 
-def vdiv(src0, src1, mask=None, mode="MODE_ZEROING"):
+def vdiv(src0, src1, mask=None, mode="MODE_ZEROING", fast=None):
+    """Divide vectors, optionally overriding the fast-math pass configuration.
+
+    ``fast=None`` follows ``tl.enable_fast_math``.  ``fast=True`` selects the
+    hardware division instruction, while ``fast=False`` selects precise fp32
+    division regardless of the pass configuration. Non-fp32 division always
+    uses the hardware instruction.
+    """
+    if fast is not None and not isinstance(fast, bool):
+        raise TypeError(f"vdiv: `fast` must be True, False, or None, got {type(fast).__name__}")
     if mask is None:
         mask = _default_mask(src0.dtype)
-    return tirx.call_intrin(str(src0.dtype), _Op("tl.simd.vdiv"), src0, src1, mask, mode)
+    annotations = None if fast is None else {"fast_math": fast}
+    return tirx.call_intrin(str(src0.dtype), _Op("tl.simd.vdiv"), src0, src1, mask, mode, annotations=annotations)
 
 
 def vmax(src0, src1, mask=None, mode="MODE_ZEROING"):  # noqa: A001

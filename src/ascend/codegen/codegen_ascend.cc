@@ -28,6 +28,7 @@ namespace {
 
 constexpr const char *kModeMerging = "MODE_MERGING";
 constexpr const char *kSimdOpPrefix = "tl.simd.";
+constexpr const char *kFastMathOverride = "fast_math";
 
 bool IsVmiOp(const CallNode *op, std::string *op_name = nullptr) {
   if (auto opt_call_op = op->op.as<Op>()) {
@@ -61,6 +62,16 @@ bool IsSimdMergingCall(const CallNode *op,
     }
   }
   return false;
+}
+
+bool UsePreciseVdiv(const CallNode *op, DataType dtype, bool enable_fast_math) {
+  if (!dtype.is_float() || dtype.bits() != 32) {
+    return false;
+  }
+  if (auto fast_override = op->annotations.Get(kFastMathOverride)) {
+    enable_fast_math = Downcast<Bool>(fast_override.value())->value;
+  }
+  return !enable_fast_math;
 }
 
 static std::string GetAscendScopeQualifier(const std::string &scope) {
@@ -969,9 +980,9 @@ bool CodeGenTileLangAscend::EmitSimdMergingCall(const CallNode *op,
   }
 
   const DataType result_dtype = op->args[1].dtype();
-  const bool use_precise_div = intrinsic_name == "vdiv" && !enable_fast_math_ &&
-                               result_dtype.is_float() &&
-                               result_dtype.bits() == 32;
+  const bool use_precise_div =
+      intrinsic_name == "vdiv" &&
+      UsePreciseVdiv(op, result_dtype, enable_fast_math_);
   os << (use_precise_div ? "simd_inst::vdiv_precise" : "::" + intrinsic_name)
      << "(*(";
   PrintExpr(op->args[0], os);
@@ -1648,9 +1659,10 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   }
   // --- SimdVF binary ops: (src0, src1, mask, mode) ---
   else if (op->op.same_as(tl::simd_vadd()) || op->op.same_as(tl::simd_vsub()) ||
-           op->op.same_as(tl::simd_vmul()) || op->op.same_as(tl::simd_vdiv()) ||
+           op->op.same_as(tl::simd_vmul()) ||
+           op->op.same_as(tl::simd_vabsdif()) ||
            op->op.same_as(tl::simd_vmax()) || op->op.same_as(tl::simd_vmin()) ||
-           op->op.same_as(tl::simd_vabsdif())) {
+           op->op.same_as(tl::simd_vdiv())) {
     ICHECK_EQ(op->args.size(), 4);
     const char *name = nullptr;
     if (op->op.same_as(tl::simd_vadd()))
@@ -1666,10 +1678,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     else if (op->op.same_as(tl::simd_vmin()))
       name = "vmin";
     else
-      name =
-          (!enable_fast_math_ && op->dtype.is_float() && op->dtype.bits() == 32)
-              ? "vdiv_precise"
-              : "vdiv";
+      name = UsePreciseVdiv(op, op->dtype, enable_fast_math_) ? "vdiv_precise"
+                                                              : "vdiv";
     os << "simd_inst::" << name << "(";
     PrintExpr(op->args[0], os); // src0
     os << ", ";

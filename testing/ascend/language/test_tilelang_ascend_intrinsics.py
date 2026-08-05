@@ -1,5 +1,6 @@
 import numpy as np
 
+import tilelang
 import tilelang.language as T
 import tilelang.testing
 from tilelang.engine.lower import lower
@@ -225,6 +226,40 @@ def test_ascend_simd_3510_intrinsics_codegen():
     assert "simd_inst::vcpadd(" in source
     assert "simd_inst::vxor(" in source
     assert "simd_inst::vnot(" in source
+
+
+def test_ascend_simd_vdiv_fast_override():
+    @T.prim_func
+    def func(
+        A: T.Buffer((64,), "float32"),
+        B: T.Buffer((64,), "float32"),
+        C: T.Buffer((192,), "float32"),
+    ):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((64,), "float32")
+            b_ub = T.alloc_shared((64,), "float32")
+            c_ub = T.alloc_shared((192,), "float32")
+            T.copy(A, a_ub)
+            T.copy(B, b_ub)
+            with T.SimdVF():
+                mask = T.simd.pset(32)
+                a = T.simd.vld(a_ub[0])
+                b = T.simd.vld(b_ub[0])
+                T.simd.vsts(c_ub[0], T.simd.vdiv(a, b, mask, fast=False), mask)
+                T.simd.vsts(c_ub[64], T.simd.vdiv(a, b, mask), mask)
+                T.simd.vsts(c_ub[128], T.simd.vdiv(a, b, mask, fast=True), mask)
+            T.copy(c_ub, C)
+
+    config_key = tilelang.PassConfigKey.TL_ENABLE_FAST_MATH.value
+    with tilelang.transform.PassContext(config={config_key: False}):
+        precise_default_source = lower(func, target="ascend").kernel_source
+    with tilelang.transform.PassContext(config={config_key: True}):
+        fast_default_source = lower(func, target="ascend").kernel_source
+
+    assert precise_default_source.count("simd_inst::vdiv_precise(") == 2
+    assert precise_default_source.count("simd_inst::vdiv(") == 1
+    assert fast_default_source.count("simd_inst::vdiv_precise(") == 1
+    assert fast_default_source.count("simd_inst::vdiv(") == 2
 
 
 def test_ascend_simd_vsstb_threads_pointer_state():
