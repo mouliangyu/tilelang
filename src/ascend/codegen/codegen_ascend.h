@@ -74,6 +74,9 @@ private:
   bool has_philox_rng_included_{false};
   std::string ascend_rng_state_var_;
 
+  std::unordered_map<Var, IntImm, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+      unroll_factor_;
+
   ffi::Array<Var> CollectVFCaptures(const SBlockNode *op) const;
   void EmitVFFunction(const SBlockNode *op, const ffi::Array<Var> &captures,
                       const std::string &helper_name,

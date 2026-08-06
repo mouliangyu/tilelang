@@ -390,6 +390,7 @@ void CodeGenTileLangAscend::PrintType(DataType t, std::ostream &os) {
 
 void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   this->InitFuncState(f);
+  unroll_factor_.clear();
   ReserveKeywordsAsUnique();
 
   // Register function parameters with their storage scope for codegen
@@ -2468,7 +2469,12 @@ bool CodeGenTileLangAscend::EmitScalarizedStore(const BufferStoreNode *op) {
 void CodeGenTileLangAscend::VisitStmt_(const ForNode *op) {
   if (op->kind == tirx::ForKind::kUnrolled) {
     PrintIndent();
-    stream << "#pragma unroll\n";
+    auto it = unroll_factor_.find(op->loop_var);
+    if (it != unroll_factor_.end()) {
+      stream << "#pragma unroll " << PrintExpr(it->second) << "\n";
+    } else {
+      stream << "#pragma unroll\n";
+    }
   }
   CodeGenC::VisitStmt_(op);
 }
@@ -2531,6 +2537,13 @@ void CodeGenTileLangAscend::VisitStmt_(const AttrStmtNode *op) {
   if (op->attr_key == "tl.simdvf_scope") {
     this->VisitStmt(op->body);
     return;
+  }
+  if (op->attr_key == "pragma_unroll_factor") {
+    const auto *factor = op->value.as<IntImmNode>();
+    ICHECK(factor) << "pragma_unroll_factor must be a constant integer";
+    const auto *loop_var = op->node.as<VarNode>();
+    ICHECK(loop_var) << "pragma_unroll_factor must annotate a loop variable";
+    unroll_factor_[ffi::GetRef<Var>(loop_var)] = Downcast<IntImm>(op->value);
   }
   CodeGenC::VisitStmt_(op);
 }
