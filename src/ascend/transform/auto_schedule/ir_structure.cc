@@ -108,14 +108,6 @@ std::shared_ptr<IRStructure> TaskNode::Clone() const {
   // Copy latency and II
   new_task->SetLatency(GetLatency());
   new_task->SetII(GetII());
-  for (const auto &shape : tensor_core_shapes_) {
-    new_task->AddTensorCoreShape(shape.m, shape.n, shape.k, shape.input_dtype,
-                                 shape.accum_dtype);
-  }
-  for (const auto &info : copy_infos_) {
-    new_task->AddCopyInfo(info.src_scope, info.dst_scope, info.dtype,
-                          info.bytes, info.pipe_mask);
-  }
   // Copy warpgroup id
   new_task->SetWarpgroupId(GetWarpgroupId());
   new_task->CopyBaseMetadataFrom(*this);

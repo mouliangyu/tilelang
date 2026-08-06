@@ -56,8 +56,8 @@ constexpr const char *kBufferVersion = "tl.buffer_version";
 // then expands synchronization back to its guarded candidate sites.
 constexpr const char *kAscendPerCoreTask = "tl.ascend_per_core_task";
 
-// Groups one or more statements into one explicit AutoSchedule TaskNode.
-// Inside a kAscendPerCoreTask region, each marker is one concrete candidate.
+// Groups statements into one AutoSchedule TaskNode. Inside a
+// kAscendPerCoreTask region, each marker is one concrete candidate.
 constexpr const char *kAscendTask = "tl.ascend_task";
 
 // Attributes to implement SourceCodeBlock

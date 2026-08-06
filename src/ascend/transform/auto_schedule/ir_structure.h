@@ -200,9 +200,6 @@ inline int64_t GetSerialTripCount(const For &loop,
   return extent / step_value + (extent % step_value != 0);
 }
 
-uint16_t GetAscendCallPipeMask(const Call &call);
-uint16_t GetAscendCopyPipeMask(const Buffer &src, const Buffer &dst);
-
 // A wrapper introduced at a node relative to its nearest surviving structural
 // ancestor. Guards are scheduling metadata rather than schedulable tasks.
 class Guard {
@@ -584,76 +581,6 @@ public:
   void SetWarpgroupId(int warpgroup_id) { warpgroup_id_ = warpgroup_id; }
   int GetWarpgroupId() const override { return warpgroup_id_; }
 
-  // Tensor Core shape information structure
-  struct TensorCoreShape {
-    int64_t m;
-    int64_t n;
-    int64_t k;
-    DataType input_dtype;
-    DataType accum_dtype;
-    TensorCoreShape(int64_t m = 0, int64_t n = 0, int64_t k = 0,
-                    DataType input_dtype = DataType::Float(16),
-                    DataType accum_dtype = DataType::Float(16))
-        : m(m), n(n), k(k), input_dtype(input_dtype), accum_dtype(accum_dtype) {
-    }
-  };
-  void AddTensorCoreShape(int64_t m, int64_t n, int64_t k) {
-    tensor_core_shapes_.emplace_back(m, n, k);
-  }
-  void AddTensorCoreShape(int64_t m, int64_t n, int64_t k, DataType input_dtype,
-                          DataType accum_dtype) {
-    tensor_core_shapes_.emplace_back(m, n, k, input_dtype, accum_dtype);
-  }
-
-  // Get shape information
-  size_t GetTensorCoreShapeCount() const { return tensor_core_shapes_.size(); }
-  const TensorCoreShape &GetTensorCoreShape(size_t index) const {
-    return tensor_core_shapes_[index];
-  }
-
-  // Helper methods for single shape (backward compatibility)
-  int64_t GetTensorCoreM() const {
-    return tensor_core_shapes_.empty() ? 0 : tensor_core_shapes_[0].m;
-  }
-  int64_t GetTensorCoreN() const {
-    return tensor_core_shapes_.empty() ? 0 : tensor_core_shapes_[0].n;
-  }
-  int64_t GetTensorCoreK() const {
-    return tensor_core_shapes_.empty() ? 0 : tensor_core_shapes_[0].k;
-  }
-  bool HasTensorCoreShape() const { return !tensor_core_shapes_.empty(); }
-
-  // Task-level copy information collected from tl.copy calls. Ascend latency
-  // estimation uses this instead of re-deriving copy direction from read/write
-  // regions, which avoids double-counting source and destination regions.
-  struct CopyInfo {
-    String src_scope;
-    String dst_scope;
-    DataType dtype;
-    int64_t bytes;
-    uint16_t pipe_mask;
-    CopyInfo(String src_scope = String(""), String dst_scope = String(""),
-             DataType dtype = DataType::Float(16), int64_t bytes = 0,
-             uint16_t pipe_mask = 0)
-        : src_scope(src_scope), dst_scope(dst_scope), dtype(dtype),
-          bytes(bytes), pipe_mask(pipe_mask) {}
-  };
-  void AddCopyInfo(String src_scope, String dst_scope, DataType dtype,
-                   int64_t bytes, uint16_t pipe_mask) {
-    copy_infos_.emplace_back(src_scope, dst_scope, dtype, bytes, pipe_mask);
-  }
-  const std::vector<CopyInfo> &GetCopyInfos() const { return copy_infos_; }
-  bool HasCopyInfo() const { return !copy_infos_.empty(); }
-
-  // Get aggregated shape information for II estimation
-  int64_t GetTotalTensorCoreOps() const {
-    int64_t total_ops = 0;
-    for (const auto &shape : tensor_core_shapes_) {
-      total_ops += shape.m * shape.n * shape.k * 2; // 2 ops per element
-    }
-    return total_ops;
-  }
-
   // Clone method
   std::shared_ptr<IRStructure> Clone() const override;
 
@@ -758,13 +685,6 @@ private:
   int64_t ii_{0};      // Initiation interval in cycles
   int warpgroup_id_{
       kWarpgroupUnassigned}; // Warpgroup id for warpgroup specialization
-
-  // Tensor Core shape information (M, N, K dimensions)
-  // A task may contain multiple Tensor Core operations with different shapes
-  std::vector<TensorCoreShape> tensor_core_shapes_;
-
-  // Selected tensor core instruction key for this task.
-  std::vector<CopyInfo> copy_infos_;
 };
 
 // Control node: contains a For operation and an ordered list of child
@@ -999,36 +919,9 @@ struct TaskNodeWithContext {
   ControlNode *control_node{nullptr}; // nullptr if not inside a loop
 };
 
-// Memory type classification
-enum class MemoryType {
-  kGlobal,   // Global memory (DRAM)
-  kShared,   // Shared memory (L1/shared)
-  kRegister, // Register/local memory
-  kTmem,     // Tensor memory (shared.tmem, Blackwell/sm_100 only)
-  kUnknown   // Unknown memory type
-};
-
-// Helper function to determine memory type from buffer scope
-inline MemoryType GetMemoryTypeFromScope(const String &scope) {
-  if (scope == "global") {
-    return MemoryType::kGlobal;
-  } else if (scope == "shared.tmem") {
-    return MemoryType::kTmem;
-  } else if (scope == "shared" || scope == "shared.dyn") {
-    return MemoryType::kShared;
-  } else if (scope == "local" || scope == "local.var" ||
-             scope == "local.fragment") {
-    return MemoryType::kRegister;
-  }
-  return MemoryType::kUnknown;
-}
-
-// Helper function to check if a buffer region is in register memory
 inline bool IsRegisterRegion(const BufferRegion &region) {
-  const Buffer &buffer = region->buffer;
-  String scope = buffer.scope();
-  MemoryType mem_type = GetMemoryTypeFromScope(scope);
-  return mem_type == MemoryType::kRegister;
+  String scope = region->buffer.scope();
+  return scope == "local" || scope == "local.var" || scope == "local.fragment";
 }
 
 // Helper function to collect all TaskNodes with context information
@@ -1158,21 +1051,6 @@ inline void PrintAllStmts(const IRStructure *node, int indent = 0) {
       PrintAllStmts(control->children[i].get(), indent + 2);
     }
   }
-}
-
-inline Stmt GetLetDecl(const BindNode *bind_node) {
-  if (bind_node == nullptr) {
-    return Stmt();
-  }
-  return Bind(bind_node->var, bind_node->value);
-}
-
-inline Stmt GetAttrDecl(const AttrStmtNode *attr_node) {
-  if (attr_node == nullptr) {
-    return Stmt();
-  }
-  return AttrStmt(attr_node->node, attr_node->attr_key, attr_node->value,
-                  Evaluate(0));
 }
 
 // Original helper function to print IRStructure (kept for backward

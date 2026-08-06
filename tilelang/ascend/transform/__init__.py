@@ -34,9 +34,14 @@ def NormalizeNoConflictHints():
     return _ffi_api.NormalizeNoConflictHints()  # type: ignore
 
 
-def NormalizePerCoreTask():
-    """Wrap unmarked inferred PerCoreTask leaves in canonical Task markers."""
-    return _ffi_api.NormalizePerCoreTask()  # type: ignore
+def NormalizeTask():
+    """Mark canonical task boundaries and annotate their Ascend hardware pipes."""
+    return _ffi_api.NormalizeTask()  # type: ignore
+
+
+def LatencyEstimator():
+    """Annotate every Ascend AutoSchedule task with latency and II."""
+    return _ffi_api.LatencyEstimator()  # type: ignore
 
 
 def AscendRemoveNoOp():
@@ -137,6 +142,7 @@ __all__ = [
     "AscendInsertOOBPadding",
     "AscendSimdVFLowerParallel",
     "AutoSchedule",
+    "LatencyEstimator",
     "IfConditionExtract",
     "InsertNd2Nz",
     "LegalizeSimdMerging",
@@ -146,7 +152,7 @@ __all__ = [
     "NormalizeControlFlowForSchedule",
     "NormalizeMixedKernelSid",
     "NormalizeNoConflictHints",
-    "NormalizePerCoreTask",
+    "NormalizeTask",
     "RewriteAscendBufferVersionLayout",
     "RestoreWhileLoops",
     "RewriteFp4ToFp4x2",

@@ -1,4 +1,23 @@
-#include "./latency_estimator.h"
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+#include "./task_cost_estimator.h"
 
 #include <tvm/runtime/logging.h>
 #include <tvm/tirx/analysis.h>
@@ -10,6 +29,8 @@
 #include <unordered_map>
 
 #include "op/builtin.h"
+#include "op/copy.h"
+#include "op/gemm.h"
 #include "transform/common/attr.h"
 
 namespace tvm {
@@ -18,6 +39,67 @@ namespace tl {
 using namespace tirx;
 
 namespace {
+
+class CostFeatureAnalyzer : public StmtExprVisitor {
+public:
+  static TaskCostFeatures Analyze(const Stmt &stmt,
+                                  arith::Analyzer *arith_analyzer) {
+    ICHECK(arith_analyzer != nullptr);
+    CostFeatureAnalyzer analyzer(arith_analyzer);
+    analyzer(stmt);
+    return analyzer.features_;
+  }
+
+private:
+  explicit CostFeatureAnalyzer(arith::Analyzer *arith_analyzer)
+      : arith_analyzer_(arith_analyzer) {}
+
+  int64_t CalculateCopyBytes(const CopyNode *copy) const {
+    RegionElementUpperBound src_estimate = EstimateRegionElementUpperBound(
+        copy->src, copy->src_range, arith_analyzer_);
+    RegionElementUpperBound dst_estimate = EstimateRegionElementUpperBound(
+        copy->dst, copy->dst_range, arith_analyzer_);
+
+    int64_t elements = src_estimate.elements;
+    PrimExpr src_elements = RegionElementCountExpr(copy->src_range);
+    PrimExpr dst_elements = RegionElementCountExpr(copy->dst_range);
+    if (arith_analyzer_->CanProveEqual(src_elements, dst_elements)) {
+      if (src_estimate.reliable && dst_estimate.reliable) {
+        elements = std::min(src_estimate.elements, dst_estimate.elements);
+      } else if (dst_estimate.reliable) {
+        elements = dst_estimate.elements;
+      }
+    }
+
+    return ElementsToBytes(elements, DataType(copy->dst->dtype));
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    static const auto copy_op = Op::Get("tl.tileop.copy");
+    static const auto gemm_op = Op::Get("tl.tileop.gemm");
+    if (op->op.same_as(copy_op)) {
+      Copy copy_obj(op->args, op->annotations);
+      const CopyNode *copy = copy_obj.get();
+      features_.copy_infos.push_back(
+          {copy->src.scope(), copy->dst.scope(), CalculateCopyBytes(copy)});
+    } else if (op->op.same_as(gemm_op)) {
+      int64_t m = op->args[5].as<IntImmNode>()->value;
+      int64_t n = op->args[6].as<IntImmNode>()->value;
+      int64_t k = op->args[7].as<IntImmNode>()->value;
+      Gemm gemm(op->args, op->annotations);
+      if (m > 0 && n > 0 && k > 0)
+        features_.cube_shapes.push_back({m, n, k, gemm->a_->dtype});
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  // Resource analysis treats blocks as atomic scheduler operations. Preserve
+  // the same boundary for cost features; VF cost is modeled from the block.
+  void VisitStmt_(const SBlockNode *) final {}
+
+  arith::Analyzer *arith_analyzer_;
+  TaskCostFeatures features_;
+};
 
 struct PerCoreTaskCost {
   int64_t latency{0};
@@ -194,12 +276,13 @@ private:
       if (attr->attr_key == tl::attr::kAscendTask) {
         Stmt marker = GetRef<Stmt>(attr);
         auto it = candidate_costs_.find(marker);
-        ICHECK(it != candidate_costs_.end())
-            << "Missing latency estimate for T.Task marker";
-        PhaseSummary result;
-        result.prefix = it->second;
-        result.candidate_markers = 1;
-        return result;
+        if (it != candidate_costs_.end()) {
+          PhaseSummary result;
+          result.prefix = it->second;
+          result.candidate_markers = 1;
+          return result;
+        }
+        return AnalyzeStmt(attr->body);
       }
       return AnalyzeStmt(attr->body);
     }
@@ -270,33 +353,41 @@ bool IsComposedLatencyStmt(const Stmt &stmt) {
 
 } // namespace
 
-void LatencyEstimator::EstimateComposedTask(
-    TaskNode *task, const LeafTaskAnalyzer &analyze_leaf) {
+void TaskCostEstimator::Estimate(TaskNode *task) {
+  ICHECK(task != nullptr);
+  arith::Analyzer analyzer;
+  task->outer_ctx.Populate(analyzer);
+  TaskCostFeatures cost_features =
+      CostFeatureAnalyzer::Analyze(task->stmt, &analyzer);
+  EstimateAscend(task, cost_features, &analyzer);
+}
+
+void TaskCostEstimator::EstimateComposedTask(TaskNode *task) {
   if (!IsComposedLatencyStmt(task->stmt)) {
     Estimate(task);
     return;
   }
-  SerialTaskCost cost =
-      EstimateStmtCost(task->stmt, task->outer_ctx, analyze_leaf);
+  SerialTaskCost cost = EstimateStmtCost(task->stmt, task->outer_ctx);
   task->SetLatency(cost.latency);
   task->SetII(std::max<int64_t>(cost.ii, 1));
 }
 
-LatencyEstimator::SerialTaskCost
-LatencyEstimator::EstimateLeafTaskCost(const Stmt &stmt,
-                                       const ConstrSet &outer_ctx,
-                                       const LeafTaskAnalyzer &analyze_leaf) {
+TaskCostEstimator::SerialTaskCost
+TaskCostEstimator::EstimateLeafTaskCost(const Stmt &stmt,
+                                        const ConstrSet &outer_ctx) {
   TaskNode leaf_task;
   leaf_task.stmt = stmt;
   leaf_task.outer_ctx = outer_ctx;
-  analyze_leaf(stmt, &leaf_task);
+  leaf_task.SetPipeMask(AnalyzeTaskPipe(stmt));
+  ApplyTaskResourceUsage(AnalyzeTaskResourceUsage(stmt), &leaf_task);
+  ApplyTaskAccesses(AnalyzeTaskAccesses(stmt), &leaf_task);
   Estimate(&leaf_task);
   return {leaf_task.GetLatency(), leaf_task.GetII()};
 }
 
-LatencyEstimator::SerialTaskCost
-LatencyEstimator::EstimateStmtCost(const Stmt &stmt, const ConstrSet &outer_ctx,
-                                   const LeafTaskAnalyzer &analyze_leaf) {
+TaskCostEstimator::SerialTaskCost
+TaskCostEstimator::EstimateStmtCost(const Stmt &stmt,
+                                    const ConstrSet &outer_ctx) {
   if (!stmt.defined())
     return {};
 
@@ -324,8 +415,7 @@ LatencyEstimator::EstimateStmtCost(const Stmt &stmt, const ConstrSet &outer_ctx,
     SerialTaskCost result;
     ConstrSet child_ctx = outer_ctx;
     for (const Stmt &child : seq->seq) {
-      result =
-          add_cost(result, EstimateStmtCost(child, child_ctx, analyze_leaf));
+      result = add_cost(result, EstimateStmtCost(child, child_ctx));
       if (const auto *bind = child.as<BindNode>())
         child_ctx.AddConstr(bind->var, bind->value);
     }
@@ -337,11 +427,11 @@ LatencyEstimator::EstimateStmtCost(const Stmt &stmt, const ConstrSet &outer_ctx,
       if (const auto *expr = attr->node.as<PrimExprNode>())
         body_ctx.AddConstr(GetRef<PrimExpr>(expr), /*is_assume=*/true);
     }
-    return EstimateStmtCost(attr->body, body_ctx, analyze_leaf);
+    return EstimateStmtCost(attr->body, body_ctx);
   }
   if (const auto *loop = stmt.as<ForNode>()) {
     if (loop->kind != ForKind::kSerial && loop->kind != ForKind::kUnrolled)
-      return EstimateLeafTaskCost(stmt, outer_ctx, analyze_leaf);
+      return EstimateLeafTaskCost(stmt, outer_ctx);
 
     arith::Analyzer analyzer;
     outer_ctx.Populate(analyzer);
@@ -350,42 +440,37 @@ LatencyEstimator::EstimateStmtCost(const Stmt &stmt, const ConstrSet &outer_ctx,
     body_ctx.AddConstr(loop->loop_var,
                        Range::FromMinExtent(loop->min, loop->extent));
     body_ctx.AddConstr(loop->extent > 0);
-    return multiply_cost(EstimateStmtCost(loop->body, body_ctx, analyze_leaf),
-                         trip_count);
+    return multiply_cost(EstimateStmtCost(loop->body, body_ctx), trip_count);
   }
   if (const auto *while_loop = stmt.as<WhileNode>()) {
     ConstrSet body_ctx = outer_ctx;
     body_ctx.AddConstr(while_loop->condition);
-    return multiply_cost(
-        EstimateStmtCost(while_loop->body, body_ctx, analyze_leaf),
-        kDynamicSerialTripCountFallback);
+    return multiply_cost(EstimateStmtCost(while_loop->body, body_ctx),
+                         kDynamicSerialTripCountFallback);
   }
   if (const auto *branch = stmt.as<IfThenElseNode>()) {
     ConstrSet then_ctx = outer_ctx;
     then_ctx.AddConstr(branch->condition);
-    SerialTaskCost then_cost =
-        EstimateStmtCost(branch->then_case, then_ctx, analyze_leaf);
+    SerialTaskCost then_cost = EstimateStmtCost(branch->then_case, then_ctx);
     SerialTaskCost else_cost;
     if (branch->else_case) {
       ConstrSet else_ctx = outer_ctx;
       else_ctx.AddConstr(Not(branch->condition));
-      else_cost =
-          EstimateStmtCost(branch->else_case.value(), else_ctx, analyze_leaf);
+      else_cost = EstimateStmtCost(branch->else_case.value(), else_ctx);
     }
     return {std::max(then_cost.latency, else_cost.latency),
             std::max(then_cost.ii, else_cost.ii)};
   }
-  return EstimateLeafTaskCost(stmt, outer_ctx, analyze_leaf);
+  return EstimateLeafTaskCost(stmt, outer_ctx);
 }
 
-void LatencyEstimator::EstimatePerCoreTask(
+void TaskCostEstimator::EstimatePerCoreTask(
     TaskNode *per_core_task, const Stmt &body,
     const std::vector<PerCoreTaskCandidate> &candidates) {
   CandidateCostMap candidate_costs;
   for (const PerCoreTaskCandidate &candidate : candidates) {
     ICHECK(candidate.task);
-    ICHECK(!candidate.task->GetReadRegions().empty() ||
-           !candidate.task->GetWriteRegions().empty())
+    ICHECK(HasTaskBufferAccess(candidate.task.get()))
         << "T.Task must contain at least one dependency-bearing "
            "statement";
     bool inserted = candidate_costs

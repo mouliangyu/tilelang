@@ -54,7 +54,7 @@ def PerCoreTask():
     return attr(tirx.const(0, "int32"), "tl.ascend_per_core_task", tirx.const(1, "int32"))
 
 
-def Task():
+def Task(latency: int | None = None, ii: int | None = None):
     """Group one or more serial statements into one scheduler task.
 
     AutoSchedule creates exactly one TaskNode for the complete marker body.
@@ -66,11 +66,19 @@ def Task():
     top-level, single-pipe statement after preprocessing. The marker does not
     select or launch a core by itself.
 
+    ``latency`` is the number of cycles from task issue until its outputs are
+    ready. ``ii`` is the minimum interval before the same hardware pipe may
+    issue another instance. Either value may be omitted, in which case the
+    ``LatencyEstimator`` pass supplies it. Provided values are trusted exact
+    overrides for the complete task body, not hints for the enclosing loop II.
+
     Inside ``T.PerCoreTask()``, the same marker also denotes one concrete
     per-core candidate. Put the control flow that selects a core outside this
     scope so automatic synchronization remains under the same guard. Explicit
     markers may be mixed with unmarked candidates; the compiler infers markers
-    for the remaining supported candidate boundaries.
+    for the remaining supported candidate boundaries. Do not nest
+    ``T.PerCoreTask()`` inside this scope; put this ``T.Task()`` inside
+    ``T.PerCoreTask()`` instead.
 
     Example
     -------
@@ -83,7 +91,17 @@ def Task():
     ...         with T.Task():
     ...             T.copy(res, C[...])
     """
-    return attr(tirx.const(0, "int32"), "tl.ascend_task", tirx.const(1, "int32"))
+    if latency is not None and (isinstance(latency, bool) or not isinstance(latency, int) or latency < 0):
+        raise ValueError(f"Task latency must be a non-negative integer, got {latency!r}")
+    if ii is not None and (isinstance(ii, bool) or not isinstance(ii, int) or ii <= 0):
+        raise ValueError(f"Task ii must be a positive integer, got {ii!r}")
+
+    annotations = {}
+    if latency is not None:
+        annotations["latency"] = IntImm("int64", latency)
+    if ii is not None:
+        annotations["ii"] = IntImm("int64", ii)
+    return attr(annotations, "tl.ascend_task", tirx.const(1, "int32"))
 
 
 def assume_no_conflict(a, b=None, *, level=None, cross=None, group=None):

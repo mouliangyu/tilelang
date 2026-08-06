@@ -56,6 +56,7 @@
 #include <utility>
 #include <vector>
 
+#include "ascend/transform/auto_schedule/task_analysis.h"
 #include "backend/common/target_utils.h"
 #include "op/builtin.h"
 #include "op/copy.h"
@@ -422,10 +423,9 @@ static Stmt GuardWithGuards(Stmt body, const GuardList &guards) {
 }
 
 // PerCoreTask is one scheduler node, but its source control flow may contain
-// several mutually-exclusive concrete candidates. IRStructureBuilder
-// normalizes inferred candidates to T.Task markers, so final emission
-// re-emits every candidate through the ordinary Task path before moving
-// synchronization beside those canonical boundaries.
+// several mutually-exclusive dependency-bearing candidates plus scalar control
+// tasks. NormalizeTask marks both kinds; only candidates receive migrated
+// synchronization.
 class PerCoreTaskSyncMigrator : public StmtMutator {
 public:
   PerCoreTaskSyncMigrator(std::vector<Stmt> before, std::vector<Stmt> after,
@@ -443,8 +443,11 @@ public:
 private:
   Stmt VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key == tl::attr::kAscendTask) {
-      ++num_candidates_;
       Stmt candidate = VisitStmt(op->body);
+      if (!HasTaskBufferAccess(candidate)) {
+        return candidate;
+      }
+      ++num_candidates_;
       return WrapCandidate(emit_candidate_(std::move(candidate)));
     }
     return StmtMutator::VisitStmt_(op);
