@@ -498,6 +498,20 @@ private:
     } else if (node->op.same_as(builtin::tvm_access_ptr())) {
       HandleTvmAccessPtr(node);
       return arith::IRMutatorWithAnalyzer::VisitExpr_(node);
+    } else if (node->op.same_as(tl::rng_rand_float())) {
+      // Stateful RNG calls produce scalar values before any destination cast.
+      // Keep that source width as a non-cast constraint: the simple-store
+      // strategy intentionally ignores cast constraints, while later passes
+      // handle the packed destination conversion independently.
+      int value_bits = node->dtype.bits() * node->dtype.lanes();
+      ICHECK_GT(value_bits, 0)
+          << "tl.rng_rand_float requires a fixed-width result dtype, got "
+          << node->dtype;
+      int vectorize_length =
+          std::max(1, std::min(4, vector_load_bits_max_ / value_bits));
+      buffer_vector_infos_.push_back(
+          {Buffer(), vectorize_length, false, {}, /*is_cast=*/false});
+      return arith::IRMutatorWithAnalyzer::VisitExpr_(node);
     } else if (node->op == tl::atomic_add_elem_op()) {
       // Assert at least 2 args (dst_ptr and src)
       ICHECK(node->args.size() >= 2)

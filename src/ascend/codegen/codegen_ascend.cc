@@ -815,6 +815,36 @@ void CodeGenTileLangAscend::VisitStmt_(const SBlockNode *op) {
 void CodeGenTileLangAscend::VisitExpr_(const BroadcastNode *op,
                                        std::ostream &os) { // NOLINT(*)
   int lanes = static_cast<int>(Downcast<IntImm>(op->lanes)->value);
+
+  // Keep casts outside broadcasts so the vector value is converted as a
+  // whole. Besides avoiding target-specific Broadcast(Cast(Call)) patterns,
+  // this lets vector casts use packed conversion intrinsics such as
+  // float2 -> bfloat16x2.
+  if (const auto *cast = op->value.as<CastNode>()) {
+    PrimExpr source = Broadcast(cast->value, op->lanes);
+    PrintExpr(Cast(op->dtype, source), os);
+    return;
+  }
+
+  // Match CUDA codegen's stateful RNG vectorization: the loop vectorizer
+  // leaves an opaque scalar RNG call under Broadcast, and target codegen
+  // replaces the vector with one backend runtime call. Ascend's default 64-bit
+  // vector width makes the FP32 case a float2.
+  const CallNode *rng_call = op->value.as<CallNode>();
+  if (rng_call != nullptr) {
+    const CallNode *call = rng_call;
+    if (call->op.same_as(tl::rng_rand_float()) && (lanes == 2 || lanes == 4) &&
+        call->dtype.is_float() && call->dtype.bits() == 32) {
+      ICHECK_EQ(call->args.size(), 1);
+      const auto *dist = call->args[0].as<StringImmNode>();
+      ICHECK(dist != nullptr) << "Ascend RNG distribution must be constant";
+      if (dist->value == "uniform" || dist->value == "normal") {
+        EmitPhiloxVectorFloat(os, dist->value, lanes);
+        return;
+      }
+    }
+  }
+
   if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 8) {
     const int64_t *p = as_const_int(op->value);
     if (p) {
@@ -1000,6 +1030,20 @@ bool CodeGenTileLangAscend::EmitSimdMergingCall(const CallNode *op,
   }
   os << ")";
   return true;
+}
+
+void CodeGenTileLangAscend::EmitPhiloxVectorFloat(
+    std::ostream &os, const std::string &distribution, int lanes) {
+  ICHECK(inside_simtvf_body_)
+      << "Ascend Philox vector RNG must be used inside T.SimtVF()";
+  ICHECK(!ascend_rng_state_var_.empty())
+      << "Ascend Philox vector RNG requires a preceding T.rng_init call";
+  ICHECK(distribution == "uniform" || distribution == "normal")
+      << "Unsupported Ascend vector RNG distribution: " << distribution;
+  ICHECK(lanes == 2 || lanes == 4)
+      << "Unsupported Ascend vector RNG width: " << lanes;
+  os << "tl::philox_rand_" << distribution << lanes;
+  os << "(&" << ascend_rng_state_var_ << ")";
 }
 
 void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
@@ -2151,8 +2195,14 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
                  << ", " << PrintExpr(op->args[2]) << ");\n";
     // args[3] (curand generator string) is ignored on Ascend.
   } else if (op->op.same_as(tl::rng_rand())) {
+    ICHECK(!ascend_rng_state_var_.empty())
+        << "tl.rng_rand requires a preceding T.rng_init call in the same "
+           "T.SimtVF() block";
     os << "tl::philox_rand(&" << ascend_rng_state_var_ << ")";
   } else if (op->op.same_as(tl::rng_rand_float())) {
+    ICHECK(!ascend_rng_state_var_.empty())
+        << "tl.rng_rand_float requires a preceding T.rng_init call in the "
+           "same T.SimtVF() block";
     ICHECK_NE(op->dtype.bits(), 64)
         << "float64 RNG (tl.rng_rand_float bit=64) is not supported on Ascend";
     const std::string dist = op->args[0].as<StringImmNode>()->value;

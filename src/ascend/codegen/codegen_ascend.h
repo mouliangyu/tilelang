@@ -78,6 +78,8 @@ private:
   void EmitVFFunction(const SBlockNode *op, const ffi::Array<Var> &captures,
                       const std::string &helper_name,
                       const std::string &func_attrs, bool &inside_vf_body);
+  void EmitPhiloxVectorFloat(std::ostream &os, const std::string &distribution,
+                             int lanes);
   bool EmitSimdMergingCall(const CallNode *op, std::ostream &os);
   bool IsGlobalGmBuffer(const BufferNode *buffer) const;
   std::string GetGmBypassPtr(DataType dtype, const BufferNode *buffer,
