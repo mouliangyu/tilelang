@@ -39,8 +39,6 @@ from .dma import *  # noqa: F401,F403
 from .dma import __all__ as _DMA_ALL
 from .mode import *  # noqa: F401,F403
 from .mode import __all__ as _MODE_ALL
-from .reduce import *  # noqa: F401,F403
-from .reduce import __all__ as _REDUCE_ALL
 from .sync import *  # noqa: F401,F403
 from .sync import __all__ as _SYNC_ALL
 
@@ -81,6 +79,6 @@ _ASCEND_API_ALL = (
 )
 
 __tilelang_dialect__ = "ascend"
-__all__ = tuple(dict.fromkeys((*_COMMON_ALL, *_ASCEND_API_ALL, *_DMA_ALL, *_MODE_ALL, *_REDUCE_ALL, *_SYNC_ALL)))
+__all__ = tuple(dict.fromkeys((*_COMMON_ALL, *_ASCEND_API_ALL, *_DMA_ALL, *_MODE_ALL, *_SYNC_ALL)))
 
-del _ASCEND_API_ALL, _COMMON_ALL, _DMA_ALL, _MODE_ALL, _REDUCE_ALL, _SYNC_ALL
+del _ASCEND_API_ALL, _COMMON_ALL, _DMA_ALL, _MODE_ALL, _SYNC_ALL

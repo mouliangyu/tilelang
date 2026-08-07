@@ -74,6 +74,12 @@ bool UsePreciseVdiv(const CallNode *op, DataType dtype, bool enable_fast_math) {
   return !enable_fast_math;
 }
 
+bool IsAscendWarpReduceDType(DataType dtype) {
+  return dtype.is_scalar() &&
+         ((dtype.is_float() && (dtype.bits() == 16 || dtype.bits() == 32)) ||
+          ((dtype.is_int() || dtype.is_uint()) && dtype.bits() == 32));
+}
+
 static std::string GetAscendScopeQualifier(const std::string &scope) {
   if (scope == "shared" || scope == "shared.dyn")
     return "__ubuf__";
@@ -1145,12 +1151,22 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         << "tl.ascend_set_atomic_none expects no arguments";
     this->PrintIndent();
     this->stream << "AscendC::SetAtomicNone();\n";
-  } else if (op->op.same_as(tl::ascend_reduce_add())) {
-    os << "asc_reduce_add(" << PrintExpr(op->args[0]) << ")";
-  } else if (op->op.same_as(tl::ascend_reduce_max())) {
-    os << "asc_reduce_max(" << PrintExpr(op->args[0]) << ")";
-  } else if (op->op.same_as(tl::ascend_reduce_min())) {
-    os << "asc_reduce_min(" << PrintExpr(op->args[0]) << ")";
+  } else if (op->op.same_as(tl::warp_reduce_sum()) ||
+             op->op.same_as(tl::warp_reduce_max()) ||
+             op->op.same_as(tl::warp_reduce_min())) {
+    ICHECK_EQ(op->args.size(), 1U)
+        << "Ascend hardware warp reduction expects exactly one argument";
+    DataType dtype = op->args[0].dtype();
+    ICHECK(IsAscendWarpReduceDType(dtype))
+        << "Ascend hardware warp reduction supports only scalar float16, "
+           "float32, int32, and uint32 values, but got "
+        << dtype;
+    const char *intrinsic =
+        op->op.same_as(tl::warp_reduce_sum())
+            ? "asc_reduce_add"
+            : (op->op.same_as(tl::warp_reduce_max()) ? "asc_reduce_max"
+                                                     : "asc_reduce_min");
+    os << intrinsic << "(" << PrintExpr(op->args[0]) << ")";
   } else if (op->op.same_as(tl::ascend_cross_core_set_flag())) {
     ICHECK_EQ(op->args.size(), 3)
         << "tl.ascend_cross_core_set_flag expects exactly 3 arguments "

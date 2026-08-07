@@ -48,7 +48,6 @@ def test_ascend_intrinsics_live_in_themed_dialect_submodules():
 
     assert T.ascend_pipe_barrier.__module__ == "tilelang.ascend.language.sync"
     assert T.ascend_set_copy_pad_value.__module__ == "tilelang.ascend.language.dma"
-    assert T.ascend_reduce_add.__module__ == "tilelang.ascend.language.reduce"
     assert T.set_atomic.__module__ == "tilelang.ascend.language.mode"
 
 

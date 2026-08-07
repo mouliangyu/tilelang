@@ -31,7 +31,7 @@ pitfalls you need to produce correct, high-performance Ascend kernels.
 | L1 cache / data | N/A | `T.alloc_l1(...)` -- Cube Buffer (CBuf) |
 | Register fragments | `T.alloc_fragment(...)` | `T.alloc_fragment(...)` |
 | Cube engine buffers | N/A | `T.alloc_l0a/l0b/l0c(...)` -- L0A/L0B/L0C |
-| Warp-level ops | `__shfl_sync` | `T.alloc_reducer` / `T.ascend_reduce_add` |
+| Warp-level ops | `__shfl_sync` | `T.alloc_reducer` / `T.warp_reduce_sum` |
 | Synchronization | `__syncthreads()`, `mbarrier`, `cp.async` | `asc_syncthreads()` (auto-inserted in SimtVF), Flag-based: `T.ascend_set_flag` / `T.ascend_wait_flag` |
 | Auto-Schedule | `T.Pipelined(...)` | `T.Pipelined(...)` with `num_stages=...` |
 | Compiler | nvcc | Bisheng (Huawei Ascend compiler) |
@@ -662,6 +662,12 @@ Reference: `examples/ascend/example_gemm_l0.py`
 10. **AIV sid indexing in output**: In `T.MixedKernel`, `T.copy` from
     UB to GM uses `sid` to partition output rows. Forgetting the `sid`
     offset causes both AIV sub-cores to write the same region.
+
+11. **Hardware warp-reduce dtypes**: `T.warp_reduce_sum`,
+    `T.warp_reduce_max`, and `T.warp_reduce_min` lower directly to the
+    `asc_reduce_*` hardware intrinsics, which support only `float16` (`half`),
+    `float32`, `int32`, and `uint32`. Other `T.reduce_*` dtypes may still use a
+    shuffle or UB fallback, but cannot call the hardware reduction directly.
 
 ---
 

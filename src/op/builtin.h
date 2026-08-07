@@ -819,9 +819,6 @@ TVM_DLL const Op &named_barrier_arrive();
  *
  */
 TVM_DLL const Op &ascend_pipe_barrier();
-TVM_DLL const Op &ascend_reduce_add();
-TVM_DLL const Op &ascend_reduce_max();
-TVM_DLL const Op &ascend_reduce_min();
 
 // Ascend SIMD raw CCE intrinsics (T.simd.* API).
 // TIR ops registered as tl.simd.<name>. Emit raw CCE intrinsics
