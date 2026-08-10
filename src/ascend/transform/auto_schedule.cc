@@ -46,6 +46,7 @@
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -175,6 +176,10 @@ static bool IsPerCoreTaskScalarControl(const TaskNode *task) {
                   call->op.same_as(tl::ascend_cross_core_wait_flag()));
 }
 
+static bool IsLetDeclTask(const TaskNode *task) {
+  return task != nullptr && task->stmt.as<BindNode>() != nullptr;
+}
+
 const AutoScheduleAttrSpec *FindAutoScheduleAttr(const String &key) {
   for (const AutoScheduleAttrSpec &spec : kAutoScheduleAttrs) {
     if (key == spec.key)
@@ -191,7 +196,6 @@ public:
   BufferVersionOverrideMap buffer_versions_overrides;
   ManualMultiBufferTable manual_multi_buffer_versions;
   std::set<std::string> unlimit_memory_scopes;
-  Optional<Var> sid;
 
   void VisitStmt_(const SBlockNode *op) override {
     if (op->name_hint == "tilelang_root") {
@@ -232,16 +236,6 @@ public:
         }
       }
       return; // Don't visit children
-    }
-    StmtVisitor::VisitStmt_(op);
-  }
-  void VisitStmt_(const AttrStmtNode *op) override {
-    if (op->attr_key == tirx::attr::thread_extent) {
-      if (const auto *iv = op->node.as<IterVarNode>()) {
-        if (iv->thread_tag == "cthread") {
-          sid = iv->var;
-        }
-      }
     }
     StmtVisitor::VisitStmt_(op);
   }
@@ -881,12 +875,168 @@ private:
   std::vector<std::shared_ptr<TaskNode>> per_core_task_candidates_;
 };
 
-Stmt ReNestLetStmts(const Stmt &stmt);
-
-// Result of scheduling a single kernel segment
+// Result of scheduling one kernel segment before serializing scheduled markers.
 struct ScheduledKernelResult {
-  Stmt scheduled_body;
+  std::vector<std::shared_ptr<IRStructure>> root;
+  FlagInfoList flag_infos;
   std::vector<MultiVersionBufferInfo> buffer_infos;
+};
+
+using ScheduledMetadata = Map<String, Any>;
+
+static Stmt WrapScheduledGuards(Stmt body, const GuardList &guards) {
+  for (auto it = guards.rbegin(); it != guards.rend(); ++it)
+    body = (*it)->Wrap(std::move(body));
+  return body;
+}
+
+class PerCoreTaskSyncMigrator : public StmtMutator {
+public:
+  PerCoreTaskSyncMigrator(std::vector<Stmt> before, std::vector<Stmt> after)
+      : before_(std::move(before)), after_(std::move(after)) {}
+
+  Stmt Rewrite(Stmt body) {
+    Stmt result = VisitStmt(std::move(body));
+    ICHECK_GT(num_candidates_, 0)
+        << "Cannot find a T.Task marker in normalized PerCoreTask";
+    return result;
+  }
+
+private:
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    if (op->attr_key != attr::kAscendTask)
+      return StmtMutator::VisitStmt_(op);
+    Stmt candidate = VisitStmt(op->body);
+    if (!HasTaskBufferAccess(candidate))
+      return candidate;
+    ++num_candidates_;
+    Array<Stmt> sequence;
+    sequence.reserve(before_.size() + 1 + after_.size());
+    for (const Stmt &stmt : before_)
+      sequence.push_back(stmt);
+    sequence.push_back(std::move(candidate));
+    for (const Stmt &stmt : after_)
+      sequence.push_back(stmt);
+    return SeqStmt::Flatten(sequence);
+  }
+
+  std::vector<Stmt> before_;
+  std::vector<Stmt> after_;
+  int num_candidates_{0};
+};
+
+class ScheduledTIREmitter {
+public:
+  Stmt Emit(const std::vector<std::shared_ptr<IRStructure>> &root,
+            const FlagInfoList &flag_infos) {
+    Array<Stmt> statements;
+    for (const FlagInfo &info : flag_infos) {
+      if (info.mode == 0) {
+        statements.push_back(
+            EmitSyntheticTask(MakeAscendSetFlag(info.hardevent, info.flag_var),
+                              info.warpgroup_id));
+      } else if (info.mode == 1) {
+        statements.push_back(EmitSyntheticTask(
+            MakeAscendCrossCoreSetFlag(4, info.hardevent, info.flag_var),
+            info.warpgroup_id));
+      }
+    }
+    for (const auto &node : root)
+      statements.push_back(EmitNode(node.get()));
+    for (const FlagInfo &info : flag_infos) {
+      if (info.mode == 0) {
+        statements.push_back(
+            EmitSyntheticTask(MakeAscendWaitFlag(info.hardevent, info.flag_var),
+                              info.warpgroup_id));
+      } else if (info.mode == 2) {
+        statements.push_back(EmitSyntheticTask(
+            MakeAscendCrossCoreWaitFlag(4, info.hardevent, info.flag_var),
+            info.warpgroup_id));
+      }
+    }
+    return SeqStmt::Flatten(statements);
+  }
+
+private:
+  Stmt EmitList(const std::vector<std::shared_ptr<IRStructure>> &nodes) {
+    Array<Stmt> statements;
+    statements.reserve(nodes.size());
+    for (const auto &node : nodes)
+      statements.push_back(EmitNode(node.get()));
+    return SeqStmt::Flatten(statements);
+  }
+
+  Stmt EmitSyntheticTask(Stmt stmt, int warpgroup_id) {
+    return EmitSyntheticTask(std::move(stmt), warpgroup_id, 0);
+  }
+
+  Stmt EmitSyntheticTask(Stmt stmt, int warpgroup_id, int stage) {
+    ScheduledMetadata metadata;
+    metadata.Set(kAscendScheduledWarpgroupId, Integer(warpgroup_id));
+    metadata.Set(kAscendScheduledStage, Integer(stage));
+    return AttrStmt(metadata, attr::kAscendTask, Integer(1), std::move(stmt));
+  }
+
+  void EmitAdjacentTasks(Array<Stmt> *result,
+                         const std::map<int, std::vector<Stmt>> &statements,
+                         int stage) {
+    for (const auto &[warpgroup_id, stmts] : statements) {
+      ICHECK(warpgroup_id == 0 || warpgroup_id == 1)
+          << "Unsupported warpgroup id in scheduled statement: "
+          << warpgroup_id;
+      for (const Stmt &stmt : stmts) {
+        result->push_back(EmitSyntheticTask(stmt, warpgroup_id, stage));
+      }
+    }
+  }
+
+  static std::vector<Stmt>
+  GetPerCoreSync(const std::map<int, std::vector<Stmt>> &statements,
+                 int warpgroup_id) {
+    auto it = statements.find(warpgroup_id);
+    return it == statements.end() ? std::vector<Stmt>() : it->second;
+  }
+
+  Stmt EmitNode(const IRStructure *node) {
+    ICHECK(node != nullptr);
+    Array<Stmt> result;
+    bool migrate_per_core_sync =
+        node->IsTask() && static_cast<const TaskNode *>(node)->IsPerCoreTask();
+    if (!migrate_per_core_sync)
+      EmitAdjacentTasks(&result, node->before, node->GetStage());
+
+    if (node->IsTask()) {
+      const auto *task = static_cast<const TaskNode *>(node);
+      ScheduledMetadata metadata;
+      metadata.Set(kAscendScheduledStage, Integer(node->GetStage()));
+      metadata.Set(kAscendScheduledWarpgroupId,
+                   Integer(task->GetWarpgroupId()));
+      Stmt task_body = task->stmt;
+      if (task->IsPerCoreTask()) {
+        task_body = PerCoreTaskSyncMigrator(
+                        GetPerCoreSync(node->before, task->GetWarpgroupId()),
+                        GetPerCoreSync(node->after, task->GetWarpgroupId()))
+                        .Rewrite(std::move(task_body));
+      }
+      result.push_back(
+          AttrStmt(metadata, attr::kAscendTask, Integer(1),
+                   WrapScheduledGuards(std::move(task_body), node->GetGuards()),
+                   task->stmt->span));
+    } else {
+      const auto *control = static_cast<const ControlNode *>(node);
+      For loop = control->control;
+      loop.CopyOnWrite()->body = EmitList(control->children);
+      ScheduledMetadata metadata;
+      metadata.Set(kAscendScheduledStage, Integer(node->GetStage()));
+      result.push_back(
+          AttrStmt(metadata, attr::kAscendTask, Integer(1),
+                   WrapScheduledGuards(std::move(loop), node->GetGuards()),
+                   control->control->span));
+    }
+    if (!migrate_per_core_sync)
+      EmitAdjacentTasks(&result, node->after, node->GetStage());
+    return SeqStmt::Flatten(result);
+  }
 };
 
 static void WarnOnUnappliedBufferVersionOverrides(
@@ -905,36 +1055,12 @@ static void WarnOnUnappliedBufferVersionOverrides(
       LOG(WARNING) << "Ascend AutoSchedule did not enable multi-buffering for "
                       "buffer \""
                    << buffer_var->name_hint
-                   << "\" although T.annotate_buffer_versions "
-                   << "requested " << num_versions
+                   << "\" although T.annotate_buffer_versions " << "requested "
+                   << num_versions
                    << " versions. The buffer must be eligible in a scheduled "
                       "serial loop and written before it is read.";
     }
   }
-}
-
-// Recursively check if any TaskNode has the given warpgroup_id.
-static bool HasWarpgroupId(IRStructure *node, int wg_id) {
-  if (!node)
-    return false;
-  if (node->IsTask())
-    return static_cast<TaskNode *>(node)->GetWarpgroupId() == wg_id;
-  if (node->IsControl()) {
-    for (auto &c : static_cast<ControlNode *>(node)->children)
-      if (HasWarpgroupId(c.get(), wg_id))
-        return true;
-  }
-  return false;
-}
-
-static bool
-HasWarpgroupId(const std::vector<std::shared_ptr<IRStructure>> &nodes,
-               int wg_id) {
-  for (const auto &n : nodes) {
-    if (HasWarpgroupId(n.get(), wg_id))
-      return true;
-  }
-  return false;
 }
 
 // Per-value warpgroup demand bitmask: bit0 = needed on wg0 (AIV), bit1 = needed
@@ -1454,14 +1580,13 @@ PropagateReadRegions(const std::vector<std::shared_ptr<IRStructure>> &root) {
   }
 }
 
-// Handles IRStructure building, Z3 scheduling (with Ascend sync insertion),
-// and Stmt conversion.
+// Build and schedule one kernel segment, leaving warpgroup partitioning and
+// final Stmt emission to the downstream WarpgroupPartition pass.
 static ScheduledKernelResult ScheduleSingleKernel(
     const Stmt &kernel_body, Target target,
     const BufferVersionOverrideMap &buffer_versions_overrides = {},
     const ManualMultiBufferTable &manual_multi_buffer_versions = {},
-    const std::set<std::string> &unlimit_memory_scopes = {},
-    Optional<Var> external_sid = {}) {
+    const std::set<std::string> &unlimit_memory_scopes = {}) {
   // Build IRStructure from the body to schedule
   ScheduledKernelResult result;
   IRStructureBuilder builder;
@@ -1485,7 +1610,7 @@ static ScheduledKernelResult ScheduleSingleKernel(
   // left untouched for barrier/dependency analysis.
   PropagateReadRegions(ir_structure);
 
-  // Schedule IRStructure in place (Z3 scheduling + Ascend sync)
+  // Schedule IRStructure in place with the Z3 scheduler.
   ScheduleBuilder unit_builder;
   int64_t shared_mem_limit = GetSharedMemoryLimit(target);
   if (TargetIsAscend(target) && !HasSimtVF(kernel_body)) {
@@ -1592,85 +1717,11 @@ static ScheduledKernelResult ScheduleSingleKernel(
   BarrierBuilder barrier_builder(manual_multi_buffer_versions,
                                  std::move(cross_core_flag_reservation));
   barrier_builder.Build(ir_structure);
-  const FlagInfoList &flag_infos = barrier_builder.GetFlagInfos();
+  result.flag_infos = barrier_builder.GetFlagInfos();
   result.buffer_infos = barrier_builder.GetBufferInfos();
   WarnOnUnappliedBufferVersionOverrides(buffer_versions_overrides,
                                         result.buffer_infos);
-
-  Var sid;
-  if (external_sid.has_value()) {
-    sid = external_sid.value();
-  } else {
-    sid = Var("sid", DataType::Int(32));
-  }
-
-  Stmt wg0_body = Evaluate(0);
-  Stmt wg1_body = Evaluate(0);
-
-  bool has_wg0 = HasWarpgroupId(ir_structure, 0);
-  bool has_wg1 = HasWarpgroupId(ir_structure, 1);
-
-  if (has_wg0) {
-    auto wg = CloneIRStructureWithWarpgroupFilter(ir_structure, 0);
-    wg0_body = EmitWarpgroupBody(wg, sid);
-  }
-  if (has_wg1) {
-    auto wg = CloneIRStructureWithWarpgroupFilter(ir_structure, 1);
-    wg1_body = EmitWarpgroupBody(wg, sid);
-  }
-
-  if (!flag_infos.empty()) {
-    std::vector<Stmt> stmts[2];
-    for (const auto &info : flag_infos) {
-      if (info.mode == 0) {
-        stmts[info.warpgroup_id].push_back(
-            MakeAscendSetFlag(info.hardevent, info.flag_var));
-      } else if (info.mode == 1) {
-        stmts[info.warpgroup_id].push_back(
-            MakeAscendCrossCoreSetFlag(4, info.hardevent, info.flag_var));
-      }
-    }
-    stmts[0].push_back(wg0_body);
-    stmts[1].push_back(wg1_body);
-    for (const auto &info : flag_infos) {
-      if (info.mode == 0) {
-        stmts[info.warpgroup_id].push_back(
-            MakeAscendWaitFlag(info.hardevent, info.flag_var));
-      } else if (info.mode == 2) {
-        stmts[info.warpgroup_id].push_back(
-            MakeAscendCrossCoreWaitFlag(4, info.hardevent, info.flag_var));
-      }
-    }
-    if (has_wg0) {
-      wg0_body = SeqStmt::Flatten(stmts[0]);
-    }
-    if (has_wg1) {
-      wg1_body = SeqStmt::Flatten(stmts[1]);
-    }
-  }
-  if (has_wg0 && has_wg1) {
-    Array<Stmt> blocks;
-    blocks.push_back(
-        SBlock({}, {}, {}, "CUBE", wg1_body, std::nullopt, {}, {}, {}));
-    Map<String, Any> vec_annotations;
-    vec_annotations.Set("vector_count", Integer(2));
-    if (external_sid.has_value()) {
-      blocks.push_back(SBlock({}, {}, {}, "VECTOR", wg0_body, std::nullopt, {},
-                              {}, vec_annotations));
-    } else {
-      IterVar sid_thread(Range(0, 2), sid, IterVarType::kThreadIndex,
-                         "cthread");
-      Stmt vec_body =
-          AttrStmt(sid_thread, tirx::attr::thread_extent, Integer(2), wg0_body);
-      blocks.push_back(SBlock({}, {}, {}, "VECTOR", vec_body, std::nullopt, {},
-                              {}, vec_annotations));
-    }
-    result.scheduled_body = SeqStmt(blocks);
-  } else if (has_wg0) {
-    result.scheduled_body = wg0_body;
-  } else {
-    result.scheduled_body = wg1_body;
-  }
+  result.root = std::move(ir_structure);
   return result;
 }
 
@@ -1705,11 +1756,29 @@ static ascend::BufferVersionMap BuildBufferVersionStagingMap(
   return result;
 }
 
-// The main pass function
+static Stmt SerializeScheduledKernel(const Stmt &kernel_subtree,
+                                     const TilelangRootBodyExtractor &extractor,
+                                     const ScheduledKernelResult &result) {
+  ScheduledTIREmitter emitter;
+  Stmt scheduled_body = emitter.Emit(result.root, result.flag_infos);
+  ascend::BufferVersionMap buffer_versions = BuildBufferVersionStagingMap(
+      extractor.manual_multi_buffer_versions, result.buffer_infos);
+  TilelangRootBodyReplacer replacer(scheduled_body, std::move(buffer_versions));
+  Stmt serialized = replacer(kernel_subtree);
+  if (!result.buffer_infos.empty()) {
+    serialized = RewriteAllocBuffers(serialized, result.buffer_infos);
+    BroadcastMultiBufferRewriter broadcast(result.buffer_infos);
+    serialized = broadcast(serialized);
+  }
+  return serialized;
+}
+
+// Build and schedule each kernel, serializing the scheduled tree into ordinary
+// TIR markers for WarpgroupPartition to consume.
 tvm::transform::Pass AutoSchedule() {
   using namespace tirx::transform;
-  auto pass_func = [](PrimFunc func, const IRModule &mod,
-                      const tvm::transform::PassContext &ctx) -> PrimFunc {
+  auto pass_func = [](PrimFunc func, const IRModule &,
+                      const tvm::transform::PassContext &) -> PrimFunc {
     // Get target from PrimFunc attribute for GemmInst determination
     auto target_opt = func->GetAttr<Target>(tvm::attr::kTarget);
     Target target;
@@ -1725,244 +1794,47 @@ tvm::transform::Pass AutoSchedule() {
         MultiKernelDetector::Detect(func->body, kernel_stmts, prefix_wrapper);
 
     if (!is_multi_kernel) {
-      // --- Single-kernel path ---
       TilelangRootBodyExtractor extractor;
       extractor(func->body);
-      Stmt body_to_schedule;
-
-      if (extractor.body.defined()) {
-        body_to_schedule = extractor.body;
-      } else {
-        LOG(FATAL);
-        body_to_schedule = func->body;
-      }
+      TVM_FFI_CHECK(extractor.body.defined(), ValueError)
+          << "AutoSchedule could not find a tilelang_root body";
 
       auto overrides = extractor.buffer_versions_overrides;
-      auto kr =
-          ScheduleSingleKernel(body_to_schedule, target, overrides,
+      ScheduledKernelResult result =
+          ScheduleSingleKernel(extractor.body, target, overrides,
                                extractor.manual_multi_buffer_versions,
-                               extractor.unlimit_memory_scopes, extractor.sid);
-
-      ascend::BufferVersionMap buffer_versions = BuildBufferVersionStagingMap(
-          extractor.manual_multi_buffer_versions, kr.buffer_infos);
-      TilelangRootBodyReplacer replacer(kr.scheduled_body,
-                                        std::move(buffer_versions));
-      Stmt final_body = replacer(func->body);
-      if (!kr.buffer_infos.empty()) {
-        final_body = RewriteAllocBuffers(final_body, kr.buffer_infos);
-        // Rewrite multi-buffered accesses that live outside the annotated loop
-        // (e.g. prologue fill): broadcast them to version 0 over the full
-        // version dimension. In-loop accesses were already versioned.
-        BroadcastMultiBufferRewriter broadcast(kr.buffer_infos);
-        final_body = broadcast(final_body);
-      }
-      final_body = ReNestLetStmts(final_body);
-
-      auto new_func = PrimFunc(func->params, final_body, func->ret_type,
-                               func->buffer_map, func->attrs);
-      return new_func;
+                               extractor.unlimit_memory_scopes);
+      Stmt body = SerializeScheduledKernel(func->body, extractor, result);
+      return PrimFunc(func->params, body, func->ret_type, func->buffer_map,
+                      func->attrs);
     }
 
-    // --- Multi-kernel path ---
     Array<Stmt> combined_stmts;
-
-    for (size_t i = 0; i < kernel_stmts.size(); ++i) {
-      const Stmt &kernel_subtree = kernel_stmts[i];
-
+    for (const Stmt &kernel_subtree : kernel_stmts) {
       TilelangRootBodyExtractor extractor;
       extractor(kernel_subtree);
-
-      if (!extractor.body.defined()) {
-        if (!combined_stmts.empty()) {
-          combined_stmts.push_back(
-              AttrStmt(Integer(0), attr::kAutoScheduleSharedMemoryBoundary, 0,
-                       Evaluate(0)));
-        }
-        combined_stmts.push_back(kernel_subtree);
-        continue;
+      Stmt serialized_subtree = kernel_subtree;
+      if (extractor.body.defined()) {
+        auto overrides = extractor.buffer_versions_overrides;
+        ScheduledKernelResult result =
+            ScheduleSingleKernel(extractor.body, target, overrides,
+                                 extractor.manual_multi_buffer_versions,
+                                 extractor.unlimit_memory_scopes);
+        serialized_subtree =
+            SerializeScheduledKernel(kernel_subtree, extractor, result);
       }
-
-      Stmt body_to_schedule = extractor.body;
-
-      auto overrides = extractor.buffer_versions_overrides;
-      auto result =
-          ScheduleSingleKernel(body_to_schedule, target, overrides,
-                               extractor.manual_multi_buffer_versions,
-                               extractor.unlimit_memory_scopes, extractor.sid);
-      Stmt scheduled_body = result.scheduled_body;
-
-      ascend::BufferVersionMap buffer_versions = BuildBufferVersionStagingMap(
-          extractor.manual_multi_buffer_versions, result.buffer_infos);
-      TilelangRootBodyReplacer replacer(scheduled_body,
-                                        std::move(buffer_versions));
-      Stmt scheduled_subtree = replacer(kernel_subtree);
-
-      if (!result.buffer_infos.empty()) {
-        scheduled_subtree =
-            RewriteAllocBuffers(scheduled_subtree, result.buffer_infos);
-        BroadcastMultiBufferRewriter broadcast(result.buffer_infos);
-        scheduled_subtree = broadcast(scheduled_subtree);
-      }
-
-      if (!combined_stmts.empty()) {
-        combined_stmts.push_back(
-            AttrStmt(Integer(0), attr::kAutoScheduleSharedMemoryBoundary, 0,
-                     Evaluate(0)));
-      }
-      combined_stmts.push_back(scheduled_subtree);
+      combined_stmts.push_back(serialized_subtree);
     }
 
-    // Reassemble: replace the inner SeqStmt in the PrimFunc body with the
-    // new combined statements
-    Stmt new_inner;
-    if (combined_stmts.size() == 1) {
-      new_inner = combined_stmts[0];
-    } else {
-      new_inner = SeqStmt(combined_stmts);
-    }
-
+    Stmt new_inner = combined_stmts.size() == 1 ? combined_stmts[0]
+                                                : Stmt(SeqStmt(combined_stmts));
     InnerSeqStmtReplacer seq_replacer(new_inner);
-    Stmt final_body = seq_replacer(func->body);
-
-    final_body = ReNestLetStmts(final_body);
-
-    // Create a new PrimFunc with the updated body
-    auto new_func = PrimFunc(func->params, final_body, func->ret_type,
-                             func->buffer_map, func->attrs);
-    return new_func;
+    Stmt body = seq_replacer(func->body);
+    return PrimFunc(func->params, body, func->ret_type, func->buffer_map,
+                    func->attrs);
   };
 
   return CreatePrimFuncPass(pass_func, 0, "tl.AutoSchedule", {});
-}
-
-// Re-write empty AttrStmt markers to nest them properly.
-// Example transformation:
-//   SeqStmt {
-//     Bind(x, 42)
-//     Bind(y, x+1)
-//     compute(x, y)                   // actual work
-//     store(result)
-//   }
-// remains flat for Bind because tirx Bind is visible to subsequent statements
-// in the same SeqStmt scope.
-class LetStmtNester : public StmtMutator {
-public:
-  Stmt VisitStmt_(const SeqStmtNode *op) override {
-    Array<Stmt> stmts;
-    for (const auto &stmt : op->seq) {
-      stmts.push_back(this->VisitStmt(stmt));
-    }
-
-    Array<Stmt> flat_stmts;
-    for (const auto &stmt : stmts) {
-      if (const auto *inner_seq = stmt.as<SeqStmtNode>()) {
-        for (const auto &inner_stmt : inner_seq->seq) {
-          flat_stmts.push_back(inner_stmt);
-        }
-      } else {
-        flat_stmts.push_back(stmt);
-      }
-    }
-    stmts = flat_stmts;
-
-    for (int i = static_cast<int>(stmts.size()) - 2; i >= 0; --i) {
-      if (const auto *attr = stmts[i].as<AttrStmtNode>()) {
-        if (IsEmptyBody(attr->body)) {
-          Stmt absorbed_body = CollectRemaining(stmts, i + 1);
-          stmts = TruncateAndReplace(
-              stmts, i,
-              AttrStmt(attr->node, attr->attr_key, attr->value, absorbed_body));
-        }
-      }
-    }
-
-    if (stmts.empty())
-      return Evaluate(0);
-    if (stmts.size() == 1)
-      return stmts[0];
-
-    return SeqStmt(stmts);
-  }
-
-private:
-  // Check if a statement body is Evaluate(0) — the empty placeholder
-  static bool IsEmptyBody(const Stmt &stmt) {
-    if (const auto *eval = stmt.as<EvaluateNode>()) {
-      if (const auto *imm = eval->value.as<IntImmNode>()) {
-        return imm->value == 0;
-      }
-    }
-    return false;
-  }
-
-  // Collect stmts[start .. end) into a single Stmt
-  static Stmt CollectRemaining(const Array<Stmt> &stmts, int start) {
-    int n = static_cast<int>(stmts.size());
-    if (start >= n) {
-      return Evaluate(0);
-    }
-    if (start == n - 1) {
-      return stmts[start];
-    }
-    Array<Stmt> remaining;
-    for (int j = start; j < n; ++j) {
-      remaining.push_back(stmts[j]);
-    }
-    return SeqStmt(remaining);
-  }
-
-  // Keep stmts[0..index), replace stmts[index] with new_stmt,
-  // discard everything after (already absorbed into new_stmt body)
-  static Array<Stmt> TruncateAndReplace(const Array<Stmt> &stmts, int index,
-                                        Stmt new_stmt) {
-    Array<Stmt> result;
-    for (int j = 0; j < index; ++j) {
-      result.push_back(stmts[j]);
-    }
-    result.push_back(new_stmt);
-    return result;
-  }
-};
-
-// Recursively flatten all nested SeqStmt nodes throughout the IR tree.
-// This must run before LetStmtNester so that every SeqStmt it encounters
-// is already flat, preventing incorrect AttrStmt absorption across
-// nested SeqStmt boundaries.
-class SeqStmtFlattener : public StmtMutator {
-public:
-  Stmt VisitStmt_(const SeqStmtNode *op) override {
-    // First, recursively visit children.
-    Array<Stmt> visited;
-    for (const auto &s : op->seq) {
-      visited.push_back(this->VisitStmt(s));
-    }
-    // Then flatten: if any child is itself a SeqStmt, inline its children.
-    Array<Stmt> flat;
-    std::function<void(const Stmt &)> Flatten = [&](const Stmt &s) {
-      if (const auto *inner = s.as<SeqStmtNode>()) {
-        for (const auto &inner_s : inner->seq) {
-          Flatten(inner_s);
-        }
-      } else {
-        flat.push_back(s);
-      }
-    };
-    for (const auto &s : visited) {
-      Flatten(s);
-    }
-    if (flat.empty())
-      return Evaluate(0);
-    if (flat.size() == 1)
-      return flat[0];
-    return SeqStmt(flat);
-  }
-};
-
-Stmt ReNestLetStmts(const Stmt &stmt) {
-  SeqStmtFlattener flattener;
-  Stmt flat = flattener(stmt);
-  LetStmtNester nester;
-  return nester(flat);
 }
 
 Layout ExpandLayoutToBuffer(const Buffer &layout_buffer,

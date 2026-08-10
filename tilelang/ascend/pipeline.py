@@ -89,8 +89,10 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
         mod = ascend_transform.NormalizeTask()(mod)
         mod = ascend_transform.LatencyEstimator()(mod)
         mod = ascend_transform.AutoSchedule()(mod)
+        mod = ascend_transform.WarpgroupPartition()(mod)
         mod = ascend_transform.RestoreWhileLoops()(mod)
         mod = ascend_transform.NormalizeMixedKernelSid()(mod)
+        mod = ascend_transform.RewriteDualCopy()(mod)
         mod = tilelang.transform.Simplify()(mod)
 
     mod = ascend_transform.NormalizeBufferVersion()(mod)

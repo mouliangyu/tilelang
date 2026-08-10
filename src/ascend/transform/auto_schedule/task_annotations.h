@@ -17,8 +17,7 @@
  * under the License.
  */
 
-#ifndef TVM_TL_ASCEND_TRANSFORM_AUTO_SCHEDULE_TASK_ANNOTATIONS_H_
-#define TVM_TL_ASCEND_TRANSFORM_AUTO_SCHEDULE_TASK_ANNOTATIONS_H_
+#pragma once
 
 #include <tvm/ffi/any.h>
 #include <tvm/tirx/stmt.h>
@@ -30,6 +29,12 @@ namespace tvm {
 namespace tl {
 
 using namespace tirx;
+
+// Compiler-owned fields carried by tl.ascend_task after AutoSchedule. These
+// form the short-lived task metadata contract consumed by WarpgroupPartition.
+constexpr const char *kAscendScheduledWarpgroupId = "wgid";
+constexpr const char *kAscendScheduledStage = "stage";
+constexpr int kAscendScheduledBroadcastWarpgroup = -2;
 
 struct TaskCost {
   int64_t latency{0};
@@ -64,5 +69,3 @@ uint16_t RequireTaskPipe(const TaskAnnotations &annotations,
 
 } // namespace tl
 } // namespace tvm
-
-#endif // TVM_TL_ASCEND_TRANSFORM_AUTO_SCHEDULE_TASK_ANNOTATIONS_H_

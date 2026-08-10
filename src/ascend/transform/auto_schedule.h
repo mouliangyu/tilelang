@@ -9,7 +9,6 @@
 #include "./auto_schedule/ir_structure.h"
 #include "./auto_schedule/memory_detector.h"
 #include "./auto_schedule/schedule_builder.h"
-#include "./auto_schedule/warpgroup_partition.h"
 #include "backend/common/target_utils.h"
 #include <tvm/runtime/logging.h>
 #include <tvm/tirx/buffer.h>

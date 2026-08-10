@@ -47,8 +47,6 @@ static constexpr const char *kAsyncCopyNoImplicitCommitWait =
 // parity from surrounding loop context.
 static constexpr const char *kPipelineMbarPhaseExpr =
     "tl.pipeline_mbar_phase_expr";
-static constexpr const char *kAutoScheduleSharedMemoryBoundary =
-    "kAutoScheduleSharedMemoryBoundary";
 static constexpr const char *kLocalVarInit = "tl.local_var_init";
 // A PrimFunc-level attribute carrying a list of handle Vars
 // that must NOT be marked with the restrict qualifier in codegen.

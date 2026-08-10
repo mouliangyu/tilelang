@@ -22,8 +22,7 @@
  * \brief Internal annotation contract for physical buffer versions.
  */
 
-#ifndef TVM_TL_ASCEND_TRANSFORM_BUFFER_VERSION_H_
-#define TVM_TL_ASCEND_TRANSFORM_BUFFER_VERSION_H_
+#pragma once
 
 #include <tvm/ffi/container/map.h>
 #include <tvm/tirx/expr.h>
@@ -43,5 +42,3 @@ using BufferVersionMap = ffi::Map<tirx::Var, PrimExpr>;
 } // namespace ascend
 } // namespace tl
 } // namespace tvm
-
-#endif // TVM_TL_ASCEND_TRANSFORM_BUFFER_VERSION_H_

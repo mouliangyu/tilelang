@@ -17,8 +17,7 @@
  * under the License.
  */
 
-#ifndef TVM_TL_ASCEND_TRANSFORM_AUTO_SCHEDULE_TASK_ANALYSIS_H_
-#define TVM_TL_ASCEND_TRANSFORM_AUTO_SCHEDULE_TASK_ANALYSIS_H_
+#pragma once
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/tirx/buffer.h>
@@ -163,5 +162,3 @@ void ApplyTaskAccesses(const TaskAccessInfo &accesses, TaskNode *task);
 
 } // namespace tl
 } // namespace tvm
-
-#endif // TVM_TL_ASCEND_TRANSFORM_AUTO_SCHEDULE_TASK_ANALYSIS_H_

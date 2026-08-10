@@ -56,6 +56,20 @@ def test_task_rejects_dual_copy_in_composed_body():
         lower(main, target="ascend")
 
 
+def test_task_allows_standalone_fixpipe_dual_copy():
+    tile = 128
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1):
+            accum = T.alloc_l0c((tile, tile), "float32")
+            temp = T.alloc_shared((tile // 2, tile), "float32")
+            with T.Task():
+                T.dual_copy(accum, temp)
+
+    lower(main, target="ascend")
+
+
 def test_task_allows_standalone_cross_core_sync():
     @T.prim_func
     def main():

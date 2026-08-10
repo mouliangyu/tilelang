@@ -19,23 +19,18 @@
 
 /*!
  * \file warpgroup_partition.cc
- * \brief Warpgroup partition and IRStructure-to-Stmt conversion for TileLang
- * AutoSchedule
+ * \brief Direct scheduled-TIR warpgroup partition and pipeline lowering.
  */
 
 #include "./warpgroup_partition.h"
+#include "./task_annotations.h"
 
-#include "../auto_schedule.h"
-#include <tvm/arith/analyzer.h>
 #include <tvm/ffi/container/array.h>
-#include <tvm/ffi/function.h>
+#include <tvm/ffi/container/map.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/function.h>
 #include <tvm/runtime/logging.h>
-#include <tvm/target/target.h>
-#include <tvm/tirx/analysis.h>
 #include <tvm/tirx/buffer.h>
-#include <tvm/tirx/builtin.h>
 #include <tvm/tirx/expr.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt.h>
@@ -43,97 +38,50 @@
 #include <tvm/tirx/transform.h>
 
 #include <algorithm>
-#include <cmath>
+#include <cstdint>
 #include <functional>
-#include <iostream>
-#include <memory>
-#include <numeric>
+#include <limits>
 #include <optional>
-#include <queue>
-#include <sstream>
-#include <string>
 #include <unordered_map>
 #include <utility>
-#include <vector>
 
-#include "ascend/transform/auto_schedule/task_analysis.h"
-#include "backend/common/target_utils.h"
 #include "op/builtin.h"
-#include "op/copy.h"
-#include "op/region.h"
-#include "runtime/thread_storage_scope.h"
-#include "tir/transforms/ir_utils.h"
+#include "support/check.h"
 #include "transform/common/attr.h"
-#include "transform/common/collector.h"
 
 namespace tvm {
 namespace tl {
 
 using namespace tirx;
+using ffi::Array;
 using ffi::GetRef;
+using ffi::Map;
+using ffi::ObjectPtrEqual;
+using ffi::ObjectPtrHash;
+using ffi::Optional;
+using ffi::String;
 
-class LetStmtVarRenamer : public StmtExprMutator {
-public:
-  explicit LetStmtVarRenamer(const std::string &suffix) : suffix_(suffix) {}
+namespace {
 
-  Stmt Rename(Stmt stmt) {
-    CollectLetVars(stmt);
-    if (var_remap_.empty())
-      return stmt;
-    return VisitStmt(stmt);
-  }
-
-private:
-  void CollectLetVars(const Stmt &stmt) {
-    class Collector : public StmtExprVisitor {
-    public:
-      explicit Collector(Map<Var, Var> &remap, const std::string &suffix)
-          : remap_(remap), suffix_(suffix) {}
-      void VisitStmt_(const BindNode *op) final {
-        remap_.Set(op->var, op->var.copy_with_suffix(suffix_));
-        StmtExprVisitor::VisitExpr(op->value);
-      }
-      Map<Var, Var> &remap_;
-      const std::string &suffix_;
-    };
-    Collector c(var_remap_, suffix_);
-    c(stmt);
-  }
-
-  Stmt VisitStmt_(const BindNode *op) final {
-    auto it = var_remap_.find(op->var);
-    Var new_var = it != var_remap_.end() ? (*it).second : op->var;
-    PrimExpr new_value = VisitExpr(op->value);
-    return Bind(new_var, new_value, op->span);
-  }
-
-  PrimExpr VisitExpr_(const VarNode *op) final {
-    Var var = GetRef<Var>(op);
-    auto it = var_remap_.find(var);
-    if (it != var_remap_.end()) {
-      return (*it).second;
-    }
-    return StmtExprMutator::VisitExpr_(op);
-  }
-
-  std::string suffix_;
-  Map<Var, Var> var_remap_;
-};
-
-static Stmt RenameLetStmtVars(Stmt stmt, const std::string &suffix) {
-  return LetStmtVarRenamer(suffix).Rename(std::move(stmt));
+Stmt MakeSequence(const Array<Stmt> &statements) {
+  if (statements.empty())
+    return Stmt();
+  if (statements.size() == 1)
+    return statements[0];
+  return SeqStmt::Flatten(statements);
 }
 
-// Like tirx::Substitute, but also remaps a buffer's backing `data` var at
-// *use* sites. The generic IRSubstitute only rewrites buffer->data at
-// definition sites (VisitBufferDef); a buffer produced by T.make_tensor is
-// backed by a LetStmt-bound var and only appears as a use inside the scheduled
-// region (e.g. the regions of a T.copy), so renaming that let var via the
-// generic Substitute leaves the buffer pointing at the old, now-undefined var.
+Array<Stmt> GetSequence(const Stmt &stmt) {
+  if (const auto *sequence = stmt.as<SeqStmtNode>())
+    return sequence->seq;
+  return {stmt};
+}
+
 class LetVarSubstituter : public StmtExprMutator {
 public:
   explicit LetVarSubstituter(const Map<Var, PrimExpr> &vmap) : vmap_(vmap) {}
 
+private:
   PrimExpr VisitExpr_(const VarNode *op) final {
     auto it = vmap_.find(GetRef<Var>(op));
     return it != vmap_.end() ? (*it).second : StmtExprMutator::VisitExpr_(op);
@@ -143,743 +91,627 @@ public:
     auto it = buffer_remap_.find(buffer);
     if (it != buffer_remap_.end())
       return (*it).second;
-    auto vit = vmap_.find(buffer->data);
-    if (vit == vmap_.end())
+    auto var_it = vmap_.find(buffer->data);
+    if (var_it == vmap_.end())
       return buffer;
-    Buffer new_buf = buffer;
-    new_buf.CopyOnWrite()->data = Downcast<Var>((*vit).second);
-    buffer_remap_[buffer] = new_buf;
-    return new_buf;
+    const auto *data = (*var_it).second.as<VarNode>();
+    if (data == nullptr)
+      return buffer;
+    Buffer new_buffer = buffer;
+    new_buffer.CopyOnWrite()->data = GetRef<Var>(data);
+    buffer_remap_[buffer] = new_buffer;
+    return new_buffer;
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (FindAutoScheduleAttr(op->attr_key) != nullptr) {
-      Any new_node = op->node;
-      bool node_changed = false;
-      if (const auto *expr_node = op->node.as<PrimExprNode>()) {
-        PrimExpr old_node = GetRef<PrimExpr>(expr_node);
-        PrimExpr rewritten_node = VisitExpr(old_node);
-        node_changed = !rewritten_node.same_as(old_node);
-        new_node = std::move(rewritten_node);
-      }
-      PrimExpr new_value = VisitExpr(op->value);
-      Stmt new_body = VisitStmt(op->body);
-      if (!node_changed && new_value.same_as(op->value) &&
-          new_body.same_as(op->body)) {
-        return GetRef<Stmt>(op);
-      }
-      return AttrStmt(new_node, op->attr_key, new_value, new_body, op->span);
+    ffi::Any node = op->node;
+    bool node_changed = false;
+    if (const auto *expr_node = op->node.as<PrimExprNode>()) {
+      PrimExpr old_node = GetRef<PrimExpr>(expr_node);
+      PrimExpr new_node = VisitExpr(old_node);
+      node_changed = !new_node.same_as(old_node);
+      node = std::move(new_node);
     }
-    return StmtExprMutator::VisitStmt_(op);
+    PrimExpr value = VisitExpr(op->value);
+    Stmt body = VisitStmt(op->body);
+    if (!node_changed && value.same_as(op->value) && body.same_as(op->body))
+      return GetRef<Stmt>(op);
+    return AttrStmt(node, op->attr_key, value, body, op->span);
   }
 
-private:
   const Map<Var, PrimExpr> &vmap_;
   std::unordered_map<Buffer, Buffer, ObjectPtrHash, ObjectPtrEqual>
       buffer_remap_;
 };
 
-static Stmt SubstituteLetVars(Stmt stmt, const Map<Var, PrimExpr> &vmap) {
+Stmt SubstituteLetVars(Stmt stmt, const Map<Var, PrimExpr> &vmap) {
   if (vmap.empty())
     return stmt;
   return LetVarSubstituter(vmap)(std::move(stmt));
 }
 
-static PrimExpr SubstituteLetVarsExpr(PrimExpr expr,
-                                      const Map<Var, PrimExpr> &vmap) {
-  if (vmap.empty())
-    return expr;
-  return LetVarSubstituter(vmap)(std::move(expr));
-}
-
-// Copy a node's guards (If conditions + supported AttrStmt wrappers) onto its
-// clone, applying the let-var remap so renamed warpgroup-local vars referenced
-// inside a guard stay defined.
-static void CloneGuards(const IRStructure *src, IRStructure *dst,
-                        const Map<Var, PrimExpr> &var_remap) {
-  GuardList remapped;
-  remapped.reserve(src->GetGuards().size());
-  for (const auto &guard : src->GetGuards()) {
-    if (guard->IsCondition()) {
-      const auto *condition_guard =
-          static_cast<const ConditionGuard *>(guard.get());
-      PrimExpr condition =
-          SubstituteLetVarsExpr(condition_guard->condition, var_remap);
-      remapped.push_back(
-          std::make_unique<ConditionGuard>(std::move(condition)));
-    } else {
-      const auto *attribute_guard =
-          static_cast<const AttributeGuard *>(guard.get());
-      Any node = attribute_guard->node;
-      if (const auto *expr_node = node.as<PrimExprNode>()) {
-        node = SubstituteLetVarsExpr(GetRef<PrimExpr>(expr_node), var_remap);
-      }
-      PrimExpr value = attribute_guard->value;
-      if (value.defined()) {
-        value = SubstituteLetVarsExpr(std::move(value), var_remap);
-      }
-      remapped.push_back(std::make_unique<AttributeGuard>(
-          std::move(node), attribute_guard->key, std::move(value),
-          attribute_guard->span));
-    }
+std::optional<int64_t> GetScheduledInt(const AttrStmtNode *op,
+                                       const char *key) {
+  if (op->attr_key != attr::kAscendTask)
+    return std::nullopt;
+  const auto *metadata = op->node.as<ffi::MapObj>();
+  if (metadata == nullptr)
+    return std::nullopt;
+  for (const auto &[metadata_key, value] : *metadata) {
+    if (metadata_key.cast<ffi::String>() != key)
+      continue;
+    PrimExpr expr = value.cast<PrimExpr>();
+    const auto *integer = expr.as<IntImmNode>();
+    TVM_FFI_CHECK(integer != nullptr, ValueError)
+        << "Scheduled metadata `" << key << "` must be an integer, got "
+        << expr;
+    return integer->value;
   }
-  dst->SetGuards(std::move(remapped));
+  return std::nullopt;
 }
 
-static void CloneSchedulingMetadata(const IRStructure *src, IRStructure *dst,
-                                    int warpgroup_id,
-                                    const Map<Var, PrimExpr> &var_remap) {
-  CloneGuards(src, dst, var_remap);
-  dst->SetStage(src->GetStage());
-  dst->SetStartTime(src->GetStartTime());
-  auto copy_stmt_list = [&](const std::vector<Stmt> &src_stmts,
-                            std::vector<Stmt> *dst_stmts) {
-    dst_stmts->clear();
-    dst_stmts->reserve(src_stmts.size());
-    for (const auto &stmt : src_stmts) {
-      dst_stmts->push_back(SubstituteLetVars(stmt, var_remap));
+int64_t RequireScheduledInt(const AttrStmtNode *op, const char *key) {
+  std::optional<int64_t> value = GetScheduledInt(op, key);
+  TVM_FFI_CHECK(value.has_value(), ValueError)
+      << "Scheduled node is missing integer metadata `" << key << "`";
+  return value.value();
+}
+
+bool IsScheduledUnitMarker(const AttrStmtNode *op) {
+  return GetScheduledInt(op, kAscendScheduledStage).has_value();
+}
+
+bool IsScheduledLeafTask(const AttrStmtNode *op) {
+  return IsScheduledUnitMarker(op) &&
+         GetScheduledInt(op, kAscendScheduledWarpgroupId).has_value();
+}
+
+int GetTaskWarpgroup(const AttrStmtNode *op) {
+  int64_t warpgroup = RequireScheduledInt(op, kAscendScheduledWarpgroupId);
+  TVM_FFI_CHECK(warpgroup == 0 || warpgroup == 1 ||
+                    warpgroup == kAscendScheduledBroadcastWarpgroup,
+                ValueError)
+      << "Scheduled task has invalid wgid " << warpgroup;
+  return static_cast<int>(warpgroup);
+}
+
+int GetMarkerStage(const AttrStmtNode *op) {
+  int64_t stage = RequireScheduledInt(op, kAscendScheduledStage);
+  TVM_FFI_CHECK_GE(stage, std::numeric_limits<int>::min(), ValueError);
+  TVM_FFI_CHECK_LE(stage, std::numeric_limits<int>::max(), ValueError);
+  return static_cast<int>(stage);
+}
+
+Optional<Bind> FindTaskBind(const Stmt &task_body) {
+  Stmt current = task_body;
+  while (true) {
+    if (const auto *bind = current.as<BindNode>())
+      return GetRef<Bind>(bind);
+    if (const auto *conditional = current.as<IfThenElseNode>()) {
+      if (conditional->else_case.has_value())
+        return std::nullopt;
+      current = conditional->then_case;
+      continue;
     }
-  };
-  if (auto it = src->before.find(warpgroup_id); it != src->before.end()) {
-    copy_stmt_list(it->second, &dst->before[warpgroup_id]);
-  }
-  if (auto it = src->after.find(warpgroup_id); it != src->after.end()) {
-    copy_stmt_list(it->second, &dst->after[warpgroup_id]);
-  }
-}
-
-bool IsLetDeclTask(const TaskNode *task) {
-  return task->stmt.as<BindNode>() != nullptr;
-}
-
-// A LetDecl whose bound value is a handle/pointer.
-bool IsHandleLetDeclTask(const TaskNode *task) {
-  const auto *bind = task->stmt.as<BindNode>();
-  return bind != nullptr && bind->value.dtype().is_handle();
-}
-
-// Helper: check if an IRStructure node is a LetDecl task.
-bool IsLetDeclNode(const IRStructure *node) {
-  if (!node)
-    return false;
-  if (node->IsTask()) {
-    return IsLetDeclTask(static_cast<const TaskNode *>(node));
-  }
-  return false;
-}
-
-// Helper: check if an IRStructure subtree contains any LetDecl tasks
-bool ContainsLetDecl(const IRStructure *node) {
-  if (!node)
-    return false;
-  if (IsLetDeclNode(node))
-    return true;
-  if (node->IsControl()) {
-    auto ctrl = static_cast<const ControlNode *>(node);
-    for (const auto &child : ctrl->children) {
-      if (ContainsLetDecl(child.get()))
-        return true;
+    if (const auto *attribute = current.as<AttrStmtNode>()) {
+      current = attribute->body;
+      continue;
     }
+    return std::nullopt;
   }
-  return false;
 }
 
-// Filter an ordered list of children for a warpgroup. LetDecl tasks are
-// always kept (needed by every warp group); other nodes are kept only if they
-// participate in `warpgroup_id`. Drops nodes that filter to null.
-std::vector<std::shared_ptr<IRStructure>>
-CloneIRStructureListWithWarpgroupFilter(
-    const std::vector<std::shared_ptr<IRStructure>> &children, int warpgroup_id,
-    Map<Var, PrimExpr> &var_remap) {
-  std::vector<std::shared_ptr<IRStructure>> out;
-  for (const auto &child : children) {
-    auto new_child = CloneIRStructureWithWarpgroupFilter(
-        child.get(), warpgroup_id, var_remap);
-    if (new_child) {
-      out.push_back(std::move(new_child));
-    }
+Stmt ReplaceTaskBind(const Stmt &task_body, const Stmt &replacement) {
+  if (task_body.as<BindNode>())
+    return replacement;
+  if (const auto *conditional = task_body.as<IfThenElseNode>()) {
+    ICHECK(!conditional->else_case.has_value());
+    return IfThenElse(conditional->condition,
+                      ReplaceTaskBind(conditional->then_case, replacement),
+                      std::nullopt, conditional->span);
   }
-  return out;
+  const auto *attribute = task_body.as<AttrStmtNode>();
+  ICHECK(attribute != nullptr)
+      << "Expected a native guard chain around Bind, got " << task_body;
+  return AttrStmt(attribute->node, attribute->attr_key, attribute->value,
+                  ReplaceTaskBind(attribute->body, replacement),
+                  attribute->span);
 }
 
-// Helper function to clone IRStructure with warpgroup filter.
-std::shared_ptr<IRStructure>
-CloneIRStructureWithWarpgroupFilter(IRStructure *node, int warpgroup_id,
-                                    Map<Var, PrimExpr> &var_remap) {
-  if (!node)
-    return nullptr;
-
-  if (node->IsTask()) {
-    auto task = static_cast<TaskNode *>(node);
-
-    if (IsLetDeclTask(task)) {
-      const auto *bind = task->stmt.as<BindNode>();
-      // A LetDecl marked broadcast is replicated onto every warpgroup; give
-      // each clone a fresh variable so the two cores use independent names.
-      if (IsWarpgroupBroadcast(task->GetWarpgroupId())) {
-        auto new_var = bind->var.copy_with_suffix("");
-        // Substitute previously renamed variables in the value expression.
-        PrimExpr new_value = var_remap.empty()
-                                 ? bind->value
-                                 : Substitute(bind->value, var_remap);
-        var_remap.Set(bind->var, new_var);
-        auto new_task = std::make_shared<TaskNode>();
-        new_task->stmt = Bind(new_var, new_value);
-        CloneSchedulingMetadata(task, new_task.get(), warpgroup_id, var_remap);
-        return new_task;
-      }
-      // A LetDecl assigned a concrete warpgroup only lives on that core (the
-      // demand-lattice pass proved all its consumers are there), so filter it
-      // like a normal task and keep its original variable name — downstream
-      // consumers on this core reference that name and get no remap for it.
-      if (!node->containWarpgroupId(warpgroup_id))
-        return nullptr;
-      PrimExpr new_value =
-          var_remap.empty() ? bind->value : Substitute(bind->value, var_remap);
-      auto new_task = std::make_shared<TaskNode>();
-      new_task->stmt = Bind(bind->var, new_value);
-      CloneSchedulingMetadata(task, new_task.get(), warpgroup_id, var_remap);
-      return new_task;
-    }
-
-    // Non-LetDecl tasks: only include if warp group matches
-    if (!node->containWarpgroupId(warpgroup_id))
-      return nullptr;
-    auto cloned = task->Clone();
-    // Substitute renamed LetDecl variables in task statements
-    if (!var_remap.empty()) {
-      auto ct = static_cast<TaskNode *>(cloned.get());
-      ct->stmt = SubstituteLetVars(ct->stmt, var_remap);
-    }
-    CloneSchedulingMetadata(task, cloned.get(), warpgroup_id, var_remap);
-    return cloned;
-  } else if (node->IsControl()) {
-    // A ControlNode is included if it contains the target warp group
-    // OR if it contains LetDecl tasks.
-    if (!node->containWarpgroupId(warpgroup_id) && !ContainsLetDecl(node))
-      return nullptr;
-    auto ctrl = static_cast<ControlNode *>(node);
-    auto new_ctrl = std::make_shared<ControlNode>();
-    For new_for = ctrl->control;
-    auto new_loop_var = ctrl->control->loop_var.copy_with_suffix("");
-    new_for.CopyOnWrite()->loop_var = new_loop_var;
-    var_remap.Set(ctrl->control->loop_var, new_loop_var);
-    new_for.CopyOnWrite()->min = Substitute(ctrl->control->min, var_remap);
-    new_for.CopyOnWrite()->extent =
-        Substitute(ctrl->control->extent, var_remap);
-    if (ctrl->control->step.has_value()) {
-      new_for.CopyOnWrite()->step =
-          Substitute(ctrl->control->step.value(), var_remap);
-    }
-    new_ctrl->control = new_for;
-    // Clone the task and apply var_remap so each warpgroup gets its own copy
-    // with correctly renamed LetDecl variables.
-    if (ctrl->task) {
-      auto cloned_task =
-          std::static_pointer_cast<TaskNode>(ctrl->task->Clone());
-      if (!var_remap.empty()) {
-        cloned_task->stmt = SubstituteLetVars(cloned_task->stmt, var_remap);
-      }
-      new_ctrl->task = std::move(cloned_task);
-    }
-    new_ctrl->children = CloneIRStructureListWithWarpgroupFilter(
-        ctrl->children, warpgroup_id, var_remap);
-    CloneSchedulingMetadata(node, new_ctrl.get(), warpgroup_id, var_remap);
-    return new_ctrl;
-  }
-  LOG(FATAL);
-  return nullptr;
+bool IsGuardedTaskBind(const AttrStmtNode *marker) {
+  return FindTaskBind(marker->body).defined() &&
+         marker->body.as<BindNode>() == nullptr;
 }
 
-// Entry point overload — creates a fresh var_remap and filters the root list.
-std::vector<std::shared_ptr<IRStructure>> CloneIRStructureWithWarpgroupFilter(
-    const std::vector<std::shared_ptr<IRStructure>> &root, int warpgroup_id) {
-  Map<Var, PrimExpr> var_remap;
-  auto cloned =
-      CloneIRStructureListWithWarpgroupFilter(root, warpgroup_id, var_remap);
-  return cloned;
-}
-
-// Wrap a single stmt in an if-guard. For SimtVF / SimdVF blocks this leaves
-// the block (and its alloc_buffers / launch_thread attrs) intact under the
-// IfThenElse — codegen's IfThenElseNode handler then naturally emits the
-// `if (cond) { asc_vf_call<...>(...) }` pattern around the call site while
-// the helper function definition stays at file scope. This avoids pushing
-// the guard into the helper body (which made every thread evaluate the
-// per-iteration condition redundantly).
-static Stmt GuardWithIf(const Stmt &body, const PrimExpr &condition) {
-  return IfThenElse(condition, body);
-}
-
-// Re-wrap a body in its guard deltas, innermost-first. A conditional guard
-// becomes `if (expr) body`; an attribute guard restores its original AttrStmt.
-// Reverse iteration preserves source nesting order: the outermost guard (front
-// of the list) ends up as the outermost wrapper.
-static Stmt GuardWithGuards(Stmt body, const GuardList &guards) {
-  for (auto it = guards.rbegin(); it != guards.rend(); ++it) {
-    body = (*it)->Wrap(std::move(body));
-  }
-  return body;
-}
-
-// PerCoreTask is one scheduler node, but its source control flow may contain
-// several mutually-exclusive dependency-bearing candidates plus scalar control
-// tasks. NormalizeTask marks both kinds; only candidates receive migrated
-// synchronization.
-class PerCoreTaskSyncMigrator : public StmtMutator {
+class WarpgroupExtractor : public StmtMutator {
 public:
-  PerCoreTaskSyncMigrator(std::vector<Stmt> before, std::vector<Stmt> after,
-                          std::function<Stmt(Stmt)> emit_candidate)
-      : before_(std::move(before)), after_(std::move(after)),
-        emit_candidate_(std::move(emit_candidate)) {}
-
-  Stmt Rewrite(Stmt body) {
-    Stmt result = VisitStmt(std::move(body));
-    ICHECK_GT(num_candidates_, 0)
-        << "Cannot find a T.Task marker in normalized PerCoreTask";
+  static Optional<Stmt> Extract(const Stmt &stmt, int warpgroup_id) {
+    WarpgroupExtractor extractor(warpgroup_id);
+    Stmt result = extractor.VisitStmt(stmt);
+    if (!extractor.found_warpgroup_)
+      return std::nullopt;
+    ICHECK(result.defined())
+        << "WarpgroupExtractor removed detected warpgroup " << warpgroup_id;
     return result;
   }
 
 private:
-  Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tl::attr::kAscendTask) {
-      Stmt candidate = VisitStmt(op->body);
-      if (!HasTaskBufferAccess(candidate)) {
-        return candidate;
-      }
-      ++num_candidates_;
-      return WrapCandidate(emit_candidate_(std::move(candidate)));
+  explicit WarpgroupExtractor(int warpgroup_id) : warpgroup_id_(warpgroup_id) {}
+
+  Stmt VisitStmt_(const SeqStmtNode *op) final {
+    Array<Stmt> statements;
+    for (const Stmt &stmt : op->seq) {
+      Stmt rewritten = VisitStmt(stmt);
+      if (rewritten.defined())
+        statements.push_back(std::move(rewritten));
     }
-    return StmtMutator::VisitStmt_(op);
+    return MakeSequence(statements);
   }
 
-  Stmt WrapCandidate(Stmt stmt) const {
-    std::vector<Stmt> sequence;
-    sequence.reserve(before_.size() + 1 + after_.size());
-    sequence.insert(sequence.end(), before_.begin(), before_.end());
-    sequence.push_back(std::move(stmt));
-    sequence.insert(sequence.end(), after_.begin(), after_.end());
-    return SeqStmt::Flatten(sequence);
+  Stmt VisitStmt_(const ForNode *op) final {
+    Map<Var, PrimExpr> outer_remap = var_remap_;
+    PrimExpr min = Substitute(op->min, var_remap_);
+    PrimExpr extent = Substitute(op->extent, var_remap_);
+    Optional<PrimExpr> step = op->step;
+    if (step.has_value())
+      step = Substitute(step.value(), var_remap_);
+    Var loop_var = op->loop_var.copy_with_suffix("");
+    var_remap_.Set(op->loop_var, loop_var);
+    Stmt body = VisitStmt(op->body);
+    var_remap_ = std::move(outer_remap);
+    if (!body.defined())
+      return Stmt();
+    return For(loop_var, min, extent, op->kind, std::move(body),
+               op->thread_binding, op->annotations, step, op->span);
   }
 
-  std::vector<Stmt> before_;
-  std::vector<Stmt> after_;
-  std::function<Stmt(Stmt)> emit_candidate_;
-  int num_candidates_{0};
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    PrimExpr condition = Substitute(op->condition, var_remap_);
+    Stmt then_case = VisitStmt(op->then_case);
+    Optional<Stmt> else_case;
+    if (op->else_case.has_value()) {
+      Stmt rewritten_else = VisitStmt(op->else_case.value());
+      if (rewritten_else.defined())
+        else_case = std::move(rewritten_else);
+    }
+    if (!then_case.defined()) {
+      if (!else_case.has_value())
+        return Stmt();
+      return IfThenElse(Not(condition), else_case.value(), std::nullopt,
+                        op->span);
+    }
+    return IfThenElse(condition, std::move(then_case), std::move(else_case),
+                      op->span);
+  }
+
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    if (IsScheduledUnitMarker(op)) {
+      if (IsScheduledLeafTask(op))
+        return ExtractTask(op);
+      Stmt body = VisitStmt(op->body);
+      if (!body.defined())
+        return Stmt();
+      return AttrStmt(op->node, op->attr_key, op->value, std::move(body),
+                      op->span);
+    }
+    Stmt body = VisitStmt(op->body);
+    if (!body.defined())
+      return Stmt();
+    return SubstituteLetVars(
+        AttrStmt(op->node, op->attr_key, op->value, std::move(body), op->span),
+        var_remap_);
+  }
+
+  Stmt ExtractTask(const AttrStmtNode *op) {
+    int task_warpgroup = GetTaskWarpgroup(op);
+    found_warpgroup_ |= task_warpgroup == warpgroup_id_;
+    if (task_warpgroup != warpgroup_id_ &&
+        task_warpgroup != kAscendScheduledBroadcastWarpgroup)
+      return Stmt();
+
+    Stmt body = SubstituteLetVars(op->body, var_remap_);
+    Optional<Bind> bind = FindTaskBind(body);
+    if (task_warpgroup == kAscendScheduledBroadcastWarpgroup &&
+        bind.defined()) {
+      Var source_var = bind.value()->var;
+      Var output_var = source_var.copy_with_suffix("");
+      body = ReplaceTaskBind(
+          body, Bind(output_var, bind.value()->value, bind.value()->span));
+      var_remap_.Set(source_var, output_var);
+    }
+    return AttrStmt(op->node, op->attr_key, op->value, std::move(body),
+                    op->span);
+  }
+
+  int warpgroup_id_;
+  bool found_warpgroup_{false};
+  Map<Var, PrimExpr> var_remap_;
 };
 
-static bool IsPerCoreTaskNode(const IRStructure *node) {
-  return node && node->IsTask() &&
-         static_cast<const TaskNode *>(node)->IsPerCoreTask();
+class ConditionalLetCollector : public StmtVisitor {
+public:
+  static Map<Var, Buffer> Collect(const Stmt &stmt) {
+    ConditionalLetCollector collector;
+    collector(stmt);
+    return collector.buffers_;
+  }
+
+private:
+  void VisitStmt_(const AttrStmtNode *op) final {
+    if (!IsScheduledLeafTask(op)) {
+      StmtVisitor::VisitStmt_(op);
+      return;
+    }
+    Optional<Bind> bind = FindTaskBind(op->body);
+    if (!bind.defined() || !IsGuardedTaskBind(op) ||
+        bind.value()->value.dtype().is_handle())
+      return;
+    Var var = bind.value()->var;
+    if (!buffers_.count(var)) {
+      buffers_.Set(var, decl_buffer({IntImm(DataType::Int(32), 1)},
+                                    bind.value()->value.dtype(), var->name_hint,
+                                    "local.var"));
+    }
+  }
+
+  Map<Var, Buffer> buffers_;
+};
+
+int GetScheduledStage(const Stmt &stmt) {
+  Stmt current = stmt;
+  while (true) {
+    if (const auto *attribute = current.as<AttrStmtNode>()) {
+      if (IsScheduledUnitMarker(attribute))
+        return GetMarkerStage(attribute);
+      current = attribute->body;
+      continue;
+    }
+    if (const auto *conditional = current.as<IfThenElseNode>()) {
+      TVM_FFI_CHECK(!conditional->else_case.has_value(), ValueError)
+          << "A scheduled control guard may not contain an else branch";
+      current = conditional->then_case;
+      continue;
+    }
+    TVM_FFI_THROW(ValueError)
+        << "Expected a tl.ascend_task scheduled unit, got " << current;
+  }
 }
 
-static std::vector<Stmt>
-CollectSchedulingStmts(const std::map<int, std::vector<Stmt>> &by_warpgroup) {
-  std::vector<Stmt> result;
-  for (const auto &[_, stmts] : by_warpgroup)
-    result.insert(result.end(), stmts.begin(), stmts.end());
+bool IsScheduledLetTask(const Stmt &stmt) {
+  const auto *attribute = stmt.as<AttrStmtNode>();
+  return attribute != nullptr && IsScheduledLeafTask(attribute) &&
+         FindTaskBind(attribute->body).defined();
+}
+
+Map<String, ffi::Any>
+FilterSchedulingAnnotations(const Map<String, ffi::Any> &annotations) {
+  Map<String, ffi::Any> result = annotations;
+  result.erase("num_stages");
+  result.erase("multi_buffer_eligible");
+  result.erase("no_conflict");
   return result;
 }
 
-// Per-warpgroup state for lowering conditional LetDecl tasks.
-struct ConditionalLetDeclCtx {
-  std::unordered_map<const TaskNode *, Buffer> buf_of;
-  Map<Var, PrimExpr> vmap;
-};
+class PipelineLowerer : public StmtMutator {
+public:
+  static Stmt Lower(const Stmt &stmt) {
+    Map<Var, Buffer> conditional_lets = ConditionalLetCollector::Collect(stmt);
+    Map<Var, PrimExpr> substitutions;
+    for (const auto &[var, buffer] : conditional_lets) {
+      substitutions.Set(var,
+                        BufferLoad(buffer, {IntImm(DataType::Int(32), 0)}));
+    }
+    Stmt rewritten = SubstituteLetVars(stmt, substitutions);
+    return PipelineLowerer(std::move(conditional_lets))(rewritten);
+  }
 
-static Stmt ConvertIRStructureToStmtInner(IRStructure *structure, Var sid,
-                                          const ConditionalLetDeclCtx &ctx);
-static Stmt ConvertIRStructureToStmt(IRStructure *structure, Var sid,
-                                     const ConditionalLetDeclCtx &ctx);
-static Stmt
-ConvertIRStructureToStmt(const std::vector<std::shared_ptr<IRStructure>> &nodes,
-                         Var sid, const ConditionalLetDeclCtx &ctx);
+private:
+  explicit PipelineLowerer(Map<Var, Buffer> conditional_lets)
+      : conditional_lets_(std::move(conditional_lets)) {}
 
-// Register every guarded scalar LetDecl as a local.var buffer.
-static void PrescanConditionalLetDecls(
-    const std::vector<std::shared_ptr<IRStructure>> &nodes,
-    ConditionalLetDeclCtx *ctx) {
-  for (const auto &child : nodes) {
-    IRStructure *node = child.get();
-    if (node->IsTask() && IsLetDeclTask(static_cast<const TaskNode *>(node)) &&
-        node->HasGuards()) {
-      const auto *task = static_cast<const TaskNode *>(node);
-      const auto *bind = task->stmt.as<BindNode>();
-      // Handle/pointer LetDecls (e.g. a T.make_tensor pointer backing a
-      // Buffer's `data`) can't become a size-1 local.var scalar — `data` must
-      // stay a Var. Leave them out of the local.var machinery; they are emitted
-      // as a plain unconditional Bind below.
-      if (IsHandleLetDeclTask(task)) {
+  Stmt VisitStmt_(const SeqStmtNode *op) final {
+    Array<Stmt> statements;
+    for (const Stmt &stmt : op->seq) {
+      Stmt lowered = VisitStmt(stmt);
+      if (lowered.defined())
+        statements.push_back(std::move(lowered));
+    }
+    if (statements.empty())
+      return Evaluate(0);
+    return MakeSequence(statements);
+  }
+
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    if (!IsScheduledUnitMarker(op))
+      return StmtMutator::VisitStmt_(op);
+    if (!IsScheduledLeafTask(op))
+      return VisitStmt(op->body);
+    return LowerTask(op);
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    Array<Stmt> children = GetSequence(op->body);
+    TVM_FFI_CHECK(!children.empty(), ValueError)
+        << "Scheduled control may not have an empty body";
+    int min_stage = std::numeric_limits<int>::max();
+    int max_stage = std::numeric_limits<int>::min();
+    for (const Stmt &child : children) {
+      int stage = GetScheduledStage(child);
+      min_stage = std::min(min_stage, stage);
+      max_stage = std::max(max_stage, stage);
+    }
+
+    PrimExpr loop_step =
+        op->step.has_value() ? op->step.value() : IntImm(DataType::Int(32), 1);
+    Array<Stmt> body;
+    for (const Stmt &child : children) {
+      int stage = GetScheduledStage(child);
+      bool is_let = IsScheduledLetTask(child);
+      Stmt lowered = VisitStmt(child);
+      ICHECK(lowered.defined());
+      if (min_stage == max_stage) {
+        body.push_back(std::move(lowered));
         continue;
       }
-      Buffer buf =
-          decl_buffer({IntImm(DataType::Int(32), 1)}, bind->value.dtype(),
-                      bind->var->name_hint, "local.var");
-      ctx->buf_of[task] = buf;
-      ctx->vmap.Set(bind->var, BufferLoad(buf, {IntImm(DataType::Int(32), 0)}));
-    }
-    if (node->IsControl()) {
-      PrescanConditionalLetDecls(
-          static_cast<const ControlNode *>(node)->children, ctx);
-    }
-  }
-}
 
-static Stmt ConvertIRStructureToStmt(IRStructure *structure, Var sid,
-                                     const ConditionalLetDeclCtx &ctx) {
-  Stmt body = ConvertIRStructureToStmtInner(structure, sid, ctx);
-  if (structure && structure->HasGuards()) {
-    // A guarded LetDecl is lowered to a mutable local.var scalar:
-    //   T v = 0;
-    //   if (cond) v = value;          // conditional guard
-    //   assume(fact) { v = value; }   // assume guard
-    if (structure->IsTask() &&
-        IsLetDeclTask(static_cast<const TaskNode *>(structure))) {
-      const auto *task = static_cast<const TaskNode *>(structure);
-      const auto *bind = task->stmt.as<BindNode>();
-      if (IsHandleLetDeclTask(task)) {
-        return body;
+      Map<Var, PrimExpr> substitution;
+      substitution.Set(op->loop_var,
+                       op->loop_var -
+                           loop_step * (max_stage - static_cast<int>(stage)));
+      if (is_let) {
+        Map<Var, PrimExpr> clamped_substitution;
+        clamped_substitution.Set(
+            op->loop_var,
+            Max(op->min,
+                Min(op->min + op->extent - loop_step,
+                    op->loop_var -
+                        loop_step * (max_stage - static_cast<int>(stage)))));
+        body.push_back(Substitute(std::move(lowered), clamped_substitution));
+        continue;
       }
-      auto it = ctx.buf_of.find(task);
-      ICHECK(it != ctx.buf_of.end())
-          << "Guarded LetDecl not registered by prescan: " << bind->var;
-      Buffer buf = it->second;
-      Map<String, Any> annotations;
-      annotations.Set(tl::attr::kLocalVarInit, make_zero(buf->dtype));
-      Stmt alloc = AllocBuffer(buf, annotations);
-      // Emit one nested guard per delta (outer..inner) rather than ANDing
-      // conditions into a single predicate, matching the guarding of
-      // non-LetDecl bodies below.
-      Stmt store = GuardWithGuards(
-          BufferStore(buf, bind->value, {IntImm(DataType::Int(32), 0)}),
-          structure->GetGuards());
-      return SeqStmt({alloc, store});
-    }
-    body = GuardWithGuards(body, structure->GetGuards());
-  }
-  return body;
-}
 
-// Top-level entry for emitting one warpgroup body
-Stmt EmitWarpgroupBody(const std::vector<std::shared_ptr<IRStructure>> &nodes,
-                       Var sid) {
-  ConditionalLetDeclCtx ctx;
-  PrescanConditionalLetDecls(nodes, &ctx);
-  Stmt body = ConvertIRStructureToStmt(nodes, sid, ctx);
-  return SubstituteLetVars(body, ctx.vmap);
-}
-
-// Emit an ordered list of scheduled nodes into a single flattened SeqStmt,
-// interleaving each node's `before` / body / `after` sync statements. This is
-// the root-level emission (and any non-pipelined loop body), replacing the old
-// SequenceNode branch.
-static Stmt
-ConvertIRStructureToStmt(const std::vector<std::shared_ptr<IRStructure>> &nodes,
-                         Var sid, const ConditionalLetDeclCtx &ctx) {
-  std::vector<Stmt> stmts;
-  for (const auto &child : nodes) {
-    auto node = child.get();
-    if (!IsPerCoreTaskNode(node)) {
-      for (auto &[_, before] : node->before) {
-        for (auto &stmt : before) {
-          stmts.push_back(stmt);
-        }
-      }
-    }
-    stmts.push_back(ConvertIRStructureToStmt(node, sid, ctx));
-    if (!IsPerCoreTaskNode(node)) {
-      for (auto &[_, after] : node->after) {
-        for (auto &stmt : after) {
-          stmts.push_back(stmt);
-        }
-      }
-    }
-  }
-  return SeqStmt::Flatten(stmts);
-}
-
-static Stmt ConvertIRStructureToStmtInner(IRStructure *structure, Var sid,
-                                          const ConditionalLetDeclCtx &ctx) {
-  if (!structure) {
-    return Evaluate(0);
-  }
-
-  if (structure->IsTask()) {
-    auto task = static_cast<TaskNode *>(structure);
-    if (!task->stmt.defined()) {
-      return Evaluate(0);
-    }
-    if (task->IsPerCoreTask()) {
-      auto emit_candidate = [&](Stmt candidate) {
-        auto candidate_task = std::make_shared<TaskNode>();
-        candidate_task->stmt = std::move(candidate);
-        return ConvertIRStructureToStmtInner(candidate_task.get(), sid, ctx);
-      };
-      return PerCoreTaskSyncMigrator(CollectSchedulingStmts(task->before),
-                                     CollectSchedulingStmts(task->after),
-                                     std::move(emit_candidate))
-          .Rewrite(task->stmt);
-    }
-    // Check for dual_copy: rewrite to copies with sid-based offset
-    {
-      if (auto *eval = task->stmt.as<EvaluateNode>()) {
-        if (auto *call = eval->value.as<CallNode>()) {
-          static const auto copy_op = Op::Get("tl.tileop.copy");
-          static const auto post_copy_op = Op::Get("tl.ascend_nd2nz_post_copy");
-          static const auto access_ptr_op = Op::Get("tl.access_ptr");
-          if (call->op.same_as(post_copy_op) && call->args.size() == 8) {
-            const auto *split_imm = call->args[6].as<IntImmNode>();
-            ICHECK(split_imm)
-                << "ascend_nd2nz_post_copy dual split_dim must be "
-                   "an IntImm (0=M, 1=N along trailing-2 axes)";
-            int split_dim_neg2 = split_imm->value;
-            ICHECK(split_dim_neg2 == 0 || split_dim_neg2 == 1)
-                << "ascend_nd2nz_post_copy dual split_dim must be 0 or 1, got "
-                << split_dim_neg2;
-            PrimExpr half_extent = call->args[7];
-            // args[0] = tl.access_ptr(BufferLoad(buf, mins), extent, rw_mask)
-            const auto *dst_ap = call->args[0].as<CallNode>();
-            ICHECK(dst_ap && dst_ap->op.same_as(access_ptr_op))
-                << "ascend_nd2nz_post_copy dst arg must be a tl.access_ptr "
-                   "Call; got "
-                << call->args[0];
-            ICHECK_EQ(dst_ap->args.size(), 3);
-            const auto *dst_load = dst_ap->args[0].as<BufferLoadNode>();
-            ICHECK(dst_load) << "tl.access_ptr first arg must be a BufferLoad";
-            int ndim = static_cast<int>(dst_load->indices.size());
-            ICHECK_GE(ndim, 2)
-                << "nd2nz dst BufferLoad must have at least 2 indices, got "
-                << ndim;
-            int split_axis = ndim - 2 + split_dim_neg2;
-            Array<PrimExpr> new_indices;
-            new_indices.reserve(ndim);
-            for (int d = 0; d < ndim; ++d) {
-              if (d == split_axis) {
-                new_indices.push_back(dst_load->indices[d] + sid * half_extent);
-              } else {
-                new_indices.push_back(dst_load->indices[d]);
-              }
-            }
-            BufferLoad new_dst_load(dst_load->buffer, new_indices);
-            Call new_dst_ap(dst_ap->dtype, access_ptr_op,
-                            {new_dst_load, dst_ap->args[1], dst_ap->args[2]});
-            Array<PrimExpr> new_args = {new_dst_ap};
-            for (size_t i = 1; i < 6; ++i) {
-              new_args.push_back(call->args[i]);
-            }
-            Call new_call(call->dtype, post_copy_op, new_args);
-            return Evaluate(new_call);
-          }
-          if (call->op.same_as(copy_op)) {
-            Copy cp(call->args, call->annotations);
-            if (cp->annotations.Get("double")) {
-              int dual_ctl = cp->GetDualDstCtl();
-              auto &src = cp->src;
-              auto &dst = cp->dst;
-              auto &src_r = cp->src_range;
-              auto &dst_r = cp->dst_range;
-              // Use last-2-dims relative indexing so that leading
-              // dimensions (e.g. buffer version) don't shift the split
-              // axis (matching the nd2nz path above).
-              int src_split_dim =
-                  static_cast<int>(src_r.size()) - 2 + (dual_ctl == 1 ? 0 : 1);
-              int dst_split_dim =
-                  static_cast<int>(dst_r.size()) - 2 + (dual_ctl == 1 ? 0 : 1);
-              // Remove dual_dst_ctl, unit_flag_ctl, and double from annotations
-              Map<String, ObjectRef> new_ann;
-              for (auto &kv : call->annotations) {
-                if (kv.first != "dual_dst_ctl" && kv.first != "unit_flag_ctl" &&
-                    kv.first != "double")
-                  new_ann.Set(kv.first, kv.second);
-              }
-              // Use RegionOp to get buffer/range info from the Call args
-              auto src_call = Downcast<Call>(call->args[0]);
-              auto dst_call = Downcast<Call>(call->args[1]);
-              RegionOp dst_rop(dst_call->args);
-              int dst_mask = dst_rop->GetAccessMask();
-              auto dst_ranges = dst_rop->GetRanges();
-              auto dst_buf = dst_rop->GetBuffer();
-              // Single copy with sid-based offset: offset = sid * half
-              PrimExpr off = sid * src_r[src_split_dim]->extent;
-              // Build new dst region args
-              Array<PrimExpr> dst_indices;
-              for (size_t d = 0; d < dst_ranges.size(); ++d) {
-                if (static_cast<int>(d) == dst_split_dim)
-                  dst_indices.push_back(dst_ranges[d]->min + off);
-                else
-                  dst_indices.push_back(dst_ranges[d]->min);
-              }
-              auto dst_load = BufferLoad(dst_buf, dst_indices);
-              Array<PrimExpr> dst_args = {dst_load, Integer(dst_mask)};
-              for (size_t d = 0; d < dst_ranges.size(); ++d) {
-                if (static_cast<int>(d) == dst_split_dim)
-                  dst_args.push_back(src_r[src_split_dim]->extent);
-                else
-                  dst_args.push_back(dst_ranges[d]->extent);
-              }
-              auto new_dst =
-                  Call(DataType::Handle(), RegionOp::Get(), dst_args);
-              Array<PrimExpr> new_args = {src_call, new_dst};
-              auto new_call = Call(call->dtype, copy_op, new_args, new_ann);
-              return Evaluate(new_call);
-            } else if (IsGlobalBuffer(cp->src) &&
-                       cp->annotations.Get("dual_dst_ctl")) {
-              int dual_ctl = cp->GetDualDstCtl();
-              auto &src_r = cp->src_range;
-              int src_split_dim =
-                  static_cast<int>(src_r.size()) - 2 + (dual_ctl == 1 ? 0 : 1);
-              PrimExpr half_ext =
-                  floordiv(src_r[src_split_dim]->extent, Integer(2));
-              // Strip dual_dst_ctl and unit_flag_ctl from annotations
-              Map<String, ObjectRef> new_ann;
-              for (auto &kv : call->annotations) {
-                if (kv.first != "dual_dst_ctl" && kv.first != "unit_flag_ctl")
-                  new_ann.Set(kv.first, kv.second);
-              }
-              PrimExpr off = sid * half_ext;
-              auto src_call = Downcast<Call>(call->args[0]);
-              auto dst_call = Downcast<Call>(call->args[1]);
-              // Rebuild src (GM) region: half extent, sid-based offset
-              RegionOp src_rop(src_call->args);
-              int src_mask = src_rop->GetAccessMask();
-              auto src_ranges = src_rop->GetRanges();
-              auto src_buf = src_rop->GetBuffer();
-              Array<PrimExpr> src_indices;
-              for (size_t d = 0; d < src_ranges.size(); ++d) {
-                if (static_cast<int>(d) == src_split_dim)
-                  src_indices.push_back(src_ranges[d]->min + off);
-                else
-                  src_indices.push_back(src_ranges[d]->min);
-              }
-              auto src_load = BufferLoad(src_buf, src_indices);
-              Array<PrimExpr> src_args = {src_load, Integer(src_mask)};
-              for (size_t d = 0; d < src_ranges.size(); ++d) {
-                if (static_cast<int>(d) == src_split_dim)
-                  src_args.push_back(half_ext);
-                else
-                  src_args.push_back(src_ranges[d]->extent);
-              }
-              auto new_src =
-                  Call(DataType::Handle(), RegionOp::Get(), src_args);
-              Array<PrimExpr> new_args = {new_src, dst_call};
-              auto new_call = Call(call->dtype, copy_op, new_args, new_ann);
-              return Evaluate(new_call);
-            }
-          }
-        }
-      }
-      return task->stmt;
-    }
-  } else if (structure->IsControl()) {
-    auto ctrl = static_cast<ControlNode *>(structure);
-    Var loop_var = ctrl->control->loop_var;
-    PrimExpr loop_start = ctrl->control->min;
-    PrimExpr loop_extent = ctrl->control->extent;
-    PrimExpr loop_step = ctrl->control->step.has_value()
-                             ? ctrl->control->step.value()
-                             : IntImm(DataType::Int(32), 1);
-    int min_stages = 100, max_stages = -1;
-    for (auto &child : ctrl->children) {
-      auto node = child.get();
-      min_stages = std::min(min_stages, node->GetStage());
-      max_stages = std::max(max_stages, node->GetStage());
-    }
-    // Stage-aware prologue/epilogue emission: substitute loop_var and wrap
-    // each task in an `if (cond)` guard so that within a single extended
-    // loop the right stages run for each iteration. Separate unrolled
-    // prologue/epilogue blocks are disabled for now (enable_pro/enable_epi
-    // forced to false).
-    if (min_stages == max_stages) {
-      Stmt body = ConvertIRStructureToStmt(ctrl->children, sid, ctx);
-      // Filter out scheduling-only annotations now that AutoSchedule is done.
-      Map<String, Any> filtered_annotations = ctrl->control->annotations;
-      filtered_annotations.erase("num_stages");
-      filtered_annotations.erase("multi_buffer_eligible");
-      filtered_annotations.erase("no_conflict");
-      return For(loop_var, loop_start, loop_extent, ctrl->control->kind, body,
-                 ctrl->control->thread_binding, filtered_annotations);
-    }
-    // Stage-aware single-loop body: substitute loop_var per task and wrap
-    // each task in a stage-appropriate `if (cond)` guard. Separate
-    // prologue/epilogue unrolled blocks are intentionally NOT emitted.
-    std::vector<Stmt> steady;
-    for (auto &child : ctrl->children) {
-      auto node = child.get();
-      Map<Var, PrimExpr> substitution, substitution_cond;
-      substitution.Set(loop_var,
-                       loop_var - loop_step * (max_stages - node->GetStage()));
-      substitution_cond.Set(
-          loop_var,
-          Max(loop_start,
-              Min(loop_start + loop_extent - loop_step,
-                  loop_var - loop_step * (max_stages - node->GetStage()))));
       PrimExpr condition =
-          And(loop_var < loop_start + loop_extent, loop_var >= loop_start);
-      if (node->GetStage() == min_stages) {
-        condition = loop_var >= loop_start;
-      }
-      if (node->GetStage() == max_stages) {
-        condition = loop_var < loop_start + loop_extent;
-      }
-      if (IsLetDeclNode(node)) {
-        std::vector<Stmt> guarded;
-        for (const auto &[_, before] : node->before) {
-          for (const auto &stmt : before) {
-            guarded.push_back(
-                Substitute(IfThenElse(condition, stmt), substitution));
-          }
-        }
-        guarded.push_back(Substitute(ConvertIRStructureToStmt(node, sid, ctx),
-                                     substitution_cond));
-        for (const auto &[_, after] : node->after) {
-          for (const auto &stmt : after) {
-            guarded.push_back(
-                Substitute(IfThenElse(condition, stmt), substitution));
-          }
-        }
-        steady.push_back(SeqStmt::Flatten(guarded));
-      } else {
-        std::vector<Stmt> stmts;
-        if (!IsPerCoreTaskNode(node)) {
-          for (const auto &[_, before] : node->before) {
-            for (const auto &stmt : before) {
-              stmts.push_back(GuardWithIf(stmt, condition));
-            }
-          }
-        }
-        stmts.push_back(
-            GuardWithIf(ConvertIRStructureToStmt(node, sid, ctx), condition));
-        if (!IsPerCoreTaskNode(node)) {
-          for (const auto &[_, after] : node->after) {
-            for (const auto &stmt : after) {
-              stmts.push_back(GuardWithIf(stmt, condition));
-            }
-          }
-        }
-        Stmt stmt = SeqStmt::Flatten(stmts);
-        steady.push_back(Substitute(stmt, substitution));
-      }
+          And(op->loop_var < op->min + op->extent, op->loop_var >= op->min);
+      if (stage == min_stage)
+        condition = op->loop_var >= op->min;
+      if (stage == max_stage)
+        condition = op->loop_var < op->min + op->extent;
+      body.push_back(
+          Substitute(IfThenElse(condition, std::move(lowered)), substitution));
     }
-    Stmt new_body = SeqStmt::Flatten(steady);
-    auto new_var = loop_var.copy_with_suffix("");
-    // Filter out scheduling-only annotations now that AutoSchedule is done.
-    Map<String, Any> filtered_annotations = ctrl->control->annotations;
-    filtered_annotations.erase("num_stages");
-    filtered_annotations.erase("multi_buffer_eligible");
-    filtered_annotations.erase("no_conflict");
-    Map<Var, PrimExpr> sub_var;
-    sub_var.Set(loop_var, new_var);
-    For for_op =
-        For(new_var, loop_start,
-            ctrl->control->extent + loop_step * (max_stages - min_stages),
-            ctrl->control->kind, Substitute(new_body, sub_var),
-            ctrl->control->thread_binding, filtered_annotations);
-    return for_op;
+
+    PrimExpr extent = op->extent;
+    if (min_stage != max_stage)
+      extent = extent + loop_step * (max_stage - min_stage);
+    return For(op->loop_var, op->min, extent, op->kind, MakeSequence(body),
+               op->thread_binding, FilterSchedulingAnnotations(op->annotations),
+               op->step, op->span);
   }
 
-  LOG(FATAL)
-      << "Failed to convert IRStructure to Stmt, returning empty statement";
+  Stmt LowerTask(const AttrStmtNode *op) {
+    Optional<Bind> bind = FindTaskBind(op->body);
+    if (!bind.defined())
+      return op->body;
+
+    Var var = bind.value()->var;
+    if (IsGuardedTaskBind(op) && !bind.value()->value.dtype().is_handle()) {
+      auto buffer = conditional_lets_.Get(var);
+      ICHECK(buffer.has_value())
+          << "Missing local.var buffer for guarded scalar Bind " << var;
+      Map<String, ffi::Any> annotations;
+      annotations.Set(attr::kLocalVarInit, make_zero(buffer.value()->dtype));
+      Stmt allocation = AllocBuffer(buffer.value(), annotations);
+      Stmt store = ReplaceTaskBind(
+          op->body, BufferStore(buffer.value(), bind.value()->value,
+                                {IntImm(DataType::Int(32), 0)}));
+      return SeqStmt::Flatten(Array<Stmt>{allocation, std::move(store)});
+    }
+
+    // Guarded handle bindings must remain unconditional so that their pointer
+    // is in scope for later buffer uses. Unguarded bindings are already native.
+    return Bind(var, bind.value()->value, bind.value()->span);
+  }
+
+  Map<Var, Buffer> conditional_lets_;
+};
+
+Optional<Stmt> LowerWarpgroup(const Stmt &scheduled_body, int warpgroup_id) {
+  Optional<Stmt> extracted =
+      WarpgroupExtractor::Extract(scheduled_body, warpgroup_id);
+  if (!extracted.has_value())
+    return std::nullopt;
+  return PipelineLowerer::Lower(extracted.value());
+}
+
+// Replace every scheduled tilelang_root independently. Walking the full
+// PrimFunc naturally handles both single- and multi-kernel functions while the
+// scoped cthread state preserves an externally supplied vector-core sid.
+class ScheduledTIRPartitioner : public StmtMutator {
+public:
+  Stmt Partition(const Stmt &stmt) { return VisitStmt(stmt); }
+  int NumPartitionedKernels() const { return num_partitioned_kernels_; }
+
+private:
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    Optional<Var> outer_sid = sid_;
+    if (op->attr_key == tirx::attr::thread_extent) {
+      if (const auto *iter_var = op->node.as<IterVarNode>()) {
+        if (iter_var->thread_tag == "cthread")
+          sid_ = iter_var->var;
+      }
+    }
+    Stmt body = VisitStmt(op->body);
+    sid_ = std::move(outer_sid);
+    if (body.same_as(op->body))
+      return GetRef<Stmt>(op);
+    return AttrStmt(op->node, op->attr_key, op->value, std::move(body),
+                    op->span);
+  }
+
+  Stmt VisitStmt_(const SBlockNode *op) final {
+    if (op->name_hint != "tilelang_root")
+      return StmtMutator::VisitStmt_(op);
+    ++num_partitioned_kernels_;
+    SBlock block = GetRef<SBlock>(op);
+    block.CopyOnWrite()->body = PartitionScheduledTIR(op->body, sid_);
+    return block;
+  }
+
+  Optional<Var> sid_;
+  int num_partitioned_kernels_{0};
+};
+
+// Re-write empty AttrStmt markers to nest them properly. A flat Bind remains
+// visible to subsequent statements in the same SeqStmt scope.
+class AttrStmtNester : public StmtMutator {
+public:
+  Stmt VisitStmt_(const SeqStmtNode *op) final {
+    Array<Stmt> statements;
+    for (const Stmt &statement : op->seq)
+      statements.push_back(VisitStmt(statement));
+
+    Array<Stmt> flattened;
+    for (const Stmt &statement : statements) {
+      if (const auto *sequence = statement.as<SeqStmtNode>()) {
+        for (const Stmt &inner : sequence->seq)
+          flattened.push_back(inner);
+      } else {
+        flattened.push_back(statement);
+      }
+    }
+    statements = std::move(flattened);
+
+    for (int index = static_cast<int>(statements.size()) - 2; index >= 0;
+         --index) {
+      if (const auto *attribute = statements[index].as<AttrStmtNode>()) {
+        if (IsEmptyBody(attribute->body)) {
+          Stmt body = CollectRemaining(statements, index + 1);
+          statements =
+              TruncateAndReplace(statements, index,
+                                 AttrStmt(attribute->node, attribute->attr_key,
+                                          attribute->value, std::move(body)));
+        }
+      }
+    }
+
+    if (statements.empty())
+      return Evaluate(0);
+    return MakeSequence(statements);
+  }
+
+private:
+  static bool IsEmptyBody(const Stmt &stmt) {
+    if (const auto *evaluate = stmt.as<EvaluateNode>()) {
+      if (const auto *integer = evaluate->value.as<IntImmNode>())
+        return integer->value == 0;
+    }
+    return false;
+  }
+
+  static Stmt CollectRemaining(const Array<Stmt> &statements, int start) {
+    if (start >= static_cast<int>(statements.size()))
+      return Evaluate(0);
+    Array<Stmt> remaining;
+    for (int index = start; index < static_cast<int>(statements.size());
+         ++index) {
+      remaining.push_back(statements[index]);
+    }
+    return MakeSequence(remaining);
+  }
+
+  static Array<Stmt> TruncateAndReplace(const Array<Stmt> &statements,
+                                        int index, Stmt replacement) {
+    Array<Stmt> result;
+    for (int current = 0; current < index; ++current)
+      result.push_back(statements[current]);
+    result.push_back(std::move(replacement));
+    return result;
+  }
+};
+
+// Recursively flatten all nested SeqStmt nodes before AttrStmtNester absorbs
+// empty AttrStmt markers, preventing absorption across nested boundaries.
+class SeqStmtFlattener : public StmtMutator {
+public:
+  Stmt VisitStmt_(const SeqStmtNode *op) final {
+    Array<Stmt> visited;
+    for (const Stmt &statement : op->seq)
+      visited.push_back(VisitStmt(statement));
+
+    Array<Stmt> flattened;
+    std::function<void(const Stmt &)> flatten = [&](const Stmt &statement) {
+      if (const auto *sequence = statement.as<SeqStmtNode>()) {
+        for (const Stmt &inner : sequence->seq)
+          flatten(inner);
+      } else {
+        flattened.push_back(statement);
+      }
+    };
+    for (const Stmt &statement : visited)
+      flatten(statement);
+    if (flattened.empty())
+      return Evaluate(0);
+    return MakeSequence(flattened);
+  }
+};
+
+Stmt ReNestAttrStmts(const Stmt &stmt) {
+  Stmt flattened = SeqStmtFlattener()(stmt);
+  return AttrStmtNester()(flattened);
+}
+
+} // namespace
+
+Stmt PartitionScheduledTIR(const Stmt &scheduled_body,
+                           Optional<Var> external_sid) {
+  Optional<Stmt> wg0_body = LowerWarpgroup(scheduled_body, 0);
+  Optional<Stmt> wg1_body = LowerWarpgroup(scheduled_body, 1);
+  if (wg0_body.has_value() && wg1_body.has_value()) {
+    Array<Stmt> blocks;
+    blocks.push_back(
+        SBlock({}, {}, {}, "CUBE", wg1_body.value(), std::nullopt, {}, {}, {}));
+    Map<String, ffi::Any> vector_annotations;
+    vector_annotations.Set("vector_count", Integer(2));
+    if (external_sid.has_value()) {
+      blocks.push_back(SBlock({}, {}, {}, "VECTOR", wg0_body.value(),
+                              std::nullopt, {}, {}, vector_annotations));
+    } else {
+      Var sid("sid", DataType::Int(32));
+      IterVar sid_thread(Range(0, 2), sid, IterVarType::kThreadIndex,
+                         "cthread");
+      Stmt vector_body = AttrStmt(sid_thread, tirx::attr::thread_extent,
+                                  Integer(2), wg0_body.value());
+      blocks.push_back(SBlock({}, {}, {}, "VECTOR", vector_body, std::nullopt,
+                              {}, {}, vector_annotations));
+    }
+    return SeqStmt(blocks);
+  }
+  if (wg0_body.has_value())
+    return wg0_body.value();
+  if (wg1_body.has_value())
+    return wg1_body.value();
   return Evaluate(0);
 }
+
+tvm::transform::Pass WarpgroupPartition() {
+  using namespace tirx::transform;
+  auto pass_func = [](PrimFunc func, const IRModule &,
+                      const tvm::transform::PassContext &) -> PrimFunc {
+    ScheduledTIRPartitioner partitioner;
+    Stmt body = partitioner.Partition(func->body);
+    TVM_FFI_CHECK_GT(partitioner.NumPartitionedKernels(), 0, ValueError)
+        << "WarpgroupPartition could not find the scheduled tilelang_root";
+    body = ReNestAttrStmts(body);
+    return PrimFunc(func->params, std::move(body), func->ret_type,
+                    func->buffer_map, func->attrs);
+  };
+  return CreatePrimFuncPass(pass_func, 0, "tl.WarpgroupPartition", {});
+}
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.transform.WarpgroupPartition", WarpgroupPartition);
+}
+
 } // namespace tl
 } // namespace tvm

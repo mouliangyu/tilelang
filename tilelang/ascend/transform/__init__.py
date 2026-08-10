@@ -55,8 +55,18 @@ def LegalizeSimdMerging():
 
 
 def AutoSchedule():
-    """Auto schedule for high-level operations"""
+    """Schedule tasks and annotate T.Task for downstream lowering."""
     return _ffi_api.AutoSchedule()  # type: ignore
+
+
+def WarpgroupPartition():
+    """Lower scheduled tasks into their AIV/AIC warpgroup bodies."""
+    return _ffi_api.WarpgroupPartition()  # type: ignore
+
+
+def RewriteDualCopy():
+    """Lower dual-copy operations using the enclosing vector-core sid."""
+    return _ffi_api.RewriteDualCopy()  # type: ignore
 
 
 def NormalizeBufferVersion():
@@ -154,7 +164,9 @@ __all__ = [
     "NormalizeNoConflictHints",
     "NormalizeTask",
     "RewriteAscendBufferVersionLayout",
+    "RewriteDualCopy",
     "RestoreWhileLoops",
     "RewriteFp4ToFp4x2",
     "RewriteFlagToBuf",
+    "WarpgroupPartition",
 ]
