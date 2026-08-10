@@ -54,6 +54,16 @@ def LegalizeSimdMerging():
     return _ffi_api.LegalizeSimdMerging()  # type: ignore
 
 
+def UnrollLoopSkipVF():
+    """Expand explicit unroll loops outside SIMD_VF / SIMT_VF blocks.
+
+    This pre-AutoSchedule pass only materializes ``T.unroll(..., explicit=True)``
+    loops. Non-explicit unroll hints, serial loops, and all VF block interiors
+    are preserved for their later lowering stages.
+    """
+    return _ffi_api.UnrollLoopSkipVF()  # type: ignore
+
+
 def AutoSchedule():
     """Schedule tasks and annotate T.Task for downstream lowering."""
     return _ffi_api.AutoSchedule()  # type: ignore
@@ -168,5 +178,6 @@ __all__ = [
     "RestoreWhileLoops",
     "RewriteFp4ToFp4x2",
     "RewriteFlagToBuf",
+    "UnrollLoopSkipVF",
     "WarpgroupPartition",
 ]

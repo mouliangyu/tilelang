@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from tvm import IRModule, s_tir, tirx
 from tvm.target import Target
-from tvm.tirx import PrimFunc, SBlock
-from tvm.tirx.stmt_functor import post_order_visit
 
 import tilelang
 from tilelang.backend.pass_pipeline import PassPipeline, register_pipeline
@@ -18,26 +16,6 @@ from tilelang.backend.pass_pipeline.pipeline_utils import (
 )
 
 from . import transform as ascend_transform
-
-
-def _has_vf_region(mod: IRModule, names: set[str] | None = None) -> bool:
-    names = names or {"SIMD_VF", "SIMT_VF"}
-    for _, func in mod.functions.items():
-        if not isinstance(func, PrimFunc):
-            continue
-        found = False
-
-        def _visit(node):
-            nonlocal found
-            if found:
-                return
-            if isinstance(node, SBlock) and node.name_hint in names:
-                found = True
-
-        post_order_visit(func.body, _visit)
-        if found:
-            return True
-    return False
 
 
 def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
@@ -61,6 +39,11 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     # read-modify-write operation rather than a pure value expression. Expose
     # the destination as an rw access before scheduling and dependency analysis.
     mod = ascend_transform.LegalizeSimdMerging()(mod)
+    mod = tilelang.transform.Simplify()(mod)
+
+    # Materialize only user-requested explicit unrolls outside VF blocks so
+    # LayoutInference and AutoSchedule can consume the expanded operations.
+    mod = ascend_transform.UnrollLoopSkipVF()(mod)
     mod = tilelang.transform.Simplify()(mod)
 
     mod = tilelang.transform.LayoutReducer()(mod)
@@ -122,8 +105,7 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     # access_ptr/copy offsets are materialized and before MergeUBAllocations.
     mod = ascend_transform.RewriteFp4ToFp4x2()(mod)
 
-    if not _has_vf_region(mod):
-        mod = tilelang.transform.LoopUnswitching()(mod)
+    mod = tilelang.transform.LoopUnswitching()(mod)
     mod = tilelang.transform.UnrollLoop()(mod)
     mod = s_tir.transform.RenormalizeSplitPattern()(mod)
     mod = tirx.transform.Simplify()(mod)
