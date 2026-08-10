@@ -23,7 +23,7 @@ def test_task_rejects_cross_pipe_body():
         lower(main, target="ascend")
 
 
-def test_task_rejects_conflicting_warpgroup_affinity():
+def test_task_rejects_conflicting_core_affinity():
     @T.prim_func
     def main(
         A: T.Tensor((TILE, TILE), "bfloat16"),

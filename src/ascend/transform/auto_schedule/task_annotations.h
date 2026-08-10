@@ -31,10 +31,9 @@ namespace tl {
 using namespace tirx;
 
 // Compiler-owned fields carried by tl.ascend_task after AutoSchedule. These
-// form the short-lived task metadata contract consumed by WarpgroupPartition.
-constexpr const char *kAscendScheduledWarpgroupId = "wgid";
+// form the short-lived task metadata contract consumed by CorePartition.
+constexpr const char *kAscendScheduledCoreMask = "core_mask";
 constexpr const char *kAscendScheduledStage = "stage";
-constexpr int kAscendScheduledBroadcastWarpgroup = -2;
 
 struct TaskCost {
   int64_t latency{0};

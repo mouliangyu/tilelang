@@ -198,7 +198,7 @@ private:
   Var RequireSid(const Call &call) const {
     TVM_FFI_CHECK(sid_.has_value(), ValueError)
         << "RewriteDualCopy found a dual-copy operation outside a cthread "
-           "scope. Run WarpgroupPartition and NormalizeMixedKernelSid before "
+           "scope. Run CorePartition and NormalizeMixedKernelSid before "
            "RewriteDualCopy. Operation: "
         << call;
     return sid_.value();

@@ -18,11 +18,11 @@
  */
 
 /*!
- * \file warpgroup_partition.cc
- * \brief Direct scheduled-TIR warpgroup partition and pipeline lowering.
+ * \file core_partition.cc
+ * \brief Direct scheduled-TIR core partition and pipeline lowering.
  */
 
-#include "./warpgroup_partition.h"
+#include "./core_partition.h"
 #include "./task_annotations.h"
 
 #include <tvm/ffi/container/array.h>
@@ -163,16 +163,18 @@ bool IsScheduledUnitMarker(const AttrStmtNode *op) {
 
 bool IsScheduledLeafTask(const AttrStmtNode *op) {
   return IsScheduledUnitMarker(op) &&
-         GetScheduledInt(op, kAscendScheduledWarpgroupId).has_value();
+         GetScheduledInt(op, kAscendScheduledCoreMask).has_value();
 }
 
-int GetTaskWarpgroup(const AttrStmtNode *op) {
-  int64_t warpgroup = RequireScheduledInt(op, kAscendScheduledWarpgroupId);
-  TVM_FFI_CHECK(warpgroup == 0 || warpgroup == 1 ||
-                    warpgroup == kAscendScheduledBroadcastWarpgroup,
+CoreMask GetTaskCoreMask(const AttrStmtNode *op) {
+  int64_t value = RequireScheduledInt(op, kAscendScheduledCoreMask);
+  TVM_FFI_CHECK_GE(value, 0, ValueError);
+  TVM_FFI_CHECK_LE(value, std::numeric_limits<CoreMask>::max(), ValueError);
+  CoreMask core_mask = static_cast<CoreMask>(value);
+  TVM_FFI_CHECK(core_mask != kCoreUnassigned && IsValidCoreMask(core_mask),
                 ValueError)
-      << "Scheduled task has invalid wgid " << warpgroup;
-  return static_cast<int>(warpgroup);
+      << "Scheduled task has invalid core mask " << value;
+  return core_mask;
 }
 
 int GetMarkerStage(const AttrStmtNode *op) {
@@ -223,20 +225,21 @@ bool IsGuardedTaskBind(const AttrStmtNode *marker) {
          marker->body.as<BindNode>() == nullptr;
 }
 
-class WarpgroupExtractor : public StmtMutator {
+class CoreExtractor : public StmtMutator {
 public:
-  static Optional<Stmt> Extract(const Stmt &stmt, int warpgroup_id) {
-    WarpgroupExtractor extractor(warpgroup_id);
+  static Optional<Stmt> Extract(const Stmt &stmt, CoreMask target_core) {
+    ICHECK(IsConcreteCore(target_core));
+    CoreExtractor extractor(target_core);
     Stmt result = extractor.VisitStmt(stmt);
-    if (!extractor.found_warpgroup_)
+    if (!extractor.found_core_)
       return std::nullopt;
-    ICHECK(result.defined())
-        << "WarpgroupExtractor removed detected warpgroup " << warpgroup_id;
+    ICHECK(result.defined()) << "CoreExtractor removed detected core "
+                             << static_cast<int>(target_core);
     return result;
   }
 
 private:
-  explicit WarpgroupExtractor(int warpgroup_id) : warpgroup_id_(warpgroup_id) {}
+  explicit CoreExtractor(CoreMask target_core) : target_core_(target_core) {}
 
   Stmt VisitStmt_(const SeqStmtNode *op) final {
     Array<Stmt> statements;
@@ -303,16 +306,16 @@ private:
   }
 
   Stmt ExtractTask(const AttrStmtNode *op) {
-    int task_warpgroup = GetTaskWarpgroup(op);
-    found_warpgroup_ |= task_warpgroup == warpgroup_id_;
-    if (task_warpgroup != warpgroup_id_ &&
-        task_warpgroup != kAscendScheduledBroadcastWarpgroup)
+    CoreMask task_core_mask = GetTaskCoreMask(op);
+    // Broadcast tasks follow an existing concrete stream, but must not create
+    // an otherwise absent Vector or Cube stream by themselves.
+    found_core_ |= task_core_mask == target_core_;
+    if (!HasCore(task_core_mask, target_core_))
       return Stmt();
 
     Stmt body = SubstituteLetVars(op->body, var_remap_);
     Optional<Bind> bind = FindTaskBind(body);
-    if (task_warpgroup == kAscendScheduledBroadcastWarpgroup &&
-        bind.defined()) {
+    if (task_core_mask == kCoreBroadcast && bind.defined()) {
       Var source_var = bind.value()->var;
       Var output_var = source_var.copy_with_suffix("");
       body = ReplaceTaskBind(
@@ -323,8 +326,8 @@ private:
                     op->span);
   }
 
-  int warpgroup_id_;
-  bool found_warpgroup_{false};
+  CoreMask target_core_;
+  bool found_core_{false};
   Map<Var, PrimExpr> var_remap_;
 };
 
@@ -515,9 +518,9 @@ private:
   Map<Var, Buffer> conditional_lets_;
 };
 
-Optional<Stmt> LowerWarpgroup(const Stmt &scheduled_body, int warpgroup_id) {
+Optional<Stmt> LowerCore(const Stmt &scheduled_body, CoreMask target_core) {
   Optional<Stmt> extracted =
-      WarpgroupExtractor::Extract(scheduled_body, warpgroup_id);
+      CoreExtractor::Extract(scheduled_body, target_core);
   if (!extracted.has_value())
     return std::nullopt;
   return PipelineLowerer::Lower(extracted.value());
@@ -553,7 +556,7 @@ private:
       return StmtMutator::VisitStmt_(op);
     ++num_partitioned_kernels_;
     SBlock block = GetRef<SBlock>(op);
-    block.CopyOnWrite()->body = PartitionScheduledTIR(op->body, sid_);
+    block.CopyOnWrite()->body = LowerScheduledTIRToCores(op->body, sid_);
     return block;
   }
 
@@ -662,55 +665,56 @@ Stmt ReNestAttrStmts(const Stmt &stmt) {
 
 } // namespace
 
-Stmt PartitionScheduledTIR(const Stmt &scheduled_body,
-                           Optional<Var> external_sid) {
-  Optional<Stmt> wg0_body = LowerWarpgroup(scheduled_body, 0);
-  Optional<Stmt> wg1_body = LowerWarpgroup(scheduled_body, 1);
-  if (wg0_body.has_value() && wg1_body.has_value()) {
+Stmt LowerScheduledTIRToCores(const Stmt &scheduled_body,
+                              Optional<Var> external_sid) {
+  Optional<Stmt> vector_body = LowerCore(scheduled_body, kCoreVector);
+  Optional<Stmt> cube_body = LowerCore(scheduled_body, kCoreCube);
+  if (vector_body.has_value() && cube_body.has_value()) {
     Array<Stmt> blocks;
-    blocks.push_back(
-        SBlock({}, {}, {}, "CUBE", wg1_body.value(), std::nullopt, {}, {}, {}));
+    blocks.push_back(SBlock({}, {}, {}, "CUBE", cube_body.value(), std::nullopt,
+                            {}, {}, {}));
     Map<String, ffi::Any> vector_annotations;
     vector_annotations.Set("vector_count", Integer(2));
     if (external_sid.has_value()) {
-      blocks.push_back(SBlock({}, {}, {}, "VECTOR", wg0_body.value(),
+      blocks.push_back(SBlock({}, {}, {}, "VECTOR", vector_body.value(),
                               std::nullopt, {}, {}, vector_annotations));
     } else {
       Var sid("sid", DataType::Int(32));
       IterVar sid_thread(Range(0, 2), sid, IterVarType::kThreadIndex,
                          "cthread");
-      Stmt vector_body = AttrStmt(sid_thread, tirx::attr::thread_extent,
-                                  Integer(2), wg0_body.value());
-      blocks.push_back(SBlock({}, {}, {}, "VECTOR", vector_body, std::nullopt,
-                              {}, {}, vector_annotations));
+      Stmt threaded_vector_body =
+          AttrStmt(sid_thread, tirx::attr::thread_extent, Integer(2),
+                   vector_body.value());
+      blocks.push_back(SBlock({}, {}, {}, "VECTOR", threaded_vector_body,
+                              std::nullopt, {}, {}, vector_annotations));
     }
     return SeqStmt(blocks);
   }
-  if (wg0_body.has_value())
-    return wg0_body.value();
-  if (wg1_body.has_value())
-    return wg1_body.value();
+  if (vector_body.has_value())
+    return vector_body.value();
+  if (cube_body.has_value())
+    return cube_body.value();
   return Evaluate(0);
 }
 
-tvm::transform::Pass WarpgroupPartition() {
+tvm::transform::Pass CorePartition() {
   using namespace tirx::transform;
   auto pass_func = [](PrimFunc func, const IRModule &,
                       const tvm::transform::PassContext &) -> PrimFunc {
     ScheduledTIRPartitioner partitioner;
     Stmt body = partitioner.Partition(func->body);
     TVM_FFI_CHECK_GT(partitioner.NumPartitionedKernels(), 0, ValueError)
-        << "WarpgroupPartition could not find the scheduled tilelang_root";
+        << "CorePartition could not find the scheduled tilelang_root";
     body = ReNestAttrStmts(body);
     return PrimFunc(func->params, std::move(body), func->ret_type,
                     func->buffer_map, func->attrs);
   };
-  return CreatePrimFuncPass(pass_func, 0, "tl.WarpgroupPartition", {});
+  return CreatePrimFuncPass(pass_func, 0, "tl.CorePartition", {});
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tl.transform.WarpgroupPartition", WarpgroupPartition);
+  refl::GlobalDef().def("tl.transform.CorePartition", CorePartition);
 }
 
 } // namespace tl

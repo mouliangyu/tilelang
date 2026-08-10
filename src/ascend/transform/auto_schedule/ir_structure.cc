@@ -108,8 +108,7 @@ std::shared_ptr<IRStructure> TaskNode::Clone() const {
   // Copy latency and II
   new_task->SetLatency(GetLatency());
   new_task->SetII(GetII());
-  // Copy warpgroup id
-  new_task->SetWarpgroupId(GetWarpgroupId());
+  new_task->SetCoreMask(GetCoreMask());
   new_task->CopyBaseMetadataFrom(*this);
   return new_task;
 }
@@ -160,12 +159,6 @@ void CollectAllTaskNodesWithContext(IRStructure *node,
 // Dependency analysis implementation
 // ============================================================================
 
-inline bool WarpgroupMatches(const TaskNode *task, int wg_id) {
-  int task_wg = task->GetWarpgroupId();
-  return IsWarpgroupBroadcast(wg_id) || IsWarpgroupBroadcast(task_wg) ||
-         wg_id == task_wg;
-}
-
 inline const VarNode *StorageKey(const Buffer &buffer) {
   return buffer->data.get();
 }
@@ -176,10 +169,8 @@ inline bool RegionUsesStorage(const BufferRegion &region,
 }
 
 TaskAccessPredicate MakeStorageAccessPredicate(const VarNode *storage_key,
-                                               bool is_write, int wg_id) {
-  return [storage_key, is_write, wg_id](const TaskNode *task) -> bool {
-    if (!WarpgroupMatches(task, wg_id))
-      return false;
+                                               bool is_write) {
+  return [storage_key, is_write](const TaskNode *task) -> bool {
     const auto &regions =
         is_write ? task->GetWriteRegions() : task->GetReadRegions();
     for (const auto &region : regions) {
@@ -253,10 +244,9 @@ std::set<BufferAccessPoint> CollectAccessPoints(const IRStructure *node,
                                                 bool producer_side) {
   std::set<BufferAccessPoint> result;
   std::vector<const IRStructure *> path;
-  CollectAllAccessPointsImpl(
-      node,
-      MakeStorageAccessPredicate(storage_key, is_write, kWarpgroupBroadcast),
-      result, path, 0, producer_side);
+  CollectAllAccessPointsImpl(node,
+                             MakeStorageAccessPredicate(storage_key, is_write),
+                             result, path, 0, producer_side);
   return result;
 }
 

@@ -6,6 +6,7 @@
 #pragma once
 
 #include "./auto_schedule/barrier.h"
+#include "./auto_schedule/core_partition.h"
 #include "./auto_schedule/ir_structure.h"
 #include "./auto_schedule/memory_detector.h"
 #include "./auto_schedule/schedule_builder.h"

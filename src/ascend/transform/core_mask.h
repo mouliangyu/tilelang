@@ -17,22 +17,36 @@
  * under the License.
  */
 
-#pragma once
+#ifndef TVM_TL_ASCEND_TRANSFORM_CORE_MASK_H_
+#define TVM_TL_ASCEND_TRANSFORM_CORE_MASK_H_
 
-#include <tvm/ffi/optional.h>
-#include <tvm/tirx/expr.h>
-#include <tvm/tirx/stmt.h>
-
-#include <optional>
+#include <array>
+#include <cstdint>
 
 namespace tvm {
 namespace tl {
 
-// Partition scheduled TIR directly into its AIV/AIC bodies and lower software
-// pipeline stages. No parallel syntax tree is reconstructed by this consumer.
-tirx::Stmt
-PartitionScheduledTIR(const tirx::Stmt &scheduled_body,
-                      ffi::Optional<tirx::Var> external_sid = std::nullopt);
+using CoreMask = uint8_t;
+
+constexpr CoreMask kCoreUnassigned = 0;
+constexpr CoreMask kCoreVector = 1U << 0;
+constexpr CoreMask kCoreCube = 1U << 1;
+constexpr CoreMask kCoreBroadcast = kCoreVector | kCoreCube;
+constexpr std::array<CoreMask, 2> kConcreteCores = {kCoreVector, kCoreCube};
+
+constexpr bool IsValidCoreMask(CoreMask mask) {
+  return (mask & static_cast<CoreMask>(~kCoreBroadcast)) == 0;
+}
+
+constexpr bool IsConcreteCore(CoreMask mask) {
+  return mask == kCoreVector || mask == kCoreCube;
+}
+
+constexpr bool HasCore(CoreMask mask, CoreMask core) {
+  return IsConcreteCore(core) && (mask & core) != 0;
+}
 
 } // namespace tl
 } // namespace tvm
+
+#endif // TVM_TL_ASCEND_TRANSFORM_CORE_MASK_H_

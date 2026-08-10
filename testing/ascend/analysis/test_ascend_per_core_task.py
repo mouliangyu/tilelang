@@ -57,7 +57,7 @@ def _make_per_core_mte2_program(to_l1: bool):
     return main
 
 
-def test_per_core_mte2_uses_copy_destination_warpgroup():
+def test_per_core_mte2_uses_copy_destination_core():
     marker = f"AscendC::CrossCoreWaitFlag<0, PIPE_MTE2>({FLAG});"
     for to_l1, expected in ((True, "AIC"), (False, "AIV")):
         source = lower(_make_per_core_mte2_program(to_l1), target="ascend").kernel_source

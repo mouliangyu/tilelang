@@ -59,7 +59,8 @@ constexpr const char *kAscendPerCoreTask = "tl.ascend_per_core_task";
 // Groups statements into one AutoSchedule TaskNode. Inside a
 // kAscendPerCoreTask region, each marker is one concrete candidate. After
 // scheduling, the compiler reuses this marker for scheduled units: leaf tasks
-// carry wgid/stage metadata, while native serial For controls carry stage only.
+// carry core_mask/stage metadata, while native serial For controls carry stage
+// only.
 constexpr const char *kAscendTask = "tl.ascend_task";
 
 // Attributes to implement SourceCodeBlock

@@ -1,11 +1,11 @@
 """Vector-core work + junk scalar GM read/write in the same kernel (.asc check).
 
-Exercises the warpgroup-id assignment path for scalar tasks that read
+Exercises the core-mask assignment path for scalar tasks that read
 straight from GM and store straight back to GM, running alongside real
 vector-core (MTE / SimdVF) work. Modeled on the ``_scatter_verified``
 scatter kernel: a persistent loop copies a row through UB (vector core)
 while a handful of scalar loads/stores gate and scatter values directly
-in GM. Auto-schedule must pin those scalar tasks to a concrete warpgroup;
+in GM. Auto-schedule must pin those scalar tasks to a concrete core;
 this test asserts on the generated ``.asc`` rather than running on NPU.
 """
 

@@ -680,7 +680,7 @@ public:
     }
     for (size_t i = 0; i < n; ++i) {
       // When offset is disabled, collapse every task into a single pipeline
-      // stage so warpgroup_partition emits a flat (non-pipelined) loop body.
+      // stage so core_partition emits a flat (non-pipelined) loop body.
       nodes[i]->SetStage(enable_offset ? (min_k_raw - raw_k[i]) : 0);
       // Adjust start_time to be relative to the earliest start_time, so that
       // the first task starts at 0.

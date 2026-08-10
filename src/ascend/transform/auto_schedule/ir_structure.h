@@ -19,6 +19,8 @@
 #include <utility>
 #include <vector>
 
+#include "../core_mask.h"
+
 namespace tvm {
 namespace tl {
 
@@ -139,23 +141,9 @@ inline bool RegionsEqual(const Region &a, const Region &b) {
   return true;
 }
 
-// Special warpgroup id constants
-constexpr int kWarpgroupUnassigned = -1; // Not yet assigned (initial state)
-constexpr int kWarpgroupBroadcast = -2;  // Broadcast: the statement is cloned
-                                         // into every warp group; each wg
-                                         // operates on its own register copies.
-                                         // No cross-wg sync is needed for
-                                         // register (local.fragment) buffers.
-
-// Helper: check if a warpgroup id represents a broadcast task
-inline bool IsWarpgroupBroadcast(int wg_id) {
-  return wg_id == kWarpgroupBroadcast;
-}
-
 // Predicate the Collect*AccessPoints walks use to decide whether a leaf
 // TaskNode "matches": pred(task) returns true if the task has a matching
-// access. The caller bakes in any buffer/storage, is_write, and warpgroup
-// filters.
+// access. The caller bakes in any buffer/storage and is_write filters.
 class TaskNode;
 using TaskAccessPredicate = std::function<bool(const TaskNode *task)>;
 
@@ -277,7 +265,7 @@ public:
   // Scheduling metadata assigned after Z3 scheduling. These used to live on a
   // separate wrapper; scheduling now writes them directly onto the TaskNode or
   // ControlNode participating in the scheduled sequence.
-  std::map<int, std::vector<Stmt>> before, after;
+  std::map<CoreMask, std::vector<Stmt>> before, after;
 
   // Guard deltas introduced at this node relative to its nearest
   // surviving structural ancestor.
@@ -305,7 +293,7 @@ public:
   }
 
   // Pipeline stage assigned by the Z3 scheduler: producer = 0, consumers
-  // NEGATIVE (absolute value = latency in stages). See warpgroup_partition.cc.
+  // NEGATIVE (absolute value = latency in stages). See core_partition.cc.
   int GetStage() const { return stage_; }
   void SetStage(int stage) { stage_ = stage; }
 
@@ -319,7 +307,7 @@ public:
   bool IsControl() const { return GetKind() == Kind::kControl; }
 
   // Substitute a var inside this node's own guard deltas. Call from each
-  // node's SubstituteVar override so warpgroup renaming reaches both If
+  // node's SubstituteVar override so core specialization reaches both If
   // conditions and propagated AttrStmt fields.
   void SubstituteVarInGuards(const Var &old_var, const Var &new_var) {
     for (auto &guard : guards_) {
@@ -401,11 +389,6 @@ public:
   // Substitute a variable throughout this IR node
   virtual void SubstituteVar(const Var &old_var, const Var &new_var) = 0;
 
-  // Get warpgroup id for this node (kWarpgroupUnassigned if not applicable)
-  virtual int GetWarpgroupId() const { return kWarpgroupUnassigned; }
-
-  virtual bool containWarpgroupId(int id) const = 0;
-
   // Special scalar registers this node *writes* (bitmask of SpecialRegister).
   // Only leaf config/control intrinsics write; everything else returns 0.
   virtual uint16_t GetSpecialWriteMask() const { return 0; }
@@ -439,7 +422,7 @@ public:
   }
 
   // Whether this node is the loop_break marker (writes the loop-control
-  // register). Used by warpgroup broadcast + sequence scans.
+  // register). Used by core broadcast + sequence scans.
   bool ContainsLoopBreak() const {
     return WritesSpecialRegister(SpecialRegister::kLoopControl);
   }
@@ -577,9 +560,11 @@ public:
   void SetLatency(int64_t latency) override { latency_ = latency; }
   void SetII(int64_t ii) override { ii_ = ii; }
 
-  // Warpgroup id for warpgroup specialization
-  void SetWarpgroupId(int warpgroup_id) { warpgroup_id_ = warpgroup_id; }
-  int GetWarpgroupId() const override { return warpgroup_id_; }
+  void SetCoreMask(CoreMask core_mask) {
+    ICHECK(IsValidCoreMask(core_mask));
+    core_mask_ = core_mask;
+  }
+  CoreMask GetCoreMask() const { return core_mask_; }
 
   // Clone method
   std::shared_ptr<IRStructure> Clone() const override;
@@ -646,10 +631,6 @@ public:
     indirect_read_vars_.push_back(var);
   }
 
-  bool containWarpgroupId(int id) const override {
-    return IsWarpgroupBroadcast(warpgroup_id_) || warpgroup_id_ == id;
-  }
-
 private:
   // Resource pipe mask (bitmask of ResourcePipe values)
   uint16_t pipe_mask_{0};
@@ -683,8 +664,7 @@ private:
   // Latency estimation
   int64_t latency_{0}; // Estimated latency in cycles
   int64_t ii_{0};      // Initiation interval in cycles
-  int warpgroup_id_{
-      kWarpgroupUnassigned}; // Warpgroup id for warpgroup specialization
+  CoreMask core_mask_{kCoreUnassigned};
 };
 
 // Control node: contains a For operation and an ordered list of child
@@ -887,14 +867,6 @@ public:
   // Clone method
   std::shared_ptr<IRStructure> Clone() const override;
 
-  bool containWarpgroupId(int id) const override {
-    for (const auto &child : children) {
-      if (child && child->containWarpgroupId(id))
-        return true;
-    }
-    return false;
-  }
-
   int64_t GetTripCount() const {
     arith::Analyzer analyzer;
     if (task)
@@ -1036,8 +1008,8 @@ inline void PrintAllStmts(const IRStructure *node, int indent = 0) {
     LOG(INFO) << indent_str << "  Resource pipe mask: 0x" << std::hex
               << task->GetPipeMask() << std::dec;
     LOG(INFO) << indent_str << "  Latency: " << task->GetLatency()
-              << " cycles, II: " << task->GetII()
-              << " cycles, warpgroup_id: " << task->GetWarpgroupId();
+              << " cycles, II: " << task->GetII() << " cycles, core_mask: "
+              << static_cast<int>(task->GetCoreMask());
   } else if (node->IsControl()) {
     const ControlNode *control = static_cast<const ControlNode *>(node);
     LOG(INFO) << indent_str << "ControlNode (For loop):";
@@ -1094,7 +1066,8 @@ inline void PrintIRStructure(const IRStructure *node, int indent = 0) {
               << task->GetPipeMask() << std::dec;
     LOG(INFO) << indent_str << "  latency: " << task->GetLatency() << " cycles";
     LOG(INFO) << indent_str << "  II: " << task->GetII() << " cycles";
-    LOG(INFO) << indent_str << "  warpgroup_id: " << task->GetWarpgroupId();
+    LOG(INFO) << indent_str
+              << "  core_mask: " << static_cast<int>(task->GetCoreMask());
   } else if (node->IsControl()) {
     const ControlNode *control = static_cast<const ControlNode *>(node);
     LOG(INFO) << indent_str << "ControlNode (For loop):";

@@ -37,15 +37,16 @@ Buffer CreateNewBuffer(const Buffer &buffer, int num_versions) {
 }
 
 void InsertStatementIntoScheduledNode(IRStructure *node, Stmt stmt,
-                                      bool at_beginning, int warpgroup_id,
+                                      bool at_beginning, CoreMask core,
                                       const PrimExpr &guard = PrimExpr()) {
+  ICHECK(IsConcreteCore(core));
   if (guard.defined()) {
     stmt = IfThenElse(guard, stmt);
   }
   if (at_beginning) {
-    node->before[warpgroup_id].insert(node->before[warpgroup_id].begin(), stmt);
+    node->before[core].insert(node->before[core].begin(), stmt);
   } else {
-    node->after[warpgroup_id].push_back(stmt);
+    node->after[core].push_back(stmt);
   }
 }
 
@@ -118,18 +119,16 @@ void BarrierBuilder::CollectInsertionSites(
     task_path.push_back(node);
     BufferAccessPoint pt(0, std::move(task_path));
     auto *task = static_cast<const TaskNode *>(node);
-    int wg = task->GetWarpgroupId();
+    CoreMask core_mask = task->GetCoreMask();
     std::string pipe = GetResourcePipeName(task->GetPipeMask());
-    std::vector<int> wgs;
-    if (IsWarpgroupBroadcast(wg)) {
-      for (int i = 0; i < kNumWarpgroups; ++i)
-        wgs.push_back(i);
-    } else if (wg >= 0 && wg < kNumWarpgroups) {
-      wgs.push_back(wg);
+    std::vector<CoreMask> cores;
+    for (CoreMask core : kConcreteCores) {
+      if (HasCore(core_mask, core))
+        cores.push_back(core);
     }
     for (bool at_beginning : {false, true}) {
-      for (int w : wgs) {
-        sites.emplace_back(pt, at_beginning, w, pipe);
+      for (CoreMask core : cores) {
+        sites.emplace_back(pt, at_beginning, core, pipe);
       }
     }
     return;
@@ -166,15 +165,12 @@ std::vector<SyncPoint> BarrierBuilder::CollectSyncPoints(
   auto deps = AnalyzeDependencies(nodes, loop_stack_, manual_,
                                   &dependency_cache_, cache_key);
 
-  // Expand a task's warpgroup id into the concrete wg ids it participates in.
-  auto expand_wgs = [&](int task_wg) {
-    std::vector<int> out;
-    if (IsWarpgroupBroadcast(task_wg)) {
-      for (int w = 0; w < kNumWarpgroups; ++w) {
-        out.push_back(w);
-      }
-    } else if (task_wg >= 0 && task_wg < kNumWarpgroups) {
-      out.push_back(task_wg);
+  // Expand a task mask into the concrete cores on which it participates.
+  auto expand_cores = [](CoreMask task_mask) {
+    std::vector<CoreMask> out;
+    for (CoreMask core : kConcreteCores) {
+      if (HasCore(task_mask, core))
+        out.push_back(core);
     }
     return out;
   };
@@ -222,15 +218,15 @@ std::vector<SyncPoint> BarrierBuilder::CollectSyncPoints(
       bool fix_unit_flag = hard_event.find("FIX") != std::string::npos &&
                            (HasUnitFlagCtrl(ppt.task()->stmt) ||
                             HasUnitFlagCtrl(cpt.task()->stmt));
-      for (int prod_wg : expand_wgs(ppt.task()->GetWarpgroupId())) {
-        for (int cons_wg : expand_wgs(cpt.task()->GetWarpgroupId())) {
+      for (CoreMask prod_core : expand_cores(ppt.task()->GetCoreMask())) {
+        for (CoreMask cons_core : expand_cores(cpt.task()->GetCoreMask())) {
           // Intra-core FIX unit-flag syncs are handled by the hardware.
-          if (prod_wg == cons_wg && fix_unit_flag)
+          if (prod_core == cons_core && fix_unit_flag)
             continue;
           size_t prod_site =
-              FindSiteId(SyncInsertionSite(ppt, false, prod_wg, prod_pipe));
+              FindSiteId(SyncInsertionSite(ppt, false, prod_core, prod_pipe));
           size_t cons_site =
-              FindSiteId(SyncInsertionSite(cpt, true, cons_wg, cons_pipe));
+              FindSiteId(SyncInsertionSite(cpt, true, cons_core, cons_pipe));
           sync_points.emplace_back(
               DepEdge(prod_site, cons_site, distance, true), num_versions,
               flag_loops);
@@ -280,10 +276,10 @@ BarrierBuilder::CollectSiteIds(const std::vector<IRStructure *> &nodes) const {
 void BarrierBuilder::AddSamePipeEdges(DepClosure &closure,
                                       const std::vector<size_t> &task_sites,
                                       int max_distance) const {
-  std::map<std::pair<int, std::string>, std::vector<size_t>> by_pipe;
+  std::map<std::pair<CoreMask, std::string>, std::vector<size_t>> by_pipe;
   for (size_t site_id : task_sites) {
     const SyncInsertionSite &site = sites_[site_id];
-    by_pipe[{site.wg, site.pipe}].push_back(site_id);
+    by_pipe[{site.core, site.pipe}].push_back(site_id);
   }
   // This level's iteration stage of a site (the outermost node in its chain is
   // the one carried by the loop being pipelined at this level).
@@ -599,33 +595,33 @@ void BarrierBuilder::AppendCrossIterFlagInfo(const FlagAllocation &allocation) {
   if (!IsCrossCore(sp)) {
     for (int version = 0; version < allocation.num_versions; ++version) {
       flag_infos_.push_back(
-          FlagInfo{src.wg, Integer(base_id + version), hard_event, 0});
+          FlagInfo{src.core, Integer(base_id + version), hard_event, 0});
     }
     return;
   }
 
   // Cross-core set uses the producer pipe; wait uses the consumer pipe.
-  if (!src.wg) {
+  if (src.core == kCoreVector) {
     for (int version = 0; version < allocation.num_versions; ++version) {
       flag_infos_.push_back(
-          FlagInfo{0, Integer(base_id + version), prod_pipe, 1});
+          FlagInfo{kCoreVector, Integer(base_id + version), prod_pipe, 1});
     }
     for (int sid = 0; sid < 2; ++sid) {
       for (int version = 0; version < allocation.num_versions; ++version) {
-        flag_infos_.push_back(
-            FlagInfo{1, Integer(base_id + sid * 16 + version), cons_pipe, 2});
+        flag_infos_.push_back(FlagInfo{
+            kCoreCube, Integer(base_id + sid * 16 + version), cons_pipe, 2});
       }
     }
   } else {
     for (int sid = 0; sid < 2; ++sid) {
       for (int version = 0; version < allocation.num_versions; ++version) {
-        flag_infos_.push_back(
-            FlagInfo{1, Integer(base_id + sid * 16 + version), prod_pipe, 1});
+        flag_infos_.push_back(FlagInfo{
+            kCoreCube, Integer(base_id + sid * 16 + version), prod_pipe, 1});
       }
     }
     for (int version = 0; version < allocation.num_versions; ++version) {
       flag_infos_.push_back(
-          FlagInfo{0, Integer(base_id + version), cons_pipe, 2});
+          FlagInfo{kCoreVector, Integer(base_id + version), cons_pipe, 2});
     }
   }
 }
@@ -654,7 +650,7 @@ void BarrierBuilder::InsertSyncPoints() {
         continue;
       }
       Stmt barrier = MakeAscendPipeBarrier(prod_pipe);
-      InsertStatementIntoScheduledNode(dst.node, barrier, true, dst.wg,
+      InsertStatementIntoScheduledNode(dst.node, barrier, true, dst.core,
                                        cons_guard);
       continue;
     }
@@ -665,16 +661,16 @@ void BarrierBuilder::InsertSyncPoints() {
         indexmod(flag_iteration, Integer(sp.num_versions)) + base_id;
 
     if (IsCrossCore(sp)) {
-      if (!src.wg) {
+      if (src.core == kCoreVector) {
         Stmt set_stmt = MakeAscendCrossCoreSetFlag(4, prod_pipe, event_id);
-        InsertStatementIntoScheduledNode(src.node, set_stmt, false, src.wg,
+        InsertStatementIntoScheduledNode(src.node, set_stmt, false, src.core,
                                          prod_guard);
         for (int sid = 0; sid < 2; ++sid) {
           Stmt wait_stmt = MakeAscendCrossCoreWaitFlag(
               4, cons_pipe,
               indexmod(flag_iteration, Integer(sp.num_versions)) +
                   Integer(base_id + 16 * sid));
-          InsertStatementIntoScheduledNode(dst.node, wait_stmt, true, dst.wg,
+          InsertStatementIntoScheduledNode(dst.node, wait_stmt, true, dst.core,
                                            cons_guard);
         }
       } else {
@@ -683,21 +679,21 @@ void BarrierBuilder::InsertSyncPoints() {
               4, prod_pipe,
               indexmod(flag_iteration, Integer(sp.num_versions)) +
                   Integer(base_id + 16 * sid));
-          InsertStatementIntoScheduledNode(src.node, set_stmt, false, src.wg,
+          InsertStatementIntoScheduledNode(src.node, set_stmt, false, src.core,
                                            prod_guard);
         }
         Stmt wait_stmt = MakeAscendCrossCoreWaitFlag(4, cons_pipe, event_id);
-        InsertStatementIntoScheduledNode(dst.node, wait_stmt, true, dst.wg,
+        InsertStatementIntoScheduledNode(dst.node, wait_stmt, true, dst.core,
                                          cons_guard);
       }
       continue;
     }
 
     Stmt set_stmt = MakeAscendSetFlag(hard_event, event_id);
-    InsertStatementIntoScheduledNode(src.node, set_stmt, false, src.wg,
+    InsertStatementIntoScheduledNode(src.node, set_stmt, false, src.core,
                                      prod_guard);
     Stmt wait_stmt = MakeAscendWaitFlag(hard_event, event_id);
-    InsertStatementIntoScheduledNode(dst.node, wait_stmt, true, dst.wg,
+    InsertStatementIntoScheduledNode(dst.node, wait_stmt, true, dst.core,
                                      cons_guard);
   }
 }

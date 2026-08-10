@@ -47,6 +47,7 @@
 #include <utility>
 #include <vector>
 
+#include "core_mask.h"
 #include "op/builtin.h"
 #include "runtime/thread_storage_scope.h"
 #include "tir/transforms/ir_utils.h"
@@ -207,7 +208,7 @@ struct LinearEvent {
   PrimExpr event_id_expr; // raw event_id expression (may contain loop vars)
   std::string pipe_name;  // for pipe_barrier
   int mode_id = 0;        // for cross_core
-  int wg_id = -1;         // Ascend core group: 0=AIV, 1=AIC, -1=unknown
+  CoreMask core_mask = kCoreUnassigned;
 
   // Scope markers
   const ForNode *for_node = nullptr;
@@ -317,14 +318,13 @@ private:
   }
 
   void VisitStmt_(const SBlockNode *op) final {
-    // 0 = Vector (AIV), 1 = Cube (AIC).
-    int saved = current_wg_;
+    CoreMask saved = current_core_mask_;
     if (op->name_hint == "VECTOR")
-      current_wg_ = 0;
+      current_core_mask_ = kCoreVector;
     else if (op->name_hint == "CUBE")
-      current_wg_ = 1;
+      current_core_mask_ = kCoreCube;
     StmtExprVisitor::VisitStmt_(op);
-    current_wg_ = saved;
+    current_core_mask_ = saved;
   }
 
   void VisitStmt_(const AttrStmtNode *op) final {
@@ -356,7 +356,7 @@ private:
       e.scope_level = static_cast<int>(scope_stack_.size());
       e.touched.push_back(buf);
       e.is_write.push_back(true);
-      e.wg_id = current_wg_;
+      e.core_mask = current_core_mask_;
       linear_events.push_back(e);
     }
   }
@@ -370,7 +370,7 @@ private:
       e.scope_level = static_cast<int>(scope_stack_.size());
       e.touched.push_back(buf);
       e.is_write.push_back(false);
-      e.wg_id = current_wg_;
+      e.core_mask = current_core_mask_;
       linear_events.push_back(e);
     }
   }
@@ -388,7 +388,7 @@ private:
       e.scope_level = static_cast<int>(scope_stack_.size());
       e.touched.push_back(op);
       e.is_write.push_back(false);
-      e.wg_id = current_wg_;
+      e.core_mask = current_core_mask_;
       linear_events.push_back(e);
     }
   }
@@ -425,7 +425,7 @@ private:
           e.scope_level = static_cast<int>(scope_stack_.size());
           e.touched.push_back(buf);
           e.is_write.push_back(is_write);
-          e.wg_id = current_wg_;
+          e.core_mask = current_core_mask_;
           linear_events.push_back(e);
           // Suppress the generic VarNode read for this buffer var while we
           // visit the rest of the access_ptr sub-expression.
@@ -450,7 +450,7 @@ private:
       if (auto *str_imm = call->args[0].as<StringImmNode>())
         e.hard_event = str_imm->value;
       e.event_id_expr = call->args[1];
-      e.wg_id = current_wg_;
+      e.core_mask = current_core_mask_;
       linear_events.push_back(e);
       return true;
     }
@@ -460,7 +460,7 @@ private:
       if (auto *str_imm = call->args[0].as<StringImmNode>())
         e.hard_event = str_imm->value;
       e.event_id_expr = call->args[1];
-      e.wg_id = current_wg_;
+      e.core_mask = current_core_mask_;
       linear_events.push_back(e);
       return true;
     }
@@ -469,7 +469,7 @@ private:
       ICHECK_GE(call->args.size(), 1U);
       if (auto *str_imm = call->args[0].as<StringImmNode>())
         e.hard_event = str_imm->value; // store pipe name in hard_event
-      e.wg_id = current_wg_;
+      e.core_mask = current_core_mask_;
       linear_events.push_back(e);
       return true;
     }
@@ -481,7 +481,7 @@ private:
       if (auto *str_imm = call->args[1].as<StringImmNode>())
         e.hard_event = str_imm->value; // store pipe name
       e.event_id_expr = call->args[2];
-      e.wg_id = current_wg_;
+      e.core_mask = current_core_mask_;
       linear_events.push_back(e);
       return true;
     }
@@ -493,7 +493,7 @@ private:
       if (auto *str_imm = call->args[1].as<StringImmNode>())
         e.hard_event = str_imm->value;
       e.event_id_expr = call->args[2];
-      e.wg_id = current_wg_;
+      e.core_mask = current_core_mask_;
       linear_events.push_back(e);
       return true;
     }
@@ -502,7 +502,7 @@ private:
 
   std::string target_scope_;
   bool in_thread_env_ = false;
-  int current_wg_ = -1; // 0=Vector(AIV), 1=Cube(AIC), -1=undetermined
+  CoreMask current_core_mask_ = kCoreUnassigned;
   // Buffer vars whose bare VarNode read should be suppressed because the
   // enclosing tvm_access_ptr already recorded the access with its rw_mask.
   std::unordered_set<const VarNode *> suppress_var_read_;
@@ -518,10 +518,10 @@ CoalesceBufferAccessRuns(const std::vector<LinearEvent> &events) {
   out.reserve(events.size());
   // Within the current run: buffer var → index in `out` of its access node.
   std::unordered_map<const VarNode *, int> run_nodes;
-  int run_wg = -2; // sentinel distinct from any real wg_id (incl. -1)
+  std::optional<CoreMask> run_core_mask;
   auto reset_run = [&]() {
     run_nodes.clear();
-    run_wg = -2;
+    run_core_mask.reset();
   };
   for (const LinearEvent &ev : events) {
     if (ev.kind != EventKind::kBufferAccess) {
@@ -530,9 +530,9 @@ CoalesceBufferAccessRuns(const std::vector<LinearEvent> &events) {
       out.push_back(ev);
       continue;
     }
-    if (ev.wg_id != run_wg)
+    if (!run_core_mask.has_value() || ev.core_mask != run_core_mask.value())
       reset_run();
-    run_wg = ev.wg_id;
+    run_core_mask = ev.core_mask;
     // Each access event touches exactly one buffer (see SyncAwareLinearizer).
     ICHECK_EQ(ev.touched.size(), 1U);
     const VarNode *buf = ev.touched[0];
@@ -1169,7 +1169,7 @@ struct EventInstance {
   std::string hard_event;
   PrimExpr event_id_expr;
   int mode_id = 0;
-  int wg_id = -1;
+  CoreMask core_mask = kCoreUnassigned;
   // Ids of *all* enclosing pipelined (multi-iteration) loops this instance
   // lives in, innermost last. Empty if the instance is at top level / only in
   // single-iteration loops. Two buffers that are both accessed inside the
@@ -1277,7 +1277,7 @@ static void BuildEventInstancesRecursive(
       inst.hard_event = ev.hard_event;
       inst.event_id_expr = ev.event_id_expr;
       inst.mode_id = ev.mode_id;
-      inst.wg_id = ev.wg_id;
+      inst.core_mask = ev.core_mask;
       inst.loop_ids = cur_loop_ids;
       instances.push_back(inst);
     }
@@ -1310,7 +1310,7 @@ static void BuildEventInstancesRecursive(
         inst.hard_event = ev.hard_event;
         inst.event_id_expr = ev.event_id_expr;
         inst.mode_id = ev.mode_id;
-        inst.wg_id = ev.wg_id;
+        inst.core_mask = ev.core_mask;
         inst.loop_ids = cur_loop_ids;
         instances.push_back(inst);
       }
@@ -1451,8 +1451,8 @@ private:
     // share no reuse paths → Pack falls back to sequential layout, which is
     // the safe answer when synchronization is invisible to us.
     //
-    // Release-acquire wiring is done PER CORE (per wg_id). In a Mix kernel the
-    // AIC (wg=1) and AIV (wg=0) instruction streams are interleaved in the
+    // Release-acquire wiring is done per concrete core mask. In a Mix kernel
+    // the Cube and Vector instruction streams are interleaved in the
     // single linear event list but execute concurrently, so an AIV buffer
     // access must NOT be wired to the nearest AIC sync (or vice-versa) merely
     // because they are adjacent in linear order — that would fabricate an
@@ -1460,8 +1460,8 @@ private:
     // closure, make almost every AIC node precede every AIV node (observed to
     // overlap two simultaneously-live L1 buffers). Genuine cross-core ordering
     // is established separately in AddSyncEdges by pairing CrossCore set→wait.
-    // Nodes with wg_id == -1 (single-core / non-Mix kernels, where the core is
-    // undetermined) all share one group, reproducing the previous behavior.
+    // Nodes with kCoreUnassigned (single-core / non-Mix kernels, where the core
+    // is undetermined) all share one group, reproducing the previous behavior.
     auto is_sync = [&](int idx) {
       EventKind k = instances[idx].kind;
       return k == EventKind::kSetFlag || k == EventKind::kWaitFlag ||
@@ -1479,12 +1479,12 @@ private:
              k == EventKind::kPipeBarrier;
     };
 
-    // Group by (unrolled_iter, wg_id) so wiring never crosses the AIC/AIV
+    // Group by (unrolled_iter, core_mask) so wiring never crosses the AIC/AIV
     // boundary. std::map keeps a deterministic group iteration order.
-    std::map<std::pair<int, int>, std::vector<int>> by_iter_core;
+    std::map<std::pair<int, CoreMask>, std::vector<int>> by_iter_core;
     for (int i = 0; i < N; ++i)
-      by_iter_core[{instances[i].unrolled_iter, instances[i].wg_id}].push_back(
-          i);
+      by_iter_core[{instances[i].unrolled_iter, instances[i].core_mask}]
+          .push_back(i);
 
     for (auto &kv : by_iter_core) {
       auto &nodes = kv.second;
@@ -1622,7 +1622,7 @@ private:
     // most recent set" within the single core). For cross-core flags, AIC
     // and AIV are CONCURRENT tracks: a wait on one side may textually
     // precede the set on the other side that releases it. We pair per-
-    // (setter_wg, waiter_wg) by position — the i-th set on the setter side
+    // (setter_core, waiter_core) by position — the i-th set on the setter side
     // pairs with the i-th wait on the waiter side, regardless of global
     // textual order.
     for (auto &kv : buckets) {
@@ -1653,30 +1653,30 @@ private:
                 });
 
       if (key.is_cross_core) {
-        auto collect = [&](int wg, bool is_set) {
+        auto collect = [&](CoreMask core, bool is_set) {
           std::vector<int> out;
           for (const Endpoint &e : eps) {
-            if (e.is_set == is_set && instances[e.idx].wg_id == wg)
+            if (e.is_set == is_set && instances[e.idx].core_mask == core)
               out.push_back(e.idx);
           }
           return out; // already in per-track linear order
         };
-        auto pair_across = [&](int setter_wg, int waiter_wg) {
-          std::vector<int> sets = collect(setter_wg, true);
-          std::vector<int> waits = collect(waiter_wg, false);
+        auto pair_across = [&](CoreMask setter_core, CoreMask waiter_core) {
+          std::vector<int> sets = collect(setter_core, true);
+          std::vector<int> waits = collect(waiter_core, false);
           size_t n = std::min(sets.size(), waits.size());
           for (size_t k = 0; k < n; ++k)
             AddEdge(sets[k], waits[k]);
         };
-        pair_across(/*Cube  */ 1, /*Vector*/ 0); // AIC set → AIV wait
-        pair_across(/*Vector*/ 0, /*Cube  */ 1); // AIV set → AIC wait
+        pair_across(kCoreCube, kCoreVector); // AIC set → AIV wait
+        pair_across(kCoreVector, kCoreCube); // AIV set → AIC wait
 
         // Defensive fallback for cross-core endpoints outside any
-        // CUBE/VECTOR block (wg_id == -1): pair them among themselves by
+        // CUBE/VECTOR block (unassigned): pair them among themselves by
         // textual order, so we don't double-pair with the edges above.
         std::vector<int> pending;
         for (const Endpoint &ep : eps) {
-          if (instances[ep.idx].wg_id != -1)
+          if (instances[ep.idx].core_mask != kCoreUnassigned)
             continue;
           if (ep.is_set) {
             pending.push_back(ep.idx);
@@ -1712,35 +1712,38 @@ private:
     }
 
     // A pipe_barrier is a PER-CORE pipe fence: it orders only the instruction
-    // stream of the core that issued it. On a Mix kernel the AIC (wg=1) and AIV
-    // (wg=0) streams execute concurrently, so a barrier on one core must NOT be
+    // stream of the core that issued it. On a Mix kernel the Cube and Vector
+    // streams execute concurrently, so a barrier on one core must NOT be
     // wired to the other core's nodes (that would fabricate an intra-core
     // happens-before across the AIC/AIV boundary). We therefore only connect a
-    // barrier to instances sharing its wg_id. A wg_id == -1 barrier
+    // barrier to instances sharing its core mask. An unassigned barrier
     // (single-core / non-Mix kernel, where the core is undetermined) connects
-    // all wg_id == -1 nodes, reproducing the previous behavior.
+    // all unassigned nodes, reproducing the previous behavior.
     for (auto &kv : barriers_by_iter) {
       int u = kv.first;
       for (int b_node : kv.second) {
         int b_linear = instances[b_node].linear_idx;
-        int b_wg = instances[b_node].wg_id;
+        CoreMask barrier_core = instances[b_node].core_mask;
 
         // All nodes before the barrier in this iteration (same core) → barrier.
         for (int i = 0; i < N; ++i) {
-          if (instances[i].wg_id == b_wg && instances[i].unrolled_iter == u &&
+          if (instances[i].core_mask == barrier_core &&
+              instances[i].unrolled_iter == u &&
               instances[i].linear_idx < b_linear)
             AddEdge(i, b_node);
         }
         // Barrier → all nodes after the barrier in this iteration (same core).
         for (int i = 0; i < N; ++i) {
-          if (instances[i].wg_id == b_wg && instances[i].unrolled_iter == u &&
+          if (instances[i].core_mask == barrier_core &&
+              instances[i].unrolled_iter == u &&
               instances[i].linear_idx > b_linear)
             AddEdge(b_node, i);
         }
 
         // Barrier → all nodes in the next unrolled iteration (same core).
         for (int i = 0; i < N; ++i) {
-          if (instances[i].wg_id == b_wg && instances[i].unrolled_iter == u + 1)
+          if (instances[i].core_mask == barrier_core &&
+              instances[i].unrolled_iter == u + 1)
             AddEdge(b_node, i);
         }
       }
@@ -1761,29 +1764,30 @@ private:
     // iterations — and thus falsely reusable — even though both are live
     // across the whole loop (e.g. double-buffered K/V in flash-attention).
     //
-    // Loop-carried ordering is PER CORE. On a Mix kernel the AIC (wg=1) and AIV
-    // (wg=0) loops are independent parallel sequences that each number their
+    // Loop-carried ordering is per core. On a Mix kernel the Cube and Vector
+    // loops are independent parallel sequences that each number their
     // iterations 0,1,2,… in the same unrolled_iter space. Wiring "iter u → iter
-    // u+1" across all wg_ids would fabricate a cross-core happens-before (AIC's
+    // u+1" across all core masks would fabricate a cross-core happens-before
+    // (AIC's
     // iteration k appearing to precede AIV's iteration k+1) that the hardware
     // never guarantees — the only legitimate AIC↔AIV ordering is a CrossCore
-    // set→wait pair (added in AddSyncEdges). So we group by (wg_id,
-    // unrolled_iter) and add iteration edges only within a single core. wg_id
-    // == -1 (single-core / non-Mix) keeps its own group, reproducing prior
-    // behavior.
-    std::unordered_map<int, std::map<int, std::vector<int>>> nodes_by_core_iter;
-    std::unordered_map<int, std::map<int, int>> phys_by_core_iter;
+    // set→wait pair (added in AddSyncEdges). So we group by (core_mask,
+    // unrolled_iter) and add iteration edges only within a single core.
+    // kCoreUnassigned (single-core / non-Mix) keeps its own group.
+    std::unordered_map<CoreMask, std::map<int, std::vector<int>>>
+        nodes_by_core_iter;
+    std::unordered_map<CoreMask, std::map<int, int>> phys_by_core_iter;
     for (int i = 0; i < N; ++i) {
-      int wg = instances[i].wg_id;
+      CoreMask core = instances[i].core_mask;
       int u = instances[i].unrolled_iter;
-      nodes_by_core_iter[wg][u].push_back(i);
-      phys_by_core_iter[wg][u] = instances[i].physical_iter;
+      nodes_by_core_iter[core][u].push_back(i);
+      phys_by_core_iter[core][u] = instances[i].physical_iter;
     }
 
     for (auto &core_kv : nodes_by_core_iter) {
-      int wg = core_kv.first;
+      CoreMask core = core_kv.first;
       auto &nodes_by_iter = core_kv.second;
-      auto &phys_for_unrolled = phys_by_core_iter[wg];
+      auto &phys_for_unrolled = phys_by_core_iter[core];
       for (const auto &it_kv : nodes_by_iter) {
         int u = it_kv.first;
         auto next = nodes_by_iter.find(u + 1);

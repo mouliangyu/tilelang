@@ -84,7 +84,7 @@ def _make_loop_nested_pad_writer_program():
     return main
 
 
-def test_loop_nested_pad_writer_follows_external_reader_warpgroup():
+def test_loop_nested_pad_writer_follows_external_reader_core():
     source = lower(_make_loop_nested_pad_writer_program(), target="ascend").kernel_source
     writer = source.index("set_mov_pad_val")
     reader = source.index("copy_gm_to_ubuf_align_v2")
@@ -122,7 +122,7 @@ def _make_nested_loop_break_program():
     return main
 
 
-def test_nested_loop_break_is_emitted_in_every_warpgroup():
+def test_nested_loop_break_is_emitted_on_every_core():
     source = lower(_make_nested_loop_break_program(), target="ascend").kernel_source
     aic_start = source.index("if ASCEND_IS_AIC")
     aiv_start = source.index("if ASCEND_IS_AIV")

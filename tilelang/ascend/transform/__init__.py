@@ -69,9 +69,9 @@ def AutoSchedule():
     return _ffi_api.AutoSchedule()  # type: ignore
 
 
-def WarpgroupPartition():
-    """Lower scheduled tasks into their AIV/AIC warpgroup bodies."""
-    return _ffi_api.WarpgroupPartition()  # type: ignore
+def CorePartition():
+    """Lower scheduled tasks into their AIV/AIC core bodies."""
+    return _ffi_api.CorePartition()  # type: ignore
 
 
 def RewriteDualCopy():
@@ -162,6 +162,7 @@ __all__ = [
     "AscendInsertOOBPadding",
     "AscendSimdVFLowerParallel",
     "AutoSchedule",
+    "CorePartition",
     "LatencyEstimator",
     "IfConditionExtract",
     "InsertNd2Nz",
@@ -179,5 +180,4 @@ __all__ = [
     "RewriteFp4ToFp4x2",
     "RewriteFlagToBuf",
     "UnrollLoopSkipVF",
-    "WarpgroupPartition",
 ]

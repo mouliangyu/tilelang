@@ -45,7 +45,7 @@ using MultiVersionBufferMap = std::unordered_map<Buffer, MultiVersionBufferInfo,
                                                  ObjectPtrHash, ObjectPtrEqual>;
 
 struct FlagInfo {
-  int warpgroup_id;
+  CoreMask core_mask;
   PrimExpr flag_var;
   std::string hardevent;
   int mode;
@@ -68,14 +68,15 @@ std::string GetHardEvent(const std::string &producer_pipe,
 struct SyncInsertionSite {
   IRStructure *node;
   bool at_beginning;
-  int wg;
+  CoreMask core;
   std::string pipe;
   std::vector<const IRStructure *> chain;
 
-  SyncInsertionSite(const BufferAccessPoint &pt, bool at_beginning, int wg,
-                    std::string pipe)
-      : node(nullptr), at_beginning(at_beginning), wg(wg),
+  SyncInsertionSite(const BufferAccessPoint &pt, bool at_beginning,
+                    CoreMask core, std::string pipe)
+      : node(nullptr), at_beginning(at_beginning), core(core),
         pipe(std::move(pipe)) {
+    ICHECK(IsConcreteCore(core));
     for (const IRStructure *path_node : pt.path) {
       node = const_cast<IRStructure *>(path_node);
       chain.push_back(node);
@@ -112,13 +113,13 @@ struct SyncInsertionSite {
     int cmp = Compare(other);
     if (cmp != 0)
       return cmp < 0;
-    if (wg != other.wg)
-      return wg < other.wg;
+    if (core != other.core)
+      return core < other.core;
     return pipe < other.pipe;
   }
 
   bool operator==(const SyncInsertionSite &other) const {
-    return Compare(other) == 0 && wg == other.wg && pipe == other.pipe;
+    return Compare(other) == 0 && core == other.core && pipe == other.pipe;
   }
 
   PrimExpr GetGuard() const {
@@ -391,7 +392,7 @@ private:
                             const DepClosure &closure) const;
 
   bool IsCrossCore(const SyncPoint &sp) const {
-    return sp.edge.Src(sites_).wg != sp.edge.Dst(sites_).wg;
+    return sp.edge.Src(sites_).core != sp.edge.Dst(sites_).core;
   }
 
   bool UsesFlag(const SyncPoint &sp) const {
@@ -404,8 +405,8 @@ private:
     const SyncInsertionSite &a_dst = a.edge.Dst(sites_);
     const SyncInsertionSite &b_src = b.edge.Src(sites_);
     const SyncInsertionSite &b_dst = b.edge.Dst(sites_);
-    return a_src.wg == b_src.wg && a_src.pipe == b_src.pipe &&
-           a_dst.wg == b_dst.wg && a_dst.pipe == b_dst.pipe;
+    return a_src.core == b_src.core && a_src.pipe == b_src.pipe &&
+           a_dst.core == b_dst.core && a_dst.pipe == b_dst.pipe;
   }
 
   bool HasCompatibleFlagKind(const SyncPoint &a, const SyncPoint &b) const {
@@ -445,7 +446,6 @@ private:
                   const ControlNode *cache_key, bool is_loop_body,
                   const std::map<Buffer, int64_t> &buffer_num_versions);
 
-  static constexpr int kNumWarpgroups = 2;
   static constexpr int kIntraCoreFlagLimit = 8;
   static constexpr int kCrossCoreFlagLimit = 16;
 

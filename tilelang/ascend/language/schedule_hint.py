@@ -61,7 +61,7 @@ def Task(latency: int | None = None, ii: int | None = None):
     Statements issue in source order without internal synchronization, so each
     preceding statement contributes its II and only the final statement exposes
     its latency. All statements must use one Ascend hardware pipe and one AIC/AIV
-    warpgroup affinity; split cross-pipe or cross-warpgroup sequences into
+    core affinity; split cross-pipe or cross-core sequences into
     separate tasks. A ``dual_copy`` is supported only when it remains the sole
     top-level, single-pipe statement after preprocessing. The marker does not
     select or launch a core by itself.
