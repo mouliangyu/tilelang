@@ -792,29 +792,18 @@ public:
                                                  // versions for multi-buffering
 };
 
-// Structure to store TaskNode with its loop context information
-struct TaskNodeWithContext {
-  TaskNode *task;
-  ControlNode *control_node{nullptr}; // nullptr if not inside a loop
-};
-
 inline bool IsRegisterRegion(const BufferRegion &region) {
   String scope = region->buffer.scope();
   return scope == "local" || scope == "local.var" || scope == "local.fragment";
 }
 
-// Helper function to collect all TaskNodes with context information
-void CollectAllTaskNodesWithContext(
-    IRStructure *node, std::vector<TaskNodeWithContext> &all_tasks,
-    ControlNode *current_control_node = nullptr);
+void CollectAllTaskNodes(IRStructure *node, std::vector<TaskNode *> &all_tasks);
 
-// List overload: collect across an ordered list of top-level nodes.
-inline void CollectAllTaskNodesWithContext(
-    const std::vector<std::shared_ptr<IRStructure>> &nodes,
-    std::vector<TaskNodeWithContext> &all_tasks) {
-  for (const auto &node : nodes) {
-    CollectAllTaskNodesWithContext(node.get(), all_tasks, nullptr);
-  }
+inline void
+CollectAllTaskNodes(const std::vector<std::shared_ptr<IRStructure>> &nodes,
+                    std::vector<TaskNode *> &all_tasks) {
+  for (const auto &node : nodes)
+    CollectAllTaskNodes(node.get(), all_tasks);
 }
 
 // Structure to represent a data dependency between a producer and consumer node

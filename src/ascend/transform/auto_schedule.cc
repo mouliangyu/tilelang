@@ -26,6 +26,7 @@
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/container/map.h>
 #include <tvm/ffi/extra/structural_equal.h>
+#include <tvm/ffi/extra/structural_hash.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/function.h>
@@ -51,7 +52,6 @@
 #include <numeric>
 #include <optional>
 #include <queue>
-#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -1061,105 +1061,106 @@ static void WarnOnUnappliedBufferVersionOverrides(
   }
 }
 
-struct CrossCoreTaskInfo {
-  TaskNode *task;
-  ControlNode *control_node;
-  PrimExpr flag_id;
-  String pipe;
-  CoreMask core_hint;
-};
+using CrossCoreCallMap = std::unordered_map<TaskNode *, std::vector<Call>>;
+using CrossCoreHintMap =
+    std::unordered_map<PrimExpr, CoreMask, ffi::StructuralHash,
+                       ffi::StructuralEqual>;
 
-static void
-AssignCrossCoreTasks(const std::vector<TaskNodeWithContext> &all_tasks) {
-  std::vector<CrossCoreTaskInfo> sync_tasks;
-  sync_tasks.reserve(all_tasks.size());
-  CoreMask kernel_core_mask = kCoreUnassigned;
-  for (const TaskNodeWithContext &task_ctx : all_tasks) {
+static void AssignCrossCoreTasksInList(
+    const std::vector<std::shared_ptr<IRStructure>> &nodes,
+    const CrossCoreCallMap &cross_core_calls, CoreMask kernel_core_mask) {
+  std::vector<TaskNode *> scoped_tasks;
+  for (const auto &node : nodes) {
+    if (!node->IsTask())
+      continue;
+    auto *task = static_cast<TaskNode *>(node.get());
     // PerCoreTask consumes its embedded cross-core synchronization internally.
     // Keep the core already inferred from its ordinary operation instead
-    // of merging those calls into an outer synchronization group.
-    if (task_ctx.task->IsPerCoreTask()) {
-      CoreMask core_mask = task_ctx.task->GetCoreMask();
+    // of merging those calls into outer placement inference.
+    if (task->IsPerCoreTask())
+      continue;
+    auto calls_it = cross_core_calls.find(task);
+    if (calls_it == cross_core_calls.end())
+      continue;
+    scoped_tasks.push_back(task);
+  }
+
+  CrossCoreHintMap flag_core_hints;
+  for (TaskNode *task : scoped_tasks) {
+    for (const Call &call : cross_core_calls.at(task))
+      flag_core_hints[call->args[2]] |=
+          GetCrossCorePipeInfo(call->args[1]).core_mask;
+  }
+
+  std::unordered_map<TaskNode *, CoreMask> task_core_masks;
+  for (TaskNode *task : scoped_tasks) {
+    for (const Call &call : cross_core_calls.at(task)) {
+      const PrimExpr &flag_id = call->args[2];
+      CoreMask core_mask = flag_core_hints.at(flag_id);
+      if (core_mask == kCoreBroadcast) {
+        LOG(FATAL) << "Cross-core set/wait calls with flag " << flag_id
+                   << " in one control scope resolve to both Vector and Cube "
+                      "cores; all matching calls must run on the same core";
+      }
+      if (core_mask == kCoreUnassigned && IsConcreteCore(kernel_core_mask)) {
+        // PIPE_S and PIPE_MTE2 exist on both core types. A pure kernel supplies
+        // the only possible placement when neither side of the pair is pinned.
+        core_mask = kernel_core_mask;
+      } else if (!IsConcreteCore(core_mask)) {
+        LOG(FATAL)
+            << "Cannot infer the core for cross-core set/wait calls with flag "
+            << flag_id << " in one control scope"
+            << ": PIPE_S and PIPE_MTE2 are ambiguous in a mixed or empty "
+               "kernel. Use PIPE_V/PIPE_MTE3 for Vector or "
+               "PIPE_M/PIPE_MTE1/PIPE_FIX for Cube on at least one call in "
+               "that scope";
+      }
+      task_core_masks[task] |= core_mask;
+    }
+  }
+  for (const auto &[task, core_mask] : task_core_masks) {
+    if (core_mask == kCoreBroadcast) {
+      LOG(FATAL) << "Cross-core synchronization calls in one task resolve to "
+                    "both Vector and Cube cores: "
+                 << task->stmt;
+    }
+    task->SetCoreMask(core_mask);
+  }
+
+  // A flag ID may be reused sequentially in another control scope. Recurse
+  // into each ordered child list so only calls with the same immediate parent
+  // influence the same core inference.
+  for (const auto &node : nodes) {
+    if (node->IsControl()) {
+      auto *control = static_cast<ControlNode *>(node.get());
+      AssignCrossCoreTasksInList(control->children, cross_core_calls,
+                                 kernel_core_mask);
+    }
+  }
+}
+
+static void
+AssignCrossCoreTasks(const std::vector<std::shared_ptr<IRStructure>> &root,
+                     const std::vector<TaskNode *> &all_tasks) {
+  CoreMask kernel_core_mask = kCoreUnassigned;
+  CrossCoreCallMap cross_core_calls;
+  for (TaskNode *task : all_tasks) {
+    if (task->IsPerCoreTask()) {
+      CoreMask core_mask = task->GetCoreMask();
       if (IsConcreteCore(core_mask))
         kernel_core_mask |= core_mask;
       continue;
     }
-    std::vector<Call> calls = CollectCrossCoreCalls(task_ctx.task);
-    if (calls.empty()) {
-      CoreMask core_mask = task_ctx.task->GetCoreMask();
-      if (IsConcreteCore(core_mask))
-        kernel_core_mask |= core_mask;
+    std::vector<Call> calls = CollectCrossCoreCalls(task);
+    if (!calls.empty()) {
+      cross_core_calls.emplace(task, std::move(calls));
       continue;
     }
-    for (const Call &call : calls) {
-      const auto *pipe_imm = call->args[1].as<StringImmNode>();
-      ICHECK(pipe_imm);
-      CrossCorePipeInfo pipe_info = GetCrossCorePipeInfo(call->args[1]);
-      sync_tasks.push_back({task_ctx.task, task_ctx.control_node, call->args[2],
-                            pipe_imm->value, pipe_info.core_mask});
-    }
+    CoreMask core_mask = task->GetCoreMask();
+    if (IsConcreteCore(core_mask))
+      kernel_core_mask |= core_mask;
   }
-  if (sync_tasks.empty())
-    return;
-
-  struct SyncGroup {
-    ControlNode *control_node;
-    PrimExpr flag_id;
-    std::vector<CrossCoreTaskInfo *> tasks;
-    CoreMask core_hints{kCoreUnassigned};
-  };
-  std::vector<SyncGroup> groups;
-  ffi::StructuralEqual structural_equal;
-  for (CrossCoreTaskInfo &sync_task : sync_tasks) {
-    SyncGroup *group = nullptr;
-    for (SyncGroup &candidate : groups) {
-      if (candidate.control_node == sync_task.control_node &&
-          structural_equal(candidate.flag_id, sync_task.flag_id)) {
-        group = &candidate;
-        break;
-      }
-    }
-    if (!group) {
-      groups.push_back(
-          {sync_task.control_node, sync_task.flag_id, {}, /*hints=*/0});
-      group = &groups.back();
-    }
-    group->tasks.push_back(&sync_task);
-    group->core_hints |= sync_task.core_hint;
-  }
-
-  for (const SyncGroup &group : groups) {
-    if (group.core_hints == kCoreBroadcast) {
-      std::ostringstream pipes;
-      for (size_t i = 0; i < group.tasks.size(); ++i) {
-        if (i)
-          pipes << ", ";
-        pipes << group.tasks[i]->pipe;
-      }
-      LOG(FATAL) << "Cross-core set/wait group for flag " << group.flag_id
-                 << " resolves to both Vector and Cube cores from pipes "
-                 << pipes.str()
-                 << "; all calls in one synchronization group must run on "
-                    "the same core";
-    }
-
-    CoreMask core_mask = group.core_hints;
-    if (core_mask == kCoreUnassigned && IsConcreteCore(kernel_core_mask)) {
-      // PIPE_S and PIPE_MTE2 exist on both core types. A pure kernel supplies
-      // the only possible placement when neither side of the pair is pinned.
-      core_mask = kernel_core_mask;
-    } else if (!IsConcreteCore(core_mask)) {
-      LOG(FATAL)
-          << "Cannot infer the core for cross-core set/wait group with flag "
-          << group.flag_id
-          << ": PIPE_S and PIPE_MTE2 are ambiguous in a mixed or empty "
-             "kernel. Use PIPE_V/PIPE_MTE3 for Vector or "
-             "PIPE_M/PIPE_MTE1/PIPE_FIX for Cube on at least one call in "
-             "the group";
-    }
-    for (const CrossCoreTaskInfo *sync_task : group.tasks)
-      sync_task->task->SetCoreMask(core_mask);
-  }
+  AssignCrossCoreTasksInList(root, cross_core_calls, kernel_core_mask);
 }
 
 // Collect every mode-0 CrossCore flag range used explicitly by the source
@@ -1220,7 +1221,7 @@ CollectExplicitCrossCoreFlags(const Stmt &kernel_body) {
 class CoreMaskPropagator {
 public:
   static void Assign(const std::vector<std::shared_ptr<IRStructure>> &root,
-                     const std::vector<TaskNodeWithContext> &all_tasks) {
+                     const std::vector<TaskNode *> &all_tasks) {
     CoreMaskPropagator analyzer(root, all_tasks);
     analyzer.Run_();
   }
@@ -1243,17 +1244,75 @@ private:
   };
 
   CoreMaskPropagator(const std::vector<std::shared_ptr<IRStructure>> &root,
-                     const std::vector<TaskNodeWithContext> &all_tasks)
+                     const std::vector<TaskNode *> &all_tasks)
       : root_(root), all_tasks_(all_tasks) {}
 
   void Run_() {
+    AssignInitialCoreMasks_();
     CollectSpecialRegisterDemand_(root_);
     AssignSpecialRegisterWriters_();
-    AssignCrossCoreTasks(all_tasks_);
+    AssignCrossCoreTasks(root_, all_tasks_);
     for (const auto &node : root_)
       SeedReads_(node.get(), kCoreBroadcast);
     PropagateReadsToFixedPoint_();
     AssignScalarWriters_();
+    AssignFallbackCore_();
+  }
+
+  void AssignInitialCoreMasks_() {
+    for (TaskNode *task : all_tasks_) {
+      // Special-register writers are placed from their concrete use sites
+      // after ordinary compute and data-movement tasks have been pinned.
+      if (task->GetSpecialWriteMask() != 0) {
+        task->SetCoreMask(kCoreUnassigned);
+        continue;
+      }
+      uint16_t pipe_mask = task->GetPipeMask();
+      if (pipe_mask & static_cast<uint16_t>(ResourcePipe::kCube)) {
+        task->SetCoreMask(kCoreCube);
+      } else if (pipe_mask & static_cast<uint16_t>(ResourcePipe::kVector)) {
+        task->SetCoreMask(kCoreVector);
+      } else if (pipe_mask & static_cast<uint16_t>(ResourcePipe::kMTE1) ||
+                 pipe_mask & static_cast<uint16_t>(ResourcePipe::kFixpipe)) {
+        task->SetCoreMask(kCoreCube);
+      } else if (pipe_mask & static_cast<uint16_t>(ResourcePipe::kMTE3)) {
+        task->SetCoreMask(kCoreVector);
+      } else if (pipe_mask & static_cast<uint16_t>(ResourcePipe::kMTE2)) {
+        bool to_l1 = false;
+        for (const BufferRegion &region : task->GetWriteRegions()) {
+          if (IsL1Buffer(region->buffer)) {
+            to_l1 = true;
+            break;
+          }
+        }
+        task->SetCoreMask(to_l1 ? kCoreCube : kCoreVector);
+      } else if (task->UsesPipe(ResourcePipe::kScalar) || pipe_mask == 0) {
+        // A scalar / mask-0 task issues on the S pipe, but its core is still
+        // fixed by the on-chip memory it touches: UB is Vector-side, while
+        // L1/L0A/L0B/L0C are Cube-side.
+        bool touches_ub = false;
+        bool touches_cube = false;
+        auto scan = [&](const Array<BufferRegion> &regions) {
+          for (const BufferRegion &region : regions) {
+            if (IsSharedBuffer(region->buffer))
+              touches_ub = true;
+            else if (IsL1Buffer(region->buffer) ||
+                     IsL0ABuffer(region->buffer) ||
+                     IsL0BBuffer(region->buffer) || IsL0CBuffer(region->buffer))
+              touches_cube = true;
+          }
+        };
+        scan(task->GetReadRegions());
+        scan(task->GetWriteRegions());
+        if (touches_ub && !touches_cube) {
+          task->SetCoreMask(kCoreVector);
+        } else if (touches_cube && !touches_ub) {
+          task->SetCoreMask(kCoreCube);
+        } else {
+          task->SetCoreMask(kCoreBroadcast);
+        }
+      }
+    }
   }
 
   static CoreMask GetConcreteCoreMask_(const TaskNode *task) {
@@ -1299,7 +1358,8 @@ private:
         continue;
       auto *task = static_cast<TaskNode *>(node.get());
       // CrossCore bits only order their target hardware pipe. The calls are
-      // placed by matching pipe hints in their flag group, not by demand.
+      // placed by matching flag uses in their immediate control scope, not by
+      // demand.
       if (!CollectCrossCoreCalls(task).empty())
         continue;
       uint16_t write_mask = task->GetSpecialWriteMask();
@@ -1318,8 +1378,7 @@ private:
   }
 
   void AssignSpecialRegisterWriters_() {
-    for (const TaskNodeWithContext &task_ctx : all_tasks_) {
-      TaskNode *task = task_ctx.task;
+    for (TaskNode *task : all_tasks_) {
       // loop_break controls the enclosing loop itself, so it must survive in
       // every core clone of that loop even when all concrete work is
       // nested below another ControlNode and contributes no same-level demand.
@@ -1433,8 +1492,7 @@ private:
     bool changed = true;
     while (changed) {
       changed = false;
-      for (const TaskNodeWithContext &task_ctx : all_tasks_) {
-        TaskNode *task = task_ctx.task;
+      for (TaskNode *task : all_tasks_) {
         if (!task->UsesPipe(ResourcePipe::kScalar) && !IsLetDeclTask(task))
           continue;
         if (AddReadsDemand_(task, GetWriteDemand_(task)))
@@ -1449,8 +1507,7 @@ private:
   }
 
   void AssignScalarWriters_() {
-    for (const TaskNodeWithContext &task_ctx : all_tasks_) {
-      TaskNode *task = task_ctx.task;
+    for (TaskNode *task : all_tasks_) {
       if (task->ContainsLoopBreak())
         continue; // Assigned broadcast above; never demote from local demand.
       if (task->GetCoreMask() != kCoreBroadcast)
@@ -1465,8 +1522,23 @@ private:
     }
   }
 
+  void AssignFallbackCore_() {
+    bool has_cube_core = false;
+    for (TaskNode *task : all_tasks_) {
+      if (task->GetCoreMask() == kCoreCube)
+        has_cube_core = true;
+    }
+    CoreMask fallback_core = has_cube_core ? kCoreCube : kCoreVector;
+    for (TaskNode *task : all_tasks_) {
+      CoreMask core_mask = task->GetCoreMask();
+      if (core_mask == kCoreUnassigned ||
+          (core_mask == kCoreBroadcast && task->IsPerCoreTask()))
+        task->SetCoreMask(fallback_core);
+    }
+  }
+
   const std::vector<std::shared_ptr<IRStructure>> &root_;
-  const std::vector<TaskNodeWithContext> &all_tasks_;
+  const std::vector<TaskNode *> &all_tasks_;
   VarDemandMap var_demand_;
   BufferDemandMap buffer_demand_;
   SpecialRegisterDemandMap special_writer_demand_;
@@ -1486,12 +1558,12 @@ static ScheduledKernelResult ScheduleSingleKernel(
 
   ICHECK(!ir_structure.empty()) << "IRStructure is empty (empty body?)";
 
-  std::vector<TaskNodeWithContext> costed_tasks;
-  CollectAllTaskNodesWithContext(ir_structure, costed_tasks);
-  for (const TaskNodeWithContext &task_ctx : costed_tasks) {
-    TVM_FFI_CHECK_GT(task_ctx.task->GetII(), 0, ValueError)
+  std::vector<TaskNode *> costed_tasks;
+  CollectAllTaskNodes(ir_structure, costed_tasks);
+  for (TaskNode *task : costed_tasks) {
+    TVM_FFI_CHECK_GT(task->GetII(), 0, ValueError)
         << "AutoSchedule found a task without latency/II annotations: "
-        << task_ctx.task->stmt
+        << task->stmt
         << ". Run tl.transform.LatencyEstimator immediately before "
            "AutoSchedule.";
   }
@@ -1515,87 +1587,9 @@ static ScheduledKernelResult ScheduleSingleKernel(
   unit_builder.SetManualMultiBuffer(manual_multi_buffer_versions);
   unit_builder.ScheduleList(ir_structure);
 
-  // Assign core masks based on pipe and buffer scopes.
-  {
-    std::vector<TaskNodeWithContext> all_tasks;
-    CollectAllTaskNodesWithContext(ir_structure, all_tasks);
-    for (auto &task_ctx : all_tasks) {
-      auto *t = task_ctx.task;
-      // Special-register writers are placed from their concrete use sites
-      // after ordinary compute and data-movement tasks have been pinned.
-      if (t->GetSpecialWriteMask() != 0) {
-        t->SetCoreMask(kCoreUnassigned);
-        continue;
-      }
-      uint16_t m = t->GetPipeMask();
-      if (m & static_cast<uint16_t>(ResourcePipe::kCube)) {
-        t->SetCoreMask(kCoreCube);
-      } else if (m & static_cast<uint16_t>(ResourcePipe::kVector)) {
-        t->SetCoreMask(kCoreVector);
-      } else if (m & static_cast<uint16_t>(ResourcePipe::kMTE1) ||
-                 m & static_cast<uint16_t>(ResourcePipe::kFixpipe)) {
-        t->SetCoreMask(kCoreCube);
-      } else if (m & static_cast<uint16_t>(ResourcePipe::kMTE3)) {
-        t->SetCoreMask(kCoreVector);
-      } else if (m & static_cast<uint16_t>(ResourcePipe::kMTE2)) {
-        bool to_l1 = false;
-        for (auto &r : t->GetWriteRegions()) {
-          if (IsL1Buffer(r->buffer)) {
-            to_l1 = true;
-            break;
-          }
-        }
-        t->SetCoreMask(to_l1 ? kCoreCube : kCoreVector);
-      } else if (t->UsesPipe(ResourcePipe::kScalar) || m == 0) {
-        // A scalar / mask-0 task issues on the S pipe, but its core is still
-        // fixed by the on-chip memory it touches: UB is Vector-side, while
-        // L1/L0A/L0B/L0C are Cube-side.
-        bool touches_ub = false, touches_cube = false;
-        auto scan = [&](const Array<BufferRegion> &regions) {
-          for (auto &r : regions) {
-            if (IsSharedBuffer(r->buffer))
-              touches_ub = true;
-            else if (IsL1Buffer(r->buffer) || IsL0ABuffer(r->buffer) ||
-                     IsL0BBuffer(r->buffer) || IsL0CBuffer(r->buffer))
-              touches_cube = true;
-          }
-        };
-        scan(t->GetReadRegions());
-        scan(t->GetWriteRegions());
-        if (touches_ub && !touches_cube) {
-          t->SetCoreMask(kCoreVector);
-        } else if (touches_cube && !touches_ub) {
-          t->SetCoreMask(kCoreCube);
-        } else {
-          t->SetCoreMask(kCoreBroadcast);
-        }
-      }
-    }
-
-    CoreMaskPropagator::Assign(ir_structure, all_tasks);
-  }
-
-  // Fallback: pin every unresolved task -- plus any still-broadcast
-  // PerCoreTask, which has no core-specific memory placement to demote it -- to
-  // a single core: Cube if the kernel has any concrete Cube-side work, else
-  // Vector.
-  {
-    std::vector<TaskNodeWithContext> all_tasks;
-    CollectAllTaskNodesWithContext(ir_structure, all_tasks);
-    std::vector<TaskNode *> unresolved;
-    bool has_cube_core = false;
-    for (auto &task_ctx : all_tasks) {
-      CoreMask core_mask = task_ctx.task->GetCoreMask();
-      if (core_mask == kCoreCube)
-        has_cube_core = true;
-      else if (core_mask == kCoreUnassigned ||
-               (core_mask == kCoreBroadcast && task_ctx.task->IsPerCoreTask()))
-        unresolved.push_back(task_ctx.task);
-    }
-    CoreMask fallback_core = has_cube_core ? kCoreCube : kCoreVector;
-    for (auto *t : unresolved)
-      t->SetCoreMask(fallback_core);
-  }
+  std::vector<TaskNode *> all_tasks;
+  CollectAllTaskNodes(ir_structure, all_tasks);
+  CoreMaskPropagator::Assign(ir_structure, all_tasks);
 
   CrossCoreFlagReservation cross_core_flag_reservation =
       CollectExplicitCrossCoreFlags(kernel_body);

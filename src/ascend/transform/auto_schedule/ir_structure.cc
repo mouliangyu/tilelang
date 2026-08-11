@@ -128,30 +128,18 @@ std::shared_ptr<IRStructure> ControlNode::Clone() const {
   return new_ctrl;
 }
 
-// Helper function to collect all TaskNodes with context information
-void CollectAllTaskNodesWithContext(IRStructure *node,
-                                    std::vector<TaskNodeWithContext> &all_tasks,
-                                    ControlNode *current_control_node) {
+void CollectAllTaskNodes(IRStructure *node,
+                         std::vector<TaskNode *> &all_tasks) {
   if (!node)
     return;
-
   if (node->IsTask()) {
-    auto task = static_cast<TaskNode *>(node);
-    TaskNodeWithContext task_ctx;
-    task_ctx.task = task;
-    task_ctx.control_node = current_control_node;
-
-    all_tasks.push_back(task_ctx);
-  } else if (node->IsControl()) {
-    auto control = static_cast<const ControlNode *>(node);
-    // When entering a control node, update the current control context
-    for (const auto &child : control->children) {
-      CollectAllTaskNodesWithContext(child.get(), all_tasks,
-                                     const_cast<ControlNode *>(control));
-    }
-  } else {
-    LOG(FATAL);
+    all_tasks.push_back(static_cast<TaskNode *>(node));
+    return;
   }
+  ICHECK(node->IsControl());
+  auto *control = static_cast<ControlNode *>(node);
+  for (const auto &child : control->children)
+    CollectAllTaskNodes(child.get(), all_tasks);
 }
 
 // ============================================================================
