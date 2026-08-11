@@ -369,15 +369,6 @@ public:
   virtual std::vector<Var> GetReadVars() const = 0;
   virtual std::vector<Var> GetWriteVars() const = 0;
 
-  // Indirect read access: read regions/vars plus anything reached transitively
-  // through scalar Let bindings (see PropagateReadRegions). Falls back to the
-  // direct sets for nodes that don't track an indirect set. Aggregate across
-  // children like GetReadRegions()/GetReadVars().
-  virtual std::vector<BufferRegion> GetIndirectReadRegions() const {
-    return GetReadRegions();
-  }
-  virtual std::vector<Var> GetIndirectReadVars() const { return GetReadVars(); }
-
   // Latency estimation
   virtual int64_t GetLatency() const = 0; // Estimated latency in cycles
   virtual int64_t GetII() const = 0;      // Initiation interval in cycles
@@ -476,18 +467,6 @@ public:
   std::vector<Var> GetReadVars() const override { return read_vars_; }
   std::vector<Var> GetWriteVars() const override { return write_vars_; }
 
-  // Indirect read access: the direct read regions/vars plus anything reached
-  // transitively through scalar Let bindings (e.g. `a = buf[0]; copy(a)` makes
-  // the copy task indirectly read `buf`). Filled by PropagateReadRegions; the
-  // direct read_regions_/read_vars_ are never mutated. Falls back to the direct
-  // set when propagation has not run, so callers always get a valid answer.
-  std::vector<BufferRegion> GetIndirectReadRegions() const override {
-    return indirect_computed_ ? indirect_read_regions_ : read_regions_;
-  }
-  std::vector<Var> GetIndirectReadVars() const override {
-    return indirect_computed_ ? indirect_read_vars_ : read_vars_;
-  }
-
   // Latency estimation
   int64_t GetLatency() const override { return latency_; }
   int64_t GetII() const override { return ii_; }
@@ -514,12 +493,6 @@ public:
   }
   void SetReadVars(const std::vector<Var> &vars) { read_vars_ = vars; }
   void SetWriteVars(const std::vector<Var> &vars) { write_vars_ = vars; }
-  void SetIndirectReads(const std::vector<BufferRegion> &regions,
-                        const std::vector<Var> &vars, bool computed) {
-    indirect_read_regions_ = regions;
-    indirect_read_vars_ = vars;
-    indirect_computed_ = computed;
-  }
   void SubstituteVar(const Var &old_var, const Var &new_var) override {
     Map<Var, PrimExpr> substitution{{old_var, new_var}};
     auto substitute_vars = [&](std::vector<Var> &vars) {
@@ -548,10 +521,8 @@ public:
     };
     substitute_vars(read_vars_);
     substitute_vars(write_vars_);
-    substitute_vars(indirect_read_vars_);
     substitute_regions(read_regions_);
     substitute_regions(write_regions_);
-    substitute_regions(indirect_read_regions_);
     outer_ctx = outer_ctx.Substitute(substitution);
     stmt = Substitute(stmt, substitution);
     SubstituteVarInGuards(old_var, new_var);
@@ -607,30 +578,6 @@ public:
     write_vars_.push_back(var);
   }
 
-  // Indirect read accumulation (used by PropagateReadRegions). Seed once from
-  // the direct sets, then add transitively-reached regions/vars.
-  void SeedIndirectReads() {
-    indirect_read_regions_ = read_regions_;
-    indirect_read_vars_ = read_vars_;
-    indirect_computed_ = true;
-  }
-  void AddIndirectReadRegion(const BufferRegion &region) {
-    for (const auto &existing : indirect_read_regions_) {
-      if (existing->buffer.same_as(region->buffer) &&
-          RegionsEqual(existing->region, region->region)) {
-        return;
-      }
-    }
-    indirect_read_regions_.push_back(region);
-  }
-  void AddIndirectReadVar(const Var &var) {
-    for (const auto &existing : indirect_read_vars_) {
-      if (existing.same_as(var))
-        return;
-    }
-    indirect_read_vars_.push_back(var);
-  }
-
 private:
   // Resource pipe mask (bitmask of ResourcePipe values)
   uint16_t pipe_mask_{0};
@@ -651,15 +598,6 @@ private:
 
   std::vector<Var> read_vars_;
   std::vector<Var> write_vars_;
-
-  // Indirect read sets: direct reads plus reads reached transitively through
-  // scalar Let bindings. Populated by PropagateReadRegions;
-  // `indirect_computed_` gates whether the Get*Indirect* accessors return these
-  // or fall back to the direct sets. Never affects barrier/dependency analysis,
-  // which uses the direct read_regions_/read_vars_.
-  std::vector<BufferRegion> indirect_read_regions_;
-  std::vector<Var> indirect_read_vars_;
-  bool indirect_computed_{false};
 
   // Latency estimation
   int64_t latency_{0}; // Estimated latency in cycles
@@ -798,37 +736,6 @@ public:
       vars.insert(vars.end(), task_vars.begin(), task_vars.end());
     }
     return vars;
-  }
-
-  // Indirect read access (aggregate from children & task)
-  std::vector<Var> GetIndirectReadVars() const override {
-    std::vector<Var> vars;
-    for (const auto &child : children) {
-      if (child) {
-        auto child_vars = child->GetIndirectReadVars();
-        vars.insert(vars.end(), child_vars.begin(), child_vars.end());
-      }
-    }
-    if (task) {
-      auto task_vars = task->GetIndirectReadVars();
-      vars.insert(vars.end(), task_vars.begin(), task_vars.end());
-    }
-    return vars;
-  }
-  std::vector<BufferRegion> GetIndirectReadRegions() const override {
-    std::vector<BufferRegion> regions;
-    for (const auto &child : children) {
-      if (child) {
-        auto child_regions = child->GetIndirectReadRegions();
-        regions.insert(regions.end(), child_regions.begin(),
-                       child_regions.end());
-      }
-    }
-    if (task) {
-      auto task_regions = task->GetIndirectReadRegions();
-      regions.insert(regions.end(), task_regions.begin(), task_regions.end());
-    }
-    return regions;
   }
 
   void SubstituteVar(const Var &old_var, const Var &new_var) override {

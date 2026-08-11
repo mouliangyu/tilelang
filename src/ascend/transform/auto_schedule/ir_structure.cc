@@ -101,10 +101,9 @@ std::shared_ptr<IRStructure> TaskNode::Clone() const {
   // Copy memory access regions
   new_task->SetReadRegions(GetReadRegions());
   new_task->SetWriteRegions(GetWriteRegions());
+  new_task->SetReadVars(GetReadVars());
+  new_task->SetWriteVars(GetWriteVars());
   new_task->outer_ctx = outer_ctx;
-  // Copy indirect read sets (propagated through scalar Let bindings)
-  new_task->SetIndirectReads(indirect_read_regions_, indirect_read_vars_,
-                             indirect_computed_);
   // Copy latency and II
   new_task->SetLatency(GetLatency());
   new_task->SetII(GetII());

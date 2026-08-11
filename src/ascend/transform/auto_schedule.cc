@@ -1472,85 +1472,6 @@ private:
   SpecialRegisterDemandMap special_writer_demand_;
 };
 
-// Local enumerator for PropagateReadRegions. IRStructureBuilder emits BindNode
-// and tl.assume AttrStmt as ordinary TaskNodes.
-static void CollectTaskNodesForPropagation(IRStructure *node,
-                                           std::vector<TaskNode *> &out) {
-  if (!node)
-    return;
-  if (node->IsTask()) {
-    out.push_back(static_cast<TaskNode *>(node));
-  } else if (node->IsControl()) {
-    auto ctrl = static_cast<const ControlNode *>(node);
-    for (const auto &child : ctrl->children)
-      CollectTaskNodesForPropagation(child.get(), out);
-  } else {
-    LOG(FATAL) << "Unknown IRStructure kind in "
-                  "CollectTaskNodesForPropagation";
-  }
-}
-
-// Compute indirect read regions/vars for every task: the direct reads plus
-// anything reached transitively through scalar Let bindings.
-static void
-PropagateReadRegions(const std::vector<std::shared_ptr<IRStructure>> &root) {
-  std::vector<TaskNode *> all_tasks;
-  for (const auto &node : root)
-    CollectTaskNodesForPropagation(node.get(), all_tasks);
-
-  // Seed every task's indirect set from its direct reads.
-  for (TaskNode *task : all_tasks)
-    task->SeedIndirectReads();
-
-  // Build mapping: var → the LetDecl TaskNode that defines it
-  std::unordered_map<const VarNode *, TaskNode *> var_to_let_decl;
-  for (TaskNode *task : all_tasks) {
-    if (IsLetDeclTask(task)) {
-      const auto *bind = task->stmt.as<BindNode>();
-      var_to_let_decl[bind->var.get()] = task;
-    }
-  }
-
-  if (var_to_let_decl.empty())
-    return;
-
-  // Iterate until no new read regions or read vars are added.
-  bool changed = true;
-  while (changed) {
-    changed = false;
-    size_t count_before = 0;
-    for (TaskNode *task : all_tasks)
-      count_before += task->GetIndirectReadRegions().size() +
-                      task->GetIndirectReadVars().size();
-
-    for (TaskNode *task : all_tasks) {
-      // Snapshot current indirect read vars (may grow during propagation)
-      std::vector<Var> read_vars = task->GetIndirectReadVars();
-      for (const auto &var : read_vars) {
-        auto it = var_to_let_decl.find(var.get());
-        if (it == var_to_let_decl.end())
-          continue;
-        TaskNode *def = it->second;
-        if (def == task)
-          continue;
-        // Fold the defining Let's already-accumulated indirect closure into
-        // this task's indirect set.
-        for (const auto &region : def->GetIndirectReadRegions())
-          task->AddIndirectReadRegion(region);
-        for (const auto &v : def->GetIndirectReadVars())
-          task->AddIndirectReadVar(v);
-      }
-    }
-
-    size_t count_after = 0;
-    for (TaskNode *task : all_tasks)
-      count_after += task->GetIndirectReadRegions().size() +
-                     task->GetIndirectReadVars().size();
-    if (count_after > count_before)
-      changed = true;
-  }
-}
-
 // Build and schedule one kernel segment, leaving core partitioning and final
 // Stmt emission to the downstream CorePartition pass.
 static ScheduledKernelResult ScheduleSingleKernel(
@@ -1574,12 +1495,6 @@ static ScheduledKernelResult ScheduleSingleKernel(
         << ". Run tl.transform.LatencyEstimator immediately before "
            "AutoSchedule.";
   }
-
-  // Compute indirect read sets (direct reads + reads reached through scalar
-  // Let bindings, e.g. m_tile → m_tile_3 → MTE copy) so core resolution
-  // can see register buffers accessed indirectly. Direct read regions/vars are
-  // left untouched for barrier/dependency analysis.
-  PropagateReadRegions(ir_structure);
 
   // Schedule IRStructure in place with the Z3 scheduler.
   ScheduleBuilder unit_builder;

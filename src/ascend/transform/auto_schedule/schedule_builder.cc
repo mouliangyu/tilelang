@@ -91,6 +91,46 @@ bool HasResourceDependency(const IRStructure *a, const IRStructure *b,
   return (a->GetHbmMask() & b->GetHbmMask()) != 0;
 }
 
+ScheduleBuilder::LetDependencyClosure
+ScheduleBuilder::CollectLetDependencyClosure_(
+    const std::vector<IRStructure *> &nodes) {
+  LetDependencyClosure result;
+  result.is_declaration.resize(nodes.size(), false);
+  result.dependencies.resize(nodes.size());
+
+  std::unordered_map<Var, size_t, ObjectPtrHash, ObjectPtrEqual>
+      declaration_by_var;
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    const IRStructure *node = nodes[i];
+    if (!node || !node->IsTask())
+      continue;
+    const auto *task = static_cast<const TaskNode *>(node);
+    if (const auto *bind = task->stmt.as<BindNode>()) {
+      result.is_declaration[i] = true;
+      declaration_by_var[bind->var] = i;
+    }
+  }
+
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    if (!nodes[i])
+      continue;
+    std::vector<Var> pending = nodes[i]->GetReadVars();
+    while (!pending.empty()) {
+      Var var = std::move(pending.back());
+      pending.pop_back();
+      auto it = declaration_by_var.find(var);
+      if (it == declaration_by_var.end())
+        continue;
+      size_t declaration = it->second;
+      if (!result.dependencies[i].insert(declaration).second)
+        continue;
+      std::vector<Var> reads = nodes[declaration]->GetReadVars();
+      pending.insert(pending.end(), reads.begin(), reads.end());
+    }
+  }
+  return result;
+}
+
 /*
   Recursively schedule root node, after scheduling IRStructure satisfies the
 following properties: 1) Each ordered child list (the root list or a

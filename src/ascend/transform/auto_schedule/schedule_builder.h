@@ -42,6 +42,15 @@ bool HasResourceDependency(const IRStructure *a, const IRStructure *b,
 
 // Builder that schedules TaskNode/ControlNode children in IRStructure
 class ScheduleBuilder {
+private:
+  struct LetDependencyClosure {
+    std::vector<bool> is_declaration;
+    std::vector<std::set<size_t>> dependencies;
+  };
+
+  static LetDependencyClosure
+  CollectLetDependencyClosure_(const std::vector<IRStructure *> &nodes);
+
 public:
   // Recursive scheduling function
   // Directly schedules the entire IRStructure tree recursively in place
@@ -546,46 +555,24 @@ public:
     //
     // AnalyzeDependencies already feeds the Let's own WAR edge to Z3, but only
     // constrains the Let's original stage, not the stages of nodes that will
-    // receive a copy. Here we add: for every node U that (transitively) reads a
+    // receive a copy. Here we add: for every node U that transitively reads a
     // Let-defined var, and every WAR consumer W of that Let (a node that writes
     // the buffer the Let reads, same-iter or cross-iter), require k_U <= k_W in
     // the Z3 (k, r) model. Equality is allowed because the clone is placed at
     // the front of the loop body, so it reads before any write in that
     // iteration.
     if (enable_offset) {
-
-      auto bind_of = [&](size_t idx) -> const BindNode * {
-        IRStructure *node = nodes[idx];
-        if (node && node->IsTask()) {
-          auto task = static_cast<TaskNode *>(node);
-          return task->stmt.as<BindNode>();
-        }
-        return nullptr;
-      };
-      std::unordered_map<const VarNode *, size_t> let_var_to_node;
-      for (size_t i = 0; i < n; ++i) {
-        if (auto *bind = bind_of(i)) {
-          let_var_to_node[bind->var.get()] = i;
-        }
-      }
-      std::vector<std::set<size_t>> unit_let_deps(n);
-      for (size_t i = 0; i < n; ++i) {
-        for (const auto &rv : nodes[i]->GetIndirectReadVars()) {
-          auto it = let_var_to_node.find(rv.get());
-          if (it != let_var_to_node.end())
-            unit_let_deps[i].insert(it->second);
-        }
-      }
+      LetDependencyClosure let_closure = CollectLetDependencyClosure_(nodes);
       // Collect WAR consumers per Let node
       std::vector<std::set<size_t>> let_war_consumers(n);
       for (const auto &dep : deps) {
         size_t p = node_idx[dep.prod_node];
-        if (bind_of(p) != nullptr) {
+        if (let_closure.is_declaration[p]) {
           let_war_consumers[p].insert(node_idx[dep.cons_node]);
         }
       }
       for (size_t u = 0; u < n; ++u) {
-        for (size_t l : unit_let_deps[u]) {
+        for (size_t l : let_closure.dependencies[u]) {
           for (size_t w : let_war_consumers[l]) {
             if (u == w)
               continue;
@@ -695,25 +682,15 @@ public:
                        return phys_time(a) < phys_time(b);
                      });
 
-    // Reorder & Copy Let-defined variables.
-    auto is_var_decl = [&](const IRStructure *node) -> bool {
-      if (!node)
-        return false;
-      if (node->IsTask()) {
-        auto task = static_cast<const TaskNode *>(node);
-        return task->stmt.as<BindNode>() != nullptr;
-      }
-      return false;
-    };
-    // Map each Let-defined var to the node that declares it.
-    std::unordered_map<const VarNode *, size_t> let_var_to_node;
-    for (size_t i = 0; i < n; ++i) {
-      if (is_var_decl(ctrl->children[i].get())) {
-        auto *bind = static_cast<TaskNode *>(ctrl->children[i].get())
-                         ->stmt.as<BindNode>();
-        let_var_to_node[bind->var.get()] = i;
-      }
-    }
+    // Reorder & copy Let-defined variables. Recompute the closure after the
+    // scheduled children have been reordered so declaration indices match the
+    // final sibling list.
+    std::vector<IRStructure *> scheduled_nodes;
+    scheduled_nodes.reserve(n);
+    for (const auto &child : ctrl->children)
+      scheduled_nodes.push_back(child.get());
+    LetDependencyClosure let_closure =
+        CollectLetDependencyClosure_(scheduled_nodes);
 
     // Resolve Let-var stage conflicts
     std::map<int, std::set<size_t>>
@@ -721,11 +698,7 @@ public:
     std::map<int, int64_t> stage_base_start; // stage -> floored start time
     for (size_t u = 0; u < n; ++u) {
       int s = ctrl->children[u]->GetStage();
-      for (const auto &rv : ctrl->children[u]->GetIndirectReadVars()) {
-        auto it = let_var_to_node.find(rv.get());
-        if (it == let_var_to_node.end())
-          continue;
-        size_t d = it->second;
+      for (size_t d : let_closure.dependencies[u]) {
         if (ctrl->children[d]->GetStage() == s)
           continue; // decl already in the consumer's stage: no clone needed
         stage_to_decls[s].insert(d);
@@ -744,6 +717,7 @@ public:
       std::vector<std::pair<Var, Var>> renames; // old var -> fresh clone var
       std::vector<std::shared_ptr<TaskNode>> stage_clones;
       for (size_t d : decls) {
+        ICHECK(let_closure.is_declaration[d]);
         auto *decl_task = static_cast<TaskNode *>(ctrl->children[d].get());
         auto *decl_bind = decl_task->stmt.as<BindNode>();
         auto new_var = decl_bind->var.copy_with_suffix("");
