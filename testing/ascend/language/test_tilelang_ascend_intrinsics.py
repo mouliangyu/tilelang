@@ -1,8 +1,10 @@
 import numpy as np
+import pytest
 
 import tilelang
 import tilelang.language as T
 import tilelang.testing
+from tilelang.ascend.language import simd as ascend_simd
 from tilelang.engine.lower import lower
 from tvm import tirx
 from tvm.tirx import Call
@@ -515,6 +517,45 @@ def test_ascend_simd_vpack_u16_to_u8_codegen():
     print(source)
     assert "simd_inst::vpack<" in source
     assert "uint8_t" in source
+
+
+def test_ascend_simd_histv2_codegen():
+    @T.prim_func
+    def func(A: T.Buffer((256,), "uint8"), B: T.Buffer((256,), "uint16")):
+        with T.Kernel(1) as _:
+            a_ub = T.alloc_shared((256,), "uint8")
+            b_ub = T.alloc_shared((256,), "uint16")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                m8 = T.simd.pset(8)
+                m16 = T.simd.pset(16)
+                src = T.simd.vld(a_ub[0], dist="NORM")
+                frequency = T.simd.alloc_var("uint16")
+                cumulative = T.simd.alloc_var("uint16")
+                frequency = T.simd.vdup(T.uint16(0), "uint16", m16)
+                cumulative = T.simd.vdup(T.uint16(0), "uint16", m16)
+                T.simd.dhistv2(frequency, src, m8, bin=0)
+                T.simd.chistv2(cumulative, src, m8, bin=1)
+                T.simd.vsts(b_ub[0], frequency, m16, dist="NORM_B16")
+                T.simd.vsts(b_ub[128], cumulative, m16, dist="NORM_B16")
+            T.copy(b_ub, B)
+
+    source = lower(func, target="ascend").kernel_source
+    print(source)
+    assert "simd_inst::dhistv2" in source and "Bin_N0" in source
+    assert "simd_inst::chistv2" in source and "Bin_N1" in source
+
+
+@pytest.mark.parametrize("invalid_bin", [-1, 2, 7])
+def test_ascend_simd_histv2_rejects_out_of_range_bins(invalid_bin):
+    with pytest.raises(ValueError, match="0 or 1"):
+        ascend_simd._histogram_bin(invalid_bin)
+
+
+@pytest.mark.parametrize("invalid_bin", ["Bin_N0", "Bin_N1", None, 0.0, False])
+def test_ascend_simd_histv2_rejects_non_integer_bins(invalid_bin):
+    with pytest.raises(TypeError, match="integer 0 or 1"):
+        ascend_simd._histogram_bin(invalid_bin)
 
 
 def test_ascend_simd_vld_e2b_b16_extent():

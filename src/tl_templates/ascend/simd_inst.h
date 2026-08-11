@@ -541,6 +541,18 @@ __simd_callee__ inline SrcVec vsqz(SrcVec src, vector_bool mask, Mode mode) {
   return dst;
 }
 
+template <typename Bin>
+__simd_callee__ inline void dhistv2(vector_u16 *dst, vector_u8 src,
+                                    vector_bool mask, Bin bin) {
+  ::dhistv2(*dst, src, mask, bin);
+}
+
+template <typename Bin>
+__simd_callee__ inline void chistv2(vector_u16 *dst, vector_u8 src,
+                                    vector_bool mask, Bin bin) {
+  ::chistv2(*dst, src, mask, bin);
+}
+
 // -- Index ramp / compare
 // ------------------------------------------------------------
 

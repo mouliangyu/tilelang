@@ -393,6 +393,52 @@ def vaxpy(dst, src, scalar, mask=None, mode="MODE_ZEROING"):
     return tirx.call_intrin("void", _Op("tl.simd.vaxpy"), dst, src, scalar, mask, mode)
 
 
+def _histogram_bin(bin):  # noqa: A002
+    if isinstance(bin, tirx.IntImm):
+        bin = int(bin.value)
+    if not isinstance(bin, int) or isinstance(bin, bool):
+        raise TypeError(f"Histogram bin must be the integer 0 or 1, got {bin!r}")
+    if bin not in (0, 1):
+        raise ValueError(f"Histogram bin must be 0 or 1, got {bin}")
+    return bin
+
+
+def _histogram(op_name, dst, src, mask, bin):  # noqa: A002
+    if not isinstance(dst, BufferLoad):
+        raise ValueError(
+            f"{op_name}: `dst` must be a buffer access (e.g. hist[0]) allocated with "
+            "T.simd.alloc_local()/alloc_var(), not an immutable register value. "
+            f"Got {type(dst).__name__} {dst}."
+        )
+    if str(dst.dtype) != "uint16x128":
+        raise TypeError(f"{op_name}: `dst` must be a uint16 vector, got {dst.dtype}")
+    if str(src.dtype) != "uint8x256":
+        raise TypeError(f"{op_name}: `src` must be a uint8 vector, got {src.dtype}")
+    if mask is None:
+        mask = _default_mask(src.dtype)
+    dst = access_ptr(dst, "rw")
+    return tirx.call_intrin("void", _Op(f"tl.simd.{op_name}"), dst, src, mask, _histogram_bin(bin))
+
+
+def dhistv2(dst, src, mask=None, bin=0):  # noqa: A002
+    """Accumulate a frequency histogram of a uint8 vector into a uint16 vector.
+
+    ``bin=0`` counts values in ``[0, 127]`` and ``bin=1`` counts values in
+    ``[128, 255]``. The destination register is updated in place.
+    """
+    return _histogram("dhistv2", dst, src, mask, bin)
+
+
+def chistv2(dst, src, mask=None, bin=0):  # noqa: A002
+    """Accumulate a cumulative histogram of a uint8 vector into a uint16 vector.
+
+    ``bin=0`` returns cumulative counts through values ``[0, 127]`` and
+    ``bin=1`` returns cumulative counts through values ``[128, 255]``. The
+    destination register is updated in place.
+    """
+    return _histogram("chistv2", dst, src, mask, bin)
+
+
 def vdiv(src0, src1, mask=None, mode="MODE_ZEROING", fast=None):
     """Divide vectors, optionally overriding the fast-math pass configuration.
 

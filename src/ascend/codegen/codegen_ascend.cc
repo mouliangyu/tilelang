@@ -1721,6 +1721,25 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     os << ", " << Downcast<StringImm>(op->args[4])->value; // mode
     os << ")";
   }
+  // --- SimdVF histogram: (dst, src, mask, bin) ---
+  else if (op->op.same_as(tl::simd_dhistv2()) ||
+           op->op.same_as(tl::simd_chistv2())) {
+    ICHECK_EQ(op->args.size(), 4);
+    const char *name =
+        op->op.same_as(tl::simd_dhistv2()) ? "dhistv2" : "chistv2";
+    os << "simd_inst::" << name << "(";
+    PrintExpr(op->args[0], os); // dst
+    os << ", ";
+    PrintExpr(op->args[1], os); // src
+    os << ", ";
+    PrintExpr(op->args[2], os); // mask
+    const auto *bin = op->args[3].as<IntImmNode>();
+    ICHECK(bin) << name << " requires bin to be the integer 0 or 1";
+    ICHECK(bin->value == 0 || bin->value == 1)
+        << name << " only supports bin=0 or bin=1, but got " << bin->value;
+    os << ", Bin_N" << bin->value;
+    os << ")";
+  }
   // --- SimdVF binary ops: (src0, src1, mask, mode) ---
   else if (op->op.same_as(tl::simd_vadd()) || op->op.same_as(tl::simd_vsub()) ||
            op->op.same_as(tl::simd_vmul()) ||
