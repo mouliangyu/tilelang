@@ -405,11 +405,16 @@ class KernelCache:
         if verbose:
             self.logger.debug(f"Checking disk cache for kernel {get_prim_func_name(func, '<unknown>')}")
 
-        # Disk loads can be expensive for large kernel sets; keep them outside
-        # the global cache lock so independent cache hits can proceed in parallel.
-        kernel = self._load_kernel_from_disk(
-            key, target, target_host, out_idx, execution_backend, pass_configs, compile_flags, func, verbose
-        )
+        if execution_backend == "torch":
+            # Metal's torch backend does not support cache yet
+            env.disable_cache()
+            kernel = None
+        else:
+            # Disk loads can be expensive for large kernel sets; keep them outside
+            # the global cache lock so independent cache hits can proceed in parallel.
+            kernel = self._load_kernel_from_disk(
+                key, target, target_host, out_idx, execution_backend, pass_configs, compile_flags, func, verbose
+            )
         if kernel is not None:
             if verbose:
                 self.logger.debug(f"Found kernel in disk cache for {get_prim_func_name(func, '<unknown>')}")
@@ -443,12 +448,13 @@ class KernelCache:
                 pass_configs=pass_configs,
                 compile_flags=compile_flags,
             )
-        with self._lock:
-            if env.is_cache_enabled():
-                cache_path = self._get_cache_path(key)
-                self._save_kernel_to_disk(key, kernel, func, verbose)
-                # Set cache path on adapter so it can save cubin after first execution
-                self._set_adapter_cache_path(kernel, cache_path)
+        # Save outside the lock: staging+rename is atomic and idempotent (like the
+        # disk load above). Holding the lock here serialized every worker's save.
+        if env.is_cache_enabled():
+            cache_path = self._get_cache_path(key)
+            self._save_kernel_to_disk(key, kernel, func, verbose)
+            # Set cache path on adapter so it can save cubin after first execution
+            self._set_adapter_cache_path(kernel, cache_path)
 
         # Store in memory cache after compilation
         self._tag_kernel_cache_entry(kernel, key, self._get_cache_path(key))
@@ -705,7 +711,8 @@ class KernelCache:
 
     def _save_so_cubin_to_disk(self, kernel: JITKernel, cache_path: str, verbose: bool = False):
         kernel_lib_path = os.path.join(cache_path, self.kernel_lib_path)
-        src_lib_path = kernel.adapter.libpath
+        if (src_lib_path := getattr(kernel.adapter, "libpath", None)) is None:
+            return
         if verbose:
             self.logger.debug(f"Saving kernel library to file: {kernel_lib_path}")
         KernelCache._safe_write_file(kernel_lib_path, "wb", lambda file: file.write(KernelCache._load_binary(src_lib_path)))

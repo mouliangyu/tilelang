@@ -35,6 +35,7 @@ from pathlib import Path
 from tilelang.autotuner.param import CompileArgs, ProfileArgs, AutotuneResult
 from tilelang.autotuner.grouped_compile import compile_grouped_unit_tvm_ffi
 from tilelang.utils.language import get_prim_func_name
+from tilelang.utils.device import get_available_cpu_count
 from tilelang.autotuner.capture import get_autotune_inputs
 from tilelang.backend.target import determine_target
 from tilelang import __version__
@@ -201,16 +202,6 @@ def _init_logger_handlers():
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
     _logger_handlers_initialized = True
-
-
-def get_available_cpu_count() -> int:
-    """Gets the number of CPU cores available to the current process."""
-    try:
-        cpu_count = len(os.sched_getaffinity(0))
-    except AttributeError:
-        cpu_count = os.cpu_count()
-
-    return cpu_count or 1
 
 
 def _normalize_value(value, sort_dict_items: bool = False):
@@ -454,8 +445,22 @@ class AutoTuner:
                     "Please provide concrete inputs with `with set_autotune_inputs(...)`."
                 )
 
-    def generate_cache_key(self, parameters: dict[str, Any], extra_parameters: dict[str, Any]) -> AutotuneResult | None:
+    def generate_cache_key(self, parameters: dict[str, Any], extra_parameters: dict[str, Any]) -> str | None:
         """Generate a cache key for the auto-tuning process."""
+
+        # Arbitrary callbacks do not have a reliable persistent identity:
+        # importable functions may serialize by name, while closures may hold
+        # unpicklable runtime state. Avoid cache reuse rather than risk serving
+        # results produced with different input or validation behavior.
+        if any(
+            callback is not None
+            for callback in (
+                self.profile_args.ref_prog,
+                self.profile_args.supply_prog,
+                self.profile_args.manual_check_prog,
+            )
+        ):
+            return None
 
         # extract parameters from the function signature
         op_parameters = []
@@ -997,7 +1002,7 @@ class AutoTuner:
         key = self.generate_cache_key(parameters, extra_parameters)
 
         with self._lock:
-            if env.is_cache_enabled() and not env.is_autotune_cache_disabled():
+            if key is not None and env.is_cache_enabled() and not env.is_autotune_cache_disabled():
                 # First check in-memory cache
                 if key in self._memory_cache:
                     # Include PrimFunc name when hitting autotuner memory cache
@@ -1077,7 +1082,8 @@ class AutoTuner:
                 # compile the kernel with the provided parameters
                 jit_kernel = self.jit_compile()
                 autotuner_result = AutotuneResult(libcode=jit_kernel.get_kernel_source(), func=jit_kernel.prim_func, kernel=jit_kernel)
-                self._memory_cache[key] = autotuner_result
+                if key is not None:
+                    self._memory_cache[key] = autotuner_result
                 return autotuner_result
 
         # After confirming tuning will actually run, validate that scalar
@@ -1279,14 +1285,15 @@ class AutoTuner:
             kernel=best_kernel,
         )
 
-        if self.compile_args.execution_backend in ("torch"):
-            logger.warning("DLPack backend does not support cache saving to disk.")
+        if self.compile_args.execution_backend == "torch":
+            logger.warning("Torch backend does not support cache saving to disk.")
         else:
             with self._lock:
-                if env.is_cache_enabled() and not env.is_autotune_cache_disabled():
+                if key is not None and env.is_cache_enabled() and not env.is_autotune_cache_disabled():
                     self._save_result_to_disk(key, autotuner_result)
 
-        self._memory_cache[key] = autotuner_result
+        if key is not None:
+            self._memory_cache[key] = autotuner_result
 
         return autotuner_result
 

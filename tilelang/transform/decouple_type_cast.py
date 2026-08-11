@@ -75,14 +75,20 @@ from tvm.tirx.transform import prim_func_pass
 # Cache the Op for if_then_else to avoid repeated lookups
 _IF_THEN_ELSE_OP = Op.get("tirx.if_then_else")
 
-from tilelang.utils.language import is_fragment, is_global, is_local, is_local_var, is_shared, is_metal_simdgroup
+from tilelang.utils.language import (
+    is_fragment,
+    is_global,
+    is_local,
+    is_local_var,
+    is_shared,
+)
 
 
 def is_local_buffer(buffer: Buffer) -> bool:
-    """Check if a buffer is local (register-level), including local.var and metal.simdgroup."""
+    """Check if a buffer is local/register-level."""
     if buffer is None:
         return False
-    return is_local(buffer) or is_fragment(buffer) or is_local_var(buffer) or is_metal_simdgroup(buffer)
+    return is_local(buffer) or is_fragment(buffer) or is_local_var(buffer)
 
 
 def is_global_or_shared_buffer(buffer: Buffer) -> bool:
@@ -625,4 +631,4 @@ def DecoupleTypeCast():
         new_body = mutator.visit_stmt(func.body)
         return func.with_body(new_body)
 
-    return prim_func_pass(pass_fn, opt_level=0)
+    return prim_func_pass(pass_fn, opt_level=0, name="tl.DecoupleTypeCast")

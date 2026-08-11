@@ -26,6 +26,7 @@ from contextlib import nullcontext
 
 from tilelang.jit.kernel import JITKernel
 from tilelang.cache import cached
+from tilelang.utils.device import get_available_cpu_count
 from os import path, makedirs
 from logging import getLogger
 from tilelang.jit.param import Kernel
@@ -93,7 +94,7 @@ class _CallFormCache:
 def compile(
     func: PrimFunc[_KP, _T] = None,
     out_idx: list[int] | int | None = None,
-    execution_backend: Literal["auto", "dlpack", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None = None,
+    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None = None,
     target: TargetLike | None = None,
     target_host: TargetLike | None = None,
     verbose: bool | None = None,
@@ -109,7 +110,7 @@ def compile(
         The TileLang TIR function to compile and wrap.
     out_idx : Union[List[int], int], optional
         Index(es) of the output tensors to return (default: None).
-    execution_backend : Literal["auto", "dlpack", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"], optional
+    execution_backend : Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"], optional
         Execution backend to use for kernel execution. If None, reads from
         TILELANG_EXECUTION_BACKEND environment variable (defaults to "auto").
     target : str, dict, or tvm.target.Target, optional
@@ -175,7 +176,7 @@ def compile(
 def par_compile(
     funcs: Iterable[PrimFunc[_KP, _T]],
     out_idx: list[int] | int | None = None,
-    execution_backend: Literal["auto", "dlpack", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None = None,
+    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None = None,
     target: TargetLike | None = None,
     target_host: TargetLike | None = None,
     verbose: bool | None = None,
@@ -193,7 +194,7 @@ def par_compile(
         The TileLang TIR functions to compile and wrap.
     out_idx : Union[List[int], int], optional
         Index(es) of the output tensors to return (default: None).
-    execution_backend : Literal["auto", "dlpack", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"], optional
+    execution_backend : Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"], optional
         Execution backend to use for kernel execution. If None, reads from
         TILELANG_EXECUTION_BACKEND environment variable (defaults to "auto").
     target : str, dict, or tvm.target.Target, optional
@@ -219,6 +220,15 @@ def par_compile(
     TILELANG_VERBOSE : str
         Set to "1", "true", "yes", or "on" to enable verbose compilation by default.
     """
+
+    # funcs may be a one-shot iterable; materialize to size the pool and reuse below.
+    funcs = list(funcs)
+
+    if num_workers is None and funcs:
+        # Scale to available cores (affinity-aware), capped at #kernels; the stdlib
+        # min(32, cpu+4) throttles large AOT batches. Lowering releases the GIL and
+        # nvcc is a subprocess, so threads parallelize.
+        num_workers = min(len(funcs), get_available_cpu_count())
 
     with concurrent.futures.ThreadPoolExecutor(num_workers, "tl-par-comp") as executor:
         futures = []
@@ -307,7 +317,7 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
     out_idx : list[int] | int | None
         Index(es) of output tensor(s) to return (lazy mode only).
     execution_backend : str | None
-        Backend for kernel execution ("auto", "dlpack", "tvm_ffi", etc.).
+        Backend for kernel execution ("auto", "tvm_ffi", etc.).
     target : str | tvm.target.Target | None
         TVM compilation target (e.g., "cuda", "llvm", "auto").
     target_host : str | tvm.target.Target | None
@@ -331,7 +341,7 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
     """
 
     out_idx: list[int] | int | None
-    execution_backend: Literal["auto", "dlpack", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None
+    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None
     target: TargetLike | None
     target_host: TargetLike | None
     verbose: bool | None
@@ -554,7 +564,7 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
             return kernel
 
 
-ExecutionBackend = Literal["auto", "dlpack", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"]
+ExecutionBackend = Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"]
 
 
 @overload
