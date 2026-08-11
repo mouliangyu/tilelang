@@ -230,7 +230,7 @@ def test_ascend_simd_3510_intrinsics_codegen():
     assert "simd_inst::vnot(" in source
 
 
-def test_ascend_simd_vdiv_fast_override():
+def test_ascend_simd_vdiv_precision_override():
     @T.prim_func
     def func(
         A: T.Buffer((64,), "float32"),
@@ -247,9 +247,9 @@ def test_ascend_simd_vdiv_fast_override():
                 mask = T.simd.pset(32)
                 a = T.simd.vld(a_ub[0])
                 b = T.simd.vld(b_ub[0])
-                T.simd.vsts(c_ub[0], T.simd.vdiv(a, b, mask, fast=False), mask)
+                T.simd.vsts(c_ub[0], T.simd.vdiv(a, b, mask, precision="exact"), mask)
                 T.simd.vsts(c_ub[64], T.simd.vdiv(a, b, mask), mask)
-                T.simd.vsts(c_ub[128], T.simd.vdiv(a, b, mask, fast=True), mask)
+                T.simd.vsts(c_ub[128], T.simd.vdiv(a, b, mask, precision="ftz_true"), mask)
             T.copy(c_ub, C)
 
     config_key = tilelang.PassConfigKey.TL_ENABLE_FAST_MATH.value
@@ -258,10 +258,43 @@ def test_ascend_simd_vdiv_fast_override():
     with tilelang.transform.PassContext(config={config_key: True}):
         fast_default_source = lower(func, target="ascend").kernel_source
 
-    assert precise_default_source.count("simd_inst::vdiv_precise(") == 2
+    assert precise_default_source.count("simd_inst::vdiv_0ulp_ftz_true(") == 2
     assert precise_default_source.count("simd_inst::vdiv(") == 1
-    assert fast_default_source.count("simd_inst::vdiv_precise(") == 1
+    assert fast_default_source.count("simd_inst::vdiv_0ulp_ftz_true(") == 1
     assert fast_default_source.count("simd_inst::vdiv(") == 2
+
+
+def test_ascend_simd_sfu_precision_merging():
+    """ftz_false in MODE_MERGING selects the *_1ulp_ftz_false wrappers."""
+
+    @T.prim_func
+    def func(
+        A: T.Buffer((64,), "float32"),
+        C: T.Buffer((64,), "float32"),
+    ):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((64,), "float32")
+            c_ub = T.alloc_shared((64,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                mask = T.simd.pset(32, "PAT_VL8")
+                full = T.simd.pset(32)
+                src = T.simd.vld(a_ub[0])
+                dst = T.simd.alloc_local((1,), "float32")
+                dst[0] = src
+                dst[0] = T.simd.vexp(src, mask, mode="MODE_MERGING", precision="ftz_false")
+                dst[0] = T.simd.vln(src, mask, mode="MODE_MERGING", precision="ftz_false")
+                dst[0] = T.simd.vsqrt(src, mask, mode="MODE_MERGING", precision="ftz_false")
+                T.simd.vsts(c_ub[0], dst[0], full)
+            T.copy(c_ub, C)
+
+    source = lower(func, target="ascend").kernel_source
+    assert "simd_inst::vexp_1ulp_ftz_false(" in source
+    assert "simd_inst::vln_1ulp_ftz_false(" in source
+    assert "simd_inst::vsqrt_0ulp_ftz_false(" in source
+    assert "::vexp(" not in source
+    assert "::vln(" not in source
+    assert "::vsqrt(" not in source
 
 
 def test_ascend_simd_vsstb_threads_pointer_state():

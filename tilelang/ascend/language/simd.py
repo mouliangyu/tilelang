@@ -1,4 +1,4 @@
-"""T.simd.* — Raw CCE vector intrinsics for Ascend SIMD programming.
+"""T.simd.* - Raw CCE vector intrinsics for Ascend SIMD programming.
 
 Function names match the underlying CCE intrinsics directly.
 """
@@ -7,6 +7,7 @@ from tvm import tirx
 from tvm.tirx import BufferLoad
 from tvm.tirx.script.builder.ir import bind as _bind
 from tvm.script.ir_builder import IRBuilder
+from tilelang import tvm
 from tilelang._typing import DType, ShapeType
 from tilelang.language.allocate import alloc_var as _alloc_var, alloc_local as _alloc_local
 from tilelang.language.builtin import access_ptr
@@ -220,11 +221,11 @@ def vld2(addr, dist="DINTLV_B16", off=None):
     """Dual-dest vector load: ``a, b = vld2(x_ub[i, col], dist=\"DINTLV_B8\")``.
 
     Supported dists:
-      - ``DINTLV_B8``: load 512×u8/fp8 → two 256-lane regs (even/odd bytes)
-      - ``DINTLV_B16``: load 256×bf16/u16 → two 128-lane regs
-      - ``DINTLV_B32``: load 128×f32/u32 → two 64-lane regs
+      - ``DINTLV_B8``: load 512xu8/fp8 -> two 256-lane regs (even/odd bytes)
+      - ``DINTLV_B16``: load 256xbf16/u16 -> two 128-lane regs
+      - ``DINTLV_B32``: load 128xf32/u32 -> two 64-lane regs
 
-    The access_ptr footprint is always 2× the single-vector width. This is an
+    The access_ptr footprint is always 2x the single-vector width. This is an
     opaque memory load: the pair is bound once at this program point so the two
     ``pair_get`` calls from the unpack share a single load rather than issuing
     two independent loads.
@@ -234,13 +235,13 @@ def vld2(addr, dist="DINTLV_B16", off=None):
     if isinstance(addr, BufferLoad):
         elem_dtype = str(addr.buffer.dtype)
         lanes = _vreg_lanes(elem_dtype)
-        # Dual-dest deinterleave always consumes 2× vector width from UB.
+        # Dual-dest deinterleave always consumes 2x vector width from UB.
         extent = lanes * 2
         addr = access_ptr(addr, "r", extent=extent)
         vec_dtype = f"{elem_dtype}x{lanes}"
     else:
         # Pre-wrapped access_ptr: this path does not auto-double the footprint
-        # (same as vld). Callers must size extent to 2× vector width themselves.
+        # (same as vld). Callers must size extent to 2x vector width themselves.
         inner_load = addr.args[0]
         vec_dtype = _vec_dtype(inner_load.buffer.dtype)
 
@@ -248,7 +249,7 @@ def vld2(addr, dist="DINTLV_B16", off=None):
     if off is not None:
         args.append(off)
     pair = tirx.call_intrin(vec_dtype, _Op("tl.simd.vld2"), *args)
-    # Bind at the original site (opaque load). Requires an active IRBuilder —
+    # Bind at the original site (opaque load). Requires an active IRBuilder -
     # do not fall back to an unbound SimdPair (that reintroduces duplicate
     # inline loads under unpack).
     if not IRBuilder.is_in_scope():
@@ -393,6 +394,39 @@ def vaxpy(dst, src, scalar, mask=None, mode="MODE_ZEROING"):
     return tirx.call_intrin("void", _Op("tl.simd.vaxpy"), dst, src, scalar, mask, mode)
 
 
+# Per-op SFU precision selectors (mirrors the l2_cache_ctrl pattern in
+# tilelang/language/copy_op.py: user-facing string aliases are normalized to
+# integer codes here, the annotation carries only the int, and codegen reads
+# the int -- no alias table lives in C++).
+# "intrinsic" is the cross-function alias for the bare hardware SFU.
+_PRECISION_MODES = {
+    # Per-op precision selectors, 3 aliases each:
+    #   "ftz_true"            - cross-function: bare hardware SFU (FTZ_TRUE)
+    #   semantic alias        - "exact" (vdiv) / "ftz_false" (unary SFUs)
+    #   CANN tier name        - <op>_<N>ulp_ftz_<mode> (kernel_reg_compute_utils.h)
+    "vdiv": {
+        "ftz_true": "hw",
+        "exact": "exact",
+        "vdiv_0ulp_ftz_true": "exact",
+    },
+    "vexp": {
+        "ftz_true": "hw",
+        "ftz_false": "ftz_false",
+        "vexp_1ulp_ftz_false": "ftz_false",
+    },
+    "vln": {
+        "ftz_true": "hw",
+        "ftz_false": "ftz_false",
+        "vln_1ulp_ftz_false": "ftz_false",
+    },
+    "vsqrt": {
+        "ftz_true": "hw",
+        "ftz_false": "ftz_false",
+        "vsqrt_0ulp_ftz_false": "ftz_false",
+    },
+}
+
+
 def _histogram_bin(bin):  # noqa: A002
     if isinstance(bin, tirx.IntImm):
         bin = int(bin.value)
@@ -439,19 +473,62 @@ def chistv2(dst, src, mask=None, bin=0):  # noqa: A002
     return _histogram("chistv2", dst, src, mask, bin)
 
 
-def vdiv(src0, src1, mask=None, mode="MODE_ZEROING", fast=None):
-    """Divide vectors, optionally overriding the fast-math pass configuration.
+# Canonical -> integer code passed through the "precision" annotation
+# (0=hw, 1=exact, 2=ftz_false), like l2_cache_ctrl's int values.
+_PRECISION_CODE = {"hw": 0, "exact": 1, "ftz_false": 2}
 
-    ``fast=None`` follows ``tl.enable_fast_math``.  ``fast=True`` selects the
-    hardware division instruction, while ``fast=False`` selects precise fp32
-    division regardless of the pass configuration. Non-fp32 division always
+
+def _normalize_precision(value, op):
+    """Validate a precision selector for `op`; return the canonical code.
+
+    Aliases (e.g. "intrinsic", "vdiv_0ulp_ftz_true") are accepted;
+    unknown names raise here so typos fail at trace time instead of silently
+    mapping to bare SFU.
+    """
+    key = str(value).lower()
+    table = _PRECISION_MODES.get(op)
+    if table is None:
+        raise ValueError(f"precision= not supported for {op}")
+    if key not in table:
+        raise ValueError(f"precision {value!r} not valid for {op}. Valid: {sorted(table)}")
+    return _PRECISION_CODE[table[key]]
+
+
+def _precision_annotation(op, precision, dtype=None):
+    """Validate a precision selector and return the annotation map.
+
+    Precise paths are float32-only: the C++ wrappers (``vdiv_0ulp_ftz_true``,
+    ``*_1ulp_ftz_false``) hardcode fp32 constants/overloads, and non-fp32 always
     uses the hardware instruction.
     """
-    if fast is not None and not isinstance(fast, bool):
-        raise TypeError(f"vdiv: `fast` must be True, False, or None, got {type(fast).__name__}")
+    code = _normalize_precision(precision, op)
+    if code != 0 and dtype is not None and tvm.DataType(dtype).with_lanes(1) != "float32":
+        raise ValueError(
+            f"{op}: precision={precision!r} requires float32 operands (got {dtype}); non-fp32 always uses the hardware instruction"
+        )
+    return {"precision": tirx.IntImm("int32", code)}
+
+
+def vdiv(src0, src1, mask=None, mode="MODE_ZEROING", precision=None):
+    """Divide vectors, optionally selecting the SFU implementation.
+
+    ``precision=None`` follows ``tl.enable_fast_math`` (precise fp32
+    division when fast math is off, hardware instruction otherwise).
+    Non-fp32 division always uses the hardware instruction.
+
+    ``precision`` selects the implementation per op:
+
+    - ``'ftz_true'``: bare hardware SFU (flush-to-zero semantics)
+    - ``'exact'`` (alias ``'vdiv_0ulp_ftz_true'``): correctly-rounded fp32
+      division (CANN DivAlgo::PRECISION_0ULP_FTZ_TRUE / DivPrecisionImpl)
+
+    Requires float32 for precise paths.
+    """
     if mask is None:
         mask = _default_mask(src0.dtype)
-    annotations = None if fast is None else {"fast_math": fast}
+    annotations = None
+    if precision is not None:
+        annotations = _precision_annotation("vdiv", precision, dtype=src0.dtype)
     return tirx.call_intrin(str(src0.dtype), _Op("tl.simd.vdiv"), src0, src1, mask, mode, annotations=annotations)
 
 
@@ -500,22 +577,25 @@ def vshr(src0, src1, mask=None, mode="MODE_ZEROING"):
 # -- Unary ------------------------------------------------------------------------
 
 
-def vexp(src, mask=None, mode="MODE_ZEROING"):
+def vexp(src, mask=None, mode="MODE_ZEROING", precision=None):
     if mask is None:
         mask = _default_mask(src.dtype)
-    return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vexp"), src, mask, mode)
+    annotations = None if precision is None else _precision_annotation("vexp", precision, dtype=src.dtype)
+    return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vexp"), src, mask, mode, annotations=annotations)
 
 
-def vln(src, mask=None, mode="MODE_ZEROING"):
+def vln(src, mask=None, mode="MODE_ZEROING", precision=None):
     if mask is None:
         mask = _default_mask(src.dtype)
-    return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vln"), src, mask, mode)
+    annotations = None if precision is None else _precision_annotation("vln", precision, dtype=src.dtype)
+    return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vln"), src, mask, mode, annotations=annotations)
 
 
-def vsqrt(src, mask=None, mode="MODE_ZEROING"):
+def vsqrt(src, mask=None, mode="MODE_ZEROING", precision=None):
     if mask is None:
         mask = _default_mask(src.dtype)
-    return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vsqrt"), src, mask, mode)
+    annotations = None if precision is None else _precision_annotation("vsqrt", precision, dtype=src.dtype)
+    return tirx.call_intrin(str(src.dtype), _Op("tl.simd.vsqrt"), src, mask, mode, annotations=annotations)
 
 
 def vabs(src, mask=None, mode="MODE_ZEROING"):  # noqa: A001
@@ -648,7 +728,7 @@ def vci(index, dtype_str: DType, order="INC_ORDER"):
 
 
 def vcmp(src0, src1, mask=None, op="eq"):
-    """Elementwise compare → vector_bool: dst = vcmp_<op>(src0, src1, mask).
+    """Elementwise compare -> vector_bool: dst = vcmp_<op>(src0, src1, mask).
 
     op: eq/ne/gt/ge/lt/le.
     """
@@ -658,7 +738,7 @@ def vcmp(src0, src1, mask=None, op="eq"):
 
 
 def vcmps(src, scalar, mask=None, op="lt"):
-    """Compare vector vs scalar → vector_bool: dst = vcmps_<op>(src, scalar, mask).
+    """Compare vector vs scalar -> vector_bool: dst = vcmps_<op>(src, scalar, mask).
 
     op: eq/ne/gt/ge/lt/le.
     """
@@ -709,7 +789,7 @@ def pair_get(pair, index):
 def vpack(src, part=0):
     """Pack wider lanes to narrower lanes: dst = vpack(src, LOWER/HIGHER).
 
-    Supports u32→u16 and u16→u8 (needed for dense UE8M0 scale packing).
+    Supports u32->u16 and u16->u8 (needed for dense UE8M0 scale packing).
     """
     if isinstance(part, tirx.IntImm):
         part = int(part.value)
@@ -833,27 +913,27 @@ def vcvt(
         IEEE-754 rounding mode. Valid values:
         - ``"ROUND_R"`` (default): Round to nearest, ties to even (banker's rounding).
         - ``"ROUND_A"``: Round away from zero.
-        - ``"ROUND_F"``: Round toward +∞ (ceiling).
-        - ``"ROUND_C"``: Round toward -∞ (floor).
+        - ``"ROUND_F"``: Round toward +inf (ceiling).
+        - ``"ROUND_C"``: Round toward -inf (floor).
         - ``"ROUND_Z"``: Round toward zero (truncation).
-        - ``"ROUND_O"``: Round to odd (only for f32→f16).
+        - ``"ROUND_O"``: Round to odd (only for f32->f16).
         - ``"ROUND_H"``: Round half away from zero (only for hif8 conversions).
         Not all modes are valid for every conversion pair; unused modes are ignored when absent.
     sat : bool
         saturation mode for narrow/overflow-prone conversions.
         - ``True`` (default): Saturate to target range on overflow.
         - ``False``: No sat; out-of-range values wrap.
-        Appears in: all float→fp8, f32→f16/bf16, all float→int, integer narrowing.
-        Absent from: widening conversions, f16→bf16, s16→f16, s32→f32 (no overflow possible).
+        Appears in: all float->fp8, f32->f16/bf16, all float->int, integer narrowing.
+        Absent from: widening conversions, f16->bf16, s16->f16, s32->f32 (no overflow possible).
     part : int
         Sub-register half/quarter selector for widening/narrowing conversions.
         For even/odd 2-way splits: ``"PART_EVEN"`` (0), ``"PART_ODD"`` (1).
         For fp8/fp4/int4 4-way splits: ``"PART_P0"`` (0), ``"PART_P1"`` (1), ``"PART_P2"`` (2), ``"PART_P3"`` (3).
-        Not needed for same-width conversions (e.g. f16↔bf16, s32→f32, f32→s32, f16→s16).
+        Not needed for same-width conversions (e.g. f16<->bf16, s32->f32, f32->s32, f16->s16).
     mode : str
         Write mode for masked-off lanes.
         - ``"MODE_ZEROING"`` (default): Inactive lanes are set to zero.
-        - ``"MODE_MERGING"``: Inactive lanes preserve their prior value (only on mask-less int→int paths; 920R1 only for mask paths).
+        - ``"MODE_MERGING"``: Inactive lanes preserve their prior value (only on mask-less int->int paths; 920R1 only for mask paths).
 
     Returns
     -------
@@ -862,10 +942,10 @@ def vcvt(
 
     Supported conversion pairs (simplified)
     ----------------------------------------
-    * Float→Int: f32→s64/s32/s16, f16→s32/s16/s8/u8, bf16→s32.
-    * Float→Float: f32→f16/bf16/fp8, f16→fp8/bf16/f32, bf16→fp8/f16/f32/fp4.
-    * Int→Float: s16/s32/s64→f16/f32, s8/u8→f16.
-    * Int→Int: Most s/u{8,16,32,64} widening/narrowing pairs.
+    * Float->Int: f32->s64/s32/s16, f16->s32/s16/s8/u8, bf16->s32.
+    * Float->Float: f32->f16/bf16/fp8, f16->fp8/bf16/f32, bf16->fp8/f16/f32/fp4.
+    * Int->Float: s16/s32/s64->f16/f32, s8/u8->f16.
+    * Int->Int: Most s/u{8,16,32,64} widening/narrowing pairs.
     """
 
     if mask is None:

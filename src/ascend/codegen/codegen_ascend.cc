@@ -28,7 +28,6 @@ namespace {
 
 constexpr const char *kModeMerging = "MODE_MERGING";
 constexpr const char *kSimdOpPrefix = "tl.simd.";
-constexpr const char *kFastMathOverride = "fast_math";
 
 bool IsVmiOp(const CallNode *op, std::string *op_name = nullptr) {
   if (auto opt_call_op = op->op.as<Op>()) {
@@ -64,14 +63,45 @@ bool IsSimdMergingCall(const CallNode *op,
   return false;
 }
 
-bool UsePreciseVdiv(const CallNode *op, DataType dtype, bool enable_fast_math) {
-  if (!dtype.is_float() || dtype.bits() != 32) {
-    return false;
+// ---------------------------------------------------------------------------
+// Per-op SFU precision resolution.
+//
+// Priority (high -> low):
+//   1. per-op "precision" annotation (Python `precision=` kwarg)
+//   2. `fallback` (legacy: fast_math for vdiv; bare SFU otherwise)
+//
+// The Python side (tilelang/ascend/language/simd.py) is the single source
+// of truth for alias resolution: string aliases are normalized to integer
+// codes (0=hw, 1=exact, 2=ftz_false) before they reach codegen, so no
+// alias table lives here (mirrors the l2_cache_ctrl pattern).
+// ---------------------------------------------------------------------------
+enum class SfuPrecision { kHw, kExact, kKeepSub };
+
+static SfuPrecision PrecisionFromCode(int code) {
+  if (code == 1)
+    return SfuPrecision::kExact;
+  if (code == 2)
+    return SfuPrecision::kKeepSub;
+  return SfuPrecision::kHw;
+}
+
+// MODE_MERGING calls are legalized to void calls, so use the explicit result
+// dtype supplied by the caller rather than reading op->dtype here.
+SfuPrecision ResolveSfuPrecision(const CallNode *op, DataType result_dtype,
+                                 SfuPrecision fallback) {
+  // Precise paths (vdiv_0ulp_ftz_true, *_ftz_false wrappers) are float32-only:
+  // non-fp32 keeps the hardware instruction regardless of annotations
+  // (historical UsePreciseVdiv contract: "non-fp32 always uses hardware").
+  if (!result_dtype.is_float() || result_dtype.bits() != 32) {
+    return fallback;
   }
-  if (auto fast_override = op->annotations.Get(kFastMathOverride)) {
-    enable_fast_math = Downcast<Bool>(fast_override.value())->value;
+  // Per-op "precision" annotation (int code from the Python side,
+  // normalized from the string aliases in tilelang/ascend/language/simd.py
+  // -- no alias table here, mirroring the l2_cache_ctrl pattern).
+  if (auto p = op->annotations.Get("precision")) {
+    return PrecisionFromCode(Downcast<IntImm>(p.value())->value);
   }
-  return !enable_fast_math;
+  return fallback;
 }
 
 bool IsAscendWarpReduceDType(DataType dtype) {
@@ -1019,12 +1049,34 @@ bool CodeGenTileLangAscend::EmitSimdMergingCall(const CallNode *op,
     intrinsic_name = "vdup";
   }
 
+  // Per-op precision picks a wrapper in MODE_MERGING too: exact ->
+  // vdiv_0ulp_ftz_true, ftz_false -> *_ftz_false (both have in-place overloads
+  // that implement merging via vsel, mirroring the non-merging emit below).
+  // Bare SFU otherwise.
   const DataType result_dtype = op->args[1].dtype();
-  const bool use_precise_div =
-      intrinsic_name == "vdiv" &&
-      UsePreciseVdiv(op, result_dtype, enable_fast_math_);
-  os << (use_precise_div ? "simd_inst::vdiv_precise" : "::" + intrinsic_name)
-     << "(*(";
+  std::string wrapper;
+  if (intrinsic_name == "vdiv") {
+    // Precise division is float32-only (vdiv_0ulp_ftz_true has vector_f32
+    // overloads); non-fp32 always uses the hardware instruction.
+    const bool is_f32 = result_dtype.is_float() && result_dtype.bits() == 32;
+    auto prec = ResolveSfuPrecision(op, result_dtype,
+                                    (is_f32 && !enable_fast_math_)
+                                        ? SfuPrecision::kExact
+                                        : SfuPrecision::kHw);
+    if (is_f32 && prec == SfuPrecision::kExact) {
+      wrapper = "simd_inst::vdiv_0ulp_ftz_true";
+    }
+  } else if (intrinsic_name == "vexp" || intrinsic_name == "vln" ||
+             intrinsic_name == "vsqrt") {
+    auto prec = ResolveSfuPrecision(op, result_dtype, SfuPrecision::kHw);
+    if (prec == SfuPrecision::kKeepSub) {
+      // CANN tier naming: <op>_<N>ulp_ftz_false (vexp/vln: 1ulp, vsqrt: 0ulp)
+      const char *suffix =
+          intrinsic_name == "vsqrt" ? "_0ulp_ftz_false" : "_1ulp_ftz_false";
+      wrapper = "simd_inst::" + intrinsic_name + suffix;
+    }
+  }
+  os << (wrapper.empty() ? "::" + intrinsic_name : wrapper) << "(*(";
   PrintExpr(op->args[0], os);
   os << ")";
   for (size_t i = 1; i < op->args.size(); ++i) {
@@ -1259,10 +1311,10 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::ascend_copy_gm_to_cbuf())) {
     ICHECK_EQ(op->args.size(), 12)
         << "tl.ascend_copy_gm_to_cbuf expects exactly 12 arguments";
-    // arg[9] is the transpose flag: 0 → nd2nz, nonzero → dn2nz
+    // arg[9] is the transpose flag: 0 -> nd2nz, nonzero -> dn2nz
     const IntImmNode *transpose_node = op->args[9].as<IntImmNode>();
     bool use_dn2nz = transpose_node && transpose_node->value != 0;
-    // Emit set_mte2_nz_para: configure MTE2 NZ layout for GM→L1 copy
+    // Emit set_mte2_nz_para: configure MTE2 NZ layout for GM->L1 copy
     // mte2NzPara encoding: [15:0]=ndNum, [31:16]=dstNzNStride,
     // [47:32]=dstNzC0Stride SDK convention (from data_copy_wrapper_nd.h):
     //   dstNzNStride = 1 (always)
@@ -1396,7 +1448,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::ascend_copy_matrix_cc_to_gm())) {
     ICHECK_EQ(op->args.size(), 25)
         << "tl.ascend_copy_matrix_cc_to_gm expects exactly 25 arguments";
-    // Emit set_loop3_para: configure LOOP3_PARA for L0C→GM NZ-to-ND
+    // Emit set_loop3_para: configure LOOP3_PARA for L0C->GM NZ-to-ND
     // conversion ndNum=1, srcNdStride=0, dstNdStride=0 (single ND block)
     this->PrintIndent();
     this->stream << "set_loop3_para(uint64_t(1));\n";
@@ -1435,9 +1487,9 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     // ascend_nd2nz_scatter(src_ub, tmp_ub, rows, cols,
     //                      dst_dtype_str, src_dtype_str)
     // Emits the SimdVF scatter from an ND tile in `src_ub` into the NZ-laid
-    // tmp buffer `tmp_ub`. The post-scatter UB→L1 raw DMA is emitted as a
+    // tmp buffer `tmp_ub`. The post-scatter UB->L1 raw DMA is emitted as a
     // separate ascend_nd2nz_post_copy stmt.
-    // Template: <ROWS, COLS, SrcT, DstT> — the (SrcT, DstT) pair selects
+    // Template: <ROWS, COLS, SrcT, DstT> - the (SrcT, DstT) pair selects
     // the specialization (same-type or fused-cast).
     ICHECK_EQ(op->args.size(), 6)
         << "tl.ascend_nd2nz_scatter expects exactly 6 arguments";
@@ -1760,9 +1812,19 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       name = "vmax";
     else if (op->op.same_as(tl::simd_vmin()))
       name = "vmin";
-    else
-      name = UsePreciseVdiv(op, op->dtype, enable_fast_math_) ? "vdiv_precise"
-                                                              : "vdiv";
+    else {
+      // fast_math legacy chain: fallback is precise when fast_math is off
+      // (historical default); per-op precision overrides it.  Non-fp32
+      // always uses the hardware instruction (vdiv_0ulp_ftz_true is
+      // float32-only).
+      const bool is_f32 = op->dtype.is_float() && op->dtype.bits() == 32;
+      auto prec = ResolveSfuPrecision(op, op->dtype,
+                                      (is_f32 && !enable_fast_math_)
+                                          ? SfuPrecision::kExact
+                                          : SfuPrecision::kHw);
+      name = is_f32 && prec == SfuPrecision::kExact ? "vdiv_0ulp_ftz_true"
+                                                    : "vdiv";
+    }
     os << "simd_inst::" << name << "(";
     PrintExpr(op->args[0], os); // src0
     os << ", ";
@@ -1833,13 +1895,18 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
            op->op.same_as(tl::simd_vnot())) {
     ICHECK_EQ(op->args.size(), 3);
     const char *name = nullptr;
-    if (op->op.same_as(tl::simd_vexp()))
-      name = "vexp";
-    else if (op->op.same_as(tl::simd_vln()))
-      name = "vln";
-    else if (op->op.same_as(tl::simd_vsqrt()))
-      name = "vsqrt";
-    else if (op->op.same_as(tl::simd_vabs()))
+    // Precision resolved per op: ftz_false selects the *_ftz_false
+    // wrappers (CANN precision sub-paths); bare SFU (intrinsic) otherwise.
+    if (op->op.same_as(tl::simd_vexp())) {
+      auto prec = ResolveSfuPrecision(op, op->dtype, SfuPrecision::kHw);
+      name = prec == SfuPrecision::kKeepSub ? "vexp_1ulp_ftz_false" : "vexp";
+    } else if (op->op.same_as(tl::simd_vln())) {
+      auto prec = ResolveSfuPrecision(op, op->dtype, SfuPrecision::kHw);
+      name = prec == SfuPrecision::kKeepSub ? "vln_1ulp_ftz_false" : "vln";
+    } else if (op->op.same_as(tl::simd_vsqrt())) {
+      auto prec = ResolveSfuPrecision(op, op->dtype, SfuPrecision::kHw);
+      name = prec == SfuPrecision::kKeepSub ? "vsqrt_0ulp_ftz_false" : "vsqrt";
+    } else if (op->op.same_as(tl::simd_vabs()))
       name = "vabs";
     else if (op->op.same_as(tl::simd_vrelu()))
       name = "vrelu";
@@ -1911,7 +1978,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     PrintExpr(op->args[2], os); // mask
     os << ")";
   }
-  // --- SimdVF register permutation: (src0, src1) → pair ---
+  // --- SimdVF register permutation: (src0, src1) -> pair ---
   else if (op->op.same_as(tl::simd_vintlv()) ||
            op->op.same_as(tl::simd_vdintlv())) {
     ICHECK_EQ(op->args.size(), 2);
@@ -1922,7 +1989,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     PrintExpr(op->args[1], os); // src1
     os << ")";
   }
-  // --- SimdVF pair element access: pair_get(pair, index) → pair.vN ---
+  // --- SimdVF pair element access: pair_get(pair, index) -> pair.vN ---
   else if (op->op.same_as(tl::simd_pair_get())) {
     ICHECK_EQ(op->args.size(), 2);
     PrintExpr(op->args[0], os); // pair
@@ -2002,7 +2069,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     os << ")";
   }
-  // --- SimdVF dual-dest load: (addr, dist [, offset]) → vec_pair ---
+  // --- SimdVF dual-dest load: (addr, dist [, offset]) -> vec_pair ---
   else if (op->op.same_as(tl::simd_vld2())) {
     ICHECK(op->args.size() >= 2 && op->args.size() <= 3);
     DataType elem = op->dtype.element_of();
@@ -2716,7 +2783,7 @@ void CodeGenTileLangAscend::VisitStmt_(const BindNode *op) {
                << "(" << dist << ");\n";
         return;
       }
-      // pair_get(pair, idx) → inline as pair.vN, no auto decl
+      // pair_get(pair, idx) -> inline as pair.vN, no auto decl
       if (call->op.same_as(tl::simd_pair_get())) {
         int idx = (int)Downcast<IntImm>(call->args[1])->value;
         std::ostringstream tmp;

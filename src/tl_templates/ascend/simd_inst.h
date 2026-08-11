@@ -204,7 +204,7 @@ __simd_callee__ inline vector_bool psel(vector_bool src_0, vector_bool src_1,
   return dst;
 }
 
-// f16→f32, f8→f32, i32→f32: ::vcvt(dst, src, mask, part/round, mode)
+// f16->f32, f8->f32, i32->f32: ::vcvt(dst, src, mask, part/round, mode)
 template <typename U, typename SrcVec, typename Part, typename Mode>
 __simd_callee__ inline vec_t<U> vcvt(SrcVec src, vector_bool srcMask, Part part,
                                      Mode mode) {
@@ -213,7 +213,7 @@ __simd_callee__ inline vec_t<U> vcvt(SrcVec src, vector_bool srcMask, Part part,
   return dst;
 }
 
-// f32→i32: ::vcvt(dst, src, mask, round, rs, mode)
+// f32->i32: ::vcvt(dst, src, mask, round, rs, mode)
 template <typename U, typename SrcVec, typename RoundMode, typename Rs,
           typename Mode>
 __simd_callee__ inline vec_t<U> vcvt(SrcVec src, vector_bool srcMask,
@@ -224,7 +224,7 @@ __simd_callee__ inline vec_t<U> vcvt(SrcVec src, vector_bool srcMask,
   return dst;
 }
 
-// f32→f16, f32→f8, f16→f8: ::vcvt(dst, src, mask, round, rs, part, mode)
+// f32->f16, f32->f8, f16->f8: ::vcvt(dst, src, mask, round, rs, part, mode)
 template <typename U, typename SrcVec, typename RoundMode, typename Rs,
           typename Part, typename Mode>
 __simd_callee__ inline vec_t<U> vcvt(SrcVec src, vector_bool srcMask,
@@ -308,10 +308,11 @@ __simd_callee__ inline SrcVec vdiv(SrcVec src_0, SrcVec src_1, vector_bool mask,
 // the 0ULP error-correction core.
 // ============================================================================
 
-// Precision f32 division exposed under the historical vdiv_precise name.
+// Precision f32 division exposed under the historical vdiv_0ulp_ftz_true name.
 template <typename Mode>
-__simd_callee__ inline vector_f32 vdiv_precise(vector_f32 src0, vector_f32 src1,
-                                               vector_bool mask, Mode mode) {
+__simd_callee__ inline vector_f32
+vdiv_0ulp_ftz_true(vector_f32 src0, vector_f32 src1, vector_bool mask,
+                   Mode mode) {
   constexpr uint32_t infNanBound = 0xff800000u;
   constexpr uint32_t signBitNum = 0x80000000u;
 
@@ -364,13 +365,13 @@ __simd_callee__ inline vector_f32 vdiv_precise(vector_f32 src0, vector_f32 src1,
 }
 
 template <typename Mode>
-__simd_callee__ inline void vdiv_precise(vector_f32 &dst, vector_f32 src0,
-                                         vector_f32 src1, vector_bool mask,
-                                         Mode mode) {
+__simd_callee__ inline void vdiv_0ulp_ftz_true(vector_f32 &dst, vector_f32 src0,
+                                               vector_f32 src1,
+                                               vector_bool mask, Mode mode) {
   (void)mode;
   // The in-place overload implements MODE_MERGING: update active lanes while
   // preserving the old destination value for inactive lanes.
-  vector_f32 result = vdiv_precise(src0, src1, mask, MODE_ZEROING);
+  vector_f32 result = vdiv_0ulp_ftz_true(src0, src1, mask, MODE_ZEROING);
   ::vsel(dst, result, dst, mask);
 }
 
@@ -480,6 +481,139 @@ __simd_callee__ inline SrcVec vexp(SrcVec src, vector_bool mask, Mode mode) {
   SrcVec dst;
   ::vexp(dst, src, mask, mode);
   return dst;
+}
+
+// ============================================================================
+// SFU precision wrappers.  Naming convention: <op>_<N>ulp_ftz_<mode> maps 1:1
+// to the CANN PRECISION_<N>ULP_FTZ_<mode> algorithm tiers
+// (kernel_reg_compute_utils.h):
+//   vdiv_0ulp_ftz_true    = DivAlgo::PRECISION_0ULP_FTZ_TRUE (DivPrecisionImpl)
+//   vexp_1ulp_ftz_false   = ExpAlgo::PRECISION_1ULP_FTZ_FALSE  (ExpPrecision)
+//   vln_1ulp_ftz_false    = LnAlgo::PRECISION_1ULP_FTZ_FALSE
+//   vsqrt_0ulp_ftz_false  = SqrtAlgo::PRECISION_0ULP_FTZ_FALSE
+//   (SqrtFastInverseImpl)
+// FTZ_FALSE wrappers preserve subnormal inputs/outputs that the hardware SFU
+// flushes to zero. Selected per op via the `precision='ftz_false'`
+// kwarg (see codegen_ascend.cc). Structurally identical to the CANN 9.1.0
+// precision sub-paths (ExpPrecision / ln / SqrtPrecision scale-unscale);
+// these are full-vector costs applied to every lane, so keep the default off.
+// ============================================================================
+
+// vexp FTZ_FALSE: normal outputs pass through; outputs that would land in the
+// subnormal range are computed as (e^(x/2))^2 so the SFU input stays normal.
+// Self-consistent at x < -174.7: e^(x/2) itself is flushed to 0, squaring
+// yields 0, and the true e^x < 2^-252 correctly rounds to 0.
+template <typename SrcVec, typename Mode>
+__simd_callee__ inline SrcVec vexp_1ulp_ftz_false(SrcVec src, vector_bool mask,
+                                                  Mode mode) {
+  constexpr float kMaxSubnormal =
+      1.1754942e-38f; // largest subnormal (2^-126 - 2^-149)
+  SrcVec z, t, half;
+  vector_bool m;
+  ::vexp(z, src, mask, mode);            // SFU initial value
+  ::vcmps_le(m, z, kMaxSubnormal, mask); // output would be subnormal?
+  ::vmuls(half, src, 0.5f, mask, mode);
+  ::vexp(t, half, mask, mode); // e^(x/2): stays in normal range
+  ::vmul(t, t, t, mask, mode);
+  SrcVec dst;
+  ::vsel(dst, t, z, m);
+  return dst;
+}
+
+// In-place overload implementing MODE_MERGING (mirrors vdiv_0ulp_ftz_true):
+// active lanes get the FTZ_FALSE result, inactive lanes keep their old value.
+template <typename SrcVec, typename Mode>
+__simd_callee__ inline void vexp_1ulp_ftz_false(SrcVec &dst, SrcVec src,
+                                                vector_bool mask, Mode mode) {
+  (void)mode;
+  SrcVec result = vexp_1ulp_ftz_false(src, mask, MODE_ZEROING);
+  ::vsel(dst, result, dst, mask);
+}
+
+// vln FTZ_FALSE: positive subnormal inputs are scaled by 2^23 before VLN and
+// compensated by -ln(2^23) (the scaled value is exact: subnormal mantissa
+// shifted into the normal range). Other inputs keep hardware semantics
+// (0 -> -inf, negative -> NaN).
+template <typename SrcVec, typename Mode>
+__simd_callee__ inline SrcVec vln_1ulp_ftz_false(SrcVec src, vector_bool mask,
+                                                 Mode mode) {
+  // 1.1754944e-38f rounds to 2^-126 (smallest normal), so the
+  // `src < kMinNormal` test below is exactly the subnormal-input test.
+  constexpr float kMinNormal = 1.1754944e-38f;   // 2^-126, smallest normal
+  constexpr float kLn2p23 = 15.942385152878742f; // ln(2^23)
+  SrcVec z, t, scaled;
+  vector_bool sub, pos, m;
+  ::vln(z, src, mask, mode);              // hardware path
+  ::vcmps_lt(sub, src, kMinNormal, mask); // subnormal magnitude
+  ::vcmps_gt(pos, src, 0.0f, mask);       // positive only
+  ::pand(m, sub, pos, mask);
+  ::vmuls(scaled, src, 8388608.0f, mask, mode); // 2^23
+  ::vln(t, scaled, mask, mode);
+  ::vadds(t, t, -kLn2p23, mask, mode);
+  SrcVec dst;
+  ::vsel(dst, t, z, m);
+  return dst;
+}
+
+// In-place overload implementing MODE_MERGING (mirrors vdiv_0ulp_ftz_true).
+template <typename SrcVec, typename Mode>
+__simd_callee__ inline void vln_1ulp_ftz_false(SrcVec &dst, SrcVec src,
+                                               vector_bool mask, Mode mode) {
+  (void)mode;
+  SrcVec result = vln_1ulp_ftz_false(src, mask, MODE_ZEROING);
+  ::vsel(dst, result, dst, mask);
+}
+
+// vsqrt FTZ_FALSE: replica of CANN 9.1.0 SqrtFastInverseImpl
+// (PRECISION_0ULP_FTZ_FALSE / FAST_INVERSE), chosen over the 1ULP_FTZ_FALSE
+// scale/unscale variant because the latter mis-rounds 0x007fffff to +0.
+// Inputs < 1 are scaled by 2^24 so the chain stays in the normal range,
+// then unscaled by 2^-12; a 1/sqrt initial value plus Newton and a second
+// residual correction gives correct rounding; +-0 and +inf pass through.
+template <typename SrcVec, typename Mode>
+__simd_callee__ inline SrcVec vsqrt_0ulp_ftz_false(SrcVec src, vector_bool mask,
+                                                   Mode mode) {
+  constexpr float kOne = 1.0f;
+  constexpr float kHalf = 0.5f;
+  constexpr float kScaleUp = 16777216.0f;     // 2^24
+  constexpr float kScaleDn = 0.000244140625f; // 2^-12
+  constexpr float kPosInf = __builtin_inff(); // true +infinity
+  SrcVec b, scaled, one, tmp, err, res, x;
+  vector_bool p, isZero, isInf, special;
+  ::vcmps_lt(p, src, kOne, mask); // scale inputs < 1 up
+  ::vmuls(scaled, src, kScaleUp, mask, mode);
+  ::vsel(b, scaled, src, p);
+  ::vdup(one, kOne, mask, mode);
+  ::vsqrt(tmp, b, mask, mode);
+  ::vdiv(x, one, tmp, mask, mode); // 1/sqrt(b) initial value
+  ::vmuls(tmp, x, -kOne, mask, mode);
+  ::vmul(err, x, b, mask, mode);
+  ::vmula(one, err, tmp, mask, mode); // first Newton step
+  ::vmuls(tmp, x, kHalf, mask, mode);
+  ::vmula(x, one, tmp, mask, mode);
+  ::vmul(res, x, b, mask, mode);
+  ::vmuls(tmp, res, -kOne, mask, mode);
+  err = b;
+  ::vmula(err, res, tmp, mask, mode); // second residual correction
+  ::vmuls(tmp, x, kHalf, mask, mode);
+  ::vmadd(tmp, err, res, mask, mode);
+  ::vmuls(scaled, tmp, kScaleDn, mask, mode);
+  ::vsel(tmp, scaled, tmp, p);           // unscale only the scaled inputs
+  ::vcmps_eq(isZero, src, 0.0f, mask);   // +-0 pass through
+  ::vcmps_eq(isInf, src, kPosInf, mask); // +inf pass through
+  ::por(special, isZero, isInf, mask);
+  SrcVec dst;
+  ::vsel(dst, src, tmp, special); // special ? src : tmp
+  return dst;
+}
+
+// In-place overload implementing MODE_MERGING (mirrors vdiv_0ulp_ftz_true).
+template <typename SrcVec, typename Mode>
+__simd_callee__ inline void vsqrt_0ulp_ftz_false(SrcVec &dst, SrcVec src,
+                                                 vector_bool mask, Mode mode) {
+  (void)mode;
+  SrcVec result = vsqrt_0ulp_ftz_false(src, mask, MODE_ZEROING);
+  ::vsel(dst, result, dst, mask);
 }
 
 // -- Cross-lane reductions
