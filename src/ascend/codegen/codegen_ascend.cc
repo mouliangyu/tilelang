@@ -2048,6 +2048,35 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     PrintExpr(op->args[2], os); // mask
     os << ")";
   }
+  // --- SimdVF predicate load: (addr, dist [, offset]) ---
+  else if (op->op.same_as(tl::simd_pld())) {
+    ICHECK(op->args.size() >= 2 && op->args.size() <= 3);
+    os << "simd_inst::plds((__ubuf__ uint32_t*)";
+    PrintExpr(op->args[0], os); // addr
+    os << ", ";
+    if (op->args.size() == 3) {
+      PrintExpr(op->args[2], os); // offset
+    } else {
+      os << "0";
+    }
+    os << ", " << Downcast<StringImm>(op->args[1])->value << ")";
+  }
+  // --- SimdVF predicate store: (addr, src, dist [, offset]) ---
+  else if (op->op.same_as(tl::simd_pst())) {
+    ICHECK(op->args.size() >= 3 && op->args.size() <= 4);
+    std::string addr = this->PrintExpr(op->args[0]);
+    std::string src = this->PrintExpr(op->args[1]);
+    std::string dist = Downcast<StringImm>(op->args[2])->value;
+    this->PrintIndent();
+    this->stream << "simd_inst::psts(" << src << ", (__ubuf__ uint32_t*)"
+                 << addr << ", ";
+    if (op->args.size() == 4) {
+      this->PrintExpr(op->args[3], this->stream); // offset
+    } else {
+      this->stream << "0";
+    }
+    this->stream << ", " << dist << ");\n";
+  }
   // --- SimdVF load: (addr, dist [, offset]) ---
   else if (op->op.same_as(tl::simd_vld())) {
     ICHECK(op->args.size() >= 2 && op->args.size() <= 3);

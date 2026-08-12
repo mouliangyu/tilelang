@@ -180,6 +180,55 @@ def alloc_local(shape: ShapeType, dtype: DType):
 # -- Data movement ---------------------------------------------------------------
 
 
+_PREDICATE_LOAD_DISTS = ("NORM", "US", "DS")
+_PREDICATE_STORE_DISTS = ("NORM", "PK")
+_PREDICATE_PAYLOAD_BYTES = {
+    "NORM": 32,
+    "US": 16,
+    "DS": 64,
+    "PK": 16,
+}
+
+
+def _validate_predicate_dist(name: str, dist: str, allowed: tuple[str, ...]) -> None:
+    if not isinstance(dist, str):
+        raise TypeError(f"{name}: `dist` must be a string, got {type(dist).__name__}")
+    if dist not in allowed:
+        raise ValueError(f"{name}: `dist` must be one of {allowed}, got {dist!r}")
+
+
+def _predicate_access_ptr(addr, access_type: str, dist: str):
+    if not isinstance(addr, BufferLoad):
+        return addr
+    elem_dtype = str(addr.buffer.dtype)
+    if elem_dtype not in _ELEM_BITS:
+        raise ValueError(f"Predicate load/store does not support buffer dtype {elem_dtype!r}")
+    payload_bits = _PREDICATE_PAYLOAD_BYTES[dist] * 8
+    elem_bits = _ELEM_BITS[elem_dtype]
+    extent = (payload_bits + elem_bits - 1) // elem_bits
+    return access_ptr(addr, access_type, extent=extent)
+
+
+def pld(addr, dist="NORM", off=None):
+    """Load a predicate from UB with an optional scalar offset."""
+    _validate_predicate_dist("pld", dist, _PREDICATE_LOAD_DISTS)
+    addr = _predicate_access_ptr(addr, "r", dist)
+    args = [addr, dist]
+    if off is not None:
+        args.append(off)
+    return tirx.call_intrin("boolx256", _Op("tl.simd.pld"), *args)
+
+
+def pst(addr, src, dist="NORM", off=None):
+    """Store a predicate to UB with an optional scalar offset."""
+    _validate_predicate_dist("pst", dist, _PREDICATE_STORE_DISTS)
+    addr = _predicate_access_ptr(addr, "w", dist)
+    args = [addr, src, dist]
+    if off is not None:
+        args.append(off)
+    return tirx.call_intrin("void", _Op("tl.simd.pst"), *args)
+
+
 def vld(addr, dist="NORM", off=None):
     """Vector load. Returns a typed vector register.
 

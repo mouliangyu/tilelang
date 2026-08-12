@@ -441,6 +441,10 @@ with T.SimdVF():
     r = T.simd.vld(buf[offset])       # 2048-bit vector load
     T.simd.vsts(buf[offset], r, mask) # 2048-bit vector store
 
+    # Predicate Load/Store
+    pred = T.simd.pld(pred_buf[0], dist="US", off=runtime_offset)
+    T.simd.pst(pred_buf[0], pred, dist="PK", off=runtime_offset)
+
     # Arithmetic
     r = T.simd.vadd(a, b, mask)
     r = T.simd.vmul(a, b, mask)
@@ -460,11 +464,11 @@ with T.SimdVF():
     x, y = T.simd.vdintlv(a0, a1)     # deinterleave back
 ```
 
-Full list of available SIMD intrinsics: `vld`, `vsts`, `vsstb`, `vadd`, `vsub`,
-`vmul`, `vdiv`, `vmax`, `vmin`, `vand`, `vexp`, `vln`, `vsqrt`,
-`vrsqrt`, `vabs`, `vneg`, `vrelu`, `vdup`, `vdupv`, `vcadd`,
-`vcmax`, `vcgadd`, `vintlv`, `vdintlv`, `vpack`, `vgatherb`, `vcvt`,
-`vsel`, `vmuls`, `vadds`, `pset`, `mem_bar`.
+Full list of available SIMD intrinsics: `pld`, `pst`, `vld`,
+`vsts`, `vsstb`, `vadd`, `vsub`, `vmul`, `vdiv`,
+`vmax`, `vmin`, `vand`, `vexp`, `vln`, `vsqrt`, `vrsqrt`, `vabs`, `vneg`,
+`vrelu`, `vdup`, `vdupv`, `vcadd`, `vcmax`, `vcgadd`, `vintlv`, `vdintlv`,
+`vpack`, `vgatherb`, `vcvt`, `vsel`, `vmuls`, `vadds`, `pset`, `mem_bar`.
 
 ### 8.2 SIMD Lower vs High-Level SIMD
 

@@ -108,6 +108,20 @@ __simd_callee__ inline vec_t<T> vlds(__ubuf__ T *src, Offset offset,
   return dst;
 }
 
+template <typename Dist>
+__simd_callee__ inline vector_bool plds(__ubuf__ uint32_t *src, int32_t offset,
+                                        Dist dist) {
+  vector_bool dst;
+  ::plds(dst, src, offset, dist);
+  return dst;
+}
+
+template <typename Dist>
+__simd_callee__ inline void psts(vector_bool src, __ubuf__ uint32_t *base,
+                                 int32_t offset, Dist dist) {
+  ::psts(src, base, offset, dist);
+}
+
 // Dual-dest memory load (ASC DIST_DINTLV_B16). Prefer ::vld(dst0,dst1,...)
 // which wraps ::vlds on dav-3510; matches asc_loadalign_v2_impl.h.
 template <typename T, typename Dist>
