@@ -55,6 +55,23 @@ protected:
                         PrimExpr rhs, std::ostream &os) final;
 
 private:
+  // Keep textual SSA reuse local to one emitted operation. This preserves
+  // single-evaluation semantics without carrying memory-dependent values
+  // across later stores.
+  class SSAOperationScope {
+  public:
+    explicit SSAOperationScope(CodeGenTileLangAscend *codegen)
+        : codegen_(codegen), scope_id_(codegen->BeginScope()) {}
+    ~SSAOperationScope() { codegen_->EndScope(scope_id_); }
+
+    SSAOperationScope(const SSAOperationScope &) = delete;
+    SSAOperationScope &operator=(const SSAOperationScope &) = delete;
+
+  private:
+    CodeGenTileLangAscend *codegen_;
+    int scope_id_;
+  };
+
   std::string current_function_name_;
   int simtvf_helper_counter_{0};
   bool inside_simtvf_body_{false};

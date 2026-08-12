@@ -1109,6 +1109,11 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   if (EmitSimdMergingCall(op, os)) {
     return;
   }
+  if (op->op.same_as(builtin::reinterpret())) {
+    SSAOperationScope ssa_scope(this);
+    CodeGenC::VisitExpr_(op, os);
+    return;
+  }
   if (op->op.same_as(tl::device_assert())) {
     ICHECK_EQ(op->args.size(), 1)
         << "tl.device_assert expects exactly 1 argument (condition)";
@@ -2583,6 +2588,7 @@ bool CodeGenTileLangAscend::EmitScalarizedStore(const BufferStoreNode *op) {
   const RampNode *ramp = index.as<RampNode>();
   ICHECK(ramp) << "scalarized store expects a ramp index, got " << index;
   DataType elem_dtype = value_dtype.element_of();
+  SSAOperationScope ssa_scope(this);
   std::string value = SSAGetID(PrintExpr(op->value), value_dtype);
   for (int i = 0; i < lanes; ++i) {
     PrimExpr lane_index =
@@ -2858,6 +2864,7 @@ void CodeGenTileLangAscend::VisitStmt_(const BindNode *op) {
         const auto *call = op->value.as<CallNode>();
         if (call && call->op.same_as(builtin::reinterpret()) &&
             !call->args[0]->dtype.is_handle()) {
+          SSAOperationScope ssa_scope(this);
           std::string rhs =
               SSAGetID(PrintExpr(call->args[0]), call->args[0]->dtype);
           std::string vid = AllocVarID(op->var.get());
@@ -2998,6 +3005,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CastNode *op,
   this->PrintIndent();
   this->PrintType(target_ty, stream);
   stream << ' ' << sret << ";\n";
+  SSAOperationScope ssa_scope(this);
   std::string src = SSAGetID(PrintExpr(op->value), from_ty);
 
   int lanes = from_ty.lanes();
@@ -3273,7 +3281,7 @@ void CodeGenTileLangAscend::PrintVecBinaryOp(const std::string &op, DataType t,
   this->PrintIndent();
   this->PrintType(t, stream);
   stream << ' ' << sret << ";\n";
-  int ssa_scope = BeginScope();
+  SSAOperationScope ssa_scope(this);
   {
     std::string vlhs = SSAGetID(PrintExpr(lhs), lhs.dtype());
     std::string vrhs = SSAGetID(PrintExpr(rhs), rhs.dtype());
@@ -3295,7 +3303,6 @@ void CodeGenTileLangAscend::PrintVecBinaryOp(const std::string &op, DataType t,
       PrintVecElemStore(sret, t, i, value_temp.str());
     }
   }
-  EndScope(ssa_scope);
   os << sret;
 }
 
@@ -3312,6 +3319,7 @@ void CodeGenTileLangAscend::PrintCallExtern(Type ret_type,
     this->PrintIndent();
     this->PrintType(ret_dtype, stream);
     stream << ' ' << sret << ";\n";
+    SSAOperationScope ssa_scope(this);
     {
       std::vector<std::string> sargs;
       size_t arg_begin = static_cast<size_t>(skip_first_arg);
