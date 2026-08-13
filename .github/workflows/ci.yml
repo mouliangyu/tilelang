@@ -176,13 +176,13 @@ jobs:
           export PIP_USER=0
 
           uv pip install --upgrade pip setuptools wheel
-          uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu130
+          uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
           uv pip install -v -r requirements-test.txt
           uv pip install pybind11==2.12.0
           echo "import torch; print(f'torch: {torch.__version__}')" | uv run --no-project --script -
           echo "::group::torch.utils.collect_env"
           uv run --no-project -m -- torch.utils.collect_env
-          uv pip install /nfs-hg/prod/deepseek/permanent/shared/caohuanqi/pytorch/dist/torch_npu-2.10.0.post4+git4421109-cp312-cp312-linux_aarch64.whl
+          uv pip install /nfs-hg/prod/deepseek/permanent/shared/caohuanqi/pytorch/dist/torch_npu-2.10.0.post1+git4be33e9-cp312-cp312-linux_aarch64.whl
           # Self-contained PTO toolchain from the official hw-native-sys/PTOAS
           # vmi-v0.1.3 release (ptodsl + MLIR dialects + ptoas CLI).
           case "${RUNNER_ARCH}" in
