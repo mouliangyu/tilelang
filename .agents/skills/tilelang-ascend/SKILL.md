@@ -442,8 +442,8 @@ with T.SimdVF():
     T.simd.vsts(buf[offset], r, mask) # 2048-bit vector store
 
     # Predicate Load/Store
-    pred = T.simd.pld(pred_buf[0], dist="US", off=runtime_offset)
-    T.simd.pst(pred_buf[0], pred, dist="PK", off=runtime_offset)
+    pred = T.simd.pld(pred_buf[runtime_offset], dist="US")
+    T.simd.pst(pred_buf[runtime_offset], pred, dist="PK")
 
     # Arithmetic
     r = T.simd.vadd(a, b, mask)
@@ -463,6 +463,11 @@ with T.SimdVF():
     a0, a1 = T.simd.vintlv(x, y)      # interleave even/odd lanes
     x, y = T.simd.vdintlv(a0, a1)     # deinterleave back
 ```
+
+`vld`, `vsts`, `pld`, and `pst` do not have a separate scalar `off`
+parameter. Express the displacement in the buffer address, as shown above;
+the Ascend code generator supplies the hardware-required zero offset. `vld2`
+retains its `off` parameter because that operand has address-register semantics.
 
 Full list of available SIMD intrinsics: `pld`, `pst`, `vld`,
 `vsts`, `vsstb`, `vadd`, `vsub`, `vmul`, `vdiv`,

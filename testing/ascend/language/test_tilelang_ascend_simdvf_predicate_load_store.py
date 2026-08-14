@@ -1,3 +1,5 @@
+import inspect
+
 import pytest
 
 import tilelang
@@ -17,9 +19,9 @@ def _predicate_load_store_kernel():
             p_ub = T.alloc_shared((128,), "uint8")
             T.copy(P, p_ub)
             with T.SimdVF():
-                dynamic_mask = T.simd.pld(p_ub[0], dist="US", off=runtime_offset)
+                dynamic_mask = T.simd.pld(p_ub[runtime_offset], dist="US")
                 default_mask = T.simd.pld(p_ub[0], dist="DS")
-                T.simd.pst(p_ub[0], dynamic_mask, dist="PK", off=runtime_offset)
+                T.simd.pst(p_ub[runtime_offset], dynamic_mask, dist="PK")
                 T.simd.pst(p_ub[0], default_mask)
 
     return func
@@ -35,6 +37,9 @@ def test_predicate_load_store_ascend_codegen():
     assert "US" in source
     assert "DS" in source
     assert "PK" in source
+    predicate_lines = [line for line in source.splitlines() if "simd_inst::p" in line]
+    assert len(predicate_lines) == 4
+    assert all(", 0, " in line for line in predicate_lines)
 
 
 def test_predicate_public_apis_share_internal_ops():
@@ -42,6 +47,16 @@ def test_predicate_public_apis_share_internal_ops():
 
     assert script.count("T.tl.simd.pld(") == 2
     assert script.count("T.tl.simd.pst(") == 2
+    assert script.count("T.access_ptr(p_ub[runtime_offset]") == 2
+
+
+@pytest.mark.parametrize(
+    ("op_name", "num_inputs"),
+    [("vld", 2), ("vsts", 4), ("pld", 2), ("pst", 3)],
+)
+def test_scalar_offset_parameter_is_not_exposed(op_name, num_inputs):
+    assert "off" not in inspect.signature(getattr(T.simd, op_name)).parameters
+    assert tirx.op.Op.get(f"tl.simd.{op_name}").num_inputs == num_inputs
 
 
 @pytest.mark.parametrize("op_name", ["pld", "pst"])

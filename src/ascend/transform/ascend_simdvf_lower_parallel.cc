@@ -302,7 +302,7 @@ private:
     Stmt vsts_stmt = Evaluate(
         Call(DataType::Void(), simd_vsts(),
              {MakeAddressOf(store->buffer, store->indices, /*rw_mask=*/2),
-              result, mask_var_}));
+              result, mask_var_, StringImm("NORM_B32")}));
     return AppendStmt(stmts, vsts_stmt);
   }
 
@@ -501,8 +501,8 @@ private:
     }
 
     PrimExpr addr = MakeAccessPtr(buf, idxs, /*rw_mask=*/2);
-    Stmt store =
-        Evaluate(Call(DataType::Void(), simd_vsts(), {addr, frag, mask}));
+    Stmt store = Evaluate(Call(DataType::Void(), simd_vsts(),
+                               {addr, frag, mask, StringImm("NORM_B32")}));
     Stmt loop =
         For(chunk, IntImm(DataType::Int(32), 0),
             IntImm(DataType::Int(32), nchunks), ForKind::kSerial, store);
@@ -607,11 +607,13 @@ private:
                                  StringImm("RS_ENABLE"), StringImm("PART_EVEN"),
                                  StringImm("MODE_ZEROING")});
       body.push_back(tirx::Bind(cast_frag, vcvt_call));
-      body.push_back(Evaluate(Call(DataType::Void(), simd_vsts(),
-                                   {dst_addr, cast_frag, mask_var_})));
+      body.push_back(Evaluate(
+          Call(DataType::Void(), simd_vsts(),
+               {dst_addr, cast_frag, mask_var_, StringImm("NORM_B32")})));
     } else {
-      body.push_back(Evaluate(Call(DataType::Void(), simd_vsts(),
-                                   {dst_addr, load_frag, mask_var_})));
+      body.push_back(Evaluate(
+          Call(DataType::Void(), simd_vsts(),
+               {dst_addr, load_frag, mask_var_, StringImm("NORM_B32")})));
     }
 
     Stmt loop = For(chunk, IntImm(DataType::Int(32), 0),
@@ -728,9 +730,9 @@ private:
                          {acc, old, mask_var_, StringImm("MODE_ZEROING")})));
         acc = merged;
       }
-      row.push_back(Evaluate(
-          Call(DataType::Void(), simd_vsts(),
-               {addr1d(dst, dst_off, /*rw_mask=*/2), acc, mask_var_})));
+      row.push_back(Evaluate(Call(DataType::Void(), simd_vsts(),
+                                  {addr1d(dst, dst_off, /*rw_mask=*/2), acc,
+                                   mask_var_, StringImm("NORM_B32")})));
 
       Stmt row_body =
           MakeSeq({tirx::Bind(mask_var_, mask_value), MakeSeq(row)});
@@ -773,9 +775,9 @@ private:
                        {acc, old, mask_var_, StringImm("MODE_ZEROING")})));
       acc = merged;
     }
-    chunk_body.push_back(
-        Evaluate(Call(DataType::Void(), simd_vsts(),
-                      {addr1d(dst, col, /*rw_mask=*/2), acc, mask_var_})));
+    chunk_body.push_back(Evaluate(Call(DataType::Void(), simd_vsts(),
+                                       {addr1d(dst, col, /*rw_mask=*/2), acc,
+                                        mask_var_, StringImm("NORM_B32")})));
 
     Stmt loop =
         For(chunk, i32(0), i32(nchunks), ForKind::kSerial, MakeSeq(chunk_body));

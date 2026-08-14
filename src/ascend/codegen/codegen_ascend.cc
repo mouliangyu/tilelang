@@ -2094,55 +2094,34 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     PrintExpr(op->args[2], os); // mask
     os << ")";
   }
-  // --- SimdVF predicate load: (addr, dist [, offset]) ---
+  // --- SimdVF predicate load: (addr, dist) ---
   else if (op->op.same_as(tl::simd_pld())) {
-    ICHECK(op->args.size() >= 2 && op->args.size() <= 3);
+    ICHECK_EQ(op->args.size(), 2);
     os << "simd_inst::plds((__ubuf__ uint32_t*)";
     PrintExpr(op->args[0], os); // addr
-    os << ", ";
-    if (op->args.size() == 3) {
-      PrintExpr(op->args[2], os); // offset
-    } else {
-      os << "0";
-    }
-    os << ", " << Downcast<StringImm>(op->args[1])->value << ")";
+    os << ", 0, " << Downcast<StringImm>(op->args[1])->value << ")";
   }
-  // --- SimdVF predicate store: (addr, src, dist [, offset]) ---
+  // --- SimdVF predicate store: (addr, src, dist) ---
   else if (op->op.same_as(tl::simd_pst())) {
-    ICHECK(op->args.size() >= 3 && op->args.size() <= 4);
+    ICHECK_EQ(op->args.size(), 3);
     std::string addr = this->PrintExpr(op->args[0]);
     std::string src = this->PrintExpr(op->args[1]);
     std::string dist = Downcast<StringImm>(op->args[2])->value;
     this->PrintIndent();
     this->stream << "simd_inst::psts(" << src << ", (__ubuf__ uint32_t*)"
-                 << addr << ", ";
-    if (op->args.size() == 4) {
-      this->PrintExpr(op->args[3], this->stream); // offset
-    } else {
-      this->stream << "0";
-    }
-    this->stream << ", " << dist << ");\n";
+                 << addr << ", 0, " << dist << ");\n";
   }
-  // --- SimdVF load: (addr, dist [, offset]) ---
+  // --- SimdVF load: (addr, dist) ---
   else if (op->op.same_as(tl::simd_vld())) {
-    ICHECK(op->args.size() >= 2 && op->args.size() <= 3);
+    ICHECK_EQ(op->args.size(), 2);
     DataType elem = op->dtype.element_of();
     std::string dist = Downcast<StringImm>(op->args[1])->value;
-    bool has_off = (op->args.size() == 3);
     // Prefer vlds with a zero scalar offset to support
     // E2B_B32/UNPK_B32/UNPK4_B8
     os << "simd_inst::vlds<" << CCEUBufType(elem) << ">((" << "__ubuf__" << " "
        << CCEUBufType(elem) << "*)";
     PrintExpr(op->args[0], os); // addr
-    os << ", ";
-    if (has_off) {
-      os << "vag_b" << CCEElemWidthBits(elem) << "(";
-      PrintExpr(op->args[2], os);
-      os << "), " << dist;
-    } else {
-      os << "0, " << dist;
-    }
-    os << ")";
+    os << ", 0, " << dist << ")";
   }
   // --- SimdVF dual-dest load: (addr, dist [, offset]) -> vec_pair ---
   else if (op->op.same_as(tl::simd_vld2())) {
@@ -2163,32 +2142,20 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     os << ")";
   }
-  // --- SimdVF store: (addr, src, mask, dist [, offset]) ---
+  // --- SimdVF store: (addr, src, mask, dist) ---
   else if (op->op.same_as(tl::simd_vsts())) {
-    ICHECK(op->args.size() >= 3 && op->args.size() <= 5);
+    ICHECK_EQ(op->args.size(), 4);
     DataType dtype = op->args[1].dtype().element_of();
-    int n = op->args.size();
-    std::string dist = "NORM_B32";
-    int off_idx = -1;
-    if (n >= 4 && op->args[3].as<StringImmNode>()) {
-      dist = Downcast<StringImm>(op->args[3])->value;
-      if (n == 5)
-        off_idx = 4;
-    } else if (n == 4 && !op->args[3].as<StringImmNode>()) {
-      off_idx = 3;
-    }
+    std::string dist = Downcast<StringImm>(op->args[3])->value;
     // Capture operands first so SSA temporaries (e.g. from reinterpret) are
     // emitted on their own lines before the call statement.
     std::string src = this->PrintExpr(op->args[1]);
     std::string addr = this->PrintExpr(op->args[0]);
     std::string mask = this->PrintExpr(op->args[2]);
-    std::string off = (off_idx >= 0) ? this->PrintExpr(op->args[off_idx]) : "0";
     this->PrintIndent();
     this->stream << "simd_inst::vsts(" << src << ", (__ubuf__ "
-                 << CCEUBufType(dtype) << "*)" << addr << ", " << off << ", "
-                 << dist << ", " << mask;
-    if (op->args.size() >= 5 && op->args[4].as<StringImmNode>())
-      this->stream << ", " << Downcast<StringImm>(op->args[4])->value;
+                 << CCEUBufType(dtype) << "*)" << addr << ", 0, " << dist
+                 << ", " << mask;
     this->stream << ");\n";
   }
 

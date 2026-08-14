@@ -209,30 +209,25 @@ def _predicate_access_ptr(addr, access_type: str, dist: str):
     return access_ptr(addr, access_type, extent=extent)
 
 
-def pld(addr, dist="NORM", off=None):
-    """Load a predicate from UB with an optional scalar offset."""
+def pld(addr, dist="NORM"):
+    """Load a predicate from UB. Express address offsets in ``addr``."""
     _validate_predicate_dist("pld", dist, _PREDICATE_LOAD_DISTS)
     addr = _predicate_access_ptr(addr, "r", dist)
-    args = [addr, dist]
-    if off is not None:
-        args.append(off)
-    return tirx.call_intrin("boolx256", _Op("tl.simd.pld"), *args)
+    return tirx.call_intrin("boolx256", _Op("tl.simd.pld"), addr, dist)
 
 
-def pst(addr, src, dist="NORM", off=None):
-    """Store a predicate to UB with an optional scalar offset."""
+def pst(addr, src, dist="NORM"):
+    """Store a predicate to UB. Express address offsets in ``addr``."""
     _validate_predicate_dist("pst", dist, _PREDICATE_STORE_DISTS)
     addr = _predicate_access_ptr(addr, "w", dist)
-    args = [addr, src, dist]
-    if off is not None:
-        args.append(off)
-    return tirx.call_intrin("void", _Op("tl.simd.pst"), *args)
+    return tirx.call_intrin("void", _Op("tl.simd.pst"), addr, src, dist)
 
 
-def vld(addr, dist="NORM", off=None):
+def vld(addr, dist="NORM"):
     """Vector load. Returns a typed vector register.
 
-    addr can be a BufferLoad auto-wrapped as tl.access_ptr.
+    addr can be a BufferLoad auto-wrapped as tl.access_ptr. Express address
+    offsets in ``addr``.
     """
     if isinstance(addr, BufferLoad):
         elem_dtype = str(addr.buffer.dtype)
@@ -257,10 +252,7 @@ def vld(addr, dist="NORM", off=None):
         inner_load = addr.args[0]
         vec_dtype = _vec_dtype(inner_load.buffer.dtype)
 
-    args = [addr, dist]
-    if off is not None:
-        args.append(off)
-    return tirx.call_intrin(vec_dtype, _Op("tl.simd.vld"), *args)
+    return tirx.call_intrin(vec_dtype, _Op("tl.simd.vld"), addr, dist)
 
 
 _VLD2_DISTS = ("DINTLV_B8", "DINTLV_B16", "DINTLV_B32")
@@ -306,10 +298,11 @@ def vld2(addr, dist="DINTLV_B16", off=None):
     return SimdPair(_bind(pair))
 
 
-def vsts(addr, src, mask=None, dist="NORM_B32", off=None, extent=None):
-    """Vector store: vsts(src, base, off, dist, mask).
+def vsts(addr, src, mask=None, dist="NORM_B32", extent=None):
+    """Vector store to ``addr``.
 
-    addr can be a BufferLoad auto-wrapped as tl.access_ptr.
+    addr can be a BufferLoad auto-wrapped as tl.access_ptr. Express address
+    offsets in ``addr``.
     Optional ``extent`` overrides the default access_ptr footprint (e.g. 8 for
     a dense PAT_VL8 NORM_B16 recip pack).
     """
@@ -327,10 +320,7 @@ def vsts(addr, src, mask=None, dist="NORM_B32", off=None, extent=None):
                 elif dist.startswith("PK4_"):
                     extent = lanes // 4
         addr = access_ptr(addr, "w", extent=extent)
-    args = [addr, src, mask, dist]
-    if off is not None:
-        args.append(off)
-    return tirx.call_intrin("void", _Op("tl.simd.vsts"), *args)
+    return tirx.call_intrin("void", _Op("tl.simd.vsts"), addr, src, mask, dist)
 
 
 def vsstb(src, base, stride, mask=None, update=False):

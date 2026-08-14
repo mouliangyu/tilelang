@@ -612,8 +612,8 @@ def test_ascend_simd_vld_e2b_b16_extent():
     source = lower(func, target="ascend").kernel_source
     print(source)
     assert "E2B_B16" in source
-    # Latest ascend lowers E2B_B16 through vlds (offset form).
-    assert "simd_inst::vlds<" in source or "simd_inst::vld<" in source
+    # Latest ascend lowers E2B_B16 through vlds with a zero hardware offset.
+    assert "simd_inst::vlds<" in source
 
 
 def test_ascend_simd_vsts_extent_override():
