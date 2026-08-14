@@ -89,6 +89,7 @@ private:
   bool has_gm_bypass_dcache_included_{false};
   bool has_philox_rng_{false};
   bool has_philox_rng_included_{false};
+  bool has_cooperative_groups_included_{false};
   std::string ascend_rng_state_var_;
 
   std::unordered_map<Var, IntImm, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>

@@ -439,6 +439,7 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
 
   // Pre-scan body to determine kernel mode (Mix / Vector / Cube)
   bool has_cube = false, has_vector = false;
+  bool has_cooperative_groups = false;
   int vector_count = 2;
   tirx::PostOrderVisit(f->body, [&](const ffi::ObjectRef &n) {
     if (const auto *block = n.as<SBlockNode>()) {
@@ -473,6 +474,9 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
       if (call->op.same_as(tl::rng_init())) {
         has_philox_rng_ = true;
       }
+      if (call->op.same_as(tl::sync_warp())) {
+        has_cooperative_groups = true;
+      }
     }
   });
 
@@ -499,6 +503,12 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   if (has_philox_rng_ && !has_philox_rng_included_) {
     decl_stream << "#include <tl_templates/ascend/philox_rng.h>\n";
     has_philox_rng_included_ = true;
+  }
+
+  // sync_warp lowers to cooperative_groups::coalesced_threads().sync().
+  if (has_cooperative_groups && !has_cooperative_groups_included_) {
+    decl_stream << "#include <simt_api/cooperative_groups.h>\n";
+    has_cooperative_groups_included_ = true;
   }
 
   if (has_cube && has_vector) {
@@ -1155,6 +1165,37 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
         << "tl.ascend_threadfence expects 0 arguments";
     this->PrintIndent();
     this->stream << "asc_threadfence();\n";
+  } else if (op->op.same_as(tl::sync_warp())) {
+    ICHECK_LE(op->args.size(), 1U)
+        << "tl.sync_warp expects an optional lane mask";
+    if (op->args.empty()) {
+      this->PrintIndent();
+      this->stream << "cooperative_groups::coalesced_threads().sync();\n";
+    } else {
+      // coalesced_threads() captures the active lanes at the call site. Enter
+      // the branch only for named lanes so the resulting group matches mask.
+      std::string mask = this->PrintExpr(op->args[0]);
+      this->PrintIndent();
+      this->stream << "if (((static_cast<uint32_t>(" << mask
+                   << ") >> laneid()) & 1U) != 0U) { "
+                      "cooperative_groups::coalesced_threads().sync(); }\n";
+    }
+  } else if (op->op.same_as(tl::ballot_sync())) {
+    ICHECK_EQ(op->args.size(), 2U)
+        << "tl.ballot_sync expects <mask, predicate>.";
+    os << "((uint64_t)(asc_ballot(";
+    PrintExpr(op->args[1], os);
+    os << ") & static_cast<uint32_t>(";
+    PrintExpr(op->args[0], os);
+    os << ")))";
+  } else if (op->op.same_as(tl::ballot())) {
+    ICHECK_EQ(op->args.size(), 1U) << "tl.ballot expects <predicate>.";
+    os << "((uint64_t)asc_ballot(";
+    PrintExpr(op->args[0], os);
+    os << "))";
+  } else if (op->op.same_as(tl::activemask())) {
+    ICHECK(op->args.empty()) << "tl.activemask takes no arguments.";
+    os << "((uint64_t)asc_activemask())";
   } else if (op->op.same_as(tl::ascend_get_buf())) {
     ICHECK_EQ(op->args.size(), 3)
         << "tl.ascend_get_buf expects exactly 3 arguments "
