@@ -168,8 +168,9 @@ jobs:
       - name: Run performance regression test
         run: |
           # The script rebuilds libtvm.so via ninja for each ref (baseline = upstream/asc,
-          # current = the PR merge), keeps the examples/ascend harness constant across both,
-          # and writes the speedup table to .perf_regression_ascend/regression_result.md.
+          # current = the PR merge), keeps the Ascend examples and maintenance driver
+          # constant across both, and writes the speedup table to
+          # .perf_regression_ascend/regression_result.md.
           bash ./maint/scripts/run_perf_regression_ascend.sh
 
       - name: Post test results as PR comment

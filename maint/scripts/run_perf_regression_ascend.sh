@@ -27,11 +27,12 @@ RESULT_MD="${WORK_DIR}/regression_result.md"
 
 MARKER="__TILELANG_PERF_RESULTS_JSON__="
 
-# The whole examples/ascend/ tree (driver + every example it imports) is the regression
-# harness. We keep it constant from the current branch across both refs, so the only
-# thing that varies is the rebuilt libtvm.so. The baseline ref may not contain these
-# files, so they are overlaid onto each checkout.
+# The Ascend examples plus their maintenance driver form the regression harness. Keep
+# both constant from the current branch across refs, so only the rebuilt libtvm.so
+# varies. The baseline ref may not contain the driver or all examples, so overlay them
+# onto each checkout.
 HARNESS_DIR="examples/ascend"
+DRIVER_PATH="maint/scripts/ascend_perf_regression.py"
 
 cd "${REPO_ROOT}"
 mkdir -p "${WORK_DIR}"
@@ -47,12 +48,15 @@ echo ""
 # Snapshot the harness dir from the current working tree FIRST (before any stash),
 # so the overlay reflects the in-flight edits. We overlay it onto each checkout.
 HARNESS_SNAP="${WORK_DIR}/harness_snapshot"
+DRIVER_SNAP="${WORK_DIR}/ascend_perf_regression.py"
 rm -rf "${HARNESS_SNAP}"
 mkdir -p "${HARNESS_SNAP}"
 cp -a "${REPO_ROOT}/${HARNESS_DIR}/." "${HARNESS_SNAP}/"
+cp -a "${REPO_ROOT}/${DRIVER_PATH}" "${DRIVER_SNAP}"
 
 restore_harness() {
     cp -a "${HARNESS_SNAP}/." "${REPO_ROOT}/${HARNESS_DIR}/"
+    cp -a "${DRIVER_SNAP}" "${REPO_ROOT}/${DRIVER_PATH}"
 }
 
 # ---- Save current state ----
@@ -74,6 +78,11 @@ cleanup() {
     echo "Cleaning up: restoring ${CURRENT_REF}..."
     cd "${REPO_ROOT}"
     git checkout -f "${CURRENT_REF}" 2>/dev/null || true
+    # An in-flight change may add the maintenance driver on top of a ref that does not
+    # track it yet. Remove the overlay before restoring that change from the stash.
+    if ! git cat-file -e "${CURRENT_REF}:${DRIVER_PATH}" 2>/dev/null; then
+        rm -f "${REPO_ROOT}/${DRIVER_PATH}"
+    fi
     git submodule update --init --recursive 2>/dev/null || true
     if [[ "${STASHED}" == "1" ]]; then
         echo "Restoring stashed changes..."
@@ -99,13 +108,12 @@ build() {
     ninja -j"${NINJA_JOBS}" -C build
 }
 
-# Run the Ascend regression suite and capture the JSON marker. regression_all.py
-# discovers every regression_*.py under the given root and emits a {name: latency} dict.
+# Run the Ascend regression suite and capture its {name: latency} JSON marker.
 run_driver() {
     local out_json="$1"
     PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/examples/ascend:$PYTHONPATH" \
         ASCEND_NPU_ARCH=dav-3510 TILELANG_DISABLE_CACHE=1 TL_PERF_REGRESSION_FORMAT=json \
-        python "${SCRIPT_DIR}/regression_all.py" --examples-root "${REPO_ROOT}/examples/ascend" \
+        python "${REPO_ROOT}/${DRIVER_PATH}" \
         | tee /dev/stderr | grep "^${MARKER}" | tail -1 | sed "s/^${MARKER}//" > "${out_json}"
 }
 

@@ -457,10 +457,9 @@ def run_regression_perf(
     dim: int = 128,
     all_seq_do_compress: bool = False,
 ) -> float:
-    """Benchmark the two-stage compress kernel; return latency (ms).
-
-    Used by `regression_example_ascend.py` for perf regression tracking.
-    """
+    """Benchmark the two-stage compress kernel; return latency (ms)."""
+    # Keep token selection and the resulting compression work deterministic.
+    torch.manual_seed(42)
     inputs = _make_decode_bench_inputs(
         overlap_ratio=overlap_ratio,
         compress_ratio=compress_ratio,
