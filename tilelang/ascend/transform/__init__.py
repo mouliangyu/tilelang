@@ -5,7 +5,6 @@ from tilelang.transform import _ffi_api
 
 from . import z3_scheduler  # noqa: F401
 from .insert_nd2nz import InsertNd2Nz  # noqa: F401
-from .normalize_mixed_kernel_sid import NormalizeMixedKernelSid  # noqa: F401
 
 
 def NormalizeControlFlowForSchedule():
@@ -34,14 +33,14 @@ def NormalizeNoConflictHints():
     return _ffi_api.NormalizeNoConflictHints()  # type: ignore
 
 
-def NormalizeTask():
-    """Mark canonical task boundaries and annotate their Ascend hardware pipes."""
-    return _ffi_api.NormalizeTask()  # type: ignore
-
-
-def LatencyEstimator():
+def EstimateLatency():
     """Annotate every Ascend AutoSchedule task with latency and II."""
-    return _ffi_api.LatencyEstimator()  # type: ignore
+    return _ffi_api.EstimateLatency()  # type: ignore
+
+
+def MaterializeScheduleUnits():
+    """Normalize task boundaries and materialize trivial schedule units."""
+    return _ffi_api.MaterializeScheduleUnits()  # type: ignore
 
 
 def AscendRemoveNoOp():
@@ -65,13 +64,23 @@ def UnrollLoopSkipVF():
 
 
 def AutoSchedule():
-    """Schedule tasks and annotate T.Task for downstream lowering."""
+    """Schedule materialized internal schedule units for downstream lowering."""
     return _ffi_api.AutoSchedule()  # type: ignore
 
 
-def CorePartition():
-    """Lower scheduled tasks into their AIV/AIC core bodies."""
-    return _ffi_api.CorePartition()  # type: ignore
+def AssignCore():
+    """Assign scheduled tasks to AIV/AIC cores and annotate their core_mask."""
+    return _ffi_api.AssignCore()  # type: ignore
+
+
+def InsertSync():
+    """Insert synchronization into scheduled Ascend TIR."""
+    return _ffi_api.InsertSync()  # type: ignore
+
+
+def LowerScheduledTIR():
+    """Lower scheduled TIR into final AIV/AIC core bodies."""
+    return _ffi_api.LowerScheduledTIR()  # type: ignore
 
 
 def RewriteDualCopy():
@@ -161,9 +170,11 @@ __all__ = [
     "AscendRemoveNoOp",
     "AscendInsertOOBPadding",
     "AscendSimdVFLowerParallel",
+    "AssignCore",
     "AutoSchedule",
-    "CorePartition",
-    "LatencyEstimator",
+    "InsertSync",
+    "LowerScheduledTIR",
+    "EstimateLatency",
     "IfConditionExtract",
     "InsertNd2Nz",
     "LegalizeSimdMerging",
@@ -171,9 +182,7 @@ __all__ = [
     "MergeUBAllocations",
     "NormalizeBufferVersion",
     "NormalizeControlFlowForSchedule",
-    "NormalizeMixedKernelSid",
     "NormalizeNoConflictHints",
-    "NormalizeTask",
     "RewriteAscendBufferVersionLayout",
     "RewriteDualCopy",
     "RestoreWhileLoops",

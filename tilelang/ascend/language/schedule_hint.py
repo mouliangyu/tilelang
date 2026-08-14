@@ -1,6 +1,4 @@
-"""Auto-schedule hints: user-declared facts the dependency analyzer cannot
-prove on its own (`assume_no_conflict`, `PerCoreTask`, `Task`; more
-may be added here)."""
+"""Auto-schedule semantic hints."""
 
 from tilelang.utils.language import to_tile_region
 from tvm import tirx
@@ -62,15 +60,15 @@ def Task(latency: int | None = None, ii: int | None = None):
     preceding statement contributes its II and only the final statement exposes
     its latency. All statements must use one Ascend hardware pipe and one AIC/AIV
     core affinity; split cross-pipe or cross-core sequences into
-    separate tasks. A ``dual_copy`` is supported only when it remains the sole
-    top-level, single-pipe statement after preprocessing. The marker does not
-    select or launch a core by itself.
+    separate tasks. The marker does not select or launch a core by itself.
 
     ``latency`` is the number of cycles from task issue until its outputs are
     ready. ``ii`` is the minimum interval before the same hardware pipe may
     issue another instance. Either value may be omitted, in which case the
-    ``LatencyEstimator`` pass supplies it. Provided values are trusted exact
+    ``EstimateLatency`` pass supplies it. Provided values are trusted exact
     overrides for the complete task body, not hints for the enclosing loop II.
+    These are the only public task parameters. The compiler derives execution
+    resources from the task body and determines core placement.
 
     Inside ``T.PerCoreTask()``, the same marker also denotes one concrete
     per-core candidate. Put the control flow that selects a core outside this

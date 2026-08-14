@@ -57,11 +57,15 @@ constexpr const char *kBufferVersion = "tl.buffer_version";
 constexpr const char *kAscendPerCoreTask = "tl.ascend_per_core_task";
 
 // Groups statements into one AutoSchedule TaskNode. Inside a
-// kAscendPerCoreTask region, each marker is one concrete candidate. After
-// scheduling, the compiler reuses this marker for scheduled units: leaf tasks
-// carry core_mask/stage metadata, while native serial For controls carry stage
-// only.
+// kAscendPerCoreTask region, each marker is one concrete candidate. This marker
+// carries task semantics and compiler-internal core ownership; stage metadata
+// lives on kScheduleUnit.
 constexpr const char *kAscendTask = "tl.ascend_task";
+
+// Short-lived scheduled-TIR wrapper shared by AutoSchedule, AssignCore,
+// InsertSync, and LowerScheduledTIR. It carries stage/guard metadata without
+// introducing task grouping or core-placement semantics.
+constexpr const char *kScheduleUnit = "tl.schedule_unit";
 
 // Attributes to implement SourceCodeBlock
 constexpr const char *kCodeBlockSource = "code_block_source";

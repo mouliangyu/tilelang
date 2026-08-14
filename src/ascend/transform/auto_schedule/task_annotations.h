@@ -20,51 +20,130 @@
 #pragma once
 
 #include <tvm/ffi/any.h>
+#include <tvm/ffi/container/map.h>
+#include <tvm/runtime/logging.h>
+#include <tvm/tirx/expr.h>
 #include <tvm/tirx/stmt.h>
 
 #include <cstdint>
 #include <optional>
+
+#include "../core_mask.h"
+#include "support/check.h"
 
 namespace tvm {
 namespace tl {
 
 using namespace tirx;
 
-// Compiler-owned fields carried by tl.ascend_task after AutoSchedule. These
-// form the short-lived task metadata contract consumed by CorePartition.
-constexpr const char *kAscendScheduledCoreMask = "core_mask";
-constexpr const char *kAscendScheduledStage = "stage";
-
 struct TaskCost {
   int64_t latency{0};
   int64_t ii{0};
 };
 
-struct TaskAnnotations {
+// Metadata carried by T.Task between MaterializeScheduleUnits,
+// EstimateLatency, AutoSchedule, AssignCore, InsertSync, and
+// LowerScheduledTIR. The frontend helper controls which fields users may
+// provide; backend consumers share this representation for user hints and
+// compiler-produced fields.
+struct TaskMetadata {
   std::optional<int64_t> latency;
   std::optional<int64_t> ii;
-  std::optional<uint16_t> pipe;
+  std::optional<CoreMask> core_mask;
 };
 
-// Parse compiler and user annotations from the structured node payload of
-// tl.ascend_task or tl.ascend_per_core_task. Legacy scalar payloads carry no
-// annotations.
-TaskAnnotations ParseTaskAnnotations(const ffi::Any &node);
+namespace task_metadata_detail {
 
-// Merge compiler-produced fields into the structured node payload while
-// preserving annotations owned by other consumers.
-ffi::Any MakeTaskPipeAnnotation(uint16_t pipe, const ffi::Any &existing);
-ffi::Any MakeTaskAnnotations(const TaskCost &cost, const ffi::Any &existing);
+inline ffi::Map<ffi::String, ffi::Any>
+CopyTaskMetadata(const ffi::Any &existing) {
+  ffi::Map<ffi::String, ffi::Any> result;
+  if (const auto *map = existing.as<ffi::MapObj>()) {
+    for (const auto &[key, value] : *map)
+      result.Set(key.cast<ffi::String>(), value);
+  }
+  return result;
+}
 
-// Apply the fields explicitly supplied by T.Task to an estimated cost.
-TaskCost ResolveTaskCost(const TaskCost &estimated,
-                         const TaskAnnotations &annotations);
+inline const IntImmNode *
+RequireConstantTaskMetadataInt(const ffi::Any &value_any,
+                               const ffi::String &key) {
+  PrimExpr value_expr = value_any.cast<PrimExpr>();
+  const auto *value = value_expr.as<IntImmNode>();
+  ICHECK(value != nullptr) << "T.Task " << key
+                           << " must be a constant integer, got " << value_expr;
+  return value;
+}
 
-// Read the complete fields required by AutoSchedule after LatencyEstimator.
-TaskCost RequireTaskCost(const TaskAnnotations &annotations,
-                         const char *context);
-uint16_t RequireTaskPipe(const TaskAnnotations &annotations,
-                         const char *context);
+} // namespace task_metadata_detail
+
+// Parse recognized task metadata from the structured node payload. Legacy
+// scalar payloads carry no metadata.
+inline TaskMetadata ParseTaskMetadata(const ffi::Any &node) {
+  TaskMetadata result;
+  const auto *map = node.as<ffi::MapObj>();
+  if (map == nullptr)
+    return result;
+  for (const auto &[key_any, value_any] : *map) {
+    ffi::String key = key_any.cast<ffi::String>();
+    if (key != "latency" && key != "ii" && key != "core_mask")
+      continue;
+    const auto *value =
+        task_metadata_detail::RequireConstantTaskMetadataInt(value_any, key);
+    if (key == "latency") {
+      ICHECK_GE(value->value, 0) << "T.Task latency must be non-negative";
+      result.latency = value->value;
+    } else if (key == "ii") {
+      ICHECK_GT(value->value, 0) << "T.Task ii must be positive";
+      result.ii = value->value;
+    } else {
+      ICHECK_GT(value->value, 0)
+          << "T.Task core_mask must select at least one Ascend core";
+      ICHECK_LE(value->value, static_cast<int64_t>(kCoreBroadcast))
+          << "T.Task core_mask exceeds the supported AIV/AIC mask";
+      CoreMask core_mask = static_cast<CoreMask>(value->value);
+      ICHECK(IsValidCoreMask(core_mask))
+          << "T.Task has invalid core_mask " << value->value;
+      result.core_mask = core_mask;
+    }
+  }
+  return result;
+}
+
+// Merge the defined fields into the structured node payload while preserving
+// metadata owned by other compiler passes.
+inline ffi::Any MergeTaskMetadata(const TaskMetadata &metadata,
+                                  const ffi::Any &existing) {
+  ffi::Map<ffi::String, ffi::Any> result =
+      task_metadata_detail::CopyTaskMetadata(existing);
+  if (metadata.latency.has_value()) {
+    ICHECK_GE(metadata.latency.value(), 0);
+    result.Set("latency", IntImm(DataType::Int(64), metadata.latency.value()));
+  }
+  if (metadata.ii.has_value()) {
+    ICHECK_GT(metadata.ii.value(), 0);
+    result.Set("ii", IntImm(DataType::Int(64), metadata.ii.value()));
+  }
+  if (metadata.core_mask.has_value()) {
+    ICHECK_NE(metadata.core_mask.value(), kCoreUnassigned);
+    ICHECK(IsValidCoreMask(metadata.core_mask.value()));
+    result.Set("core_mask",
+               IntImm(DataType::Int(64), metadata.core_mask.value()));
+  }
+  return result;
+}
+
+// Apply any latency/II overrides present on T.Task to an estimated cost.
+inline TaskCost ResolveTaskCost(const TaskCost &estimated,
+                                const TaskMetadata &metadata) {
+  TaskCost result = estimated;
+  if (metadata.latency.has_value())
+    result.latency = metadata.latency.value();
+  if (metadata.ii.has_value())
+    result.ii = metadata.ii.value();
+  ICHECK_GE(result.latency, 0);
+  ICHECK_GT(result.ii, 0);
+  return result;
+}
 
 } // namespace tl
 } // namespace tvm

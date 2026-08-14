@@ -18,9 +18,10 @@
  * Doing this before AutoSchedule (rather than inside copy.cc's LowerTileOp
  * lowering, which runs after AutoSchedule) makes the fill visible to
  * pipe/barrier analysis: it is scheduled as its own MTE2 task (see
- * auto_schedule.cc's ResourceAnalyzer) and participates in the dependency
- * before the MTE1 L1->L0 loads that read the padded buffer. copy.cc lowering
- * consumes the already-clamped ranges and inserts the final copy guard.
+ * auto_schedule/task_analysis.h's ResourceAnalyzer) and participates in the
+ * dependency before the MTE1 L1->L0 loads that read the padded buffer. copy.cc
+ * lowering consumes the already-clamped ranges and inserts the final copy
+ * guard.
  * Both stages share the clamp/fill helpers in oob_padding.h.
  */
 

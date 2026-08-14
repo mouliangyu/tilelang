@@ -1,8 +1,10 @@
 import re
 
 import pytest
+import tilelang
 import tilelang.language as T
 import tilelang.testing
+from tilelang import tvm
 
 from tilelang.engine.lower import lower
 
@@ -103,6 +105,30 @@ def test_per_core_explicit_tasks_drive_sync_migration():
     _assert_per_core_mte2_mte1_sync(source)
 
 
+def test_per_core_syncs_preserve_candidate_task_markers():
+    snapshots = {}
+
+    @tvm.ir.instrument.pass_instrument
+    class CaptureScheduledIR:
+        def run_after_pass(self, mod, info):
+            if info.name in {"tl.AutoSchedule", "tl.AssignCore", "tl.InsertSync"}:
+                snapshots[info.name] = mod.script()
+
+    with tvm.transform.PassContext(opt_level=3, instruments=[CaptureScheduledIR()]):
+        tilelang.lower(_make_per_core_candidate_program(explicit=True), target="ascend")
+
+    scheduled = snapshots["tl.AutoSchedule"]
+    assigned = snapshots["tl.AssignCore"]
+    synchronized = snapshots["tl.InsertSync"]
+    assert '"core_mask"' not in scheduled
+    assert '"core_mask"' in assigned
+    assert synchronized.count('"tl.ascend_per_core_task"') == 1
+    # InsertSync wraps each migrated synchronization statement in its own
+    # compiler-generated T.Task carrying compiler-owned core metadata.
+    assert synchronized.count('"tl.ascend_task"') > assigned.count('"tl.ascend_task"')
+    assert "T.ascend_set_flag" in synchronized
+
+
 def test_per_core_implicit_candidate_inference_remains_supported():
     source = lower(_make_per_core_candidate_program(explicit=False), target="ascend").kernel_source
     _assert_per_core_mte2_mte1_sync(source)
@@ -146,7 +172,7 @@ def test_per_core_task_rejects_nesting_inside_task():
                 T.copy(A, temp)
             T.copy(temp, B)
 
-    with pytest.raises(ValueError, match=r"T\.PerCoreTask cannot be nested inside T\.Task"):
+    with pytest.raises(tvm.error.InternalError, match=r"T\.PerCoreTask cannot be nested inside T\.Task"):
         lower(main, target="ascend")
 
 

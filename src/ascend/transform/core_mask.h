@@ -17,8 +17,7 @@
  * under the License.
  */
 
-#ifndef TVM_TL_ASCEND_TRANSFORM_CORE_MASK_H_
-#define TVM_TL_ASCEND_TRANSFORM_CORE_MASK_H_
+#pragma once
 
 #include <array>
 #include <cstdint>
@@ -48,5 +47,3 @@ constexpr bool HasCore(CoreMask mask, CoreMask core) {
 
 } // namespace tl
 } // namespace tvm
-
-#endif // TVM_TL_ASCEND_TRANSFORM_CORE_MASK_H_

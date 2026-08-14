@@ -51,8 +51,6 @@ namespace {
 
 constexpr int kVersionAlignmentBits = 256;
 
-using BufferVersionTable =
-    std::unordered_map<Var, int64_t, ObjectPtrHash, ObjectPtrEqual>;
 // A single storage Var may back several Buffer objects (the allocation plus
 // any T.view / T.reshape aliases), so collect every alias sharing the Var
 // rather than assuming a unique owner.
@@ -68,19 +66,17 @@ class StorageMetadataCollector : public StmtExprVisitor {
 public:
   void VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key == tl::attr::kBufferVersion) {
-      auto versions = op->node.try_cast<ascend::BufferVersionMap>();
+      auto versions = op->node.try_cast<BufferVersionMap>();
       ICHECK(versions.has_value())
           << "'" << tl::attr::kBufferVersion
           << "' AttrStmt node must be a buffer version map";
       for (const auto &[data, version] : versions.value()) {
-        const auto *count = version.as<IntImmNode>();
-        ICHECK(count && count->value > 0)
-            << "'" << tl::attr::kBufferVersion
-            << "' values must be positive constant version counts";
-        auto [it, inserted] = versions_.emplace(data, count->value);
-        ICHECK(inserted || it->second == count->value)
-            << "Conflicting buffer version counts for storage " << data << ": "
-            << it->second << " vs " << count->value;
+        ICHECK_GT(version, 0) << "'" << tl::attr::kBufferVersion
+                              << "' values must be positive version counts";
+        auto existing = versions_.find(data);
+        ICHECK(existing == versions_.end() || (*existing).second == version)
+            << "Conflicting buffer version counts for storage " << data;
+        versions_.Set(data, version);
       }
     }
     StmtExprVisitor::VisitStmt_(op);
@@ -91,7 +87,7 @@ public:
     StmtExprVisitor::VisitStmt_(op);
   }
 
-  BufferVersionTable versions_;
+  BufferVersionMap versions_;
   AllocationTable allocations_;
 };
 
@@ -116,7 +112,7 @@ using StorageLayoutTable =
 // realign. Returns nullopt when no alias exposes the version axis (e.g. a flat
 // count-only manual buffer that hand-lays-out its own slots).
 Optional<Buffer> FindVersionCarryingAlias(const std::vector<Buffer> &aliases,
-                                          int64_t num_versions,
+                                          int num_versions,
                                           arith::Analyzer *analyzer) {
   for (const Buffer &buffer : aliases) {
     if (buffer->shape.empty()) {

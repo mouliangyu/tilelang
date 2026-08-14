@@ -61,22 +61,18 @@ private:
         << "'" << tl::attr::kBufferVersion
         << "' is compiler-internal and must not be provided by the frontend";
 
-    auto staged = block->annotations.Get(ascend::kManualMultiBuffer);
+    auto staged = block->annotations.Get(kManualMultiBuffer);
     if (!staged.has_value()) {
       return block;
     }
 
     ffi::Map<ffi::String, ffi::Any> annotations = block->annotations;
-    annotations.erase(ascend::kManualMultiBuffer);
+    annotations.erase(kManualMultiBuffer);
 
-    ascend::BufferVersionMap staged_versions =
-        Downcast<ascend::BufferVersionMap>(staged.value());
-    for (const auto &item : staged_versions) {
-      const PrimExpr &version = item.second;
-      const auto *count = version.as<IntImmNode>();
-      ICHECK(count && count->value > 0)
-          << "'" << ascend::kManualMultiBuffer
-          << "' values must be positive constant version counts";
+    BufferVersionMap staged_versions = staged.value().cast<BufferVersionMap>();
+    for (const auto &[_, version] : staged_versions) {
+      ICHECK_GT(version, 0) << "'" << kManualMultiBuffer
+                            << "' values must be positive version counts";
     }
 
     SBlockNode *writer = block.CopyOnWrite();

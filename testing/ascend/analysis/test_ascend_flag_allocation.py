@@ -8,7 +8,7 @@ from tilelang.ascend import transform as ascend_transform
 from tilelang.engine.lower import lower
 
 
-def _make_many_flags_program():
+def _make_many_flags_program(annotate_versions: bool = True):
     tile = 64
     stages = 2
 
@@ -16,7 +16,8 @@ def _make_many_flags_program():
     def main(A: T.Buffer((4096,), "float32"), C: T.Buffer((4096,), "float32")):
         with T.Kernel(1):
             ub = T.alloc_shared((tile,), "float32")
-            T.annotate_buffer_versions({ub: stages})
+            if annotate_versions:
+                T.annotate_buffer_versions({ub: stages})
 
             for w in T.Pipelined(8, num_stages=stages):
                 base = w * 5 * tile
@@ -371,6 +372,59 @@ def test_rewrite_flag_to_buf_tracks_bind_context():
     rewritten = ascend_transform.RewriteFlagToBuf()(mod)
 
     assert "T.ascend_get_buf" in rewritten["main"].script()
+
+
+def test_auto_schedule_stages_multi_buffer_claim_for_insert_sync():
+    snapshots = {}
+
+    @tvm.ir.instrument.pass_instrument
+    class CaptureScheduledIR:
+        def run_after_pass(self, mod, info):
+            if info.name in {
+                "tl.AutoSchedule",
+                "tl.AssignCore",
+                "tl.InsertSync",
+                "tl.LowerScheduledTIR",
+            }:
+                snapshots[info.name] = mod.script()
+
+    with tvm.transform.PassContext(opt_level=3, instruments=[CaptureScheduledIR()]):
+        lower(_make_many_flags_program(), target="ascend")
+
+    scheduled = snapshots["tl.AutoSchedule"]
+    assert scheduled.count("tl.buffer_versions_map") == 1
+    assert scheduled.count("multi_buffer_eligible") == 1
+    assert "tl.auto_schedule.buffer_num_versions" not in scheduled
+
+    assigned = snapshots["tl.AssignCore"]
+    assert assigned.count("tl.buffer_versions_map") == 1
+    assert assigned.count("multi_buffer_eligible") == 1
+
+    synchronized = snapshots["tl.InsertSync"]
+    assert "tl.buffer_versions_map" not in synchronized
+    assert synchronized.count("multi_buffer_eligible") == 1
+
+    lowered = snapshots["tl.LowerScheduledTIR"]
+    assert "multi_buffer_eligible" not in lowered
+
+
+def test_auto_schedule_stages_solver_selected_buffer_versions_globally():
+    snapshots = {}
+
+    @tvm.ir.instrument.pass_instrument
+    class CaptureScheduledIR:
+        def run_after_pass(self, mod, info):
+            if info.name in {"tl.AutoSchedule", "tl.AssignCore"}:
+                snapshots[info.name] = mod.script()
+
+    with tvm.transform.PassContext(opt_level=3, instruments=[CaptureScheduledIR()]):
+        lower(_make_many_flags_program(annotate_versions=False), target="ascend")
+
+    for pass_name in ("tl.AutoSchedule", "tl.AssignCore"):
+        snapshot = snapshots[pass_name]
+        assert snapshot.count("tl.buffer_versions_map") == 1
+        assert "tl.auto_schedule.buffer_num_versions" not in snapshot
+        assert snapshot.count("multi_buffer_eligible") == 1
 
 
 def _make_cross_core_reuse_program(

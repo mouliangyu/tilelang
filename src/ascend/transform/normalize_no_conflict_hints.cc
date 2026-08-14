@@ -41,8 +41,10 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
+#include "ascend/transform/auto_schedule/kernel_rewriter.h"
 #include "op/utils.h"
 #include "support/check.h"
 
@@ -58,14 +60,14 @@ static constexpr const char *kForAnnotKey = "no_conflict";
 
 class NoConflictHintNormalizer : public StmtExprMutator {
 public:
-  static PrimFunc Substitute(PrimFunc &f) {
+  static Stmt Rewrite(const Stmt &body) {
     NoConflictHintNormalizer m;
-    f.CopyOnWrite()->body = m(f->body);
+    Stmt rewritten = m(body);
     ICHECK(m.stack_.empty()) << "unbalanced loop stack";
     ICHECK(m.pending_group_.empty())
         << "assume_no_conflict group '" << m.pending_group_.begin()->first
         << "' appears only once; each group must appear exactly twice";
-    return f;
+    return rewritten;
   }
 
 private:
@@ -231,7 +233,15 @@ private:
 using namespace tirx::transform;
 tvm::transform::Pass NormalizeNoConflictHints() {
   auto pass_func = [=](PrimFunc f, const IRModule &, const PassContext &) {
-    return NoConflictHintNormalizer::Substitute(f);
+    return RewriteTilelangKernels(
+        std::move(f), "NormalizeNoConflictHints",
+        [](const TilelangKernelContext &context) {
+          SBlock root = context.root;
+          root.CopyOnWrite()->body =
+              NoConflictHintNormalizer::Rewrite(root->body);
+          return root;
+        },
+        /*require_kernel=*/false);
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.NormalizeNoConflictHints", {});
 }

@@ -15,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -45,6 +46,25 @@ enum class ResourcePipe : uint16_t {
   kFixpipe = 1 << 5, // L0C -> UB / L0C -> GM
   kScalar = 1 << 6,  // S pipe: scalar ops, set_flag / wait_flag
 };
+
+inline std::string GetResourcePipeName(uint16_t mask) {
+  ICHECK((mask & (mask - 1)) == 0) << "Multiple pipes in one task: " << mask;
+  if (mask & static_cast<uint16_t>(ResourcePipe::kMTE1))
+    return "MTE1";
+  if (mask & static_cast<uint16_t>(ResourcePipe::kMTE2))
+    return "MTE2";
+  if (mask & static_cast<uint16_t>(ResourcePipe::kMTE3))
+    return "MTE3";
+  if (mask & static_cast<uint16_t>(ResourcePipe::kCube))
+    return "M";
+  if (mask & static_cast<uint16_t>(ResourcePipe::kVector))
+    return "V";
+  if (mask & static_cast<uint16_t>(ResourcePipe::kFixpipe))
+    return "FIX";
+  if (mask & static_cast<uint16_t>(ResourcePipe::kScalar))
+    return "S";
+  return "UNKNOWN";
+}
 
 // HBM bandwidth-contention resource bits. These are tracked separately from
 // ResourcePipe because a load and a store use different issue pipes but can
@@ -95,32 +115,6 @@ inline uint16_t PipeSpecialRegisterMask(uint16_t pipe_mask) {
 // queried subtree's root down to (and including) the task — only real IR-tree
 // nodes; synthetic helpers introduced during traversal are excluded. The task
 // itself is always the last element of `path`.
-struct BufferAccessPoint {
-  int64_t timestamp; // The time at which the access occurs
-  std::vector<const IRStructure *> path;
-
-  BufferAccessPoint(int64_t timestamp,
-                    std::vector<const IRStructure *> path = {})
-      : timestamp(timestamp), path(std::move(path)) {}
-
-  // The task where the access occurs (= path.back()).
-  const TaskNode *task() const;
-
-  bool operator<(const BufferAccessPoint &other) const {
-    if (timestamp != other.timestamp) {
-      return timestamp < other.timestamp;
-    }
-    return path < other.path;
-  }
-
-  bool operator==(const BufferAccessPoint &other) const {
-    return timestamp == other.timestamp && path == other.path;
-  }
-
-  bool operator!=(const BufferAccessPoint &other) const {
-    return !(*this == other);
-  }
-};
 
 // Helper function to compare if two regions are equal
 inline bool RegionsEqual(const Region &a, const Region &b) {
@@ -140,14 +134,6 @@ inline bool RegionsEqual(const Region &a, const Region &b) {
   }
   return true;
 }
-
-// Predicate the Collect*AccessPoints walks use to decide whether a leaf
-// TaskNode "matches": pred(task) returns true if the task has a matching
-// access. The caller bakes in any buffer/storage and is_write filters.
-class TaskNode;
-using TaskAccessPredicate = std::function<bool(const TaskNode *task)>;
-
-PrimExpr CalculateIterationCount(const std::vector<For> &loops);
 
 constexpr int64_t kDynamicSerialTripCountFallback = 100;
 
@@ -253,19 +239,49 @@ public:
 
 using GuardList = std::vector<std::unique_ptr<Guard>>;
 
-// Base class for all IR nodes in scheduling
+// Optional pass-local state owned by an IRStructure node. Concrete extra-info
+// types are declared by the pass that owns them; shared IR only defines their
+// lifecycle and substitution hooks.
+class IRExtraInfo {
+public:
+  virtual ~IRExtraInfo() = default;
+  virtual std::unique_ptr<IRExtraInfo> Clone() const = 0;
+  virtual void SubstituteVar(const Var &, const Var &) {}
+};
+
+// Structural and dependency-analysis state shared by both local IR phases.
 class IRStructure {
 public:
   enum class Kind { kTask, kControl };
+
+  explicit IRStructure(std::unique_ptr<IRExtraInfo> extra_info = nullptr)
+      : extra_info_(std::move(extra_info)) {}
 
   virtual ~IRStructure() = default;
   virtual Kind GetKind() const = 0;
   virtual std::shared_ptr<IRStructure> Clone() const = 0;
 
-  // Scheduling metadata assigned after Z3 scheduling. These used to live on a
-  // separate wrapper; scheduling now writes them directly onto the TaskNode or
-  // ControlNode participating in the scheduled sequence.
-  std::map<CoreMask, std::vector<Stmt>> before, after;
+  // The parent does not own this node; ownership remains with the parent's
+  // shared_ptr fields. Root nodes have no parent.
+  IRStructure *GetParent() { return parent_; }
+  const IRStructure *GetParent() const { return parent_; }
+  void SetParent(IRStructure *parent) {
+    ICHECK(parent != this) << "An IRStructure node cannot parent itself";
+    parent_ = parent;
+  }
+
+  // Return the structural path from the root to this node, inclusive.
+  std::vector<IRStructure *> Path();
+  std::vector<const IRStructure *> Path() const;
+
+  template <typename T> T *GetExtraInfo() {
+    ICHECK(extra_info_ != nullptr) << "Expected pass-local IR extra info";
+    return static_cast<T *>(extra_info_.get());
+  }
+  template <typename T> const T *GetExtraInfo() const {
+    ICHECK(extra_info_ != nullptr) << "Expected pass-local IR extra info";
+    return static_cast<const T *>(extra_info_.get());
+  }
 
   // Guard deltas introduced at this node relative to its nearest
   // surviving structural ancestor.
@@ -292,10 +308,18 @@ public:
                    std::make_unique<AttributeGuard>(node, key, value, span));
   }
 
-  // Pipeline stage assigned by the Z3 scheduler: producer = 0, consumers
-  // NEGATIVE (absolute value = latency in stages). See core_partition.cc.
+  // Pipeline stage assigned by the Z3 scheduler: producer = 0, consumers are
+  // positive (value = latency in stages). See lower_scheduled_tir.cc.
   int GetStage() const { return stage_; }
   void SetStage(int stage) { stage_ = stage; }
+
+  // Task cost carried by T.Task annotations or synthesized for a ControlNode.
+  // These are ordinary IR properties used by scheduling and dependency
+  // analysis, rather than scratch state owned by one pass.
+  void SetLatency(int64_t latency) { latency_ = latency; }
+  int64_t GetLatency() const { return latency_; }
+  void SetII(int64_t ii) { ii_ = ii; }
+  int64_t GetII() const { return ii_; }
 
   // Position in the scheduled sibling list. Together with stage this determines
   // the emitted software-pipeline order inside the current parent.
@@ -315,38 +339,17 @@ public:
     }
   }
 
-  void SubstituteVarInSchedulingMetadata(const Var &old_var,
-                                         const Var &new_var) {
-    for (auto &[_, stmts] : before) {
-      for (auto &stmt : stmts) {
-        stmt = Substitute(stmt, {{old_var, new_var}});
-      }
-    }
-    for (auto &[_, stmts] : after) {
-      for (auto &stmt : stmts) {
-        stmt = Substitute(stmt, {{old_var, new_var}});
-      }
-    }
-  }
-
   void CopyBaseMetadataFrom(const IRStructure &other) {
     guards_.clear();
     guards_.reserve(other.guards_.size());
     for (const auto &guard : other.guards_) {
       guards_.push_back(guard->Clone());
     }
-    before = other.before;
-    after = other.after;
     stage_ = other.stage_;
     index_ = other.index_;
-    start_time_ = other.start_time_;
+    latency_ = other.latency_;
+    ii_ = other.ii_;
   }
-
-  // Start time assigned by the Z3 scheduler. Only meaningful on scheduled
-  // TaskNode/ControlNode children of an ordered list (a ControlNode body or
-  // the root list). Expressed as cycle offset relative to that list's start.
-  void SetStartTime(int64_t start_time) { start_time_ = start_time; }
-  int64_t GetStartTime() const { return start_time_; }
 
   // Resource pipe bitmask (accessible by all IR nodes)
   virtual uint16_t GetPipeMask() const = 0;
@@ -368,14 +371,6 @@ public:
   // Variable access (used for dependency analysis)
   virtual std::vector<Var> GetReadVars() const = 0;
   virtual std::vector<Var> GetWriteVars() const = 0;
-
-  // Latency estimation
-  virtual int64_t GetLatency() const = 0; // Estimated latency in cycles
-  virtual int64_t GetII() const = 0;      // Initiation interval in cycles
-
-  // Setters (for analysis passes to update these values)
-  virtual void SetLatency(int64_t latency) = 0;
-  virtual void SetII(int64_t ii) = 0;
 
   // Substitute a variable throughout this IR node
   virtual void SubstituteVar(const Var &old_var, const Var &new_var) = 0;
@@ -418,11 +413,23 @@ public:
     return WritesSpecialRegister(SpecialRegister::kLoopControl);
   }
 
+protected:
+  std::unique_ptr<IRExtraInfo> CloneExtraInfo() const {
+    return extra_info_ ? extra_info_->Clone() : nullptr;
+  }
+  void SubstituteVarInExtraInfo(const Var &old_var, const Var &new_var) {
+    if (extra_info_)
+      extra_info_->SubstituteVar(old_var, new_var);
+  }
+
 private:
+  IRStructure *parent_{nullptr};
+  std::unique_ptr<IRExtraInfo> extra_info_;
   GuardList guards_;
   int stage_{0};
   size_t index_{0};
-  int64_t start_time_{0};
+  int64_t latency_{0};
+  int64_t ii_{0};
 };
 
 // Task node: one atomic scheduler node. Ordinary tasks contain one statement;
@@ -430,15 +437,19 @@ private:
 // node while scheduling and dependency analysis keep it atomic.
 class TaskNode : public IRStructure {
 public:
+  explicit TaskNode(std::unique_ptr<IRExtraInfo> extra_info = nullptr)
+      : IRStructure(std::move(extra_info)) {}
+
   Stmt stmt;
 
   // Snapshot of the surrounding-scope ConstrSet at the moment this task was
-  // built. Captures ancestor For ranges, LetStmt bindings, kernel-block
+  // built or decoded. Captures ancestor For ranges, LetStmt bindings,
+  // kernel-block
   // thread_extent / virtual_thread iter ranges, tilelang_assume, and
-  // IfThenElse / Select branch guards. Populated by IRStructureBuilder in
-  // auto_schedule.cc when the TaskNode is constructed; consumed by
-  // RegionsMayConflict so the prover sees the symbol environment
-  // each region was written under.
+  // IfThenElse / Select branch guards. Populated by the scheduled-TIR builder
+  // or decoder when the TaskNode is constructed; consumed by
+  // RegionsMayConflict so the prover sees the symbol environment each region
+  // was written under.
   ConstrSet outer_ctx;
 
   Kind GetKind() const override { return Kind::kTask; }
@@ -467,21 +478,14 @@ public:
   std::vector<Var> GetReadVars() const override { return read_vars_; }
   std::vector<Var> GetWriteVars() const override { return write_vars_; }
 
-  // Latency estimation
-  int64_t GetLatency() const override { return latency_; }
-  int64_t GetII() const override { return ii_; }
-
   // Setters
   void SetPipeMask(uint16_t mask) { pipe_mask_ = mask; }
   void SetHbmMask(uint16_t mask) { hbm_mask_ = mask; }
   void SetSpecialWriteMask(uint16_t mask) { special_write_mask_ = mask; }
   void SetReadsPadValue(bool v) { reads_pad_value_ = v; }
   void SetReadsAtomic(bool v) { reads_atomic_ = v; }
-  void SetPerCoreTaskPipeMask(uint16_t mask) {
-    per_core_task_pipe_mask_ = mask;
-  }
-  bool IsPerCoreTask() const { return per_core_task_pipe_mask_ != 0; }
-  uint16_t GetPerCoreTaskPipeMask() const { return per_core_task_pipe_mask_; }
+  void MarkPerCoreTask() { is_per_core_task_ = true; }
+  bool IsPerCoreTask() const { return is_per_core_task_; }
   void AddSpecialWrite(SpecialRegister reg) {
     special_write_mask_ |= static_cast<uint16_t>(reg);
   }
@@ -526,11 +530,8 @@ public:
     outer_ctx = outer_ctx.Substitute(substitution);
     stmt = Substitute(stmt, substitution);
     SubstituteVarInGuards(old_var, new_var);
-    SubstituteVarInSchedulingMetadata(old_var, new_var);
+    SubstituteVarInExtraInfo(old_var, new_var);
   }
-  void SetLatency(int64_t latency) override { latency_ = latency; }
-  void SetII(int64_t ii) override { ii_ = ii; }
-
   void SetCoreMask(CoreMask core_mask) {
     ICHECK(IsValidCoreMask(core_mask));
     core_mask_ = core_mask;
@@ -587,10 +588,10 @@ private:
   // Whether a padded GM->UB copy in this leaf reads the pad-value register.
   bool reads_pad_value_{false};
   bool reads_atomic_{false};
-  // Non-zero for a T.PerCoreTask task. The stmt is scheduled as one logical
-  // group. During final Stmt emission, synchronization attached to this task is
-  // moved beside each inferred or explicitly marked candidate.
-  uint16_t per_core_task_pipe_mask_{0};
+  // A T.PerCoreTask is scheduled as one logical group. When InsertSync
+  // materializes synchronization, same-core syncs are moved beside each
+  // inferred or explicitly marked candidate.
+  bool is_per_core_task_{false};
 
   // Memory access regions (collected during analysis)
   std::vector<BufferRegion> read_regions_;
@@ -599,9 +600,6 @@ private:
   std::vector<Var> read_vars_;
   std::vector<Var> write_vars_;
 
-  // Latency estimation
-  int64_t latency_{0}; // Estimated latency in cycles
-  int64_t ii_{0};      // Initiation interval in cycles
   CoreMask core_mask_{kCoreUnassigned};
 };
 
@@ -610,6 +608,9 @@ private:
 // body's ordered children live directly here.
 class ControlNode : public IRStructure {
 public:
+  explicit ControlNode(std::unique_ptr<IRExtraInfo> extra_info = nullptr)
+      : IRStructure(std::move(extra_info)) {}
+
   For control; // The For operation
   std::shared_ptr<TaskNode> task;
   std::vector<std::shared_ptr<IRStructure>> children;
@@ -756,20 +757,8 @@ public:
     }
     control = new_for;
     SubstituteVarInGuards(old_var, new_var);
-    SubstituteVarInSchedulingMetadata(old_var, new_var);
+    SubstituteVarInExtraInfo(old_var, new_var);
   }
-
-  // Latency estimation (aggregate from child)
-  int64_t GetLatency() const override { return latency_; }
-  int64_t GetII() const override { return ii_; }
-
-  // Setters
-  void SetLatency(int64_t latency) override { latency_ = latency; }
-  void SetII(int64_t ii) override { ii_ = ii; }
-
-  void SetIIperIter(int64_t ii) { ii_per_iter_ = ii; }
-
-  int64_t GetIIperIter() const { return ii_per_iter_; }
 
   // Clone method
   std::shared_ptr<IRStructure> Clone() const override;
@@ -780,17 +769,12 @@ public:
       task->outer_ctx.Populate(analyzer);
     return GetSerialTripCount(control, &analyzer);
   }
-
-private:
-  // Latency estimation
-  int64_t latency_{0}; // Estimated latency in cycles
-  int64_t ii_{0};      // Initiation interval in cycles
-  int64_t ii_per_iter_{0};
-
-public:
-  std::map<Buffer, int64_t> buffer_num_versions; // Map from buffer to number of
-                                                 // versions for multi-buffering
 };
+
+// Rebuild every non-owning parent link in a forest. Call this after attaching,
+// removing, or replacing nodes through public child vectors.
+void RebuildIRStructureParents(
+    const std::vector<std::shared_ptr<IRStructure>> &roots);
 
 inline bool IsRegisterRegion(const BufferRegion &region) {
   String scope = region->buffer.scope();
@@ -806,175 +790,8 @@ CollectAllTaskNodes(const std::vector<std::shared_ptr<IRStructure>> &nodes,
     CollectAllTaskNodes(node.get(), all_tasks);
 }
 
-// Structure to represent a data dependency between a producer and consumer node
-struct DepInfo {
-  IRStructure *prod_node;
-  IRStructure *cons_node;
-  Buffer buffer;
-  // Conflicting (producer access, consumer access) pairs. Each pair is a
-  // concrete producer→consumer ordering that needs a sync.
-  std::vector<std::pair<BufferAccessPoint, BufferAccessPoint>> task_pairs;
-  // Cross-iteration distance of this dependency:
-  //   0   : same-iteration dependency.
-  //   -1  : cross-iteration dependency on an auto-versioned buffer; the true
-  //         distance equals the buffer's num_versions.
-  //   >=1 : dependency on a manually multi-buffered buffer, at the physical
-  //         iteration distance solved per access pair.
-  int distance;
-  int64_t latency;
-};
-
-// Table of user-declared manual multi-buffer buffers, keyed by the buffer's
-// data Var, value = number of versions N (the user allocated the buffer with an
-// explicit leading dim of size N and writes the version index into dim 0
-// themselves). Built per kernel from the `tl.manual_multi_buffer` annotation
-// and threaded through dependency analysis (to solve the real cross-iteration
-// distance) and the barrier pass.
-using ManualMultiBufferTable = std::unordered_map<const VarNode *, int64_t>;
-
-// Per-phase dependency-analysis cache. A ControlNode key represents the
-// dependency result for its ordered child list at that phase.
-using DependencyCache = std::map<const ControlNode *, std::vector<DepInfo>>;
-
-// Analyze data dependencies among scheduled TaskNode/ControlNode nodes.
-// `loop_stack` is the full enclosing serial loop stack at this level
-// (outermost-first). Empty means root/list level. Non-empty means the last loop
-// is the current loop body, enabling cross-iteration dependencies.
-// `manual` maps user-declared manual multi-buffer data Vars to their version
-// count; empty means no manual buffers.
-// `dependency_cache` is shared for one scheduling or barrier phase. A non-null
-// `cache_key` identifies `nodes` as that ControlNode's ordered child list.
-// An `i == j` control-node self-dependency whose producer→consumer pairs are
-// already established anywhere inside that node's own subtree is dropped.
-std::vector<DepInfo>
-AnalyzeDependencies(const std::vector<IRStructure *> &nodes,
-                    const std::vector<For> &loop_stack,
-                    const ManualMultiBufferTable &manual = {},
-                    DependencyCache *dependency_cache = nullptr,
-                    const ControlNode *cache_key = nullptr);
-
-// Helper function to print BufferRegion details
-inline void PrintBufferRegion(const BufferRegion &region,
-                              const std::string &indent) {
-  const Buffer &buffer = region->buffer;
-  const Region &ranges = region->region;
-
-  std::string buffer_name = buffer->name;
-  if (buffer_name.empty())
-    buffer_name = "unnamed_buffer";
-
-  LOG(INFO) << indent << "Buffer: " << buffer_name;
-
-  // Get scope information
-  String scope_str = buffer.scope();
-  LOG(INFO) << indent << "  Scope: " << scope_str;
-
-  // Build shape string
-  std::ostringstream shape_ss;
-  shape_ss << "[";
-  for (size_t i = 0; i < buffer->shape.size(); ++i) {
-    if (i > 0)
-      shape_ss << ", ";
-    shape_ss << buffer->shape[i];
-  }
-  shape_ss << "]";
-  LOG(INFO) << indent << "  Shape: " << shape_ss.str();
-
-  LOG(INFO) << indent << "  Region:";
-  for (size_t i = 0; i < ranges.size(); ++i) {
-    const Range &range = ranges[i];
-    std::ostringstream range_ss;
-    range_ss << "[" << range->min << ", " << range->min + range->extent
-             << ") (extent=" << range->extent << ")";
-    LOG(INFO) << indent << "    dim " << i << ": " << range_ss.str();
-  }
-}
-
-// Helper function to print all stmts in IRStructure
-inline void PrintAllStmts(const IRStructure *node, int indent = 0) {
-  if (!node)
-    return;
-
-  std::string indent_str(indent * 2, ' ');
-
-  if (node->IsTask()) {
-    const TaskNode *task = static_cast<const TaskNode *>(node);
-    LOG(INFO) << indent_str << "TaskNode statement:";
-    LOG(INFO) << indent_str + "    " << task->stmt;
-    LOG(INFO) << indent_str << "  Resource pipe mask: 0x" << std::hex
-              << task->GetPipeMask() << std::dec;
-    LOG(INFO) << indent_str << "  Latency: " << task->GetLatency()
-              << " cycles, II: " << task->GetII() << " cycles, core_mask: "
-              << static_cast<int>(task->GetCoreMask());
-  } else if (node->IsControl()) {
-    const ControlNode *control = static_cast<const ControlNode *>(node);
-    LOG(INFO) << indent_str << "ControlNode (For loop):";
-    // Print the For statement itself
-    LOG(INFO) << indent_str << "  For statement:";
-    LOG(INFO) << indent_str + "    " << control->control;
-
-    // Recursively print child statements
-    LOG(INFO) << indent_str << "  Loop body:";
-    for (size_t i = 0; i < control->children.size(); i++) {
-      PrintAllStmts(control->children[i].get(), indent + 2);
-    }
-  }
-}
-
-// Original helper function to print IRStructure (kept for backward
-// compatibility)
-inline void PrintIRStructure(const IRStructure *node, int indent = 0) {
-  if (!node)
-    return;
-
-  std::string indent_str(indent * 2, ' ');
-
-  for (const auto &guard : node->GetGuards()) {
-    if (guard->IsAttribute()) {
-      const auto *attribute_guard =
-          static_cast<const AttributeGuard *>(guard.get());
-      LOG(INFO) << indent_str << "  [attr " << attribute_guard->key << "] "
-                << attribute_guard->node;
-    } else {
-      const auto *condition_guard =
-          static_cast<const ConditionGuard *>(guard.get());
-      LOG(INFO) << indent_str << "  [guard] " << condition_guard->condition;
-    }
-  }
-
-  if (node->IsTask()) {
-    const TaskNode *task = static_cast<const TaskNode *>(node);
-    LOG(INFO) << indent_str << "TaskNode:";
-    LOG(INFO) << indent_str << "  stmt: " << task->stmt;
-    for (auto &region : task->GetReadRegions()) {
-      LOG(INFO) << indent_str << "  Read Region: " << region;
-    }
-    for (auto &region : task->GetWriteRegions()) {
-      LOG(INFO) << indent_str << "  Write Region: " << region;
-    }
-    for (auto &var : task->GetReadVars()) {
-      LOG(INFO) << indent_str << "  Read Var: " << var;
-    }
-    for (auto &var : task->GetWriteVars()) {
-      LOG(INFO) << indent_str << "  Write Var: " << var;
-    }
-    LOG(INFO) << indent_str << "  pipe_mask: 0x" << std::hex
-              << task->GetPipeMask() << std::dec;
-    LOG(INFO) << indent_str << "  latency: " << task->GetLatency() << " cycles";
-    LOG(INFO) << indent_str << "  II: " << task->GetII() << " cycles";
-    LOG(INFO) << indent_str
-              << "  core_mask: " << static_cast<int>(task->GetCoreMask());
-  } else if (node->IsControl()) {
-    const ControlNode *control = static_cast<const ControlNode *>(node);
-    LOG(INFO) << indent_str << "ControlNode (For loop):";
-    LOG(INFO) << indent_str << "  Loop body: " << control->children.size()
-              << " children";
-    for (size_t i = 0; i < control->children.size(); i++) {
-      LOG(INFO) << indent_str << "  Child " << i << ":";
-      PrintIRStructure(control->children[i].get(), indent + 2);
-    }
-  }
-}
+// Debug logging helpers.
+void PrintIRStructure(const IRStructure *node, int indent = 0);
 
 } // namespace tl
 } // namespace tvm

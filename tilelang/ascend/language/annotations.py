@@ -23,6 +23,9 @@ def annotate_buffer_versions(buffer_versions_map: dict):
     This is useful when you want to guarantee double-buffering for a critical
     buffer regardless of the Z3 solver's choice.
 
+    AutoSchedule consumes this map and replaces it with the selected version
+    counts, including versions chosen automatically by the solver.
+
     Example
     -------
     >>> @T.prim_func

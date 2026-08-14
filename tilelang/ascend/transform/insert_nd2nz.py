@@ -223,7 +223,7 @@ def _rewrite_copy(value, nz_l1_vars, nz_source_vars, pending_allocs):
     same_dtype = str(src_buf.dtype) == str(dst_buf.dtype)
     post_copy_op = tirx.op.Op.get(_POST_COPY_OP)
 
-    # Build the trailing dual extras (consumed by core_partition and
+    # Build the trailing dual extras (consumed by LowerScheduledTIR and
     # stripped before codegen).
     dual_extras = [tirx.const(split_dim_neg2, "int32"), half_extent] if is_dual else []
 

@@ -19,7 +19,7 @@
 
 /*!
  * \file tl/ascend/transform/buffer_version.h
- * \brief Internal annotation contract for physical buffer versions.
+ * \brief Annotation contract for buffer version metadata.
  */
 
 #pragma once
@@ -31,14 +31,16 @@
 
 namespace tvm {
 namespace tl {
-namespace ascend {
 
-/*! \brief Frontend staging annotation for manually versioned buffers. */
+/*! \brief Frontend overrides before AutoSchedule; selected versions afterward.
+ */
+constexpr const char *kBufferVersionsMap = "tl.buffer_versions_map";
+
+/*! \brief Manual-version annotation and physical-version staging key. */
 constexpr const char *kManualMultiBuffer = "tl.manual_multi_buffer";
 
-/*! \brief Storage data Var -> number of equal-sized physical versions. */
-using BufferVersionMap = ffi::Map<tirx::Var, PrimExpr>;
+/*! \brief Storage data Var -> positive compile-time version count. */
+using BufferVersionMap = ffi::Map<tirx::Var, int>;
 
-} // namespace ascend
 } // namespace tl
 } // namespace tvm

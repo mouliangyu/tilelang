@@ -31,6 +31,7 @@
 #include "cuda/transform/ptx_async_copy_injector.h"
 
 #include "arith/ir_mutator_with_analyzer.h"
+#include "ascend/transform/buffer_version.h"
 #include "common/attr.h"
 #include "common/mbarrier.h"
 #include "common/pipeline_utils.h"
@@ -1354,7 +1355,7 @@ private:
       return stmt;
     }
 
-    auto versions = op->node.try_cast<Map<Var, PrimExpr>>();
+    auto versions = op->node.try_cast<BufferVersionMap>();
     ICHECK(versions.has_value())
         << "'" << tl::attr::kBufferVersion
         << "' AttrStmt node must be a buffer version map";
@@ -1363,9 +1364,9 @@ private:
     return attr;
   }
 
-  Map<Var, PrimExpr>
-  RemapBufferVersionMap_(const Map<Var, PrimExpr> &versions) const {
-    Map<Var, PrimExpr> remapped_versions;
+  BufferVersionMap
+  RemapBufferVersionMap_(const BufferVersionMap &versions) const {
+    BufferVersionMap remapped_versions;
     for (const auto &[data, version] : versions) {
       Var remapped_data = data;
       if (auto remap = var_remap_.find(data); remap != var_remap_.end()) {
@@ -1373,7 +1374,7 @@ private:
       }
       auto existing = remapped_versions.find(remapped_data);
       ICHECK(existing == remapped_versions.end() ||
-             StructuralEqual()((*existing).second, version))
+             (*existing).second == version)
           << "Conflicting buffer version counts after storage remapping for "
           << remapped_data;
       remapped_versions.Set(std::move(remapped_data), version);

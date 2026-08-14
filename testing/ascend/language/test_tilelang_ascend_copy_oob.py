@@ -173,6 +173,7 @@ def test_copy_oob_guards_are_lowered_after_auto_schedule() -> None:
         "tl.AscendInsertOOBPadding",
         "tl.AnnotateMultiBufferEligible",
         "tl.AutoSchedule",
+        "tl.InsertSync",
         "tl.LowerTileOp",
     }
 
@@ -201,8 +202,11 @@ def test_copy_oob_guards_are_lowered_after_auto_schedule() -> None:
     assert not generated_guard_lines("tl.AnnotateMultiBufferEligible")
     assert not generated_guard_lines("tl.AutoSchedule")
     scheduled = snapshots["tl.AutoSchedule"]
-    assert "T.ascend_set_flag" in scheduled
-    assert "T.ascend_wait_flag" in scheduled
+    assert "T.ascend_set_flag" not in scheduled
+    assert "T.ascend_wait_flag" not in scheduled
+    synchronized = snapshots["tl.InsertSync"]
+    assert "T.ascend_set_flag" in synchronized
+    assert "T.ascend_wait_flag" in synchronized
     annotation_lines = [line for line in snapshots["tl.AnnotateMultiBufferEligible"].splitlines() if "multi_buffer_eligible" in line]
     assert any("ub" in line for line in annotation_lines), annotation_lines
 

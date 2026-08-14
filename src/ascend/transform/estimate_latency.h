@@ -17,8 +17,7 @@
  * under the License.
  */
 
-#ifndef TVM_TL_ASCEND_TRANSFORM_LATENCY_ESTIMATOR_PARAMS_H_
-#define TVM_TL_ASCEND_TRANSFORM_LATENCY_ESTIMATOR_PARAMS_H_
+#pragma once
 
 #include <cstdint>
 
@@ -109,5 +108,3 @@ struct AscendLatencyParams {
 
 } // namespace tl
 } // namespace tvm
-
-#endif // TVM_TL_ASCEND_TRANSFORM_LATENCY_ESTIMATOR_PARAMS_H_

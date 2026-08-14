@@ -19,14 +19,27 @@
 
 /*!
  * \file auto_schedule.cc
- * \brief AutoSchedule pass for TileLang
+ * \brief AutoSchedule pass and schedule builder.
  */
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <memory>
+#include <optional>
+#include <queue>
+#include <set>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/container/array.h>
-#include <tvm/ffi/container/map.h>
-#include <tvm/ffi/extra/structural_equal.h>
-#include <tvm/ffi/extra/structural_hash.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/function.h>
@@ -41,36 +54,17 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
-#include <algorithm>
-#include <array>
-#include <cmath>
-#include <functional>
-#include <iostream>
-#include <limits>
-#include <map>
-#include <memory>
-#include <numeric>
-#include <optional>
-#include <queue>
-#include <string>
-#include <unordered_map>
-#include <unordered_set>
-#include <utility>
-#include <vector>
-
-#include "ascend/transform/auto_schedule/ir_structure.h"
-#include "ascend/transform/auto_schedule/task_analysis.h"
-#include "ascend/transform/auto_schedule/task_annotations.h"
-#include "auto_schedule.h"
+#include "./auto_schedule/dependency_analysis.h"
+#include "./auto_schedule/ir_structure.h"
+#include "./auto_schedule/kernel_rewriter.h"
+#include "./auto_schedule/scheduled_tir.h"
+#include "./auto_schedule/task_analysis.h"
+#include "./auto_schedule/task_annotations.h"
 #include "backend/common/target_utils.h"
-#include "buffer_version.h"
-#include "layout/layout.h"
-#include "op/builtin.h"
-#include "op/copy.h"
 #include "op/utils.h"
 #include "runtime/thread_storage_scope.h"
+#include "support/check.h"
 #include "tir/transforms/ir_utils.h"
-#include "transform/common/attr.h"
 #include "transform/common/collector.h"
 #include "transform/common/constr_visitor.h"
 
@@ -78,982 +72,1081 @@ namespace tvm {
 namespace tl {
 
 using namespace tirx;
-using ffi::GetRef;
 
-// AttrStmt wrappers that AutoSchedule supports.
-static const AutoScheduleAttrSpec kAutoScheduleAttrs[] = {
-    {tirx::attr::tilelang_assume, true},
-    {tl::attr::kAssumeRequiresRuntimeCheck, false},
-};
+namespace {
 
-class PerCoreTaskControlValidator : public StmtExprVisitor {
+// AutoSchedule target resource limits.
+
+// Check whether a kernel body contains any SIMT_VF blocks. SIMT_VF
+// (asc_vf_call) reserves 32 KB of the physical 248 KB Unified Buffer for
+// thread context, so the usable shared memory depends on its presence.
+class SimtVFDetector : public tirx::StmtVisitor {
 public:
-  explicit PerCoreTaskControlValidator(uint16_t pipe_mask)
-      : expected_pipe_("PIPE_" + GetResourcePipeName(pipe_mask)) {}
+  bool found = false;
 
-private:
-  void VisitExpr_(const CallNode *op) final {
-    if (op->op.same_as(tl::ascend_cross_core_set_flag()) ||
-        op->op.same_as(tl::ascend_cross_core_wait_flag())) {
-      ICHECK_EQ(op->args.size(), 3);
-      const auto *mode = op->args[0].as<IntImmNode>();
-      ICHECK(mode) << "Cross-core synchronization mode must be a constant "
-                      "integer, got "
-                   << op->args[0];
-      ICHECK_EQ(mode->value, 0)
-          << "Cross-core synchronization inside T.PerCoreTask only supports "
-             "mode 0, got "
-          << mode->value;
-      const auto *pipe = op->args[1].as<StringImmNode>();
-      ICHECK(pipe) << "Inter-core synchronization pipe must be a constant "
-                      "string, got "
-                   << op->args[1];
-      ICHECK_EQ(pipe->value, expected_pipe_)
-          << "Inter-core synchronization inside T.PerCoreTask must use its "
-             "inferred pipe "
-          << expected_pipe_ << ", got " << pipe->value;
+  void VisitStmt_(const tirx::SBlockNode *op) override {
+    if (op->name_hint == "SIMT_VF") {
+      found = true;
     }
-    StmtExprVisitor::VisitExpr_(op);
-  }
-
-  std::string expected_pipe_;
-};
-
-class TaskMarkerControlValidator : public StmtExprVisitor {
-public:
-  TaskMarkerControlValidator(bool reject_candidate_selection,
-                             bool allow_cross_core_sync)
-      : reject_candidate_selection_(reject_candidate_selection),
-        allow_cross_core_sync_(allow_cross_core_sync) {}
-
-private:
-  void VisitStmt_(const AttrStmtNode *op) final {
-    ICHECK_NE(op->attr_key, tl::attr::kAscendTask)
-        << "Nested T.Task regions are not supported";
-    StmtExprVisitor::VisitStmt_(op);
-  }
-
-  void VisitStmt_(const IfThenElseNode *op) final {
-    ICHECK(!reject_candidate_selection_)
-        << "Control flow selecting a T.Task candidate must be outside the "
-           "T.Task scope";
-    StmtExprVisitor::VisitStmt_(op);
-  }
-
-  void VisitExpr_(const CallNode *op) final {
-    TVM_FFI_CHECK(allow_cross_core_sync_ ||
-                      (!op->op.same_as(tl::ascend_cross_core_set_flag()) &&
-                       !op->op.same_as(tl::ascend_cross_core_wait_flag())),
-                  ValueError)
-        << "Inter-core synchronization inside T.Task must be the task's only "
-           "statement";
-    StmtExprVisitor::VisitExpr_(op);
-  }
-
-  bool reject_candidate_selection_;
-  bool allow_cross_core_sync_;
-};
-
-static bool IsStandaloneCrossCoreSync(const Stmt &stmt) {
-  const auto *evaluate = stmt.as<EvaluateNode>();
-  if (!evaluate)
-    return false;
-  const auto *call = evaluate->value.as<CallNode>();
-  return call && (call->op.same_as(tl::ascend_cross_core_set_flag()) ||
-                  call->op.same_as(tl::ascend_cross_core_wait_flag()));
-}
-
-static bool IsPerCoreTaskScalarControl(const TaskNode *task) {
-  if (task->stmt.as<BindNode>())
-    return true;
-  const auto *evaluate = task->stmt.as<EvaluateNode>();
-  if (!evaluate)
-    return false;
-  if (is_zero(evaluate->value))
-    return true;
-  const auto *call = evaluate->value.as<CallNode>();
-  return call && (call->op.same_as(tl::ascend_cross_core_set_flag()) ||
-                  call->op.same_as(tl::ascend_cross_core_wait_flag()));
-}
-
-static bool IsLetDeclTask(const TaskNode *task) {
-  return task != nullptr && task->stmt.as<BindNode>() != nullptr;
-}
-
-const AutoScheduleAttrSpec *FindAutoScheduleAttr(const String &key) {
-  for (const AutoScheduleAttrSpec &spec : kAutoScheduleAttrs) {
-    if (key == spec.key)
-      return &spec;
-  }
-  return nullptr;
-}
-
-// Mutator to extract the body of tilelang_root block and optional
-// buffer version overrides annotation.
-class TilelangRootBodyExtractor : public StmtVisitor {
-public:
-  Stmt body;
-  BufferVersionOverrideMap buffer_versions_overrides;
-  ManualMultiBufferTable manual_multi_buffer_versions;
-  std::set<std::string> unlimit_memory_scopes;
-
-  void VisitStmt_(const SBlockNode *op) override {
-    if (op->name_hint == "tilelang_root") {
-      body = op->body;
-      auto ann_val = op->annotations.Get("tl.buffer_versions_map");
-      if (ann_val.has_value()) {
-        auto *map_obj = ann_val.value().as<ffi::MapObj>();
-        if (map_obj) {
-          for (const auto &it : *map_obj) {
-            if (auto *var = it.first.as<VarNode>()) {
-              if (auto imm = it.second.as<int>()) {
-                buffer_versions_overrides[GetRef<Var>(var)] = imm.value();
-              }
-            }
-          }
-        }
-      }
-      auto manual_ann = op->annotations.Get("tl.manual_multi_buffer");
-      if (manual_ann.has_value()) {
-        if (auto *map_obj = manual_ann.value().as<ffi::MapObj>()) {
-          for (const auto &it : *map_obj) {
-            if (auto *var = it.first.as<VarNode>()) {
-              if (auto imm = it.second.as<int>()) {
-                manual_multi_buffer_versions[var] = imm.value();
-              }
-            }
-          }
-        }
-      }
-      auto mem_ann = op->annotations.Get("tl.unlimit_memory_scopes");
-      if (mem_ann.has_value()) {
-        if (auto *arr = mem_ann.value().as<ffi::ArrayObj>()) {
-          for (const auto &it : *arr) {
-            if (auto str_opt = it.as<ffi::String>()) {
-              unlimit_memory_scopes.insert(str_opt.value());
-            }
-          }
-        }
-      }
-      return; // Don't visit children
-    }
-    StmtVisitor::VisitStmt_(op);
+    tirx::StmtVisitor::VisitStmt_(op);
   }
 };
 
-static bool IsAutoScheduleAttrWrapper(const AttrStmtNode *op) {
-  return FindAutoScheduleAttr(op->attr_key) != nullptr;
-}
-
-struct CrossCorePipeInfo {
-  SpecialRegister special_register;
-  CoreMask core_mask;
-};
-
-static CrossCorePipeInfo GetCrossCorePipeInfo(const PrimExpr &pipe_arg) {
-  const auto *pipe_imm = pipe_arg.as<StringImmNode>();
-  ICHECK(pipe_imm)
-      << "Auto-scheduled cross-core synchronization requires a constant pipe "
-         "string";
-  const String &pipe = pipe_imm->value;
-  if (pipe == "PIPE_S")
-    return {SpecialRegister::kPipeScalar, kCoreUnassigned};
-  if (pipe == "PIPE_V")
-    return {SpecialRegister::kPipeVector, kCoreVector};
-  if (pipe == "PIPE_M")
-    return {SpecialRegister::kPipeCube, kCoreCube};
-  if (pipe == "PIPE_MTE1")
-    return {SpecialRegister::kPipeMTE1, kCoreCube};
-  if (pipe == "PIPE_MTE2")
-    return {SpecialRegister::kPipeMTE2, kCoreUnassigned};
-  if (pipe == "PIPE_MTE3")
-    return {SpecialRegister::kPipeMTE3, kCoreVector};
-  if (pipe == "PIPE_FIX")
-    return {SpecialRegister::kPipeFixpipe, kCoreCube};
-  LOG(FATAL) << "Ascend AutoSchedule does not support cross-core pipe \""
-             << pipe
-             << "\". Expected one of PIPE_S, PIPE_V, PIPE_M, PIPE_MTE1, "
-                "PIPE_MTE2, PIPE_MTE3, or PIPE_FIX";
-  return {SpecialRegister::kNone, kCoreUnassigned};
-}
-
-static Optional<Call> GetCrossCoreCall(const Call &call) {
-  if (!call->op.same_as(tl::ascend_cross_core_set_flag()) &&
-      !call->op.same_as(tl::ascend_cross_core_wait_flag())) {
-    return std::nullopt;
-  }
-  ICHECK_EQ(call->args.size(), 3)
-      << "ascend_cross_core_set_flag/wait_flag expects exactly 3 arguments";
-  const auto *mode = call->args[0].as<IntImmNode>();
-  ICHECK(mode)
-      << "Ascend AutoSchedule requires cross-core mode_id to be constant 0";
-  ICHECK_EQ(mode->value, 0)
-      << "Ascend AutoSchedule only supports cross-core synchronization with "
-         "mode_id=0; disable AutoSchedule for manually scheduled mode_id="
-      << mode->value;
-  return call;
-}
-
-static std::vector<Call> CollectCrossCoreCalls(const TaskNode *task) {
-  class Collector : public StmtExprVisitor {
-  public:
-    std::vector<Call> calls;
-
-  private:
-    void VisitExpr_(const CallNode *op) final {
-      Call call = GetRef<Call>(op);
-      if (GetCrossCoreCall(call).defined())
-        calls.push_back(call);
-      StmtExprVisitor::VisitExpr_(op);
-    }
-  } collector;
-  collector(task->stmt);
-  return collector.calls;
-}
-
-static uint16_t CollectSpecialRegisterWrites(const Stmt &stmt) {
-  class Collector : public StmtExprVisitor {
-  public:
-    uint16_t mask{0};
-
-  private:
-    void VisitExpr_(const CallNode *op) final {
-      if (op->op.same_as(tl::loop_break())) {
-        mask |= static_cast<uint16_t>(SpecialRegister::kLoopControl);
-      } else if (op->op.same_as(tl::ascend_set_hf32_mode())) {
-        mask |= static_cast<uint16_t>(SpecialRegister::kHf32Mode);
-      } else if (op->op.same_as(tl::ascend_set_copy_pad_value())) {
-        mask |= static_cast<uint16_t>(SpecialRegister::kPadValue);
-      } else if (op->op.same_as(tl::ascend_set_atomic()) ||
-                 op->op.same_as(tl::ascend_set_atomic_none())) {
-        mask |= static_cast<uint16_t>(SpecialRegister::kAtomicMode);
-      } else if (op->op.same_as(tl::ascend_cross_core_set_flag()) ||
-                 op->op.same_as(tl::ascend_cross_core_wait_flag())) {
-        Call call = GetRef<Call>(op);
-        ICHECK(GetCrossCoreCall(call).defined());
-        mask |= static_cast<uint16_t>(
-            GetCrossCorePipeInfo(op->args[1]).special_register);
-      }
-      StmtExprVisitor::VisitExpr_(op);
-    }
-  } collector;
-  collector(stmt);
-  return collector.mask;
-}
-
-static bool ContainsDualCopy(const Stmt &stmt) {
-  class Detector : public StmtExprVisitor {
-  public:
-    bool found{false};
-
-  private:
-    void VisitExpr_(const CallNode *op) final {
-      if (found)
-        return;
-      static const auto copy_op = Op::Get("tl.tileop.copy");
-      if (op->op.same_as(copy_op)) {
-        Copy copy(op->args, op->annotations);
-        found = copy->GetDualDstCtl() != 0;
-      } else if (op->op.same_as(tl::ascend_nd2nz_post_copy()) &&
-                 op->args.size() == 8) {
-        found = true;
-      }
-      if (!found)
-        StmtExprVisitor::VisitExpr_(op);
-    }
-  } detector;
+inline bool HasSimtVF(const tirx::Stmt &stmt) {
+  SimtVFDetector detector;
   detector(stmt);
   return detector.found;
 }
 
-// Detect multiple kernel launches in the PrimFunc body.
-// In tilelang, when multiple T.Kernel() blocks are used, the IR structure is:
-//   root block body:
-//     AttrStmt(tl.assume_requires_runtime_check, ...)
-//       AttrStmt(tl.assume, ...)
-//         SeqStmt [
-//           AttrStmt(blockIdx.x, thread_extent, ..., kernel1_subtree),
-//           AttrStmt(blockIdx.x, thread_extent, ..., kernel2_subtree),
-//         ]
-// Each kernel subtree contains its own launch_threads and tilelang_root block.
-// This class finds that SeqStmt and returns each child as a separate kernel.
-class MultiKernelDetector {
-public:
-  static bool Detect(const Stmt &func_body, std::vector<Stmt> &kernel_stmts,
-                     Stmt &prefix_wrapper) {
-    std::vector<Stmt> stmts;
-    const Stmt *inner = &func_body;
-
-    // Peel through root block.
-    if (const auto *block = inner->as<SBlockNode>()) {
-      inner = &block->body;
-    } else if (const auto *br = inner->as<SBlockRealizeNode>()) {
-      inner = &br->block->body;
-    }
-
-    // Peel through Attribute chains.
-    while (const auto *attr = inner->as<AttrStmtNode>()) {
-      if (!IsAutoScheduleAttrWrapper(attr))
-        break;
-      inner = &attr->body;
-    }
-
-    // Check if we have a SeqStmt with multiple children that each contain
-    // a launch_thread (thread_extent)
-    const auto *seq = inner->as<SeqStmtNode>();
-    if (!seq || seq->seq.size() < 2)
-      return false;
-
-    int kernel_count = 0;
-    for (const auto &child : seq->seq) {
-      if (ContainsLaunchThread(child)) {
-        kernel_count++;
-      }
-    }
-
-    if (kernel_count < 2)
-      return false;
-
-    for (const auto &child : seq->seq) {
-      kernel_stmts.push_back(child);
-    }
-    return true;
-  }
-
-private:
-  static bool ContainsLaunchThread(const Stmt &stmt) {
-    if (const auto *attr = stmt.as<AttrStmtNode>()) {
-      if (attr->attr_key == tirx::attr::thread_extent) {
-        return true;
-      }
-    }
-    return false;
-  }
-};
-
-// Mutator that replaces the inner SeqStmt (inside root block -> assume-wrapper
-// chain) with a new body. Used to reassemble multi-kernel results.
-class InnerSeqStmtReplacer : public StmtMutator {
-public:
-  explicit InnerSeqStmtReplacer(Stmt new_inner) : new_inner_(new_inner) {}
-
-  Stmt VisitStmt_(const SBlockRealizeNode *op) override {
-    auto new_block_body = this->VisitStmt(op->block->body);
-    if (new_block_body.same_as(op->block->body))
-      return GetRef<Stmt>(op);
-    auto new_block =
-        SBlock(op->block->iter_vars, op->block->reads, op->block->writes,
-               op->block->name_hint, new_block_body, op->block->init,
-               op->block->alloc_buffers, op->block->match_buffers,
-               op->block->annotations);
-    return SBlockRealize(op->iter_values, op->predicate, new_block);
-  }
-
-  Stmt VisitStmt_(const SBlockNode *op) override {
-    auto new_body = this->VisitStmt(op->body);
-    if (new_body.same_as(op->body))
-      return GetRef<Stmt>(op);
-    return SBlock(op->iter_vars, op->reads, op->writes, op->name_hint, new_body,
-                  op->init, op->alloc_buffers, op->match_buffers,
-                  op->annotations, op->span);
-  }
-
-  Stmt VisitStmt_(const AttrStmtNode *op) override {
-    if (IsAutoScheduleAttrWrapper(op)) {
-      auto new_body = this->VisitStmt(op->body);
-      if (new_body.same_as(op->body))
-        return GetRef<Stmt>(op);
-      return AttrStmt(op->node, op->attr_key, op->value, new_body, op->span);
-    }
-    return GetRef<Stmt>(op);
-  }
-
-  Stmt VisitStmt_(const SeqStmtNode *op) override { return new_inner_; }
-
-private:
-  Stmt new_inner_;
-};
-
-// Mutator to replace the body of tilelang_root block
-class TilelangRootBodyReplacer : public StmtMutator {
-public:
-  TilelangRootBodyReplacer(Stmt new_body,
-                           ascend::BufferVersionMap buffer_versions)
-      : new_body_(std::move(new_body)),
-        buffer_versions_(std::move(buffer_versions)) {}
-
-  Stmt VisitStmt_(const SBlockNode *op) override {
-    if (op->name_hint == "tilelang_root") {
-      Map<String, Any> annotations = op->annotations;
-      annotations.erase(ascend::kManualMultiBuffer);
-      if (!buffer_versions_.empty()) {
-        annotations.Set(ascend::kManualMultiBuffer, buffer_versions_);
-      }
-      return SBlock(op->iter_vars, op->reads, op->writes, op->name_hint,
-                    new_body_, op->init, op->alloc_buffers, op->match_buffers,
-                    annotations, op->span);
-    }
-    return StmtMutator::VisitStmt_(op);
-  }
-
-private:
-  Stmt new_body_;
-  ascend::BufferVersionMap buffer_versions_;
-};
-
-// Visitor to build IRStructure from TIR statements
-//
-// Inherits `ConstrVisitor` so the constraint stack (For ranges, LetStmt
-// bindings, AttrStmt thread_extent/virtual_thread/tilelang_assume,
-// IfThenElse branch guards) is maintained automatically. Whenever a fresh
-// TaskNode is constructed, `StampCtx` snapshots `GetConstrSet()` onto it
-// for later use by RegionsMayConflict.
-//
-// Caveat: each VisitStmt_ override below replaces ConstrVisitor's default —
-// for nodes that introduce a scope (For, LetStmt, AttrStmt, IfThenElse),
-// the override must manually call `MakeGuard(...)` around the body
-// recursion to keep the stack accurate.
-class IRStructureBuilder : public TaskAwareConstrVisitor {
-public:
-  // Build an ordered list of IRStructure nodes from a statement. The old
-  // SequenceNode wrapper is gone: a SeqStmt simply contributes its children to
-  // the current list inline.
-  std::vector<std::shared_ptr<IRStructure>> Build(const Stmt &stmt) {
-    auto list = BuildList(stmt);
-    if (list.empty()) {
-      LOG(WARNING) << "IRStructureBuilder: produced empty list after visiting "
-                      "statement. "
-                   << "This may indicate an unhandled statement type.";
-      auto task_node = std::make_shared<TaskNode>();
-      task_node->stmt = stmt;
-      list.push_back(std::move(task_node));
-    }
-    return list;
-  }
-
-protected:
-  // Visit `stmt` into a fresh accumulator list and return it. Nested visits
-  // (loop bodies, if-branches) use this to collect their own ordered list
-  // without disturbing the caller's.
-  std::vector<std::shared_ptr<IRStructure>> BuildList(const Stmt &stmt) {
-    std::vector<std::shared_ptr<IRStructure>> saved;
-    saved.swap(result_);
-    VisitStmt(stmt);
-    std::vector<std::shared_ptr<IRStructure>> out;
-    out.swap(result_);
-    result_.swap(saved);
-    return out;
-  }
-
-  // Stamp the current ConstrVisitor stack snapshot onto a freshly-built
-  // TaskNode, so dependency proving and latency estimation see the symbol
-  // environment (ancestor For ranges, Let bindings, thread_extents,
-  // tilelang_assume, branch guards) the region was written under.
-  void StampCtx(TaskNode *task) { task->outer_ctx = GetConstrSet(); }
-
-  void VisitStmt_(const ForNode *op) override {
-    // Determine if this is a sequential or parallel for
-    if (op->kind == ForKind::kSerial || op->kind == ForKind::kUnrolled) {
-      // Sequential For -> ControlNode
-      auto control_node = std::make_shared<ControlNode>();
-      control_node->control = GetRef<For>(op);
-      control_node->task = std::make_shared<TaskNode>();
-      control_node->task->stmt =
-          For(op->loop_var, op->min, op->extent, op->kind, Evaluate(0),
-              op->thread_binding, op->annotations, op->step, op->span);
-      // The loop task itself sees the context outside the loop.
-      StampCtx(control_node->task.get());
-      ApplyTaskAccesses(AnalyzeTaskAccesses(Evaluate(op->min)),
-                        control_node->task.get());
-      ApplyTaskAccesses(AnalyzeTaskAccesses(Evaluate(op->extent)),
-                        control_node->task.get());
-      if (op->step.defined())
-        ApplyTaskAccesses(
-            AnalyzeTaskAccesses(Evaluate(GetRef<PrimExpr>(op->step.get()))),
-            control_node->task.get());
-
-      // Process the loop body inside the loop scope (push loop_var range).
-      {
-        auto guard_1 =
-            MakeGuard(op->loop_var, Range::FromMinExtent(op->min, op->extent));
-        auto guard_2 = MakeGuard(op->extent > 0);
-        control_node->children = BuildList(op->body);
-      }
-
-      result_.push_back(std::move(control_node));
-    } else {
-      ThrowUnmarkedTask("AutoSchedule", "parallel loop");
-    }
-  }
-
-  void VisitStmt_(const EvaluateNode *op) override {
-    ThrowUnmarkedTask("AutoSchedule", "Evaluate");
-  }
-
-  void VisitStmt_(const BufferStoreNode *op) override {
-    ThrowUnmarkedTask("AutoSchedule", "BufferStore");
-  }
-
-  // Stamp a guard condition onto every schedule candidate produced for an
-  // if-branch
-  void StampConditionOnBranch(IRStructure *node, const PrimExpr &cond) {
-    if (!node)
-      return;
-    auto stamp_task = [&](IRStructure *item, TaskNode *sink) {
-      item->PrependCondition(cond);
-      if (sink) {
-        ApplyTaskAccesses(AnalyzeTaskAccesses(Evaluate(cond)), sink);
-      }
-    };
-    if (node->IsTask()) {
-      stamp_task(node, static_cast<TaskNode *>(node));
-    } else if (node->IsControl()) {
-      stamp_task(node, static_cast<ControlNode *>(node)->task.get());
-    } else {
-      // Post-scheduling-only metadata does not appear pre-scheduling; stamp
-      // defensively.
-      node->PrependCondition(cond);
-    }
-  }
-
-  // Stamp a supported AttrStmt onto every schedule candidate produced for its
-  // body. Attr metadata remains an ordered guard delta and is not materialized
-  // as a schedulable task.
-  void StampAttributeOnBranch(IRStructure *node, const Any &attr_node,
-                              const String &key, const PrimExpr &value,
-                              const Span &span) {
-    if (!node)
-      return;
-    auto stamp_task = [&](IRStructure *item, TaskNode *sink) {
-      item->PrependAttribute(attr_node, key, value, span);
-      if (sink) {
-        if (const auto *expr_node = attr_node.as<PrimExprNode>()) {
-          ApplyTaskAccesses(
-              AnalyzeTaskAccesses(Evaluate(GetRef<PrimExpr>(expr_node))), sink);
-        }
-      }
-    };
-    if (node->IsTask()) {
-      stamp_task(node, static_cast<TaskNode *>(node));
-    } else if (node->IsControl()) {
-      stamp_task(node, static_cast<ControlNode *>(node)->task.get());
-    } else {
-      node->PrependAttribute(attr_node, key, value, span);
-    }
-  }
-
-  void VisitStmt_(const IfThenElseNode *op) override {
-    // No dedicated IfNode: the guard is stamped onto the branch's schedule
-    // candidates as a `conditions` delta (see StampConditionOnBranch).
-    // then/else become ordinary schedule candidates distinguished only by their
-    // conditions; both branches' candidates are spliced into the current list.
-    std::vector<std::shared_ptr<IRStructure>> then_list;
-    {
-      auto guard = MakeGuard(op->condition);
-      then_list = BuildList(op->then_case);
-    }
-    for (auto &node : then_list) {
-      StampConditionOnBranch(node.get(), op->condition);
-      result_.push_back(std::move(node));
-    }
-
-    if (op->else_case) {
-      auto guard = MakeGuard(Not(op->condition));
-      auto else_list = BuildList(op->else_case.value());
-      for (auto &node : else_list) {
-        StampConditionOnBranch(node.get(), Not(op->condition));
-        result_.push_back(std::move(node));
-      }
-    }
-  }
-
-  void VisitStmt_(const BindNode *op) override {
-    ThrowUnmarkedTask("AutoSchedule", "Bind");
-  }
-
-  void VisitStmt_(const AttrStmtNode *op) override {
-    if (op->attr_key == tl::attr::kAscendTask) {
-      ICHECK_EQ(task_marker_depth_, 0)
-          << "Nested T.Task regions are not supported";
-
-      TaskAnnotations annotations = ParseTaskAnnotations(op->node);
-      Stmt task_body = op->body;
-
-      bool inside_per_core_task = per_core_task_depth_ > 0;
-      ++task_marker_depth_;
-      TaskMarkerControlValidator task_control_validator(
-          inside_per_core_task, IsStandaloneCrossCoreSync(task_body));
-      task_control_validator(task_body);
-      --task_marker_depth_;
-
-      TVM_FFI_CHECK(task_body.as<EvaluateNode>() ||
-                        !ContainsDualCopy(task_body),
-                    ValueError)
-          << "T.Task does not support dual_copy after it is combined with "
-             "other statements or expanded into a multi-statement body; "
-             "keep dual_copy as a standalone single-pipe task. Body="
-          << task_body;
-
-      auto task_node = std::make_shared<TaskNode>();
-      task_node->stmt = task_body;
-      task_node->SetPipeMask(RequireTaskPipe(annotations, "T.Task"));
-      StampCtx(task_node.get());
-      task_node->SetSpecialWriteMask(
-          CollectSpecialRegisterWrites(task_node->stmt));
-      ApplyTaskResourceUsage(AnalyzeTaskResourceUsage(task_node->stmt),
-                             task_node.get());
-      ApplyTaskAccesses(AnalyzeTaskAccesses(task_node->stmt), task_node.get());
-      uint16_t issue_pipe_mask = task_node->GetPipeMask();
-      if (task_node->GetSpecialWriteMask() != 0) {
-        issue_pipe_mask |= static_cast<uint16_t>(ResourcePipe::kScalar);
-      }
-      TVM_FFI_CHECK((issue_pipe_mask & (issue_pipe_mask - 1)) == 0, ValueError)
-          << "T.Task supports exactly one Ascend hardware pipe, but its body "
-             "uses multiple pipes (mask="
-          << issue_pipe_mask
-          << "). Split the statements into separate T.Task regions. Body="
-          << task_node->stmt;
-      uint16_t hbm_mask = task_node->GetHbmMask();
-      TVM_FFI_CHECK((hbm_mask & (hbm_mask - 1)) == 0, ValueError)
-          << "T.Task requires one Ascend core affinity, but its body "
-             "uses both AIC and AIV HBM paths. Split GM-to-L1 and GM-to-UB "
-             "operations into separate T.Task regions. Body="
-          << task_node->stmt;
-      TaskCost cost = RequireTaskCost(annotations, "T.Task");
-      task_node->SetLatency(cost.latency);
-      task_node->SetII(cost.ii);
-      if (inside_per_core_task && HasTaskBufferAccess(task_node.get()))
-        per_core_task_candidates_.push_back(task_node);
-      result_.push_back(std::move(task_node));
-      return;
-    }
-
-    if (op->attr_key == tl::attr::kAscendPerCoreTask) {
-      ICHECK_EQ(per_core_task_depth_, 0)
-          << "Nested T.PerCoreTask regions are not supported";
-
-      TaskAnnotations annotations = ParseTaskAnnotations(op->node);
-      uint16_t pipe_mask = RequireTaskPipe(annotations, "T.PerCoreTask");
-      TVM_FFI_CHECK((pipe_mask & (pipe_mask - 1)) == 0, ValueError)
-          << "T.PerCoreTask requires exactly one annotated hardware pipe, but "
-             "its mask is "
-          << pipe_mask;
-      Stmt per_core_body = op->body;
-      std::vector<std::shared_ptr<TaskNode>> saved_task_candidates;
-      saved_task_candidates.swap(per_core_task_candidates_);
-      ++per_core_task_depth_;
-      std::vector<std::shared_ptr<IRStructure>> body_list =
-          BuildList(per_core_body);
-      --per_core_task_depth_;
-      std::vector<std::shared_ptr<TaskNode>> task_candidates;
-      task_candidates.swap(per_core_task_candidates_);
-      per_core_task_candidates_.swap(saved_task_candidates);
-      ICHECK(!task_candidates.empty())
-          << "T.PerCoreTask must contain at least one dependency-bearing task "
-             "after NormalizeTask; run NormalizeTask immediately before "
-             "AutoSchedule";
-      std::unordered_set<const TaskNode *> candidate_tasks;
-      for (const std::shared_ptr<TaskNode> &candidate : task_candidates) {
-        ICHECK(candidate);
-        ICHECK(candidate_tasks.insert(candidate.get()).second)
-            << "Duplicate T.Task candidate TaskNode";
-      }
-      bool has_dependency_stmt = false;
-
-      std::function<void(IRStructure *)> collect_sites;
-      collect_sites = [&](IRStructure *node) {
-        if (!node)
-          return;
-        if (node->IsControl()) {
-          auto *control = static_cast<ControlNode *>(node);
-          for (const auto &child : control->children)
-            collect_sites(child.get());
-          return;
-        }
-
-        auto *task = static_cast<TaskNode *>(node);
-        ICHECK(!task->IsPerCoreTask())
-            << "Nested T.PerCoreTask regions are not supported";
-        const bool has_access = HasTaskBufferAccess(task);
-        if (!has_access) {
-          ICHECK(IsPerCoreTaskScalarControl(task))
-              << "T.PerCoreTask only permits scalar Bind/condition/loop "
-                 "control and inter-core synchronization in addition to "
-                 "operations on its inferred pipe; got "
-              << task->stmt;
-          return;
-        }
-        ICHECK(candidate_tasks.count(task))
-            << "NormalizeTask did not assign a T.Task candidate marker "
-               "to a dependency-bearing statement in T.PerCoreTask; got "
-            << task->stmt;
-        uint16_t task_pipe_mask = task->GetPipeMask();
-        ICHECK_NE(task_pipe_mask, 0)
-            << "Cannot infer an Ascend pipe for T.PerCoreTask candidate "
-            << task->stmt;
-        ICHECK_EQ(task_pipe_mask & (task_pipe_mask - 1), 0)
-            << "Each dependency-bearing statement in T.PerCoreTask must use "
-               "exactly one hardware pipe, but statement mask="
-            << task_pipe_mask << ", statement=" << task->stmt;
-        ICHECK_EQ(task_pipe_mask, pipe_mask)
-            << "T.PerCoreTask candidate pipe does not match its annotated "
-               "pipe. Annotated mask="
-            << pipe_mask << ", statement mask=" << task_pipe_mask
-            << ", statement=" << task->stmt;
-        has_dependency_stmt = true;
-      };
-      for (const auto &node : body_list)
-        collect_sites(node.get());
-      ICHECK(has_dependency_stmt)
-          << "T.PerCoreTask must contain at least one dependency-bearing "
-             "statement on its annotated pipe";
-
-      PerCoreTaskControlValidator control_validator(pipe_mask);
-      control_validator(per_core_body);
-      auto task_node = std::make_shared<TaskNode>();
-      task_node->stmt = per_core_body;
-      ApplyTaskResourceUsage(AnalyzeTaskResourceUsage(per_core_body),
-                             task_node.get());
-      ApplyTaskAccesses(AnalyzeTaskAccesses(per_core_body), task_node.get());
-      task_node->SetPipeMask(pipe_mask);
-      task_node->SetPerCoreTaskPipeMask(pipe_mask);
-      // Cross-core calls inside PerCoreTask are internal sequencing of this
-      // compound task. They migrate with its concrete candidates at emission
-      // time and intentionally do not expose special-register writes to the
-      // outer scheduler; placement comes from the task's inferred pipe/memory.
-      StampCtx(task_node.get());
-      TaskCost cost = RequireTaskCost(annotations, "T.PerCoreTask");
-      task_node->SetLatency(cost.latency);
-      task_node->SetII(cost.ii);
-      result_.push_back(std::move(task_node));
-      return;
-    }
-
-    const AutoScheduleAttrSpec *attr_spec = FindAutoScheduleAttr(op->attr_key);
-    ICHECK(attr_spec != nullptr)
-        << "AutoSchedule IRStructureBuilder only supports AttrStmt "
-           "keys listed in kAutoScheduleAttrs inside the schedulable "
-           "tilelang_root body. "
-           "Unsupported attr_key: "
-        << op->attr_key;
-
-    // Supported AttrStmts become ordered guard deltas on every candidate.
-    // tl.assume additionally enters the prover environment while its body is
-    // built; transparent attrs only preserve their source nesting.
-    std::vector<std::shared_ptr<IRStructure>> body_list;
-    if (attr_spec->is_assumption) {
-      auto guard = MakeGuard(Downcast<PrimExpr>(op->node), /*is_assume=*/true);
-      body_list = BuildList(op->body);
-    } else {
-      body_list = BuildList(op->body);
-    }
-    if (body_list.empty()) {
-      auto task_node = std::make_shared<TaskNode>();
-      task_node->stmt = Evaluate(0);
-      StampCtx(task_node.get());
-      body_list.push_back(std::move(task_node));
-    }
-    for (auto &node : body_list) {
-      StampAttributeOnBranch(node.get(), op->node, op->attr_key, op->value,
-                             op->span);
-      result_.push_back(std::move(node));
-    }
-  }
-
-  void VisitStmt_(const WhileNode *op) override {
-    ThrowUnmarkedTask("AutoSchedule", "While");
-  }
-
-  void VisitStmt_(const SBlockNode *op) override {
-    ThrowUnmarkedTask("AutoSchedule", "block");
-  }
-
-private:
-  std::vector<std::shared_ptr<IRStructure>> result_;
-  int per_core_task_depth_{0};
-  int task_marker_depth_{0};
-  std::vector<std::shared_ptr<TaskNode>> per_core_task_candidates_;
-};
-
-// Result of scheduling one kernel segment before serializing scheduled markers.
-struct ScheduledKernelResult {
-  std::vector<std::shared_ptr<IRStructure>> root;
-  FlagInfoList flag_infos;
-  std::vector<MultiVersionBufferInfo> buffer_infos;
-};
-
-using ScheduledMetadata = Map<String, Any>;
-
-static Stmt WrapScheduledGuards(Stmt body, const GuardList &guards) {
-  for (auto it = guards.rbegin(); it != guards.rend(); ++it)
-    body = (*it)->Wrap(std::move(body));
-  return body;
+inline int64_t GetSharedMemoryLimit(const tirx::Stmt &kernel_body) {
+  constexpr int64_t kPhysicalUnifiedBufferSize = 248 * 1024;
+  constexpr int64_t kSimtVFThreadContextSize = 32 * 1024;
+  return HasSimtVF(kernel_body)
+             ? kPhysicalUnifiedBufferSize - kSimtVFThreadContextSize
+             : kPhysicalUnifiedBufferSize;
 }
 
-class PerCoreTaskSyncMigrator : public StmtMutator {
-public:
-  PerCoreTaskSyncMigrator(std::vector<Stmt> before, std::vector<Stmt> after)
-      : before_(std::move(before)), after_(std::move(after)) {}
+inline int64_t GetL1MemoryLimit(Target target) {
+  if (TargetIsAscend(target)) {
+    return 512 * 1024; // 512 KB L1 cache on Ascend
+  }
+  return 0;
+}
 
-  Stmt Rewrite(Stmt body) {
-    Stmt result = VisitStmt(std::move(body));
-    ICHECK_GT(num_candidates_, 0)
-        << "Cannot find a T.Task marker in normalized PerCoreTask";
-    return result;
+inline int64_t GetL0CMemoryLimit(Target target) {
+  if (TargetIsAscend(target)) {
+    return 256 * 1024; // 256 KB L0C buffer on Ascend
+  }
+  return 0;
+}
+
+inline int64_t GetL0AMemoryLimit(Target target) {
+  if (TargetIsAscend(target)) {
+    return 64 * 1024; // 64 KB L0A buffer on Ascend
+  }
+  return 0;
+}
+
+inline int64_t GetL0BMemoryLimit(Target target) {
+  if (TargetIsAscend(target)) {
+    return 64 * 1024; // 64 KB L0B buffer on Ascend
+  }
+  return 0;
+}
+
+// Scheduler.
+
+std::unique_ptr<IRExtraInfo> MakeAutoScheduleExtraInfo();
+
+// Check if two variables are the same
+bool SameVar(const Var &a, const Var &b);
+
+// Check if there is a variable dependency between two IRStructures
+bool HasVarDependency(const IRStructure *a, const IRStructure *b);
+
+// Check if two IRStructures have resource dependency (use same hardware
+// resource)
+bool HasResourceDependency(const IRStructure *a, const IRStructure *b,
+                           uint16_t mask = UINT16_MAX);
+
+// Builder that schedules TaskNode/ControlNode children in IRStructure
+class ScheduleBuilder {
+private:
+  struct LetDependencyClosure {
+    std::vector<bool> is_declaration;
+    std::vector<std::set<size_t>> dependencies;
+  };
+
+  static LetDependencyClosure
+  CollectLetDependencyClosure_(const std::vector<IRStructure *> &nodes);
+
+public:
+  // Recursive scheduling function
+  // Directly schedules the entire IRStructure tree recursively in place
+  void ScheduleRecursive(std::shared_ptr<IRStructure> &node,
+                         std::vector<For> &loop_stack);
+
+  // Schedule an ordered child list in place (root list or a ControlNode body):
+  // gather + recurse into each child, then Z3-schedule and write the reordered
+  // list back.
+  void ScheduleList(std::vector<std::shared_ptr<IRStructure>> &children);
+
+  // Z3-based scheduler for a straight-line child list.
+  std::vector<std::shared_ptr<IRStructure>>
+  Z3SchedulePython(const std::vector<std::shared_ptr<IRStructure>> &children);
+
+  // Distance-aware Z3 scheduler for a ControlNode loop body.
+  void Z3SchedulePythonLoop(ControlNode *ctrl,
+                            const std::vector<For> &loop_stack);
+
+  // Set memory limit for a given buffer scope (e.g. "shared", "shared.l1")
+  void SetMemoryLimit(const std::string &scope, int64_t bytes) {
+    memory_limits_[scope] = bytes;
+  }
+
+  // Set manual buffer version overrides (from annotate_buffer_versions).
+  // Keys are buffer data variables, values are fixed num_versions.
+  void SetBufferVersionOverrides(BufferVersionMap overrides) {
+    buffer_version_overrides_ = std::move(overrides);
+  }
+
+  // Set the user-declared manual multi-buffer table (from
+  // annotate_manual_multi_buffer), threaded into dependency analysis so
+  // cross-iteration distances are solved per access pair.
+  void SetManualBufferVersions(BufferVersionMap manual_buffer_versions) {
+    manual_buffer_versions_ = std::move(manual_buffer_versions);
+    dependency_cache_.clear();
+  }
+
+  const BufferVersionMap &GetSelectedBufferVersions() const {
+    return selected_buffer_versions_;
   }
 
 private:
-  Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key != attr::kAscendTask)
-      return StmtMutator::VisitStmt_(op);
-    Stmt candidate = VisitStmt(op->body);
-    if (!HasTaskBufferAccess(candidate))
-      return candidate;
-    ++num_candidates_;
-    Array<Stmt> sequence;
-    sequence.reserve(before_.size() + 1 + after_.size());
-    for (const Stmt &stmt : before_)
-      sequence.push_back(stmt);
-    sequence.push_back(std::move(candidate));
-    for (const Stmt &stmt : after_)
-      sequence.push_back(stmt);
-    return SeqStmt::Flatten(sequence);
+  void RecordSelectedBufferVersion(const Buffer &buffer, int num_versions) {
+    if (num_versions <= 1)
+      return;
+    const Var &data = buffer->data;
+    auto existing = selected_buffer_versions_.find(data);
+    if (existing != selected_buffer_versions_.end()) {
+      ICHECK_EQ((*existing).second, num_versions)
+          << "AutoSchedule selected conflicting version counts for storage "
+          << data;
+      return;
+    }
+    selected_buffer_versions_.Set(data, num_versions);
   }
 
-  std::vector<Stmt> before_;
-  std::vector<Stmt> after_;
-  int num_candidates_{0};
+  std::map<std::string, int64_t> memory_limits_;
+  BufferVersionMap buffer_version_overrides_;
+  BufferVersionMap manual_buffer_versions_;
+  DependencyCache dependency_cache_;
+  BufferVersionMap selected_buffer_versions_;
 };
 
-class ScheduledTIREmitter {
+// Scratch timing state used only while AutoSchedule is solving and ordering an
+// IRStructure tree. Task latency and II live directly on IRStructure because
+// they are ordinary T.Task metadata.
+class AutoScheduleExtraInfo final : public IRExtraInfo {
 public:
-  Stmt Emit(const std::vector<std::shared_ptr<IRStructure>> &root,
-            const FlagInfoList &flag_infos) {
-    Array<Stmt> statements;
-    for (const FlagInfo &info : flag_infos) {
-      if (info.mode == 0) {
-        statements.push_back(EmitSyntheticTask(
-            MakeAscendSetFlag(info.hardevent, info.flag_var), info.core_mask));
-      } else if (info.mode == 1) {
-        statements.push_back(EmitSyntheticTask(
-            MakeAscendCrossCoreSetFlag(4, info.hardevent, info.flag_var),
-            info.core_mask));
-      }
-    }
-    for (const auto &node : root)
-      statements.push_back(EmitNode(node.get()));
-    for (const FlagInfo &info : flag_infos) {
-      if (info.mode == 0) {
-        statements.push_back(EmitSyntheticTask(
-            MakeAscendWaitFlag(info.hardevent, info.flag_var), info.core_mask));
-      } else if (info.mode == 2) {
-        statements.push_back(EmitSyntheticTask(
-            MakeAscendCrossCoreWaitFlag(4, info.hardevent, info.flag_var),
-            info.core_mask));
-      }
-    }
-    return SeqStmt::Flatten(statements);
+  std::unique_ptr<IRExtraInfo> Clone() const final {
+    return std::make_unique<AutoScheduleExtraInfo>(*this);
   }
+
+  void SetStartTime(int64_t start_time) { start_time_ = start_time; }
+  int64_t GetStartTime() const { return start_time_; }
+  void SetIIperIter(int64_t ii_per_iter) { ii_per_iter_ = ii_per_iter; }
+  int64_t GetIIperIter() const { return ii_per_iter_; }
 
 private:
-  Stmt EmitList(const std::vector<std::shared_ptr<IRStructure>> &nodes) {
-    Array<Stmt> statements;
-    statements.reserve(nodes.size());
-    for (const auto &node : nodes)
-      statements.push_back(EmitNode(node.get()));
-    return SeqStmt::Flatten(statements);
+  int64_t start_time_{0};
+  int64_t ii_per_iter_{0};
+};
+
+AutoScheduleExtraInfo *GetAutoScheduleExtraInfo(IRStructure *node) {
+  return node->GetExtraInfo<AutoScheduleExtraInfo>();
+}
+
+const AutoScheduleExtraInfo *GetAutoScheduleExtraInfo(const IRStructure *node) {
+  return node->GetExtraInfo<AutoScheduleExtraInfo>();
+}
+
+int64_t GetAutoScheduleStartTime(const IRStructure *node) {
+  return GetAutoScheduleExtraInfo(node)->GetStartTime();
+}
+
+int64_t GetAutoScheduleIIperIter(const ControlNode *node) {
+  return GetAutoScheduleExtraInfo(node)->GetIIperIter();
+}
+
+const DependencyTiming kAutoScheduleDependencyTiming{GetAutoScheduleStartTime,
+                                                     GetAutoScheduleIIperIter};
+
+std::unique_ptr<IRExtraInfo> MakeAutoScheduleExtraInfo() {
+  return std::make_unique<AutoScheduleExtraInfo>();
+}
+
+bool SameVar(const Var &a, const Var &b) { return a.same_as(b); }
+
+bool HasVarDependency(const IRStructure *a, const IRStructure *b) {
+  for (const auto &write_var_a : a->GetWriteVars()) {
+    for (const auto &read_var_b : b->GetReadVars()) {
+      if (SameVar(write_var_a, read_var_b))
+        return true;
+    }
+  }
+  return false;
+}
+
+bool HasResourceDependency(const IRStructure *a, const IRStructure *b,
+                           uint16_t mask) {
+  if (((a->GetPipeMask() & b->GetPipeMask()) & mask) != 0)
+    return true;
+  return (a->GetHbmMask() & b->GetHbmMask()) != 0;
+}
+
+ScheduleBuilder::LetDependencyClosure
+ScheduleBuilder::CollectLetDependencyClosure_(
+    const std::vector<IRStructure *> &nodes) {
+  LetDependencyClosure result;
+  result.is_declaration.resize(nodes.size(), false);
+  result.dependencies.resize(nodes.size());
+
+  std::unordered_map<Var, size_t, ObjectPtrHash, ObjectPtrEqual>
+      declaration_by_var;
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    const IRStructure *node = nodes[i];
+    if (!node || !node->IsTask())
+      continue;
+    const auto *task = static_cast<const TaskNode *>(node);
+    if (ffi::Optional<Bind> bind = GetFlatTaskBind(task->stmt);
+        bind.defined()) {
+      result.is_declaration[i] = true;
+      declaration_by_var[bind.value()->var] = i;
+    }
   }
 
-  Stmt EmitSyntheticTask(Stmt stmt, CoreMask core_mask) {
-    return EmitSyntheticTask(std::move(stmt), core_mask, 0);
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    if (!nodes[i])
+      continue;
+    std::vector<Var> pending = nodes[i]->GetReadVars();
+    while (!pending.empty()) {
+      Var var = std::move(pending.back());
+      pending.pop_back();
+      auto it = declaration_by_var.find(var);
+      if (it == declaration_by_var.end())
+        continue;
+      size_t declaration = it->second;
+      if (!result.dependencies[i].insert(declaration).second)
+        continue;
+      std::vector<Var> reads = nodes[declaration]->GetReadVars();
+      pending.insert(pending.end(), reads.begin(), reads.end());
+    }
+  }
+  return result;
+}
+
+/*
+  Recursively schedule root node, after scheduling IRStructure satisfies the
+following properties: 1) Each ordered child list (the root list or a
+ControlNode body) is reordered by the Z3 scheduler and the children carry
+scheduling metadata directly. 2) For each ControlNode, its `children` are the
+Z3-scheduled loop body. Conditional execution is carried by each node's
+`conditions` delta (no dedicated IfNode), so guarded tasks are ordinary
+schedule candidates.
+*/
+void ScheduleBuilder::ScheduleList(
+    std::vector<std::shared_ptr<IRStructure>> &children) {
+  dependency_cache_.clear();
+  std::vector<For> loop_stack;
+  std::vector<std::shared_ptr<IRStructure>> origin_children = children;
+  for (size_t i = 0; i < origin_children.size(); ++i) {
+    origin_children[i]->SetIndex(i);
+  }
+  for (auto &child : origin_children) {
+    ScheduleRecursive(child, loop_stack);
+  }
+  children = Z3SchedulePython(origin_children);
+  for (size_t i = 0; i < children.size(); ++i) {
+    children[i]->SetIndex(i);
+  }
+  RebuildIRStructureParents(children);
+}
+
+void ScheduleBuilder::ScheduleRecursive(std::shared_ptr<IRStructure> &node,
+                                        std::vector<For> &loop_stack) {
+  if (!node)
+    return;
+
+  if (node->IsTask()) {
+    return;
+  } else if (node->IsControl()) {
+    auto ctrl = static_cast<ControlNode *>(node.get());
+    std::vector<std::shared_ptr<IRStructure>> origin_children = ctrl->children;
+    for (size_t i = 0; i < origin_children.size(); ++i) {
+      origin_children[i]->SetIndex(i);
+    }
+    // Children see this loop in their loop stack; this node's own Z3 schedule
+    // sees only its enclosing ancestors (not itself), so pop before scheduling.
+    loop_stack.push_back(ctrl->control);
+    for (auto &child : origin_children) {
+      ScheduleRecursive(child, loop_stack);
+    }
+    loop_stack.pop_back();
+    Z3SchedulePythonLoop(ctrl, loop_stack);
+    for (size_t i = 0; i < ctrl->children.size(); ++i) {
+      ctrl->children[i]->SetIndex(i);
+    }
+    return;
   }
 
-  Stmt EmitSyntheticTask(Stmt stmt, CoreMask core_mask, int stage) {
-    ScheduledMetadata metadata;
-    metadata.Set(kAscendScheduledCoreMask, Integer(core_mask));
-    metadata.Set(kAscendScheduledStage, Integer(stage));
-    return AttrStmt(metadata, attr::kAscendTask, Integer(1), std::move(stmt));
+  LOG(FATAL) << "[ScheduleRecursive] Unknown IRStructure type" << node.get();
+}
+
+std::vector<std::shared_ptr<IRStructure>> ScheduleBuilder::Z3SchedulePython(
+    const std::vector<std::shared_ptr<IRStructure>> &children) {
+  size_t n = children.size();
+  std::vector<std::shared_ptr<IRStructure>> scheduled = children;
+  for (const auto &node : scheduled) {
+    // MaterializeScheduleUnits uses -1 to distinguish unscheduled units. A
+    // straight-line list has no software-pipeline offset, so scheduling it
+    // always publishes stage 0, including all fallback paths below.
+    node->SetStage(0);
+    GetAutoScheduleExtraInfo(node.get())->SetStartTime(0);
   }
 
-  void
-  EmitAdjacentTasks(Array<Stmt> *result,
-                    const std::map<CoreMask, std::vector<Stmt>> &statements,
-                    int stage) {
-    for (const auto &[core_mask, stmts] : statements) {
-      ICHECK(IsConcreteCore(core_mask))
-          << "Scheduled statement must belong to one concrete core, got mask "
-          << static_cast<int>(core_mask);
-      for (const Stmt &stmt : stmts) {
-        result->push_back(EmitSyntheticTask(stmt, core_mask, stage));
+  if (n <= 1) {
+    return scheduled;
+  }
+
+  try {
+    // Get the Python-registered function using ffi::Function::GetGlobal
+    static std::optional<ffi::Function> z3_schedule_func =
+        ffi::Function::GetGlobal("tl.transform.z3_schedule_python");
+    if (!z3_schedule_func.has_value()) {
+      LOG(WARNING) << "Python Z3 scheduler not registered, falling back to "
+                      "topological sort";
+      return scheduled;
+    }
+
+    std::vector<IRStructure *> nodes;
+    nodes.reserve(n);
+    for (const auto &u : scheduled) {
+      nodes.push_back(u.get());
+    }
+
+    // Prepare input data
+    std::vector<int64_t> latencies;
+    std::vector<int64_t> iis;
+    std::vector<int64_t> resource_flags;
+    std::vector<std::tuple<int64_t, int64_t, int64_t>> data_deps;
+    std::vector<std::pair<int64_t, int64_t>> resource_deps;
+
+    latencies.reserve(n);
+    iis.reserve(n);
+    resource_flags.reserve(n);
+
+    for (size_t i = 0; i < n; ++i) {
+      const IRStructure *node = nodes[i];
+      latencies.push_back(node->GetLatency());
+      iis.push_back(node->GetII());
+
+      // Pass pipe mask directly as resource flags
+      resource_flags.push_back(static_cast<int64_t>(node->GetPipeMask()));
+    }
+
+    // Variable (Let-var write -> read) data dependencies
+    for (size_t i = 0; i < n; ++i) {
+      for (size_t j = i + 1; j < n; ++j) {
+        if (HasVarDependency(nodes[i], nodes[j])) {
+          data_deps.emplace_back(i, j, latencies[i]);
+        }
+      }
+    }
+
+    // Special-register ordering: a node writing register R must be ordered
+    // against every node reading R (RAW forward, WAR backward) and every
+    // other writer of R (WAW), preserving program order. loop_break writes
+    // kLoopControl, which every node reads, so it fences against all
+    // siblings; hf32/pad match only their consumers.
+    for (size_t i = 0; i < n; ++i) {
+      uint16_t wmask = nodes[i]->GetSpecialWriteMask();
+      if (wmask == 0)
+        continue;
+      for (size_t j = 0; j < n; ++j) {
+        if (j == i || (wmask & nodes[j]->GetSpecialReadMask()) == 0)
+          continue;
+        if (i < j) {
+          data_deps.emplace_back(i, j, latencies[i]);
+        } else {
+          data_deps.emplace_back(j, i, 0);
+        }
+      }
+      for (size_t j = i + 1; j < n; ++j) {
+        if ((wmask & nodes[j]->GetSpecialWriteMask()) != 0)
+          data_deps.emplace_back(i, j, latencies[i]);
+      }
+    }
+
+    // Buffer-region data dependencies
+    auto deps = AnalyzeDependencies(
+        nodes, /*loop_stack=*/{}, manual_buffer_versions_, &dependency_cache_,
+        /*cache_key=*/nullptr, &kAutoScheduleDependencyTiming);
+    std::unordered_map<IRStructure *, size_t> node_idx;
+    for (size_t i = 0; i < n; ++i) {
+      node_idx[nodes[i]] = i;
+    }
+    for (const auto &dep : deps) {
+      size_t i = node_idx[dep.prod_node];
+      size_t j = node_idx[dep.cons_node];
+      data_deps.emplace_back(i, j, dep.latency);
+    }
+
+    // Collect resource dependencies
+    for (size_t i = 0; i < n; ++i) {
+      for (size_t j = i + 1; j < n; ++j) {
+        if (HasResourceDependency(nodes[i], nodes[j])) {
+          resource_deps.emplace_back(i, j);
+        }
+      }
+    }
+
+    // Convert vectors to TVM containers
+    ffi::Array<int64_t> tvm_latencies;
+    ffi::Array<int64_t> tvm_iis;
+    ffi::Array<int64_t> tvm_resource_flags;
+    ffi::Array<ffi::Array<int64_t>> tvm_data_deps;
+    ffi::Array<ffi::Array<int64_t>> tvm_resource_deps;
+
+    for (auto val : latencies) {
+      tvm_latencies.push_back(val);
+    }
+    for (auto val : iis) {
+      tvm_iis.push_back(val);
+    }
+    for (auto val : resource_flags) {
+      tvm_resource_flags.push_back(val);
+    }
+    for (const auto &dep : data_deps) {
+      ffi::Array<int64_t> pair;
+      pair.push_back(std::get<0>(dep));
+      pair.push_back(std::get<1>(dep));
+      pair.push_back(std::get<2>(dep));
+      tvm_data_deps.push_back(pair);
+    }
+    for (const auto &dep : resource_deps) {
+      ffi::Array<int64_t> pair;
+      pair.push_back(dep.first);
+      pair.push_back(dep.second);
+      tvm_resource_deps.push_back(pair);
+    }
+
+    // Extract results
+    // Python function returns only start_times, C++ side will sort by
+    // start_time
+    auto start_times = z3_schedule_func
+                           .value()(tvm_latencies, tvm_iis, tvm_resource_flags,
+                                    tvm_data_deps, tvm_resource_deps)
+                           .cast<ffi::Array<int64_t>>();
+
+    if (start_times.size() != n) {
+      LOG(WARNING) << "Python Z3 scheduler returned invalid results (size "
+                      "mismatch), falling back to topological sort";
+      return scheduled;
+    }
+
+    // Write start_times onto the scheduled nodes, then sort them in place by
+    // start_time (stable: ties keep original program order).
+    for (size_t i = 0; i < n; ++i) {
+      GetAutoScheduleExtraInfo(nodes[i])->SetStartTime(start_times[i]);
+    }
+
+    std::stable_sort(
+        scheduled.begin(), scheduled.end(),
+        [](const std::shared_ptr<IRStructure> &a,
+           const std::shared_ptr<IRStructure> &b) {
+          return GetAutoScheduleExtraInfo(a.get())->GetStartTime() <
+                 GetAutoScheduleExtraInfo(b.get())->GetStartTime();
+        });
+    return scheduled;
+
+  } catch (const std::exception &e) {
+    LOG(WARNING) << "Python Z3 scheduler failed with exception: " << e.what()
+                 << ", falling back to topological sort";
+    return scheduled;
+  } catch (...) {
+    LOG(WARNING) << "Python Z3 scheduler failed with unknown exception, "
+                    "falling back to topological sort";
+    return scheduled;
+  }
+}
+
+// Z3-based scheduler for loops that calls Python implementation via FFI
+// with distance-aware dependencies
+void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
+                                           const std::vector<For> &loop_stack) {
+  if (ctrl->children.empty()) {
+    LOG(WARNING)
+        << "Z3SchedulePythonLoop called on a control node without children";
+    return;
+  }
+
+  std::vector<IRStructure *> nodes;
+  nodes.reserve(ctrl->children.size());
+  for (const auto &child : ctrl->children) {
+    nodes.push_back(child.get());
+  }
+
+  size_t n = nodes.size();
+
+  auto num_stages = 1;
+  auto num_stages_val = ctrl->control.get()->annotations.Get("num_stages");
+  if (num_stages_val.has_value()) {
+    num_stages = num_stages_val.value().cast<IntImm>()->value;
+  }
+
+  // When false, the Z3 loop scheduler keeps each resource's tasks within a
+  // single II window (max(start) - min(start) < II). Sourced from the loop's
+  // "enable_offset" annotation; defaults to false (constraint applied).
+  bool enable_offset = false;
+  auto enable_offset_val =
+      ctrl->control.get()->annotations.Get("enable_offset");
+  if (enable_offset_val.has_value()) {
+    enable_offset = enable_offset_val.value().cast<bool>();
+  }
+
+  static std::optional<ffi::Function> z3_schedule_loop_func =
+      ffi::Function::GetGlobal("tl.transform.z3_schedule_loop_python");
+  if (!z3_schedule_loop_func.has_value()) {
+    LOG(FATAL) << "Python Z3 loop scheduler not registered, falling back "
+                  "to topological sort";
+  }
+
+  // Prepare input data
+  std::vector<int64_t> latencies;
+  std::vector<int64_t> iis;
+  std::vector<int64_t> resource_flags;
+  std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t>>
+      data_deps; // (i, j, distance, latency)
+  std::vector<std::pair<int64_t, int64_t>> resource_deps;
+  std::vector<std::pair<int64_t, int64_t>> stage_order_deps;
+
+  latencies.reserve(n);
+  iis.reserve(n);
+  resource_flags.reserve(n);
+
+  for (size_t i = 0; i < n; ++i) {
+    const IRStructure *node = nodes[i];
+    latencies.push_back(node->GetLatency());
+    iis.push_back(node->GetII());
+    resource_flags.push_back(static_cast<int64_t>(node->GetPipeMask()));
+  }
+
+  // Multi-buffer eligible set from AnnotateMultiBufferEligible pass.
+  // The pass runs before AutoSchedule and records on the For loop
+  // which on-chip buffers are safe to multi-buffer (written before any
+  // read inside the loop, not referenced outside).
+  std::set<const VarNode *> eligible_storage_set;
+  {
+    auto v = ctrl->control->annotations.Get("multi_buffer_eligible");
+    if (v.has_value()) {
+      for (const auto &b : v.value().cast<Array<Buffer>>()) {
+        eligible_storage_set.insert(b->data.get());
       }
     }
   }
 
-  static std::vector<Stmt>
-  GetPerCoreSync(const std::map<CoreMask, std::vector<Stmt>> &statements,
-                 CoreMask core_mask) {
-    auto it = statements.find(core_mask);
-    return it == statements.end() ? std::vector<Stmt>() : it->second;
+  // Collect all shared buffers and detect multi-buffer candidates.
+  // Then we need to add variables and constraints in Z3 scheduler for these
+  // buffers.
+  std::vector<int64_t> buffer_sizes;
+  // Insertion-order-preserving storage->buffers map. The ordered key vector
+  // is iterated in first-encountered (program) order rather than pointer
+  // order, so buffer id assignment fed to Z3 is deterministic run-to-run.
+  std::vector<const VarNode *> storage_keys_ordered;
+  std::unordered_map<const VarNode *, std::vector<Buffer>> storage_to_buffers;
+  std::map<Buffer, size_t> buffer_var_id;
+  // Build memory groups from memory_limits_ map.
+  // std::map iteration is ordered by key: "shared" then "shared.l1".
+  std::map<std::string, int> scope_to_group;
+  std::vector<int64_t> group_capacities;
+  std::vector<std::string> group_scopes;
+  std::vector<std::vector<int64_t>> group_indices;
+  for (const auto &entry : memory_limits_) {
+    if (entry.second > 0) {
+      scope_to_group[entry.first] = (int)group_capacities.size();
+      group_capacities.push_back(entry.second);
+      group_scopes.push_back(entry.first);
+      group_indices.push_back({});
+    }
   }
-
-  Stmt EmitNode(const IRStructure *node) {
-    ICHECK(node != nullptr);
-    Array<Stmt> result;
-    bool migrate_per_core_sync =
-        node->IsTask() && static_cast<const TaskNode *>(node)->IsPerCoreTask();
-    if (!migrate_per_core_sync)
-      EmitAdjacentTasks(&result, node->before, node->GetStage());
-
-    if (node->IsTask()) {
-      const auto *task = static_cast<const TaskNode *>(node);
-      ScheduledMetadata metadata;
-      metadata.Set(kAscendScheduledStage, Integer(node->GetStage()));
-      metadata.Set(kAscendScheduledCoreMask, Integer(task->GetCoreMask()));
-      Stmt task_body = task->stmt;
-      if (task->IsPerCoreTask()) {
-        task_body = PerCoreTaskSyncMigrator(
-                        GetPerCoreSync(node->before, task->GetCoreMask()),
-                        GetPerCoreSync(node->after, task->GetCoreMask()))
-                        .Rewrite(std::move(task_body));
+  std::map<Buffer, int> annotated_buffer_versions;
+  auto get_buffer_size = [](const Buffer &buffer) -> int64_t {
+    // Bits-based: dtype.bits()*lanes()/8 truncates sub-byte dtypes to 0
+    // (fp4 -> 0). Accumulate elements, then ceil(elements*bits/8).
+    int64_t elem_bits = buffer->dtype.bits() * buffer->dtype.lanes();
+    PrimExpr elems = IntImm(DataType::Int(64), 1);
+    for (const auto &dim : buffer->shape) {
+      elems *= dim;
+    }
+    PrimExpr size = FloorDiv(elems * IntImm(DataType::Int(64), elem_bits) +
+                                 IntImm(DataType::Int(64), 7),
+                             IntImm(DataType::Int(64), 8));
+    arith::Analyzer analyzer;
+    auto size_val = analyzer.Simplify(size);
+    if (const auto *int_imm = size_val.as<IntImmNode>()) {
+      return int_imm->value;
+    }
+    return 0;
+  };
+  auto enumerate_buffers = [&](auto &&visit) {
+    for (const auto &r : ctrl->GetReadRegions())
+      visit(r->buffer);
+    for (const auto &r : ctrl->GetWriteRegions())
+      visit(r->buffer);
+  };
+  enumerate_buffers([&](const Buffer &buffer) {
+    if (!IsSharedBuffer(buffer) && !IsL1Buffer(buffer) &&
+        !IsL0CBuffer(buffer) && !IsL0ABuffer(buffer) && !IsL0BBuffer(buffer)) {
+      return; // Only consider on-chip buffers for multi-buffer
+    }
+    const VarNode *key = buffer->data.get();
+    auto it = storage_to_buffers.find(key);
+    if (it == storage_to_buffers.end()) {
+      storage_keys_ordered.push_back(key);
+      it = storage_to_buffers.emplace(key, std::vector<Buffer>{}).first;
+    }
+    auto &aliases = it->second;
+    bool seen_alias = false;
+    for (const auto &alias : aliases) {
+      if (alias.same_as(buffer)) {
+        seen_alias = true;
+        break;
       }
-      result.push_back(
-          AttrStmt(metadata, attr::kAscendTask, Integer(1),
-                   WrapScheduledGuards(std::move(task_body), node->GetGuards()),
-                   task->stmt->span));
+    }
+    if (!seen_alias)
+      aliases.push_back(buffer);
+  });
+
+  for (const auto *storage_key : storage_keys_ordered) {
+    const auto &buffers = storage_to_buffers.at(storage_key);
+    ICHECK(!buffers.empty());
+    const Buffer &buffer = buffers.front();
+    std::string scope;
+    if (IsL1Buffer(buffer)) {
+      scope = "shared.l1";
+    } else if (IsL0CBuffer(buffer)) {
+      scope = "shared.l0c";
+    } else if (IsL0ABuffer(buffer)) {
+      scope = "shared.l0a";
+    } else if (IsL0BBuffer(buffer)) {
+      scope = "shared.l0b";
     } else {
-      const auto *control = static_cast<const ControlNode *>(node);
-      For loop = control->control;
-      loop.CopyOnWrite()->body = EmitList(control->children);
-      ScheduledMetadata metadata;
-      metadata.Set(kAscendScheduledStage, Integer(node->GetStage()));
-      result.push_back(
-          AttrStmt(metadata, attr::kAscendTask, Integer(1),
-                   WrapScheduledGuards(std::move(loop), node->GetGuards()),
-                   control->control->span));
+      scope = "shared";
     }
-    if (!migrate_per_core_sync)
-      EmitAdjacentTasks(&result, node->after, node->GetStage());
-    return SeqStmt::Flatten(result);
+    int group_id = scope_to_group[scope];
+    if (!eligible_storage_set.count(storage_key)) {
+      // These buffers cannot be multi-buffered, and cannot share memory with
+      // other buffers either, so we directly reduce the capacity of the
+      // memory group by their size
+      group_capacities[group_id] -= get_buffer_size(buffer);
+    } else {
+      // Alias buffers created by T.view/T.reshape share one storage Var. They
+      // must share one version variable so dependency distances and barrier
+      // ring sizes stay consistent no matter which logical Buffer appears at
+      // an access point.
+      // Check if this buffer has a manually annotated version count
+      auto override_it =
+          buffer_version_overrides_.find(ffi::GetRef<Var>(storage_key));
+      if (override_it != buffer_version_overrides_.end()) {
+        int override_val = (*override_it).second;
+        for (const auto &alias : buffers) {
+          annotated_buffer_versions[alias] = override_val;
+        }
+        group_capacities[group_id] -= get_buffer_size(buffer) * override_val;
+      } else {
+        size_t id = buffer_sizes.size();
+        for (const auto &alias : buffers) {
+          buffer_var_id[alias] = id;
+        }
+        group_indices[group_id].push_back((int64_t)id);
+        buffer_sizes.push_back(get_buffer_size(buffer));
+      }
+    }
   }
-};
+
+  // Validate buffer capacities upfront: if the minimum requirement (one
+  // version of each eligible buffer) already exceeds the remaining capacity,
+  // Z3 will never find a feasible solution.
+  for (size_t g = 0; g < group_capacities.size(); ++g) {
+    int64_t capacity = group_capacities[g];
+    const auto &idxs = group_indices[g];
+    if (!idxs.empty()) {
+      if (capacity < 0) {
+        LOG(FATAL)
+            << "Z3 loop scheduling failed: scope \"" << group_scopes[g]
+            << "\" capacity is negative (" << capacity
+            << "). Non-eligible and fixed-version buffers already exceed"
+            << " the memory limit. Try using T.annotate_unlimit_memory(\""
+            << group_scopes[g] << "\") or reduce buffer sizes.";
+      }
+      int64_t min_usage = 0;
+      for (int64_t idx : idxs) {
+        min_usage += buffer_sizes[idx];
+      }
+      if (min_usage > capacity) {
+        LOG(FATAL) << "Z3 loop scheduling failed: scope \"" << group_scopes[g]
+                   << "\" capacity " << capacity
+                   << " is insufficient for minimum buffer usage " << min_usage
+                   << ". Try using T.annotate_unlimit_memory(\""
+                   << group_scopes[g] << "\") or reduce buffer sizes.";
+      }
+    }
+  }
+
+  // Variable (Let-var write -> read) data dependencies
+  for (size_t i = 0; i < n; ++i) {
+    for (size_t j = i + 1; j < n; ++j) {
+      if (HasVarDependency(nodes[i], nodes[j])) {
+        data_deps.emplace_back(i, j, 0, latencies[i]);
+      }
+    }
+  }
+
+  // Special-register ordering: a node writing register R must be ordered
+  // against every node reading R (RAW forward, WAR backward) and every other
+  // writer of R (WAW), preserving program order. loop_break writes
+  // kLoopControl, which every node reads, so it fences against all siblings;
+  // hf32/pad match only their consumers. The distance bit encodes intra-iter
+  // (0) vs next-iter (1) direction.
+  for (size_t i = 0; i < n; ++i) {
+    uint16_t wmask = nodes[i]->GetSpecialWriteMask();
+    if (wmask == 0)
+      continue;
+    for (size_t j = 0; j < n; ++j) {
+      if (j == i || (wmask & nodes[j]->GetSpecialReadMask()) == 0)
+        continue;
+      if (i < j) {
+        data_deps.emplace_back(i, j, 0, latencies[i]);
+        data_deps.emplace_back(j, i, 1, 0);
+      } else {
+        data_deps.emplace_back(i, j, 1, latencies[i]);
+        data_deps.emplace_back(j, i, 0, 0);
+      }
+    }
+    for (size_t j = i + 1; j < n; ++j) {
+      if ((wmask & nodes[j]->GetSpecialWriteMask()) == 0)
+        continue;
+      data_deps.emplace_back(i, j, 0, latencies[i]);
+      data_deps.emplace_back(j, i, 1, latencies[j]);
+    }
+  }
+
+  // Buffer-region data dependencies
+  std::vector<For> current_loop_stack = loop_stack;
+  current_loop_stack.push_back(ctrl->control);
+  auto deps = AnalyzeDependencies(nodes, current_loop_stack,
+                                  manual_buffer_versions_, &dependency_cache_,
+                                  ctrl, &kAutoScheduleDependencyTiming);
+  std::unordered_map<IRStructure *, size_t> node_idx;
+  for (size_t i = 0; i < n; ++i) {
+    node_idx[nodes[i]] = i;
+  }
+  for (const auto &dep : deps) {
+    size_t i = node_idx[dep.prod_node];
+    size_t j = node_idx[dep.cons_node];
+    if (dep.distance >= 0) {
+      data_deps.emplace_back(i, j, dep.distance, dep.latency);
+    } else {
+      const Buffer &buffer = dep.buffer;
+      auto it = buffer_var_id.find(buffer);
+      int64_t distance = 1;
+      if (it != buffer_var_id.end()) {
+        // Encode the buffer id in the negative distance for the Z3
+        // scheduler to recognize.
+        distance = -(int64_t)it->second - 1;
+      } else {
+        // Check if this buffer has a manually annotated version count.
+        auto ann_it = annotated_buffer_versions.find(buffer);
+        if (ann_it != annotated_buffer_versions.end()) {
+          distance = ann_it->second;
+        }
+      }
+      data_deps.emplace_back(i, j, distance, dep.latency);
+    }
+  }
+
+  // Collect resource dependencies
+  for (size_t i = 0; i < n; ++i) {
+    for (size_t j = i + 1; j < n; ++j) {
+      if (HasResourceDependency(nodes[i], nodes[j],
+                                ~((uint16_t)ResourcePipe::kScalar))) {
+        resource_deps.emplace_back(i, j);
+      }
+    }
+  }
+
+  // Stage-order constraints for copied Let variables.
+  //
+  // A Let task `a = buf[...]` only READS buffers (it writes a scalar var).
+  // When `a` is consumed in a different pipeline stage, solve_conflict_var
+  // clones the Let into that consumer's stage and prepends it to the loop
+  // body. The clone re-reads `buf` at the consumer's iteration. If `buf` is
+  // also WRITTEN inside the loop, that re-read must observe the value from
+  // before the write — otherwise the clone reads a stale/overwritten buffer.
+  //
+  // AnalyzeDependencies already feeds the Let's own WAR edge to Z3, but only
+  // constrains the Let's original stage, not the stages of nodes that will
+  // receive a copy. Here we add: for every node U that transitively reads a
+  // Let-defined var, and every WAR consumer W of that Let (a node that writes
+  // the buffer the Let reads, same-iter or cross-iter), require k_U <= k_W in
+  // the Z3 (k, r) model. Equality is allowed because the clone is placed at
+  // the front of the loop body, so it reads before any write in that
+  // iteration.
+  if (enable_offset) {
+    LetDependencyClosure let_closure = CollectLetDependencyClosure_(nodes);
+    // Collect WAR consumers per Let node
+    std::vector<std::set<size_t>> let_war_consumers(n);
+    for (const auto &dep : deps) {
+      size_t p = node_idx[dep.prod_node];
+      if (let_closure.is_declaration[p]) {
+        let_war_consumers[p].insert(node_idx[dep.cons_node]);
+      }
+    }
+    for (size_t u = 0; u < n; ++u) {
+      for (size_t l : let_closure.dependencies[u]) {
+        for (size_t w : let_war_consumers[l]) {
+          if (u == w)
+            continue;
+          stage_order_deps.emplace_back((int64_t)u, (int64_t)w);
+        }
+      }
+    }
+  }
+
+  // Convert vectors to TVM containers
+  ffi::Array<int64_t> tvm_latencies;
+  ffi::Array<int64_t> tvm_iis;
+  ffi::Array<int64_t> tvm_resource_flags;
+  ffi::Array<ffi::Array<int64_t>>
+      tvm_data_deps; // each element is [i, j, distance]
+  ffi::Array<ffi::Array<int64_t>> tvm_resource_deps;
+  ffi::Array<int64_t> tvm_buffer_sizes;
+
+  for (auto val : latencies) {
+    tvm_latencies.push_back(val);
+  }
+  for (auto val : iis) {
+    tvm_iis.push_back(val);
+  }
+  for (auto val : resource_flags) {
+    tvm_resource_flags.push_back(val);
+  }
+  for (const auto &dep : data_deps) {
+    ffi::Array<int64_t> triple;
+    triple.push_back(std::get<0>(dep));
+    triple.push_back(std::get<1>(dep));
+    triple.push_back(std::get<2>(dep));
+    triple.push_back(std::get<3>(dep));
+    tvm_data_deps.push_back(triple);
+  }
+  for (const auto &dep : resource_deps) {
+    ffi::Array<int64_t> pair;
+    pair.push_back(dep.first);
+    pair.push_back(dep.second);
+    tvm_resource_deps.push_back(pair);
+  }
+  ffi::Array<ffi::Array<int64_t>> tvm_stage_order_deps;
+  for (const auto &dep : stage_order_deps) {
+    ffi::Array<int64_t> pair;
+    pair.push_back(dep.first);
+    pair.push_back(dep.second);
+    tvm_stage_order_deps.push_back(pair);
+  }
+  for (auto val : buffer_sizes) {
+    tvm_buffer_sizes.push_back(val);
+  }
+
+  // Build memory groups for FFI: each inner array is [capacity, idx0, idx1,
+  // ...]
+  ffi::Array<ffi::Array<int64_t>> tvm_memory_groups;
+  for (size_t g = 0; g < group_capacities.size(); ++g) {
+    ffi::Array<int64_t> group;
+    group.push_back(group_capacities[g]);
+    for (auto idx : group_indices[g]) {
+      group.push_back(idx);
+    }
+    tvm_memory_groups.push_back(group);
+  }
+
+  // Extract results
+  // Python function returns (start_times, buffer_versions, best_ii) as a
+  // 3-tuple. Stages are computed in C++ from start_times and II — see below.
+  auto return_val =
+      z3_schedule_loop_func
+          .value()(num_stages, tvm_latencies, tvm_iis, tvm_resource_flags,
+                   tvm_data_deps, tvm_resource_deps, tvm_buffer_sizes,
+                   tvm_memory_groups, tvm_stage_order_deps, enable_offset)
+          .cast<ffi::Tuple<ffi::Array<int64_t>, ffi::Array<int>, int64_t>>();
+
+  ffi::Array<int64_t> start_times = return_val.get<0>();
+  ffi::Array<int> buffer_versions = return_val.get<1>();
+  int64_t ii = return_val.get<2>();
+
+  // Derive a per-task stage from (start_time / ii). Z3 schedules
+  // `start = k * ii + r` so `start_time / ii` recovers k. Producers (low k,
+  // earliest in z3's absolute time) get stage 0; later tasks get positive
+  // stages.
+  std::vector<int> raw_k(n, 0);
+  int min_k_raw = std::numeric_limits<int>::max();
+  int64_t min_start_time = std::numeric_limits<int64_t>::max();
+  for (size_t i = 0; i < n; ++i) {
+    int k = (ii > 0) ? static_cast<int>(start_times[i] / ii) : 0;
+    raw_k[i] = k;
+    min_k_raw = std::min(min_k_raw, k);
+    min_start_time = std::min(min_start_time, start_times[i]);
+  }
+  for (size_t i = 0; i < n; ++i) {
+    // When offset is disabled, collapse every task into a single pipeline
+    // stage so LowerScheduledTIR emits a flat (non-pipelined) loop body.
+    nodes[i]->SetStage(enable_offset ? (raw_k[i] - min_k_raw) : 0);
+    // Adjust start_time to be relative to the earliest start_time, so that
+    // the first task starts at 0.
+    GetAutoScheduleExtraInfo(nodes[i])->SetStartTime(start_times[i] -
+                                                     min_start_time);
+  }
+  auto phys_time = [&](const std::shared_ptr<IRStructure> &c) -> int64_t {
+    return GetAutoScheduleExtraInfo(c.get())->GetStartTime() -
+           c->GetStage() * ii;
+  };
+  std::stable_sort(ctrl->children.begin(), ctrl->children.end(),
+                   [&](const std::shared_ptr<IRStructure> &a,
+                       const std::shared_ptr<IRStructure> &b) {
+                     return phys_time(a) < phys_time(b);
+                   });
+
+  // Reorder & copy Let-defined variables. Recompute the closure after the
+  // scheduled children have been reordered so declaration indices match the
+  // final sibling list.
+  std::vector<IRStructure *> scheduled_nodes;
+  scheduled_nodes.reserve(n);
+  for (const auto &child : ctrl->children)
+    scheduled_nodes.push_back(child.get());
+  LetDependencyClosure let_closure =
+      CollectLetDependencyClosure_(scheduled_nodes);
+
+  // Resolve Let-var stage conflicts
+  // Later stages run earlier in a physical pipeline iteration, so prepend
+  // their clones first.
+  std::map<int, std::set<size_t>, std::greater<int>> stage_to_decls;
+  std::map<int, int64_t> stage_base_start; // stage -> floored start time
+  for (size_t u = 0; u < n; ++u) {
+    int s = ctrl->children[u]->GetStage();
+    for (size_t d : let_closure.dependencies[u]) {
+      if (ctrl->children[d]->GetStage() == s)
+        continue; // decl already in the consumer's stage: no clone needed
+      stage_to_decls[s].insert(d);
+      int64_t st =
+          GetAutoScheduleExtraInfo(ctrl->children[u].get())->GetStartTime();
+      auto bit = stage_base_start.find(s);
+      if (bit == stage_base_start.end())
+        stage_base_start[s] = st;
+      else
+        bit->second = std::min(bit->second, st);
+    }
+  }
+
+  std::vector<std::shared_ptr<IRStructure>> new_clones;
+  for (auto &[s, decls] : stage_to_decls) {
+    int64_t base_start = (ii > 0) ? stage_base_start[s] / ii * ii : 0;
+    std::vector<std::pair<Var, Var>> renames; // old var -> fresh clone var
+    std::vector<std::shared_ptr<TaskNode>> stage_clones;
+    for (size_t d : decls) {
+      ICHECK(let_closure.is_declaration[d]);
+      auto *decl_task = static_cast<TaskNode *>(ctrl->children[d].get());
+      ffi::Optional<Bind> decl_bind = GetFlatTaskBind(decl_task->stmt);
+      ICHECK(decl_bind.defined());
+      auto new_var = decl_bind.value()->var.copy_with_suffix("");
+      auto cloned_task = std::static_pointer_cast<TaskNode>(decl_task->Clone());
+      cloned_task->stmt = ReplaceFlatTaskBind(
+          decl_task->stmt,
+          Bind(new_var, decl_bind.value()->value, decl_bind.value()->span));
+      cloned_task->SetReadVars(decl_task->GetReadVars());
+      auto write_vars = decl_task->GetWriteVars();
+      for (auto &v : write_vars) {
+        if (v.same_as(decl_bind.value()->var))
+          v = new_var;
+      }
+      cloned_task->SetWriteVars(write_vars);
+      cloned_task->SetStage(s);
+      GetAutoScheduleExtraInfo(cloned_task.get())->SetStartTime(base_start);
+      renames.emplace_back(decl_bind.value()->var, new_var);
+      stage_clones.push_back(cloned_task);
+    }
+    // Rewire chained references among the clones
+    for (auto &clone : stage_clones)
+      for (auto &[old_var, new_var] : renames)
+        clone->SubstituteVar(old_var, new_var);
+    for (size_t u = 0; u < n; ++u) {
+      if (ctrl->children[u]->GetStage() != s)
+        continue;
+      for (auto &[old_var, new_var] : renames)
+        ctrl->children[u]->SubstituteVar(old_var, new_var);
+    }
+    // Emit the clones defs-before-uses
+    std::set<const VarNode *> clone_writes;
+    for (auto &c : stage_clones)
+      for (auto &w : c->GetWriteVars())
+        clone_writes.insert(w.get());
+    std::vector<bool> emitted(stage_clones.size(), false);
+    std::set<const VarNode *> available;
+    size_t done = 0;
+    while (done < stage_clones.size()) {
+      bool progress = false;
+      for (size_t ci = 0; ci < stage_clones.size(); ++ci) {
+        if (emitted[ci])
+          continue;
+        bool ready = true;
+        for (auto &rv : stage_clones[ci]->GetReadVars()) {
+          if (clone_writes.count(rv.get()) && !available.count(rv.get())) {
+            ready = false;
+            break;
+          }
+        }
+        if (!ready)
+          continue;
+        for (auto &w : stage_clones[ci]->GetWriteVars())
+          available.insert(w.get());
+        new_clones.push_back(stage_clones[ci]);
+        emitted[ci] = true;
+        ++done;
+        progress = true;
+      }
+      if (!progress) { // defensive: emit any remainder (no cycle expected)
+        for (size_t ci = 0; ci < stage_clones.size(); ++ci) {
+          if (!emitted[ci]) {
+            new_clones.push_back(stage_clones[ci]);
+            emitted[ci] = true;
+            ++done;
+          }
+        }
+      }
+    }
+  }
+  ctrl->children.insert(ctrl->children.begin(), new_clones.begin(),
+                        new_clones.end());
+
+  // Estimate overall latency across loop iterations.
+  int64_t overall_latency = 0;
+  for (const auto &child : ctrl->children) {
+    int64_t start_time = GetAutoScheduleExtraInfo(child.get())->GetStartTime();
+    overall_latency =
+        std::max(overall_latency, start_time + child->GetLatency());
+  }
+  overall_latency += ii * (ctrl->GetTripCount() - 1);
+
+  ctrl->SetII(overall_latency);
+  ctrl->SetLatency(overall_latency);
+  GetAutoScheduleExtraInfo(ctrl)->SetIIperIter(ii);
+  for (auto &[buffer, versions] : annotated_buffer_versions) {
+    RecordSelectedBufferVersion(buffer, versions);
+  }
+  for (auto &[buffer, id] : buffer_var_id) {
+    RecordSelectedBufferVersion(buffer, buffer_versions[id]);
+  }
+}
+
+// Pass orchestration.
 
 static void WarnOnUnappliedBufferVersionOverrides(
-    const BufferVersionOverrideMap &buffer_versions_overrides,
-    const std::vector<MultiVersionBufferInfo> &buffer_infos) {
-  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>
-      multi_buffered_storages;
-  for (const MultiVersionBufferInfo &info : buffer_infos) {
-    if (info.num_versions > 1) {
-      multi_buffered_storages.insert(info.buffer->data);
-    }
-  }
-
-  for (const auto &[buffer_var, num_versions] : buffer_versions_overrides) {
-    if (num_versions > 1 && !multi_buffered_storages.count(buffer_var)) {
+    const BufferVersionMap &buffer_version_overrides,
+    const BufferVersionMap &selected_buffer_versions) {
+  for (const auto &[buffer_var, num_versions] : buffer_version_overrides) {
+    if (num_versions > 1 && !selected_buffer_versions.count(buffer_var)) {
       LOG(WARNING) << "Ascend AutoSchedule did not enable multi-buffering for "
                       "buffer \""
                    << buffer_var->name_hint
-                   << "\" although T.annotate_buffer_versions " << "requested "
+                   << "\" although T.annotate_buffer_versions requested "
                    << num_versions
                    << " versions. The buffer must be eligible in a scheduled "
                       "serial loop and written before it is read.";
@@ -1061,600 +1154,45 @@ static void WarnOnUnappliedBufferVersionOverrides(
   }
 }
 
-using CrossCoreCallMap = std::unordered_map<TaskNode *, std::vector<Call>>;
-using CrossCoreHintMap =
-    std::unordered_map<PrimExpr, CoreMask, ffi::StructuralHash,
-                       ffi::StructuralEqual>;
-
-static void AssignCrossCoreTasksInList(
-    const std::vector<std::shared_ptr<IRStructure>> &nodes,
-    const CrossCoreCallMap &cross_core_calls, CoreMask kernel_core_mask) {
-  std::vector<TaskNode *> scoped_tasks;
-  for (const auto &node : nodes) {
-    if (!node->IsTask())
-      continue;
-    auto *task = static_cast<TaskNode *>(node.get());
-    // PerCoreTask consumes its embedded cross-core synchronization internally.
-    // Keep the core already inferred from its ordinary operation instead
-    // of merging those calls into outer placement inference.
-    if (task->IsPerCoreTask())
-      continue;
-    auto calls_it = cross_core_calls.find(task);
-    if (calls_it == cross_core_calls.end())
-      continue;
-    scoped_tasks.push_back(task);
-  }
-
-  CrossCoreHintMap flag_core_hints;
-  for (TaskNode *task : scoped_tasks) {
-    for (const Call &call : cross_core_calls.at(task))
-      flag_core_hints[call->args[2]] |=
-          GetCrossCorePipeInfo(call->args[1]).core_mask;
-  }
-
-  std::unordered_map<TaskNode *, CoreMask> task_core_masks;
-  for (TaskNode *task : scoped_tasks) {
-    for (const Call &call : cross_core_calls.at(task)) {
-      const PrimExpr &flag_id = call->args[2];
-      CoreMask core_mask = flag_core_hints.at(flag_id);
-      if (core_mask == kCoreBroadcast) {
-        LOG(FATAL) << "Cross-core set/wait calls with flag " << flag_id
-                   << " in one control scope resolve to both Vector and Cube "
-                      "cores; all matching calls must run on the same core";
-      }
-      if (core_mask == kCoreUnassigned && IsConcreteCore(kernel_core_mask)) {
-        // PIPE_S and PIPE_MTE2 exist on both core types. A pure kernel supplies
-        // the only possible placement when neither side of the pair is pinned.
-        core_mask = kernel_core_mask;
-      } else if (!IsConcreteCore(core_mask)) {
-        LOG(FATAL)
-            << "Cannot infer the core for cross-core set/wait calls with flag "
-            << flag_id << " in one control scope"
-            << ": PIPE_S and PIPE_MTE2 are ambiguous in a mixed or empty "
-               "kernel. Use PIPE_V/PIPE_MTE3 for Vector or "
-               "PIPE_M/PIPE_MTE1/PIPE_FIX for Cube on at least one call in "
-               "that scope";
-      }
-      task_core_masks[task] |= core_mask;
-    }
-  }
-  for (const auto &[task, core_mask] : task_core_masks) {
-    if (core_mask == kCoreBroadcast) {
-      LOG(FATAL) << "Cross-core synchronization calls in one task resolve to "
-                    "both Vector and Cube cores: "
-                 << task->stmt;
-    }
-    task->SetCoreMask(core_mask);
-  }
-
-  // A flag ID may be reused sequentially in another control scope. Recurse
-  // into each ordered child list so only calls with the same immediate parent
-  // influence the same core inference.
-  for (const auto &node : nodes) {
-    if (node->IsControl()) {
-      auto *control = static_cast<ControlNode *>(node.get());
-      AssignCrossCoreTasksInList(control->children, cross_core_calls,
-                                 kernel_core_mask);
-    }
-  }
-}
-
-static void
-AssignCrossCoreTasks(const std::vector<std::shared_ptr<IRStructure>> &root,
-                     const std::vector<TaskNode *> &all_tasks) {
-  CoreMask kernel_core_mask = kCoreUnassigned;
-  CrossCoreCallMap cross_core_calls;
-  for (TaskNode *task : all_tasks) {
-    if (task->IsPerCoreTask()) {
-      CoreMask core_mask = task->GetCoreMask();
-      if (IsConcreteCore(core_mask))
-        kernel_core_mask |= core_mask;
-      continue;
-    }
-    std::vector<Call> calls = CollectCrossCoreCalls(task);
-    if (!calls.empty()) {
-      cross_core_calls.emplace(task, std::move(calls));
-      continue;
-    }
-    CoreMask core_mask = task->GetCoreMask();
-    if (IsConcreteCore(core_mask))
-      kernel_core_mask |= core_mask;
-  }
-  AssignCrossCoreTasksInList(root, cross_core_calls, kernel_core_mask);
-}
-
-// Collect every mode-0 CrossCore flag range used explicitly by the source
-// kernel. Track enclosing loops, flat Bind declarations, branch guards, and
-// assumptions so ConstIntBound can resolve expressions such as
-// indexmod(iter, num_versions) + base. PerCoreTask bodies are visited as
-// ordinary statements because their explicit flags still share the
-// kernel-global hardware namespace.
-class ExplicitCrossCoreFlagCollector : public TaskAwareConstrVisitor {
-public:
-  CrossCoreFlagReservation Collect(const Stmt &stmt) {
-    operator()(stmt);
-    return std::move(reservation_);
-  }
-
-private:
-  void VisitExpr_(const CallNode *op) final {
-    Call call = GetRef<Call>(op);
-    if (GetCrossCoreCall(call).defined()) {
-      const PrimExpr &flag_id = call->args[2];
-      arith::Analyzer analyzer;
-      GetConstrSet().Populate(analyzer);
-      arith::ConstIntBound bound = analyzer.const_int_bound(flag_id);
-      arith::Analyzer unconstrained_analyzer;
-      Var unconstrained_flag_id("unconstrained_cross_core_flag_id",
-                                flag_id.dtype());
-      arith::ConstIntBound unconstrained_bound =
-          unconstrained_analyzer.const_int_bound(unconstrained_flag_id);
-      if (bound->min_value == arith::ConstIntBound::kNegInf ||
-          bound->max_value == arith::ConstIntBound::kPosInf ||
-          (bound->min_value == unconstrained_bound->min_value &&
-           bound->max_value == unconstrained_bound->max_value)) {
-        reservation_.has_unbounded_id = true;
-      } else {
-        ICHECK_LE(bound->min_value, bound->max_value)
-            << "Ascend AutoSchedule inferred an invalid explicit cross-core "
-               "flag range ["
-            << bound->min_value << ", " << bound->max_value << "]";
-        reservation_.explicit_id_ranges.emplace_back(bound->min_value,
-                                                     bound->max_value);
-      }
-    }
-    ConstrVisitor::VisitExpr_(op);
-  }
-
-  CrossCoreFlagReservation reservation_;
-};
-
-static CrossCoreFlagReservation
-CollectExplicitCrossCoreFlags(const Stmt &kernel_body) {
-  ExplicitCrossCoreFlagCollector collector;
-  return collector.Collect(kernel_body);
-}
-
-// Assign scalar, register-buffer, and special-register producers to the core
-// mask union of their consumers. CrossCore synchronization remains a dedicated
-// side-effecting path and contributes no special-register demand.
-class CoreMaskPropagator {
-public:
-  static void Assign(const std::vector<std::shared_ptr<IRStructure>> &root,
-                     const std::vector<TaskNode *> &all_tasks) {
-    CoreMaskPropagator analyzer(root, all_tasks);
-    analyzer.Run_();
-  }
-
-private:
-  static constexpr int kSpecialRegisterBits =
-      std::numeric_limits<uint16_t>::digits;
-  using VarDemandMap =
-      std::unordered_map<Var, CoreMask, ObjectPtrHash, ObjectPtrEqual>;
-  using BufferDemandMap =
-      std::unordered_map<Buffer, CoreMask, ObjectPtrHash, ObjectPtrEqual>;
-  using SpecialRegisterDemandMap =
-      std::unordered_map<const TaskNode *, CoreMask>;
-  using SpecialRegisterReadDemand = std::array<CoreMask, kSpecialRegisterBits>;
-  using SpecialRegisterWriters =
-      std::array<std::vector<TaskNode *>, kSpecialRegisterBits>;
-  struct SpecialRegisterScopeDemand {
-    SpecialRegisterReadDemand readers{};
-    SpecialRegisterWriters writers;
-  };
-
-  CoreMaskPropagator(const std::vector<std::shared_ptr<IRStructure>> &root,
-                     const std::vector<TaskNode *> &all_tasks)
-      : root_(root), all_tasks_(all_tasks) {}
-
-  void Run_() {
-    AssignInitialCoreMasks_();
-    CollectSpecialRegisterDemand_(root_);
-    AssignSpecialRegisterWriters_();
-    AssignCrossCoreTasks(root_, all_tasks_);
-    for (const auto &node : root_)
-      SeedReads_(node.get(), kCoreBroadcast);
-    PropagateReadsToFixedPoint_();
-    AssignScalarWriters_();
-    AssignFallbackCore_();
-  }
-
-  void AssignInitialCoreMasks_() {
-    for (TaskNode *task : all_tasks_) {
-      // Special-register writers are placed from their concrete use sites
-      // after ordinary compute and data-movement tasks have been pinned.
-      if (task->GetSpecialWriteMask() != 0) {
-        task->SetCoreMask(kCoreUnassigned);
-        continue;
-      }
-      uint16_t pipe_mask = task->GetPipeMask();
-      if (pipe_mask & static_cast<uint16_t>(ResourcePipe::kCube)) {
-        task->SetCoreMask(kCoreCube);
-      } else if (pipe_mask & static_cast<uint16_t>(ResourcePipe::kVector)) {
-        task->SetCoreMask(kCoreVector);
-      } else if (pipe_mask & static_cast<uint16_t>(ResourcePipe::kMTE1) ||
-                 pipe_mask & static_cast<uint16_t>(ResourcePipe::kFixpipe)) {
-        task->SetCoreMask(kCoreCube);
-      } else if (pipe_mask & static_cast<uint16_t>(ResourcePipe::kMTE3)) {
-        task->SetCoreMask(kCoreVector);
-      } else if (pipe_mask & static_cast<uint16_t>(ResourcePipe::kMTE2)) {
-        bool to_l1 = false;
-        for (const BufferRegion &region : task->GetWriteRegions()) {
-          if (IsL1Buffer(region->buffer)) {
-            to_l1 = true;
-            break;
-          }
-        }
-        task->SetCoreMask(to_l1 ? kCoreCube : kCoreVector);
-      } else if (task->UsesPipe(ResourcePipe::kScalar) || pipe_mask == 0) {
-        // A scalar / mask-0 task issues on the S pipe, but its core is still
-        // fixed by the on-chip memory it touches: UB is Vector-side, while
-        // L1/L0A/L0B/L0C are Cube-side.
-        bool touches_ub = false;
-        bool touches_cube = false;
-        auto scan = [&](const Array<BufferRegion> &regions) {
-          for (const BufferRegion &region : regions) {
-            if (IsSharedBuffer(region->buffer))
-              touches_ub = true;
-            else if (IsL1Buffer(region->buffer) ||
-                     IsL0ABuffer(region->buffer) ||
-                     IsL0BBuffer(region->buffer) || IsL0CBuffer(region->buffer))
-              touches_cube = true;
-          }
-        };
-        scan(task->GetReadRegions());
-        scan(task->GetWriteRegions());
-        if (touches_ub && !touches_cube) {
-          task->SetCoreMask(kCoreVector);
-        } else if (touches_cube && !touches_ub) {
-          task->SetCoreMask(kCoreCube);
-        } else {
-          task->SetCoreMask(kCoreBroadcast);
-        }
-      }
-    }
-  }
-
-  static CoreMask GetConcreteCoreMask_(const TaskNode *task) {
-    CoreMask core_mask = task->GetCoreMask();
-    return IsConcreteCore(core_mask) ? core_mask : kCoreUnassigned;
-  }
-
-  // Special registers have one independent instance per core. Return both
-  // reader demand and concrete descendant writers so readers in an outer
-  // sibling list can place writers nested under a control node. loop_break is
-  // body-local and is therefore the only register not propagated outward.
-  SpecialRegisterScopeDemand CollectSpecialRegisterDemand_(
-      const std::vector<std::shared_ptr<IRStructure>> &nodes) {
-    SpecialRegisterScopeDemand scope;
-
-    for (const auto &node : nodes) {
-      if (node->IsControl()) {
-        const auto *control = static_cast<const ControlNode *>(node.get());
-        SpecialRegisterScopeDemand child_scope =
-            CollectSpecialRegisterDemand_(control->children);
-        for (int bit_index = 0; bit_index < kSpecialRegisterBits; ++bit_index) {
-          uint16_t bit = static_cast<uint16_t>(1U << bit_index);
-          if (bit == static_cast<uint16_t>(SpecialRegister::kLoopControl))
-            continue;
-          scope.readers[bit_index] |= child_scope.readers[bit_index];
-          scope.writers[bit_index].insert(
-              scope.writers[bit_index].end(),
-              child_scope.writers[bit_index].begin(),
-              child_scope.writers[bit_index].end());
-        }
-      } else {
-        const auto *task = static_cast<const TaskNode *>(node.get());
-        CoreMask core_mask = GetConcreteCoreMask_(task);
-        uint16_t read_mask = node->GetSpecialReadMask();
-        for (int bit_index = 0; bit_index < kSpecialRegisterBits; ++bit_index) {
-          uint16_t bit = static_cast<uint16_t>(1U << bit_index);
-          if ((read_mask & bit) != 0)
-            scope.readers[bit_index] |= core_mask;
-        }
-      }
-
-      if (!node->IsTask())
-        continue;
-      auto *task = static_cast<TaskNode *>(node.get());
-      // CrossCore bits only order their target hardware pipe. The calls are
-      // placed by matching flag uses in their immediate control scope, not by
-      // demand.
-      if (!CollectCrossCoreCalls(task).empty())
-        continue;
-      uint16_t write_mask = task->GetSpecialWriteMask();
-      for (int bit_index = 0; bit_index < kSpecialRegisterBits; ++bit_index) {
-        uint16_t bit = static_cast<uint16_t>(1U << bit_index);
-        if ((write_mask & bit) != 0)
-          scope.writers[bit_index].push_back(task);
-      }
-    }
-
-    for (int bit_index = 0; bit_index < kSpecialRegisterBits; ++bit_index) {
-      for (TaskNode *writer : scope.writers[bit_index])
-        special_writer_demand_[writer] |= scope.readers[bit_index];
-    }
-    return scope;
-  }
-
-  void AssignSpecialRegisterWriters_() {
-    for (TaskNode *task : all_tasks_) {
-      // loop_break controls the enclosing loop itself, so it must survive in
-      // every core clone of that loop even when all concrete work is
-      // nested below another ControlNode and contributes no same-level demand.
-      if (task->ContainsLoopBreak()) {
-        task->SetCoreMask(kCoreBroadcast);
-        continue;
-      }
-      auto it = special_writer_demand_.find(task);
-      if (it == special_writer_demand_.end())
-        continue;
-      AssignTaskFromDemand_(task, it->second);
-    }
-  }
-
-  bool AddReadsDemand_(const TaskNode *task, CoreMask mask) {
-    if (!mask)
-      return false;
-    bool grew = false;
-    for (const Var &var : task->GetReadVars()) {
-      CoreMask &demand = var_demand_[var];
-      if ((demand | mask) != demand) {
-        demand |= mask;
-        grew = true;
-      }
-    }
-    for (const BufferRegion &region : task->GetReadRegions()) {
-      if (!IsRegisterRegion(region))
-        continue;
-      CoreMask &demand = buffer_demand_[region->buffer];
-      if ((demand | mask) != demand) {
-        demand |= mask;
-        grew = true;
-      }
-    }
-    return grew;
-  }
-
-  void AddGuardDemand_(const IRStructure *node, CoreMask mask) {
-    if (!mask)
-      return;
-    for (const auto &guard : node->GetGuards()) {
-      if (!guard->IsCondition())
-        continue;
-      const auto *condition_guard =
-          static_cast<const ConditionGuard *>(guard.get());
-      for (const Var &var : UndefinedVars(condition_guard->condition))
-        var_demand_[var] |= mask;
-    }
-  }
-
-  static CoreMask GetLoopBodyCoverage_(const IRStructure *node) {
-    if (!node)
-      return 0;
-    if (node->IsTask()) {
-      const auto *task = static_cast<const TaskNode *>(node);
-      // A loop break controls whether the loop continues, so every core
-      // that receives a clone of the loop must evaluate the break condition.
-      if (task->ContainsLoopBreak())
-        return kCoreBroadcast;
-      return GetConcreteCoreMask_(task);
-    }
-    CoreMask mask = kCoreUnassigned;
-    const auto *control = static_cast<const ControlNode *>(node);
-    for (const auto &child : control->children)
-      mask |= GetLoopBodyCoverage_(child.get());
-    return mask;
-  }
-
-  void SeedReads_(const IRStructure *node, CoreMask enclosing) {
-    if (!node)
-      return;
-    if (node->IsTask()) {
-      const auto *task = static_cast<const TaskNode *>(node);
-      CoreMask task_mask = task->GetCoreMask();
-      CoreMask mask = IsConcreteCore(task_mask) ? task_mask : enclosing;
-      AddGuardDemand_(task, mask);
-      AddReadsDemand_(task, mask);
-      return;
-    }
-
-    const auto *control = static_cast<const ControlNode *>(node);
-    CoreMask coverage = GetLoopBodyCoverage_(node);
-    AddGuardDemand_(control, coverage);
-    if (control->task)
-      AddReadsDemand_(control->task.get(), coverage);
-    for (const auto &child : control->children)
-      SeedReads_(child.get(), coverage);
-  }
-
-  CoreMask GetWriteDemand_(const TaskNode *task) const {
-    CoreMask mask = kCoreUnassigned;
-    auto special_it = special_writer_demand_.find(task);
-    if (special_it != special_writer_demand_.end())
-      mask |= special_it->second;
-    for (const Var &var : task->GetWriteVars()) {
-      auto it = var_demand_.find(var);
-      if (it != var_demand_.end())
-        mask |= it->second;
-    }
-    for (const BufferRegion &region : task->GetWriteRegions()) {
-      if (!IsRegisterRegion(region))
-        continue;
-      auto it = buffer_demand_.find(region->buffer);
-      if (it != buffer_demand_.end())
-        mask |= it->second;
-    }
-    return mask;
-  }
-
-  void PropagateReadsToFixedPoint_() {
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      for (TaskNode *task : all_tasks_) {
-        if (!task->UsesPipe(ResourcePipe::kScalar) && !IsLetDeclTask(task))
-          continue;
-        if (AddReadsDemand_(task, GetWriteDemand_(task)))
-          changed = true;
-      }
-    }
-  }
-
-  static void AssignTaskFromDemand_(TaskNode *task, CoreMask demand) {
-    if (demand != kCoreUnassigned)
-      task->SetCoreMask(demand);
-  }
-
-  void AssignScalarWriters_() {
-    for (TaskNode *task : all_tasks_) {
-      if (task->ContainsLoopBreak())
-        continue; // Assigned broadcast above; never demote from local demand.
-      if (task->GetCoreMask() != kCoreBroadcast)
-        continue;
-      if (!task->UsesPipe(ResourcePipe::kScalar) && !IsLetDeclTask(task))
-        continue;
-      CoreMask demand = GetWriteDemand_(task);
-      if (demand == kCoreUnassigned)
-        task->SetCoreMask(kCoreUnassigned);
-      else
-        AssignTaskFromDemand_(task, demand);
-    }
-  }
-
-  void AssignFallbackCore_() {
-    bool has_cube_core = false;
-    for (TaskNode *task : all_tasks_) {
-      if (task->GetCoreMask() == kCoreCube)
-        has_cube_core = true;
-    }
-    CoreMask fallback_core = has_cube_core ? kCoreCube : kCoreVector;
-    for (TaskNode *task : all_tasks_) {
-      CoreMask core_mask = task->GetCoreMask();
-      if (core_mask == kCoreUnassigned ||
-          (core_mask == kCoreBroadcast && task->IsPerCoreTask()))
-        task->SetCoreMask(fallback_core);
-    }
-  }
-
-  const std::vector<std::shared_ptr<IRStructure>> &root_;
-  const std::vector<TaskNode *> &all_tasks_;
-  VarDemandMap var_demand_;
-  BufferDemandMap buffer_demand_;
-  SpecialRegisterDemandMap special_writer_demand_;
-};
-
-// Build and schedule one kernel segment, leaving core partitioning and final
-// Stmt emission to the downstream CorePartition pass.
-static ScheduledKernelResult ScheduleSingleKernel(
-    const Stmt &kernel_body, Target target,
-    const BufferVersionOverrideMap &buffer_versions_overrides = {},
-    const ManualMultiBufferTable &manual_multi_buffer_versions = {},
-    const std::set<std::string> &unlimit_memory_scopes = {}) {
-  // Build IRStructure from the body to schedule
-  ScheduledKernelResult result;
-  IRStructureBuilder builder;
-  auto ir_structure = builder.Build(kernel_body);
-
+// Build and schedule one kernel segment, leaving core assignment and final
+// lowering to the downstream AssignCore and LowerScheduledTIR passes.
+static void ScheduleSingleKernel(const Stmt &kernel_body, Target target,
+                                 ScheduledTIR *scheduled_tir) {
+  auto &ir_structure = scheduled_tir->tree;
+  ScheduledTIRMetadata &metadata = scheduled_tir->metadata;
   ICHECK(!ir_structure.empty()) << "IRStructure is empty (empty body?)";
 
   std::vector<TaskNode *> costed_tasks;
   CollectAllTaskNodes(ir_structure, costed_tasks);
   for (TaskNode *task : costed_tasks) {
-    TVM_FFI_CHECK_GT(task->GetII(), 0, ValueError)
+    ICHECK_GT(task->GetII(), 0)
         << "AutoSchedule found a task without latency/II annotations: "
         << task->stmt
-        << ". Run tl.transform.LatencyEstimator immediately before "
-           "AutoSchedule.";
+        << ". Run tl.transform.EstimateLatency before AutoSchedule.";
   }
 
   // Schedule IRStructure in place with the Z3 scheduler.
   ScheduleBuilder unit_builder;
-  int64_t shared_mem_limit = GetSharedMemoryLimit(target);
-  if (TargetIsAscend(target) && !HasSimtVF(kernel_body)) {
-    shared_mem_limit = 248 * 1024;
-  }
+  int64_t shared_mem_limit = GetSharedMemoryLimit(kernel_body);
   unit_builder.SetMemoryLimit("shared", shared_mem_limit);
   unit_builder.SetMemoryLimit("shared.l1", GetL1MemoryLimit(target));
   unit_builder.SetMemoryLimit("shared.l0c", GetL0CMemoryLimit(target));
   unit_builder.SetMemoryLimit("shared.l0a", GetL0AMemoryLimit(target));
   unit_builder.SetMemoryLimit("shared.l0b", GetL0BMemoryLimit(target));
   constexpr int64_t kUnlimitedMemory = 1LL << 40;
-  for (const auto &scope : unlimit_memory_scopes) {
+  for (const String &scope : metadata.unlimit_memory_scopes) {
     unit_builder.SetMemoryLimit(scope, kUnlimitedMemory);
   }
-  unit_builder.SetBufferVersionsOverride(buffer_versions_overrides);
-  unit_builder.SetManualMultiBuffer(manual_multi_buffer_versions);
+  unit_builder.SetBufferVersionOverrides(metadata.buffer_versions);
+  unit_builder.SetManualBufferVersions(metadata.manual_buffer_versions);
   unit_builder.ScheduleList(ir_structure);
 
-  std::vector<TaskNode *> all_tasks;
-  CollectAllTaskNodes(ir_structure, all_tasks);
-  CoreMaskPropagator::Assign(ir_structure, all_tasks);
-
-  CrossCoreFlagReservation cross_core_flag_reservation =
-      CollectExplicitCrossCoreFlags(kernel_body);
-
-  BarrierBuilder barrier_builder(manual_multi_buffer_versions,
-                                 std::move(cross_core_flag_reservation));
-  barrier_builder.Build(ir_structure);
-  result.flag_infos = barrier_builder.GetFlagInfos();
-  result.buffer_infos = barrier_builder.GetBufferInfos();
-  WarnOnUnappliedBufferVersionOverrides(buffer_versions_overrides,
-                                        result.buffer_infos);
-  result.root = std::move(ir_structure);
-  return result;
+  metadata.buffer_versions = unit_builder.GetSelectedBufferVersions();
 }
-
-static void AddBufferVersion(ascend::BufferVersionMap *buffer_versions,
-                             const Var &data, int64_t num_versions) {
-  ICHECK_GT(num_versions, 0);
-  if (num_versions == 1) {
-    return;
-  }
-  if (buffer_versions->count(data)) {
-    const auto *existing = (*buffer_versions)[data].as<IntImmNode>();
-    ICHECK(existing);
-    ICHECK_EQ(existing->value, num_versions)
-        << "Conflicting manual and automatic buffer version counts for storage "
-        << data << ": " << existing->value << " vs " << num_versions;
-    return;
-  }
-  buffer_versions->Set(
-      data, IntImm(DataType::Int(32), static_cast<int64_t>(num_versions)));
-}
-
-static ascend::BufferVersionMap BuildBufferVersionStagingMap(
-    const ManualMultiBufferTable &manual_buffer_versions,
-    const std::vector<MultiVersionBufferInfo> &automatic_buffer_versions) {
-  ascend::BufferVersionMap result;
-  for (const auto &[data_node, num_versions] : manual_buffer_versions) {
-    AddBufferVersion(&result, GetRef<Var>(data_node), num_versions);
-  }
-  for (const MultiVersionBufferInfo &info : automatic_buffer_versions) {
-    AddBufferVersion(&result, info.new_buffer->data, info.num_versions);
-  }
-  return result;
-}
-
-static Stmt SerializeScheduledKernel(const Stmt &kernel_subtree,
-                                     const TilelangRootBodyExtractor &extractor,
-                                     const ScheduledKernelResult &result) {
-  ScheduledTIREmitter emitter;
-  Stmt scheduled_body = emitter.Emit(result.root, result.flag_infos);
-  ascend::BufferVersionMap buffer_versions = BuildBufferVersionStagingMap(
-      extractor.manual_multi_buffer_versions, result.buffer_infos);
-  TilelangRootBodyReplacer replacer(scheduled_body, std::move(buffer_versions));
-  Stmt serialized = replacer(kernel_subtree);
-  if (!result.buffer_infos.empty()) {
-    serialized = RewriteAllocBuffers(serialized, result.buffer_infos);
-    BroadcastMultiBufferRewriter broadcast(result.buffer_infos);
-    serialized = broadcast(serialized);
-  }
-  return serialized;
-}
+} // namespace
 
 // Build and schedule each kernel, serializing the scheduled tree into ordinary
-// TIR markers for CorePartition to consume.
+// TIR markers for AssignCore to consume.
 tvm::transform::Pass AutoSchedule() {
   using namespace tirx::transform;
   auto pass_func = [](PrimFunc func, const IRModule &,
@@ -1665,172 +1203,21 @@ tvm::transform::Pass AutoSchedule() {
     if (target_opt.defined()) {
       target = target_opt.value();
     }
-    // Detect multiple kernel launches in the PrimFunc body.
-    // When multiple T.Kernel() blocks are used, the IR has a SeqStmt
-    // containing separate kernel subtrees, each with its own tilelang_root.
-    std::vector<Stmt> kernel_stmts;
-    Stmt prefix_wrapper;
-    bool is_multi_kernel =
-        MultiKernelDetector::Detect(func->body, kernel_stmts, prefix_wrapper);
-
-    if (!is_multi_kernel) {
-      TilelangRootBodyExtractor extractor;
-      extractor(func->body);
-      TVM_FFI_CHECK(extractor.body.defined(), ValueError)
-          << "AutoSchedule could not find a tilelang_root body";
-
-      auto overrides = extractor.buffer_versions_overrides;
-      ScheduledKernelResult result =
-          ScheduleSingleKernel(extractor.body, target, overrides,
-                               extractor.manual_multi_buffer_versions,
-                               extractor.unlimit_memory_scopes);
-      Stmt body = SerializeScheduledKernel(func->body, extractor, result);
-      return PrimFunc(func->params, body, func->ret_type, func->buffer_map,
-                      func->attrs);
-    }
-
-    Array<Stmt> combined_stmts;
-    for (const Stmt &kernel_subtree : kernel_stmts) {
-      TilelangRootBodyExtractor extractor;
-      extractor(kernel_subtree);
-      Stmt serialized_subtree = kernel_subtree;
-      if (extractor.body.defined()) {
-        auto overrides = extractor.buffer_versions_overrides;
-        ScheduledKernelResult result =
-            ScheduleSingleKernel(extractor.body, target, overrides,
-                                 extractor.manual_multi_buffer_versions,
-                                 extractor.unlimit_memory_scopes);
-        serialized_subtree =
-            SerializeScheduledKernel(kernel_subtree, extractor, result);
-      }
-      combined_stmts.push_back(serialized_subtree);
-    }
-
-    Stmt new_inner = combined_stmts.size() == 1 ? combined_stmts[0]
-                                                : Stmt(SeqStmt(combined_stmts));
-    InnerSeqStmtReplacer seq_replacer(new_inner);
-    Stmt body = seq_replacer(func->body);
-    return PrimFunc(func->params, body, func->ret_type, func->buffer_map,
-                    func->attrs);
+    return RewriteTilelangKernels(
+        std::move(func), "AutoSchedule",
+        [&](const TilelangKernelContext &context) {
+          ScheduledTIR scheduled_tir = DecodeScheduledTIR(
+              context.root, context.outer_ctx, MakeAutoScheduleExtraInfo);
+          BufferVersionMap buffer_version_overrides =
+              scheduled_tir.metadata.buffer_versions;
+          ScheduleSingleKernel(context.root->body, target, &scheduled_tir);
+          WarnOnUnappliedBufferVersionOverrides(
+              buffer_version_overrides, scheduled_tir.metadata.buffer_versions);
+          return EncodeScheduledTIR(std::move(scheduled_tir));
+        });
   };
 
   return CreatePrimFuncPass(pass_func, 0, "tl.AutoSchedule", {});
-}
-
-Layout ExpandLayoutToBuffer(const Buffer &layout_buffer,
-                            const Buffer &target_buffer, const Layout &layout) {
-  if (!layout.defined() ||
-      target_buffer->shape.size() < layout_buffer->shape.size()) {
-    return Layout();
-  }
-  size_t leading_ndim =
-      target_buffer->shape.size() - layout_buffer->shape.size();
-  if (leading_ndim == 0) {
-    return layout;
-  }
-  Array<PrimExpr> leading_shape;
-  for (size_t i = 0; i < leading_ndim; ++i) {
-    leading_shape.push_back(target_buffer->shape[i]);
-  }
-  return layout->Expand(leading_shape);
-}
-
-Layout FindLayoutForBuffer(const Map<Buffer, Layout> &layout_map,
-                           const Buffer &buffer) {
-  if (layout_map.count(buffer)) {
-    return layout_map[buffer];
-  }
-  for (const auto &[layout_buffer, layout] : layout_map) {
-    if (layout_buffer->data.same_as(buffer->data) ||
-        layout_buffer->name == buffer->name) {
-      Layout expanded = ExpandLayoutToBuffer(layout_buffer, buffer, layout);
-      if (expanded.defined()) {
-        return expanded;
-      }
-    }
-  }
-  return Layout();
-}
-
-bool AddLayoutForBuffer(Map<Buffer, Layout> *layout_map, const Buffer &buffer) {
-  if (!layout_map || layout_map->count(buffer)) {
-    return false;
-  }
-  Layout layout = FindLayoutForBuffer(*layout_map, buffer);
-  if (!layout.defined()) {
-    return false;
-  }
-  layout_map->Set(buffer, layout);
-  return true;
-}
-
-// StmtMutator to rewrite alloc_buffers in SBlock nodes for double buffering
-class AllocBufferRewriter : public StmtMutator {
-public:
-  AllocBufferRewriter(const std::vector<MultiVersionBufferInfo> &buffer_infos)
-      : buffer_infos_(buffer_infos) {
-    for (const auto &info : buffer_infos_) {
-      buffer_remap_[info.buffer] = info.new_buffer;
-    }
-  }
-
-private:
-  Stmt VisitStmt_(const SBlockNode *op) override {
-    Stmt new_body = this->VisitStmt(op->body);
-
-    bool needs_update = false;
-    bool layout_update = false;
-    Array<Buffer> new_alloc_buffers;
-    Map<String, Any> new_annotations = op->annotations;
-    bool has_layout_map = false;
-    Map<Buffer, Layout> layout_map;
-    if (auto layout_map_ref = op->annotations.Get(attr::kLayoutMap)) {
-      if (auto map = layout_map_ref.value().as<Map<Buffer, Layout>>()) {
-        layout_map = map.value();
-        has_layout_map = true;
-      }
-    }
-    for (auto buffer : op->alloc_buffers) {
-      auto it = buffer_remap_.find(buffer);
-      if (it != buffer_remap_.end()) {
-        new_alloc_buffers.push_back(it->second);
-        needs_update = true;
-      } else {
-        new_alloc_buffers.push_back(buffer);
-      }
-    }
-    if (has_layout_map) {
-      for (const auto &buffer : new_alloc_buffers) {
-        layout_update |= AddLayoutForBuffer(&layout_map, buffer);
-      }
-    }
-    if (layout_update) {
-      new_annotations.Set(attr::kLayoutMap, layout_map);
-    }
-
-    auto new_block = CopyOnWrite(op);
-    new_block->body = new_body;
-    if (needs_update) {
-      new_block->alloc_buffers = new_alloc_buffers;
-    }
-    if (layout_update) {
-      new_block->annotations = new_annotations;
-    }
-    return Stmt(new_block);
-  }
-
-  const std::vector<MultiVersionBufferInfo> &buffer_infos_;
-  std::unordered_map<Buffer, Buffer, ObjectPtrHash, ObjectPtrEqual>
-      buffer_remap_;
-};
-
-Stmt RewriteAllocBuffers(
-    const Stmt &stmt, const std::vector<MultiVersionBufferInfo> &buffer_infos) {
-  if (buffer_infos.empty()) {
-    return stmt;
-  }
-  AllocBufferRewriter rewriter(buffer_infos);
-  return rewriter(stmt);
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {

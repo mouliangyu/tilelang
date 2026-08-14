@@ -18,15 +18,16 @@
  */
 
 /*!
- * \file core_partition.cc
- * \brief Direct scheduled-TIR core partition and pipeline lowering.
+ * \file lower_scheduled_tir.cc
+ * \brief Lower scheduled TIR into final Ascend core TIR.
  */
 
-#include "./core_partition.h"
-#include "./task_annotations.h"
+#include "./auto_schedule/kernel_rewriter.h"
+#include "./auto_schedule/scheduled_tir.h"
 
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/container/map.h>
+#include <tvm/ffi/optional.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/function.h>
 #include <tvm/runtime/logging.h>
@@ -44,6 +45,7 @@
 #include <optional>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "op/builtin.h"
 #include "support/check.h"
@@ -130,58 +132,18 @@ Stmt SubstituteLetVars(Stmt stmt, const Map<Var, PrimExpr> &vmap) {
   return LetVarSubstituter(vmap)(std::move(stmt));
 }
 
-std::optional<int64_t> GetScheduledInt(const AttrStmtNode *op,
-                                       const char *key) {
-  if (op->attr_key != attr::kAscendTask)
-    return std::nullopt;
-  const auto *metadata = op->node.as<ffi::MapObj>();
-  if (metadata == nullptr)
-    return std::nullopt;
-  for (const auto &[metadata_key, value] : *metadata) {
-    if (metadata_key.cast<ffi::String>() != key)
-      continue;
-    PrimExpr expr = value.cast<PrimExpr>();
-    const auto *integer = expr.as<IntImmNode>();
-    TVM_FFI_CHECK(integer != nullptr, ValueError)
-        << "Scheduled metadata `" << key << "` must be an integer, got "
-        << expr;
-    return integer->value;
+CoreMask GetUnitCoreMask(const AttrStmtNode *op) {
+  return RequireScheduledCoreMask(op);
+}
+
+int GetMarkerStage(const AttrStmtNode *op) { return GetScheduleUnitStage(op); }
+
+Stmt StripTaskMarker(const Stmt &stmt) {
+  if (const auto *attribute = stmt.as<AttrStmtNode>()) {
+    if (attribute->attr_key == attr::kAscendTask)
+      return attribute->body;
   }
-  return std::nullopt;
-}
-
-int64_t RequireScheduledInt(const AttrStmtNode *op, const char *key) {
-  std::optional<int64_t> value = GetScheduledInt(op, key);
-  TVM_FFI_CHECK(value.has_value(), ValueError)
-      << "Scheduled node is missing integer metadata `" << key << "`";
-  return value.value();
-}
-
-bool IsScheduledUnitMarker(const AttrStmtNode *op) {
-  return GetScheduledInt(op, kAscendScheduledStage).has_value();
-}
-
-bool IsScheduledLeafTask(const AttrStmtNode *op) {
-  return IsScheduledUnitMarker(op) &&
-         GetScheduledInt(op, kAscendScheduledCoreMask).has_value();
-}
-
-CoreMask GetTaskCoreMask(const AttrStmtNode *op) {
-  int64_t value = RequireScheduledInt(op, kAscendScheduledCoreMask);
-  TVM_FFI_CHECK_GE(value, 0, ValueError);
-  TVM_FFI_CHECK_LE(value, std::numeric_limits<CoreMask>::max(), ValueError);
-  CoreMask core_mask = static_cast<CoreMask>(value);
-  TVM_FFI_CHECK(core_mask != kCoreUnassigned && IsValidCoreMask(core_mask),
-                ValueError)
-      << "Scheduled task has invalid core mask " << value;
-  return core_mask;
-}
-
-int GetMarkerStage(const AttrStmtNode *op) {
-  int64_t stage = RequireScheduledInt(op, kAscendScheduledStage);
-  TVM_FFI_CHECK_GE(stage, std::numeric_limits<int>::min(), ValueError);
-  TVM_FFI_CHECK_LE(stage, std::numeric_limits<int>::max(), ValueError);
-  return static_cast<int>(stage);
+  return stmt;
 }
 
 Optional<Bind> FindTaskBind(const Stmt &task_body) {
@@ -221,8 +183,9 @@ Stmt ReplaceTaskBind(const Stmt &task_body, const Stmt &replacement) {
 }
 
 bool IsGuardedTaskBind(const AttrStmtNode *marker) {
-  return FindTaskBind(marker->body).defined() &&
-         marker->body.as<BindNode>() == nullptr;
+  Stmt task_body = StripTaskMarker(marker->body);
+  return FindTaskBind(task_body).defined() &&
+         task_body.as<BindNode>() == nullptr;
 }
 
 class CoreExtractor : public StmtMutator {
@@ -288,9 +251,9 @@ private:
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (IsScheduledUnitMarker(op)) {
-      if (IsScheduledLeafTask(op))
-        return ExtractTask(op);
+    if (IsScheduleUnit(op)) {
+      if (GetScheduledCoreMask(op).has_value())
+        return ExtractCoreOwnedUnit(op);
       Stmt body = VisitStmt(op->body);
       if (!body.defined())
         return Stmt();
@@ -305,8 +268,8 @@ private:
         var_remap_);
   }
 
-  Stmt ExtractTask(const AttrStmtNode *op) {
-    CoreMask task_core_mask = GetTaskCoreMask(op);
+  Stmt ExtractCoreOwnedUnit(const AttrStmtNode *op) {
+    CoreMask task_core_mask = GetUnitCoreMask(op);
     // Broadcast tasks follow an existing concrete stream, but must not create
     // an otherwise absent Vector or Cube stream by themselves.
     found_core_ |= task_core_mask == target_core_;
@@ -341,7 +304,7 @@ public:
 
 private:
   void VisitStmt_(const AttrStmtNode *op) final {
-    if (!IsScheduledLeafTask(op)) {
+    if (!IsScheduleUnit(op) || !GetScheduledCoreMask(op).has_value()) {
       StmtVisitor::VisitStmt_(op);
       return;
     }
@@ -360,29 +323,29 @@ private:
   Map<Var, Buffer> buffers_;
 };
 
-int GetScheduledStage(const Stmt &stmt) {
+int GetUnitStage(const Stmt &stmt) {
   Stmt current = stmt;
   while (true) {
     if (const auto *attribute = current.as<AttrStmtNode>()) {
-      if (IsScheduledUnitMarker(attribute))
+      if (IsScheduleUnit(attribute))
         return GetMarkerStage(attribute);
       current = attribute->body;
       continue;
     }
     if (const auto *conditional = current.as<IfThenElseNode>()) {
-      TVM_FFI_CHECK(!conditional->else_case.has_value(), ValueError)
+      ICHECK(!conditional->else_case.has_value())
           << "A scheduled control guard may not contain an else branch";
       current = conditional->then_case;
       continue;
     }
-    TVM_FFI_THROW(ValueError)
-        << "Expected a tl.ascend_task scheduled unit, got " << current;
+    LOG(FATAL) << "Expected a `tl.schedule_unit` AttrStmt, got " << current;
   }
 }
 
-bool IsScheduledLetTask(const Stmt &stmt) {
+bool IsScheduledLetUnit(const Stmt &stmt) {
   const auto *attribute = stmt.as<AttrStmtNode>();
-  return attribute != nullptr && IsScheduledLeafTask(attribute) &&
+  return attribute != nullptr && IsScheduleUnit(attribute) &&
+         GetScheduledCoreMask(attribute).has_value() &&
          FindTaskBind(attribute->body).defined();
 }
 
@@ -425,21 +388,20 @@ private:
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (!IsScheduledUnitMarker(op))
+    if (!IsScheduleUnit(op))
       return StmtMutator::VisitStmt_(op);
-    if (!IsScheduledLeafTask(op))
+    if (!GetScheduledCoreMask(op).has_value())
       return VisitStmt(op->body);
-    return LowerTask(op);
+    return LowerCoreOwnedUnit(op);
   }
 
   Stmt VisitStmt_(const ForNode *op) final {
     Array<Stmt> children = GetSequence(op->body);
-    TVM_FFI_CHECK(!children.empty(), ValueError)
-        << "Scheduled control may not have an empty body";
+    ICHECK(!children.empty()) << "Scheduled control may not have an empty body";
     int min_stage = std::numeric_limits<int>::max();
     int max_stage = std::numeric_limits<int>::min();
     for (const Stmt &child : children) {
-      int stage = GetScheduledStage(child);
+      int stage = GetUnitStage(child);
       min_stage = std::min(min_stage, stage);
       max_stage = std::max(max_stage, stage);
     }
@@ -448,8 +410,8 @@ private:
         op->step.has_value() ? op->step.value() : IntImm(DataType::Int(32), 1);
     Array<Stmt> body;
     for (const Stmt &child : children) {
-      int stage = GetScheduledStage(child);
-      bool is_let = IsScheduledLetTask(child);
+      int stage = GetUnitStage(child);
+      bool is_let = IsScheduledLetUnit(child);
       Stmt lowered = VisitStmt(child);
       ICHECK(lowered.defined());
       if (min_stage == max_stage) {
@@ -460,7 +422,7 @@ private:
       Map<Var, PrimExpr> substitution;
       substitution.Set(op->loop_var,
                        op->loop_var -
-                           loop_step * (max_stage - static_cast<int>(stage)));
+                           loop_step * (static_cast<int>(stage) - min_stage));
       if (is_let) {
         Map<Var, PrimExpr> clamped_substitution;
         clamped_substitution.Set(
@@ -468,7 +430,7 @@ private:
             Max(op->min,
                 Min(op->min + op->extent - loop_step,
                     op->loop_var -
-                        loop_step * (max_stage - static_cast<int>(stage)))));
+                        loop_step * (static_cast<int>(stage) - min_stage))));
         body.push_back(Substitute(std::move(lowered), clamped_substitution));
         continue;
       }
@@ -476,9 +438,9 @@ private:
       PrimExpr condition =
           And(op->loop_var < op->min + op->extent, op->loop_var >= op->min);
       if (stage == min_stage)
-        condition = op->loop_var >= op->min;
-      if (stage == max_stage)
         condition = op->loop_var < op->min + op->extent;
+      if (stage == max_stage)
+        condition = op->loop_var >= op->min;
       body.push_back(
           Substitute(IfThenElse(condition, std::move(lowered)), substitution));
     }
@@ -491,7 +453,7 @@ private:
                op->step, op->span);
   }
 
-  Stmt LowerTask(const AttrStmtNode *op) {
+  Stmt LowerCoreOwnedUnit(const AttrStmtNode *op) {
     Optional<Bind> bind = FindTaskBind(op->body);
     if (!bind.defined())
       return op->body;
@@ -518,51 +480,24 @@ private:
   Map<Var, Buffer> conditional_lets_;
 };
 
+class TaskMarkerStripper : public StmtMutator {
+private:
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    if (op->attr_key == attr::kAscendTask ||
+        op->attr_key == attr::kAscendPerCoreTask)
+      return VisitStmt(op->body);
+    return StmtMutator::VisitStmt_(op);
+  }
+};
+
 Optional<Stmt> LowerCore(const Stmt &scheduled_body, CoreMask target_core) {
   Optional<Stmt> extracted =
       CoreExtractor::Extract(scheduled_body, target_core);
   if (!extracted.has_value())
     return std::nullopt;
-  return PipelineLowerer::Lower(extracted.value());
+  Stmt lowered = PipelineLowerer::Lower(extracted.value());
+  return TaskMarkerStripper()(std::move(lowered));
 }
-
-// Replace every scheduled tilelang_root independently. Walking the full
-// PrimFunc naturally handles both single- and multi-kernel functions while the
-// scoped cthread state preserves an externally supplied vector-core sid.
-class ScheduledTIRPartitioner : public StmtMutator {
-public:
-  Stmt Partition(const Stmt &stmt) { return VisitStmt(stmt); }
-  int NumPartitionedKernels() const { return num_partitioned_kernels_; }
-
-private:
-  Stmt VisitStmt_(const AttrStmtNode *op) final {
-    Optional<Var> outer_sid = sid_;
-    if (op->attr_key == tirx::attr::thread_extent) {
-      if (const auto *iter_var = op->node.as<IterVarNode>()) {
-        if (iter_var->thread_tag == "cthread")
-          sid_ = iter_var->var;
-      }
-    }
-    Stmt body = VisitStmt(op->body);
-    sid_ = std::move(outer_sid);
-    if (body.same_as(op->body))
-      return GetRef<Stmt>(op);
-    return AttrStmt(op->node, op->attr_key, op->value, std::move(body),
-                    op->span);
-  }
-
-  Stmt VisitStmt_(const SBlockNode *op) final {
-    if (op->name_hint != "tilelang_root")
-      return StmtMutator::VisitStmt_(op);
-    ++num_partitioned_kernels_;
-    SBlock block = GetRef<SBlock>(op);
-    block.CopyOnWrite()->body = LowerScheduledTIRToCores(op->body, sid_);
-    return block;
-  }
-
-  Optional<Var> sid_;
-  int num_partitioned_kernels_{0};
-};
 
 // Re-write empty AttrStmt markers to nest them properly. A flat Bind remains
 // visible to subsequent statements in the same SeqStmt scope.
@@ -663,10 +598,55 @@ Stmt ReNestAttrStmts(const Stmt &stmt) {
   return AttrStmtNester()(flattened);
 }
 
-} // namespace
+class MixedKernelSidRelocator : public StmtMutator {
+public:
+  static Stmt Relocate(const Stmt &stmt) {
+    MixedKernelSidRelocator relocator;
+    return relocator(stmt);
+  }
 
-Stmt LowerScheduledTIRToCores(const Stmt &scheduled_body,
-                              Optional<Var> external_sid) {
+private:
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    const auto *iter_var = op->node.as<IterVarNode>();
+    bool is_outer_cthread =
+        op->attr_key == tirx::attr::thread_extent && iter_var != nullptr &&
+        iter_var->thread_tag == "cthread" && inside_vector_ == 0;
+    if (!is_outer_cthread)
+      return StmtMutator::VisitStmt_(op);
+
+    IterVar cthread = GetRef<IterVar>(iter_var);
+    cthread_stack_.push_back(cthread);
+    Stmt body = VisitStmt(op->body);
+    cthread_stack_.pop_back();
+    return body;
+  }
+
+  Stmt VisitStmt_(const SBlockNode *op) final {
+    bool is_vector = op->name_hint == "VECTOR";
+    if (is_vector)
+      ++inside_vector_;
+    SBlock block = Downcast<SBlock>(StmtMutator::VisitStmt_(op));
+    if (is_vector)
+      --inside_vector_;
+    if (!is_vector || cthread_stack_.empty())
+      return block;
+
+    IterVar outer_cthread = cthread_stack_.back();
+    IterVar inner_cthread(outer_cthread->dom, outer_cthread->var,
+                          outer_cthread->iter_type, outer_cthread->thread_tag);
+    Stmt block_body = block->body;
+    block.CopyOnWrite()->body =
+        AttrStmt(inner_cthread, tirx::attr::thread_extent,
+                 outer_cthread->dom->extent, std::move(block_body));
+    return block;
+  }
+
+  int inside_vector_{0};
+  std::vector<IterVar> cthread_stack_;
+};
+
+Stmt LowerScheduledKernel(const Stmt &scheduled_body,
+                          Optional<Var> external_sid) {
   Optional<Stmt> vector_body = LowerCore(scheduled_body, kCoreVector);
   Optional<Stmt> cube_body = LowerCore(scheduled_body, kCoreCube);
   if (vector_body.has_value() && cube_body.has_value()) {
@@ -697,24 +677,30 @@ Stmt LowerScheduledTIRToCores(const Stmt &scheduled_body,
   return Evaluate(0);
 }
 
-tvm::transform::Pass CorePartition() {
+} // namespace
+
+tvm::transform::Pass LowerScheduledTIR() {
   using namespace tirx::transform;
   auto pass_func = [](PrimFunc func, const IRModule &,
                       const tvm::transform::PassContext &) -> PrimFunc {
-    ScheduledTIRPartitioner partitioner;
-    Stmt body = partitioner.Partition(func->body);
-    TVM_FFI_CHECK_GT(partitioner.NumPartitionedKernels(), 0, ValueError)
-        << "CorePartition could not find the scheduled tilelang_root";
-    body = ReNestAttrStmts(body);
-    return PrimFunc(func->params, std::move(body), func->ret_type,
-                    func->buffer_map, func->attrs);
+    func = RewriteTilelangKernels(std::move(func), "LowerScheduledTIR",
+                                  [](const TilelangKernelContext &context) {
+                                    SBlock root = context.root;
+                                    root.CopyOnWrite()->body =
+                                        LowerScheduledKernel(root->body,
+                                                             context.outer_sid);
+                                    return root;
+                                  });
+    Stmt body = ReNestAttrStmts(func->body);
+    func.CopyOnWrite()->body = MixedKernelSidRelocator::Relocate(body);
+    return func;
   };
-  return CreatePrimFuncPass(pass_func, 0, "tl.CorePartition", {});
+  return CreatePrimFuncPass(pass_func, 0, "tl.LowerScheduledTIR", {});
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tl.transform.CorePartition", CorePartition);
+  refl::GlobalDef().def("tl.transform.LowerScheduledTIR", LowerScheduledTIR);
 }
 
 } // namespace tl

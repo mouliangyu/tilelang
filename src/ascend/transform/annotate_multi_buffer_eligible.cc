@@ -24,7 +24,6 @@
  */
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/container/array.h>
-#include <tvm/ffi/container/map.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/transform.h>
 #include <tvm/tirx/analysis.h>
@@ -34,10 +33,12 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
-#include <set>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
+#include "ascend/transform/auto_schedule/kernel_rewriter.h"
+#include "ascend/transform/buffer_version.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 #include "transform/common/attr.h"
@@ -51,10 +52,11 @@ using namespace ffi;
 namespace {
 
 using BufferSet = std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>;
+using StorageSet = std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>;
 
 // ---------------------------------------------------------------------------
-// WriteFirstClassifier: program-order classification of a single buffer's
-// access pattern inside a Stmt.
+// WriteFirstClassifier: program-order classification of a storage's access
+// pattern inside a Stmt. All Buffer aliases sharing buffer->data participate.
 //
 // Four-state lattice:
 //   kUntouched         — subtree provably never accesses the buffer
@@ -77,14 +79,14 @@ enum class AccessOrder {
 class WriteFirstClassifier : public StmtExprVisitor {
 public:
   AccessOrder Classify(const Stmt &s, const Buffer &buf) {
-    target_ = buf;
+    target_storage_ = buf->data;
     result_ = AccessOrder::kUntouched;
     StmtExprVisitor::VisitStmt(s);
     return result_;
   }
 
 private:
-  Buffer target_;
+  Var target_storage_;
   AccessOrder result_ = AccessOrder::kUntouched;
   arith::Analyzer analyzer_;
 
@@ -176,7 +178,7 @@ private:
       if (IsTerminal(result_))
         return;
     }
-    if (target_.same_as(op->buffer))
+    if (target_storage_.same_as(op->buffer->data))
       result_ = AccessOrder::kReadFirst;
   }
 
@@ -190,7 +192,7 @@ private:
       if (IsTerminal(result_))
         return;
     }
-    if (target_.same_as(op->buffer))
+    if (target_storage_.same_as(op->buffer->data))
       result_ = AccessOrder::kWriteFirst;
   }
 
@@ -342,7 +344,7 @@ private:
       if (IsTerminal(result_))
         return;
     }
-    if (target_.same_as(bl->buffer)) {
+    if (target_storage_.same_as(bl->buffer->data)) {
       int m = mode->value;
       if (m & 1)
         result_ = AccessOrder::kReadFirst;
@@ -380,7 +382,7 @@ private:
     VisitExpr(op->args[1]);
     if (IsTerminal(result_))
       return;
-    if (target_.same_as(bl->buffer)) {
+    if (target_storage_.same_as(bl->buffer->data)) {
       int rw = mask->value;
       if (rw & 1)
         result_ = AccessOrder::kReadFirst;
@@ -435,15 +437,14 @@ public:
 
 // ---------------------------------------------------------------------------
 // MultiBufferAnnotator: walk the PrimFunc body, mirroring the recursion that
-// the AutoSchedule IR-structure builder will perform. Only loops that the
-// builder turns into a ControlNode (i.e. ForKind::kSerial) get annotated; all
-// other constructs (parallel/vectorized/unrolled For, While, Block) become
-// opaque TaskNodes downstream and are left untouched.
+// the initial scheduled-TIR builder will perform. Serial and unrolled loops
+// become structural ControlNodes and may own an automatic version ring; other
+// loops and blocks are opaque leaves.
 //
-// Recursion mirrors auto_schedule.cc's StructureBuilder:
+// Recursion mirrors MaterializeScheduleUnits:
 //   - SeqStmt          -> walk children
-//   - For (kSerial)    -> ControlNode: annotate + walk body
-//   - For (other kind) -> TaskNode: leaf, do not walk
+//   - For (serial/unrolled) -> ControlNode: annotate + walk body
+//   - For (other kind)      -> TaskNode: leaf, do not walk
 //   - IfThenElse       -> walk both branches
 //   - LetStmt          -> leaf
 //   - AttrStmt         -> walk tl.assume body, reject other attrs downstream
@@ -452,16 +453,16 @@ public:
 // ---------------------------------------------------------------------------
 class MultiBufferAnnotator : public StmtMutator {
 public:
-  explicit MultiBufferAnnotator(std::set<const VarNode *> manual = {})
+  explicit MultiBufferAnnotator(StorageSet manual = {})
       : manual_buffers_(std::move(manual)) {}
 
 private:
-  BufferSet used_buffers_;
+  StorageSet used_storages_;
   // Data Vars of buffers the user manually multi-buffered (from
   // `tl.manual_multi_buffer`). These are excluded from eligibility: the pass
   // must not add a version dim / rewrite them; the barrier pass handles their
   // synchronization directly.
-  std::set<const VarNode *> manual_buffers_;
+  StorageSet manual_buffers_;
 
   static bool IsOnChipMultiBufferScope(const Buffer &b) {
     return IsSharedBuffer(b) || IsL1Buffer(b) || IsL0CBuffer(b) ||
@@ -474,18 +475,25 @@ private:
     return std::move(c.touched);
   }
 
+  static StorageSet CollectTouchedStorages(const Stmt &s) {
+    StorageSet storages;
+    for (const Buffer &buffer : CollectTouched(s))
+      storages.insert(buffer->data);
+    return storages;
+  }
+
   // Walk `s` and collect every buffer that any nested For has already claimed
   // via "multi_buffer_eligible". Used so that an outer For doesn't
   // re-claim a buffer that an inner For will multi-buffer — the storage is
   // owned by the innermost claimant.
-  static BufferSet CollectInnerClaimed(const Stmt &s) {
+  static StorageSet CollectInnerClaimed(const Stmt &s) {
     struct Visitor : public StmtVisitor {
-      BufferSet claimed;
+      StorageSet claimed;
       void VisitStmt_(const ForNode *op) final {
         auto v = op->annotations.Get("multi_buffer_eligible");
         if (v.has_value()) {
           for (const auto &b : v.value().cast<Array<Buffer>>()) {
-            claimed.insert(b);
+            claimed.insert(b->data);
           }
         }
         StmtVisitor::VisitStmt_(op);
@@ -496,80 +504,80 @@ private:
   }
 
   Stmt VisitStmt_(const SeqStmtNode *op) final {
-    // Pre-scan each child's touched set so we can augment used_buffers_ for
+    // Pre-scan each child's touched set so we can augment used_storages_ for
     // recursion into the others.
     const size_t n = op->seq.size();
-    std::vector<BufferSet> per_child(n);
+    std::vector<StorageSet> per_child(n);
     for (size_t i = 0; i < n; ++i)
-      per_child[i] = CollectTouched(op->seq[i]);
+      per_child[i] = CollectTouchedStorages(op->seq[i]);
 
     Array<Stmt> new_seq;
     new_seq.reserve(n);
-    auto saved = used_buffers_;
+    auto saved = used_storages_;
     for (size_t i = 0; i < n; ++i) {
-      used_buffers_ = saved;
+      used_storages_ = saved;
       for (size_t j = 0; j < n; ++j) {
         if (j == i)
           continue;
-        used_buffers_.insert(per_child[j].begin(), per_child[j].end());
+        used_storages_.insert(per_child[j].begin(), per_child[j].end());
       }
       new_seq.push_back(VisitStmt(op->seq[i]));
     }
-    used_buffers_ = saved;
+    used_storages_ = saved;
     return SeqStmt(std::move(new_seq));
   }
 
   Stmt VisitStmt_(const ForNode *op) final {
-    // Only kSerial loops become ControlNodes in the AutoSchedule IR structure
-    // and thus participate in multi-buffer scheduling. Parallel / unrolled /
-    // vectorized loops are sunk into a leaf TaskNode and never scheduled, so
-    // an annotation on them would be wasted (and may mislead downstream).
-    if (op->kind != ForKind::kSerial) {
+    // Serial and unrolled loops are structural ControlNodes and may own an
+    // automatic version ring. Parallel/vectorized loops remain opaque tasks.
+    if (op->kind != ForKind::kSerial && op->kind != ForKind::kUnrolled) {
       return GetRef<For>(op);
     }
 
-    auto parent_used = used_buffers_;
+    auto parent_used = used_storages_;
 
     Stmt new_body = VisitStmt(op->body);
-    used_buffers_ = parent_used;
+    used_storages_ = parent_used;
 
     // Seed the eligible set with any frontend-provided annotation, then union
     // in everything the analysis proves safe. The frontend list is a hint of
     // buffers the user definitely wants multi-buffered; it does not suppress
     // additional candidates (the user pins unwanted ones to a single version
     // via T.annotate_buffer_versions instead).
+    auto inner_claimed = CollectInnerClaimed(new_body);
     Array<Buffer> eligible;
-    BufferSet already;
+    StorageSet already;
     if (auto v = op->annotations.Get("multi_buffer_eligible")) {
       for (const auto &b : v.value().cast<Array<Buffer>>()) {
-        if (already.insert(b).second)
+        if (!inner_claimed.count(b->data) && already.insert(b->data).second)
           eligible.push_back(b);
       }
     }
 
     auto touched = CollectTouched(new_body);
-    auto inner_claimed = CollectInnerClaimed(new_body);
     for (const auto &buf : touched) {
-      if (already.count(buf))
+      if (already.count(buf->data))
         continue;
       // Manually multi-buffered buffers are never pass-versioned.
-      if (manual_buffers_.count(buf->data.get()))
+      if (manual_buffers_.count(buf->data))
         continue;
       if (!IsOnChipMultiBufferScope(buf))
         continue;
-      if (parent_used.count(buf))
+      if (parent_used.count(buf->data))
         continue;
       // An inner For has already claimed this buffer for multi-buffering;
       // the outer For must not also claim it.
-      if (inner_claimed.count(buf))
+      if (inner_claimed.count(buf->data))
         continue;
       WriteFirstClassifier cls;
       auto order = cls.Classify(new_body, buf);
       // kMaybeWriteFirst is also safe for multi-buffering: each iteration
       // either skips the buffer or writes-first to it.
       if (order == AccessOrder::kWriteFirst ||
-          order == AccessOrder::kMaybeWriteFirst)
+          order == AccessOrder::kMaybeWriteFirst) {
+        already.insert(buf->data);
         eligible.push_back(buf);
+      }
     }
 
     For for_node = GetRef<For>(op);
@@ -581,18 +589,9 @@ private:
 
   // Leaves in the IR structure: do not descend (matches AutoSchedule).
   //
-  // Caveat for SBlockNode: the AutoSchedule entry (TilelangRootBodyExtractor)
-  // peels the outer `root` / `tilelang_root` blocks before building the IR
-  // tree, so those wrappers must be passed through here. Only INNER blocks
-  // (SIMT_VF / SIMD_VF / user-named blocks) become TaskNode leaves and should
-  // not be descended into.
-  Stmt VisitStmt_(const SBlockNode *op) final {
-    if (op->name_hint == HostMainBlockName ||
-        op->name_hint == DeviceMainBlockName) {
-      return StmtMutator::VisitStmt_(op);
-    }
-    return GetRef<SBlock>(op);
-  }
+  // The callback runs this visitor on tilelang_root's body. Every block below
+  // that root is an opaque TaskNode leaf.
+  Stmt VisitStmt_(const SBlockNode *op) final { return GetRef<SBlock>(op); }
   Stmt VisitStmt_(const WhileNode *op) final { return GetRef<While>(op); }
 };
 
@@ -602,16 +601,14 @@ using namespace tirx::transform;
 
 // Collect the data Vars named in the `tl.manual_multi_buffer` annotation on any
 // SBlock in the function body.
-static std::set<const VarNode *> CollectManualMultiBuffers(const Stmt &body) {
+static StorageSet CollectManualMultiBuffers(const Stmt &body) {
   struct Visitor : public StmtVisitor {
-    std::set<const VarNode *> vars;
+    StorageSet vars;
     void VisitStmt_(const SBlockNode *op) final {
-      if (auto ann = op->annotations.Get("tl.manual_multi_buffer")) {
-        if (auto *map_obj = ann.value().as<ffi::MapObj>()) {
-          for (const auto &it : *map_obj) {
-            if (auto *var = it.first.as<VarNode>())
-              vars.insert(var);
-          }
+      if (auto annotation = op->annotations.Get(kManualMultiBuffer)) {
+        for (const auto &[data, _] :
+             annotation.value().cast<BufferVersionMap>()) {
+          vars.insert(data);
         }
       }
       StmtVisitor::VisitStmt_(op);
@@ -623,10 +620,16 @@ static std::set<const VarNode *> CollectManualMultiBuffers(const Stmt &body) {
 
 tvm::transform::Pass AnnotateMultiBufferEligible() {
   auto pass_func = [=](PrimFunc f, const IRModule &, const PassContext &) {
-    auto *n = f.CopyOnWrite();
-    auto manual = CollectManualMultiBuffers(n->body);
-    n->body = MultiBufferAnnotator(std::move(manual))(std::move(n->body));
-    return f;
+    return RewriteTilelangKernels(
+        std::move(f), "AnnotateMultiBufferEligible",
+        [](const TilelangKernelContext &context) {
+          SBlock root = context.root;
+          auto manual = CollectManualMultiBuffers(root);
+          root.CopyOnWrite()->body =
+              MultiBufferAnnotator(std::move(manual))(root->body);
+          return root;
+        },
+        /*require_kernel=*/false);
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.AnnotateMultiBufferEligible", {});
 }

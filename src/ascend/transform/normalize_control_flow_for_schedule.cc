@@ -23,8 +23,10 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
+#include <utility>
+
+#include "ascend/transform/auto_schedule/kernel_rewriter.h"
 #include "op/builtin.h"
-#include "transform/common/attr.h"
 
 namespace tvm {
 namespace tl {
@@ -34,10 +36,9 @@ using namespace ffi;
 
 class ControlFlowNormalizer : public StmtExprMutator {
 public:
-  static PrimFunc Substitute(PrimFunc &f) {
+  static Stmt Rewrite(const Stmt &body) {
     auto rewriter = ControlFlowNormalizer();
-    f.CopyOnWrite()->body = rewriter(f->body);
-    return f;
+    return rewriter(body);
   }
 
 private:
@@ -136,9 +137,9 @@ private:
     }
 
     // Extract the complex condition into a temporary bind variable so its
-    // value is computed once and consumers (e.g. AutoSchedule) see a flat var,
-    // but keep the if-then-else as a single node. AutoSchedule's
-    // IRStructureBuilder already handles both branches natively.
+    // value is computed once and consumers see a flat var, but keep the
+    // if-then-else as a single node. The initial scheduled-TIR builder handles
+    // both branches natively.
     std::string var_name = "__cond_" + std::to_string(counter_++);
     Var cond_var(var_name, DataType::Bool());
     Stmt new_if = IfThenElse(cond_var, then_case, else_case);
@@ -161,32 +162,34 @@ private:
   }
 
   // Only descend through the same spine AutoSchedule's IRStructure tree walks:
-  // kSerial For loops and the outer root / tilelang_root blocks. Everything
-  // else (Parallel / Vectorized / Unrolled loops, SIMT_VF / SIMD_VF / user
-  // blocks) becomes an opaque TaskNode leaf that is never scheduled, so a
+  // serial/unrolled ControlNode loops. The callback runs this visitor on
+  // tilelang_root's body. Everything else (Parallel / Vectorized loops,
+  // SIMT_VF / SIMD_VF / user blocks) becomes an opaque TaskNode leaf that is
+  // never scheduled, so a
   // `while` nested inside it must NOT be rewritten (codegen emits it verbatim)
   // and its conditions need no extraction. This mirrors the leaf boundaries in
   // MultiBufferAnnotator (annotate_multi_buffer_eligible.cc).
   Stmt VisitStmt_(const ForNode *op) final {
-    if (op->kind != ForKind::kSerial) {
+    if (op->kind != ForKind::kSerial && op->kind != ForKind::kUnrolled) {
       return GetRef<For>(op);
     }
     return StmtExprMutator::VisitStmt_(op);
   }
 
-  Stmt VisitStmt_(const SBlockNode *op) final {
-    if (op->name_hint == HostMainBlockName ||
-        op->name_hint == DeviceMainBlockName) {
-      return StmtExprMutator::VisitStmt_(op);
-    }
-    return GetRef<SBlock>(op);
-  }
+  Stmt VisitStmt_(const SBlockNode *op) final { return GetRef<SBlock>(op); }
 };
 
 using namespace tirx::transform;
 tvm::transform::Pass NormalizeControlFlowForSchedule() {
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
-    return ControlFlowNormalizer::Substitute(f);
+    return RewriteTilelangKernels(
+        std::move(f), "NormalizeControlFlowForSchedule",
+        [](const TilelangKernelContext &context) {
+          SBlock root = context.root;
+          root.CopyOnWrite()->body = ControlFlowNormalizer::Rewrite(root->body);
+          return root;
+        },
+        /*require_kernel=*/false);
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.NormalizeControlFlowForSchedule",
                             {});
