@@ -184,15 +184,15 @@ jobs:
           uv run --no-project -m -- torch.utils.collect_env
           uv pip install /nfs-hg/prod/deepseek/permanent/shared/caohuanqi/pytorch/dist/torch_npu-2.10.0.post1+git4be33e9-cp312-cp312-linux_aarch64.whl
           # Self-contained PTO toolchain from the official hw-native-sys/PTOAS
-          # vmi-v0.1.3 release (ptodsl + MLIR dialects + ptoas CLI).
+          # vmi-v0.1.4 release (ptodsl + MLIR dialects + ptoas CLI).
           case "${RUNNER_ARCH}" in
             ARM64)
               PTOAS_ARCH=aarch64
-              PTOAS_SHA256=b2339469c0bf96a80f8a36fd8415574e738e7dc47cc89f3d43b126df484305d6
+              PTOAS_SHA256=660fba44bb8230c37507ceb7340f49a0add9a31cde0d4af1b4572e08efb61dc1
               ;;
             X64)
               PTOAS_ARCH=x86_64
-              PTOAS_SHA256=84917c1e9f4b352620876f22ae96430fe08bc8688e8b94e4f3b03590c5c0bbb7
+              PTOAS_SHA256=8521ce0ae638e690a0430110d730d0252be6d9acd7a1b1631282368e943cb8a4
               ;;
             *)
               echo "Unsupported runner architecture: ${RUNNER_ARCH}" >&2
@@ -200,7 +200,7 @@ jobs:
               ;;
           esac
           PTOAS_CACHE_DIR="${XDG_CACHE_HOME}/ptoas"
-          PTOAS_FILENAME="ptoas_vmi-0.1.3-cp312-cp312-manylinux_2_34_${PTOAS_ARCH}.whl"
+          PTOAS_FILENAME="ptoas_vmi-0.1.4-cp312-cp312-manylinux_2_34_${PTOAS_ARCH}.whl"
           PTOAS_WHEEL="${PTOAS_CACHE_DIR}/${PTOAS_FILENAME}"
           mkdir -p "${PTOAS_CACHE_DIR}"
           if ! [[ -f "${PTOAS_WHEEL}" ]] || \
@@ -209,7 +209,7 @@ jobs:
             trap 'rm -f "${PTOAS_DOWNLOAD}"' EXIT
             curl --fail --location --retry 3 \
               --output "${PTOAS_DOWNLOAD}" \
-              "https://github.com/hw-native-sys/PTOAS/releases/download/vmi-v0.1.3/${PTOAS_FILENAME}"
+              "https://github.com/hw-native-sys/PTOAS/releases/download/vmi-v0.1.4/${PTOAS_FILENAME}"
             printf '%s  %s\n' "${PTOAS_SHA256}" "${PTOAS_DOWNLOAD}" | sha256sum --check -
             mv "${PTOAS_DOWNLOAD}" "${PTOAS_WHEEL}"
             trap - EXIT

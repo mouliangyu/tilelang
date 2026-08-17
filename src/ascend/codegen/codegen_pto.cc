@@ -496,6 +496,78 @@ private:
   arith::Analyzer analyzer_;
 };
 
+class SimtPersistentBufferCollector final : public StmtExprVisitor {
+public:
+  std::unordered_set<const VarNode *> Collect(const Stmt &body) {
+    VisitStmt(body);
+
+    std::unordered_set<const VarNode *> persistent_buffers;
+    for (const VarNode *var : outer_local_allocations_) {
+      if (simt_accesses_.count(var)) {
+        persistent_buffers.insert(var);
+      }
+    }
+    return persistent_buffers;
+  }
+
+private:
+  void RecordAllocation(const Buffer &buffer) {
+    std::string scope = buffer.scope();
+    if (simt_depth_ == 0 && (scope == "local" || scope == "local.fragment")) {
+      outer_local_allocations_.insert(buffer->data.get());
+    }
+  }
+
+  void RecordAccess(const Buffer &buffer) {
+    if (simt_depth_ > 0) {
+      simt_accesses_.insert(buffer->data.get());
+    }
+  }
+
+  void VisitStmt_(const AllocBufferNode *op) final {
+    RecordAllocation(op->buffer);
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const SBlockNode *op) final {
+    const bool is_simt = op->name_hint == "SIMT_VF";
+    if (is_simt) {
+      ++simt_depth_;
+    }
+    for (const Buffer &buffer : op->alloc_buffers) {
+      RecordAllocation(buffer);
+    }
+    StmtExprVisitor::VisitStmt_(op);
+    if (is_simt) {
+      --simt_depth_;
+    }
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+    RecordAccess(op->buffer);
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    RecordAccess(op->buffer);
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  int simt_depth_{0};
+  std::unordered_set<const VarNode *> outer_local_allocations_;
+  std::unordered_set<const VarNode *> simt_accesses_;
+};
+
+bool UsesVar(const Stmt &body, const VarNode *target) {
+  bool found = false;
+  PostOrderVisit(body, [&](const ObjectRef &node) {
+    if (node.get() == target) {
+      found = true;
+    }
+  });
+  return found;
+}
+
 } // namespace
 
 void CodeGenTileLangPTO::AddFunction(const GlobalVar &gvar,
@@ -506,6 +578,8 @@ void CodeGenTileLangPTO::AddFunction(const GlobalVar &gvar,
   CheckPTOKernel(func);
   fragment_info_.clear();
   local_var_buffers_.clear();
+  inside_simtvf_body_ = false;
+  persistent_buffer_vars_ = SimtPersistentBufferCollector().Collect(func->body);
   gemm_emit_ctx_ = PTOGemmEmitContext();
   hf32_mode_by_gemm_ = PTOHf32ModeAnalyzer::Analyze(func);
   current_function_has_gemm_ = HasAscendGemmL1(func);
@@ -628,14 +702,6 @@ bool CodeGenTileLangPTO::HasAscendGemmL1(const PrimFunc &func) const {
   return found;
 }
 
-std::string CodeGenTileLangPTO::ResolveVarName(const Var &v) const {
-  auto it = var_idmap_.find(v.get());
-  if (it != var_idmap_.end()) {
-    return it->second;
-  }
-  return v->name_hint;
-}
-
 std::string CodeGenTileLangPTO::ScopeOfBuffer(const BufferNode *buffer) const {
   std::string scope;
   auto it = alloc_storage_scope_.find(buffer->data.get());
@@ -648,41 +714,6 @@ std::string CodeGenTileLangPTO::ScopeOfBuffer(const BufferNode *buffer) const {
   return scope;
 }
 
-ffi::Array<Var>
-CodeGenTileLangPTO::CollectVFCaptures(const SBlockNode *op) const {
-  ffi::Array<Var> predefined;
-  for (const Buffer &buf : op->alloc_buffers) {
-    predefined.push_back(buf->data);
-  }
-
-  ffi::Array<Var> undefined = UndefinedVars(op->body, predefined);
-  ffi::Array<Var> captures;
-  std::unordered_set<const VarNode *> seen;
-  for (const Var &var : undefined) {
-    if (seen.count(var.get())) {
-      continue;
-    }
-    // Kernel blockIdx.x is mapped directly to the PTODSL builtin in
-    // VisitStmt_(AttrStmtNode), so SIMT helpers can reference it without a
-    // scalar capture parameter.
-    auto it = var_idmap_.find(var.get());
-    if (it != var_idmap_.end() && it->second == "pto.get_block_idx()") {
-      continue;
-    }
-    seen.insert(var.get());
-
-    const DataType dtype = var->dtype;
-    ICHECK(dtype.lanes() == 1 &&
-           (dtype.is_int() || dtype.is_uint() || dtype.is_float() ||
-            dtype.is_handle() || dtype.is_bool()))
-        << op->name_hint << " capture variable `" << var
-        << "` has unsupported dtype `" << dtype
-        << "`. Only scalar int/uint/float/bool/handle captures are supported.";
-    captures.push_back(var);
-  }
-  return captures;
-}
-
 void CodeGenTileLangPTO::ExtractSimtThreadExtents(const SBlockNode *op,
                                                   int64_t *thread_x,
                                                   int64_t *thread_y,
@@ -691,153 +722,77 @@ void CodeGenTileLangPTO::ExtractSimtThreadExtents(const SBlockNode *op,
   *thread_y = 1;
   *thread_z = 1;
 
-  tirx::PostOrderVisit(op->body, [&](const ffi::ObjectRef &node) {
-    const auto *attr = node.as<AttrStmtNode>();
-    if (attr == nullptr || attr->attr_key != tirx::attr::thread_extent) {
-      return;
-    }
-    const auto *iv = attr->node.as<IterVarNode>();
-    if (!iv) {
-      return;
-    }
-    int64_t value = 1;
-    if (TryGetConstInt(attr->value, &value)) {
-      if (iv->thread_tag == "threadIdx.x") {
-        *thread_x = value;
-      } else if (iv->thread_tag == "threadIdx.y") {
-        *thread_y = value;
-      } else if (iv->thread_tag == "threadIdx.z") {
-        *thread_z = value;
-      }
-    }
-  });
+  tirx::PostOrderVisit(
+      op->body, [&](const ffi::ObjectRef &node) {
+        const auto *attr = node.as<AttrStmtNode>();
+        if (attr == nullptr || attr->attr_key != tirx::attr::thread_extent) {
+          return;
+        }
+        const auto *iv = attr->node.as<IterVarNode>();
+        if (!iv) {
+          return;
+        }
+
+        int64_t *dimension = nullptr;
+        if (iv->thread_tag == "threadIdx.x") {
+          dimension = thread_x;
+        } else if (iv->thread_tag == "threadIdx.y") {
+          dimension = thread_y;
+        } else if (iv->thread_tag == "threadIdx.z") {
+          dimension = thread_z;
+        } else {
+          return;
+        }
+
+        int64_t value = 0;
+        ICHECK(TryGetConstInt(attr->value, &value))
+            << "PTO inline SIMT launch dimensions must be static, got "
+            << attr->value;
+        ICHECK_GT(value, 0)
+            << "PTO inline SIMT launch dimensions must be positive, got "
+            << value;
+        *dimension = value;
+      });
 }
 
-void CodeGenTileLangPTO::EmitSimtVFFunction(const SBlockNode *op,
-                                            const ffi::Array<Var> &captures,
-                                            const std::string &helper_name,
-                                            int64_t thread_x, int64_t thread_y,
-                                            int64_t thread_z) {
-  std::unordered_map<const VarNode *, std::string> capture_scope;
-  for (const Var &v : captures) {
-    if (v->type_annotation.as<PointerTypeNode>()) {
-      alloc_storage_scope_[v.get()] = GetPtrStorageScope(v);
-    }
-    auto it = alloc_storage_scope_.find(v.get());
-    if (it != alloc_storage_scope_.end()) {
-      capture_scope[v.get()] = it->second;
-    }
-  }
-
-  std::unordered_map<const VarNode *, std::string> saved_var_idmap;
-  saved_var_idmap.swap(var_idmap_);
-  NameSupply saved_name_supply = name_supply_;
-  name_supply_ = NameSupply();
-  ReserveKeywordsAsUnique_();
-  for (const auto &kv : saved_var_idmap) {
-    var_idmap_[kv.first] = kv.second;
-  }
-  for (const Var &v : captures) {
-    if (!var_idmap_.count(v.get())) {
-      AllocVarID(v.get());
-    }
-    name_supply_->ReserveName(ResolveVarName(v), false);
-  }
-
-  std::vector<std::string> capture_names;
-  capture_names.reserve(captures.size());
-  for (const Var &v : captures) {
-    capture_names.push_back(ResolveVarName(v));
-  }
-
-  CodeGenTileLangPTO body_codegen;
-  body_codegen.var_idmap_ = var_idmap_;
-  body_codegen.name_supply_ = name_supply_;
-  body_codegen.alloc_storage_scope_ = alloc_storage_scope_;
-  body_codegen.inside_simtvf_body_ = true;
-  for (const Var &v : captures) {
-    if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
-      if (auto *prim = ptr->element_type.as<PrimTypeNode>()) {
-        body_codegen.RegisterHandleType_(v.get(), prim->dtype);
-      }
-    }
-  }
-  int helper_scope = body_codegen.BeginScope();
-  for (const Buffer &buf : op->alloc_buffers) {
-    body_codegen.EmitPtoBufferAllocation(buf);
-  }
-  body_codegen.VisitStmt(op->body);
-  body_codegen.EndScope(helper_scope);
-  std::string helper_body = body_codegen.stream.str();
-
-  var_idmap_.swap(saved_var_idmap);
-  name_supply_ = saved_name_supply;
-
-  const int64_t total_threads = thread_x * thread_y * thread_z;
-  decl_stream << "@pto.simt(name=\"" << helper_name << "\"";
-  if (total_threads > 0) {
-    decl_stream << ", max_threads=" << total_threads;
-  }
-  decl_stream << ")\n";
-  decl_stream << "def " << helper_name << "(";
-  for (size_t i = 0; i < captures.size(); ++i) {
-    if (i != 0) {
-      decl_stream << ", ";
-    }
-    const Var &v = captures[i];
-    std::string vname = capture_names[i];
-    decl_stream << vname << ": ";
-    if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
-      if (auto *prim = ptr->element_type.as<PrimTypeNode>()) {
-        std::string scope =
-            ptr->storage_scope.empty() ? "gm" : ptr->storage_scope;
-        auto scope_it = capture_scope.find(v.get());
-        if (scope_it != capture_scope.end() &&
-            (scope_it->second == "shared" ||
-             scope_it->second == "shared.dyn")) {
-          decl_stream << PtoPtrType(prim->dtype, "ub");
-          RegisterHandleType_(v.get(), prim->dtype);
-          continue;
-        }
-        if (scope == "global") {
-          scope = "gm";
-        } else if (scope == "shared" || scope == "shared.dyn") {
-          scope = "ub";
-        }
-        decl_stream << PtoPtrType(prim->dtype, scope);
-        RegisterHandleType_(v.get(), prim->dtype);
-      } else {
-        decl_stream << PtoScalarType(v->dtype);
-      }
-    } else {
-      decl_stream << PtoScalarType(v->dtype);
-    }
-  }
-  decl_stream << "):\n";
-  if (helper_body.empty()) {
-    decl_stream << "  return\n";
-  } else {
-    decl_stream << helper_body;
-  }
-  decl_stream << "\n";
-}
-
-void CodeGenTileLangPTO::EmitSimtVFLaunch(const ffi::Array<Var> &captures,
-                                          const std::string &helper_name,
+void CodeGenTileLangPTO::EmitInlineSimtVF(const SBlockNode *op,
                                           int64_t thread_x, int64_t thread_y,
                                           int64_t thread_z) {
+  constexpr int64_t kMaxSimtWorkitems = 2048;
+  ICHECK_LE(thread_x, kMaxSimtWorkitems)
+      << "PTO inline SIMT launch has more than " << kMaxSimtWorkitems
+      << " workitems";
+  ICHECK_LE(thread_y, kMaxSimtWorkitems / thread_x)
+      << "PTO inline SIMT launch has more than " << kMaxSimtWorkitems
+      << " workitems";
+  ICHECK_LE(thread_z, kMaxSimtWorkitems / (thread_x * thread_y))
+      << "PTO inline SIMT launch has more than " << kMaxSimtWorkitems
+      << " workitems";
+
   PrintIndent();
-  stream << helper_name << "[" << thread_x << ", " << thread_y << ", "
-         << thread_z << "](";
-  for (size_t i = 0; i < captures.size(); ++i) {
-    if (i != 0) {
-      stream << ", ";
-    }
-    const Var &v = captures[i];
-    std::string arg = ResolveVarName(v);
-    stream << arg;
+  stream << "with pto.simt(" << thread_x << ", " << thread_y << ", " << thread_z
+         << "):\n";
+  int simt_scope = BeginScope();
+  const auto body_start = stream.tellp();
+  bool saved_inside_simtvf_body = inside_simtvf_body_;
+  inside_simtvf_body_ = true;
+
+  // Older TIR forms keep section-local allocations on the SBlock. Current
+  // lowering emits them as AllocBuffer statements in the body.
+  for (const Buffer &buffer : op->alloc_buffers) {
+    EmitPtoBufferAllocation(buffer);
   }
-  stream << ")\n";
+  if (op->init.defined()) {
+    PrintStmt_(op->init.value());
+  }
+  PrintStmt_(op->body);
+  if (stream.tellp() == body_start) {
+    PrintIndent();
+    stream << "pass\n";
+  }
+
+  inside_simtvf_body_ = saved_inside_simtvf_body;
+  EndScope(simt_scope);
 }
 
 std::string CodeGenTileLangPTO::GetPtoPointerExpr(const VarNode *buffer_var,
@@ -992,9 +947,12 @@ void CodeGenTileLangPTO::EmitPtoBufferAllocation(const Buffer &buffer) {
     ICHECK(opt_size.has_value())
         << "PTO local.fragment currently requires constant allocation size";
     PrintIndent();
-    if (inside_simtvf_body_) {
+    const bool persistent =
+        persistent_buffer_vars_.count(buffer->data.get()) != 0;
+    if (inside_simtvf_body_ || persistent) {
       ICHECK(IsFloat32(buffer->dtype))
-          << "PTO SIMT local allocation currently supports float32 only, got "
+          << "PTO SIMT/persistent local allocation currently supports "
+             "float32 only, got "
           << buffer->dtype;
       stream << vid << " = pto.alloc_buffer((" << opt_size.value()
              << ",), pto.f32)\n";
@@ -2080,6 +2038,17 @@ void CodeGenTileLangPTO::VisitStmt_(const AttrStmtNode *op) {
       return;
     }
 
+    const bool is_simt_thread = iv->thread_tag == "threadIdx.x" ||
+                                iv->thread_tag == "threadIdx.y" ||
+                                iv->thread_tag == "threadIdx.z";
+    if (!inside_simtvf_body_ && is_simt_thread) {
+      ICHECK(!UsesVar(op->body, iv->var.get()))
+          << "PTO codegen cannot use " << iv->thread_tag
+          << " outside a SIMT section; move the use into T.SimtVF";
+      VisitStmt(op->body);
+      return;
+    }
+
     std::string vid = AllocVarID(iv->var.get());
     std::string thread_value;
     if (iv->thread_tag == "cthread") {
@@ -2113,25 +2082,32 @@ void CodeGenTileLangPTO::VisitStmt_(const AttrStmtNode *op) {
 }
 
 void CodeGenTileLangPTO::VisitStmt_(const ForNode *op) {
-  if (!current_function_has_gemm_) {
-    PrintIndent();
-    std::string vid = AllocVarID(op->loop_var.get());
-    std::string begin = RemoveOutermostParentheses(PrintExpr_(op->min));
-    PrimExpr upper_bound = arith::Analyzer().Simplify(op->extent + op->min);
-    std::string end = RemoveOutermostParentheses(PrintExpr_(upper_bound));
-    stream << "for " << vid << " in range(" << begin << ", " << end << "):\n";
-    int for_scope = BeginScope();
-    PrintStmt_(op->body);
-    EndScope(for_scope);
-    return;
-  }
+  // Trace-time Python iteration is safe only for explicitly unrolled loops
+  // whose full triplet is known. Every other loop must remain device-side.
+  arith::Analyzer analyzer;
+  PrimExpr start = analyzer.Simplify(op->min);
+  PrimExpr extent = analyzer.Simplify(op->extent);
+  PrimExpr step = op->step.has_value() ? analyzer.Simplify(op->step.value())
+                                       : make_const(op->loop_var.dtype(), 1);
+  PrimExpr stop = analyzer.Simplify(start + extent);
 
-  PrimExpr start = arith::Analyzer().Simplify(op->min);
-  PrimExpr stop = arith::Analyzer().Simplify(op->min + op->extent);
+  int64_t start_value = 0;
+  int64_t extent_value = 0;
+  int64_t step_value = 0;
+  const bool use_static_range = op->kind == tirx::ForKind::kUnrolled &&
+                                TryGetConstInt(start, &start_value) &&
+                                TryGetConstInt(extent, &extent_value) &&
+                                TryGetConstInt(step, &step_value);
+
   PrintIndent();
   std::string vid = AllocVarID(op->loop_var.get());
-  stream << "with pto.for_(" << PrintExpr_(start) << ", " << PrintExpr_(stop)
-         << ", step=1) as " << vid << ":\n";
+  if (use_static_range) {
+    stream << "for " << vid << " in pto.static_range(" << PrintExpr_(start)
+           << ", " << PrintExpr_(stop) << ", " << PrintExpr_(step) << "):\n";
+  } else {
+    stream << "with pto.for_(" << PrintExpr_(start) << ", " << PrintExpr_(stop)
+           << ", step=" << PrintExpr_(step) << ") as " << vid << ":\n";
+  }
   int scope = BeginScope();
   PrintStmt_(op->body);
   EndScope(scope);
@@ -2143,18 +2119,7 @@ void CodeGenTileLangPTO::VisitStmt_(const SBlockNode *op) {
     int64_t thread_y = 1;
     int64_t thread_z = 1;
     ExtractSimtThreadExtents(op, &thread_x, &thread_y, &thread_z);
-
-    auto captures = CollectVFCaptures(op);
-    int64_t vf_idx = simtvf_helper_counter_++;
-    auto it = op->annotations.find("tl.vf_source_index");
-    if (it != op->annotations.end()) {
-      if (auto *imm = (*it).second.as<IntImmNode>()) {
-        vf_idx = imm->value;
-      }
-    }
-    std::string helper_name = "simt_vf_" + std::to_string(vf_idx);
-    EmitSimtVFFunction(op, captures, helper_name, thread_x, thread_y, thread_z);
-    EmitSimtVFLaunch(captures, helper_name, thread_x, thread_y, thread_z);
+    EmitInlineSimtVF(op, thread_x, thread_y, thread_z);
     return;
   }
 

@@ -77,16 +77,10 @@ private:
   std::string GetAscendCopyUbGmExpr_(const CallNode *op);
   std::string EmitPTOAllReduceExpr_(const std::string &func_name,
                                     const CallNode *op);
-  ffi::Array<Var> CollectVFCaptures(const SBlockNode *op) const;
-  void EmitSimtVFFunction(const SBlockNode *op, const ffi::Array<Var> &captures,
-                          const std::string &helper_name, int64_t thread_x,
-                          int64_t thread_y, int64_t thread_z);
+  void EmitInlineSimtVF(const SBlockNode *op, int64_t thread_x,
+                        int64_t thread_y, int64_t thread_z);
   void ExtractSimtThreadExtents(const SBlockNode *op, int64_t *thread_x,
                                 int64_t *thread_y, int64_t *thread_z) const;
-  void EmitSimtVFLaunch(const ffi::Array<Var> &captures,
-                        const std::string &helper_name, int64_t thread_x,
-                        int64_t thread_y, int64_t thread_z);
-  std::string ResolveVarName(const Var &v) const;
   std::string PtoScalarLoad(const BufferNode *buffer, const PrimExpr &index);
   void EmitPtoScalarStore(const BufferNode *buffer, const std::string &value,
                           const PrimExpr &index);
@@ -99,8 +93,10 @@ private:
                         std::ostream &os) override; // NOLINT(*)
 
   std::string current_function_name_;
-  int simtvf_helper_counter_{0};
   bool inside_simtvf_body_{false};
+  // Outer local buffers referenced by a SIMT section. Var identity is the
+  // ownership key because lowering can leave duplicate name hints behind.
+  std::unordered_set<const VarNode *> persistent_buffer_vars_;
   std::string GetPtoLocalPtrExpr(const PrimExpr &expr, const std::string &space,
                                  DataType fallback_dtype);
   std::string GetPtoLocalByteAddrExpr(const PrimExpr &index,
