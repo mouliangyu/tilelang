@@ -30,11 +30,11 @@
 #include <optional>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include <tvm/arith/analyzer.h>
-#include <tvm/ffi/extra/structural_hash.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/tirx/analysis.h>
 #include <tvm/tirx/expr.h>
@@ -47,9 +47,15 @@ namespace tvm {
 namespace tl {
 
 using namespace tirx;
-using ffi::GetRef;
 
 using TaskAccessPredicate = std::function<bool(const TaskNode *task)>;
+using StorageSet =
+    std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
+
+using CoveredTaskPair = std::pair<const TaskNode *, const TaskNode *>;
+using CoveredDependencyMap =
+    std::unordered_map<Var, std::set<CoveredTaskPair>, ffi::ObjectPtrHash,
+                       ffi::ObjectPtrEqual>;
 
 PrimExpr CalculateIterationCount(const std::vector<For> &loops) {
   PrimExpr total_iter = IntImm(DataType::Int(32), 0);
@@ -77,43 +83,37 @@ const TaskNode *BufferAccessPoint::task() const {
 // Dependency analysis implementation
 // ============================================================================
 
-inline const VarNode *StorageKey(const Buffer &buffer) {
-  return buffer->data.get();
+inline bool RegionUsesStorage(const BufferRegion &region, const Var &storage) {
+  return region->buffer->data.same_as(storage);
 }
 
-inline bool RegionUsesStorage(const BufferRegion &region,
-                              const VarNode *storage_key) {
-  return StorageKey(region->buffer) == storage_key;
-}
-
-TaskAccessPredicate MakeStorageAccessPredicate(const VarNode *storage_key,
+TaskAccessPredicate MakeStorageAccessPredicate(const Var &storage,
                                                bool is_write) {
-  return [storage_key, is_write](const TaskNode *task) -> bool {
+  return [storage, is_write](const TaskNode *task) -> bool {
     const auto &regions =
         is_write ? task->GetWriteRegions() : task->GetReadRegions();
     for (const auto &region : regions) {
-      if (RegionUsesStorage(region, storage_key))
+      if (RegionUsesStorage(region, storage))
         return true;
     }
     return false;
   };
 }
 
-std::vector<BufferRegion> TaskRegionsForStorage(const TaskNode *task,
-                                                const VarNode *storage_key,
-                                                bool is_write) {
+std::vector<BufferRegion>
+TaskRegionsForStorage(const TaskNode *task, const Var &storage, bool is_write) {
   std::vector<BufferRegion> result;
   const auto &regions =
       is_write ? task->GetWriteRegions() : task->GetReadRegions();
   for (const auto &region : regions) {
-    if (RegionUsesStorage(region, storage_key)) {
+    if (RegionUsesStorage(region, storage)) {
       result.push_back(region);
     }
   }
   return result;
 }
 
-// Collect access points for every task touching `storage_key`. Unlike the old
+// Collect access points for every task touching `storage`. Unlike the old
 // first/last-only collection, this gathers ALL matching points; the caller
 // pairs producer/consumer points and lets the closure prune redundancy.
 // `producer_side` shifts a loop body's timing to its last iteration so a
@@ -157,13 +157,12 @@ static void CollectAllAccessPointsImpl(const IRStructure *node,
 }
 
 std::set<BufferAccessPoint>
-CollectAccessPoints(const IRStructure *node, const VarNode *storage_key,
-                    bool is_write, bool producer_side,
-                    const DependencyTiming *timing) {
+CollectAccessPoints(const IRStructure *node, const Var &storage, bool is_write,
+                    bool producer_side, const DependencyTiming *timing) {
   std::set<BufferAccessPoint> result;
   std::vector<const IRStructure *> path;
   CollectAllAccessPointsImpl(node,
-                             MakeStorageAccessPredicate(storage_key, is_write),
+                             MakeStorageAccessPredicate(storage, is_write),
                              result, path, 0, producer_side, timing);
   return result;
 }
@@ -189,7 +188,7 @@ static bool DeclaredNoConflict(const BufferRegion &a_region,
   // and region.
   auto operand_matches = [](const Any &hint, const BufferRegion &q) {
     if (auto var = hint.as<Var>())
-      return var.value().get() == StorageKey(q->buffer);
+      return var.value().same_as(q->buffer->data);
     auto hr = Downcast<BufferRegion>(hint);
     return hr->buffer.same_as(q->buffer) && RegionsEqual(hr->region, q->region);
   };
@@ -209,15 +208,15 @@ static bool DeclaredNoConflict(const BufferRegion &a_region,
 }
 
 static bool
-IsCurrentLoopMultiBufferEligible(const Buffer &buffer,
+IsCurrentLoopMultiBufferEligible(const Var &storage,
                                  const std::vector<For> &loop_stack) {
   if (loop_stack.empty())
     return false;
-  auto ann = loop_stack.back()->annotations.Get("multi_buffer_eligible");
+  auto ann = loop_stack.back()->annotations.Get(kMultiBufferEligible);
   if (!ann.has_value())
     return false;
-  for (const auto &eligible : ann.value().cast<Array<Buffer>>()) {
-    if (eligible->data.same_as(buffer->data))
+  for (const Var &eligible : ann.value().cast<Array<Var>>()) {
+    if (eligible.same_as(storage))
       return true;
   }
   return false;
@@ -226,7 +225,7 @@ IsCurrentLoopMultiBufferEligible(const Buffer &buffer,
 // Check whether a_region and b_region are provably disjoint under their
 // per-side outer contexts. Cross-iteration checks normally relate the
 // innermost loop variable. For a buffer claimed by the current loop's
-// multi_buffer_eligible annotation, they instead relate the flattened complete
+// kMultiBufferEligible annotation, they instead relate the flattened complete
 // loop nest so an outer-loop change also counts. `offset`: <0 constrains
 // consumer > producer; ==0 is same iteration; >0 constrains consumer ==
 // producer + offset.
@@ -261,7 +260,7 @@ bool RegionsMayConflict(const ConstrSet &a_ctx, const BufferRegion &a_region,
   ConstrSet loop_ctx;
   if (cross) {
     bool use_complete_loop_nest =
-        IsCurrentLoopMultiBufferEligible(a_region->buffer, loop_stack);
+        IsCurrentLoopMultiBufferEligible(a_region->buffer->data, loop_stack);
     Var pivot_lv = use_complete_loop_nest ? loop_stack.front()->loop_var
                                           : loop_stack.back()->loop_var;
     a_local_ctx = a_local_ctx.RenameFrom("_p", a_sub, pivot_lv);
@@ -312,26 +311,24 @@ static std::vector<DepInfo> AnalyzeDependenciesImpl(
   const size_t n = nodes.size();
   std::vector<DepInfo> deps;
 
-  std::vector<const VarNode *> storage_keys;
-  std::unordered_set<const VarNode *> storage_keys_seen;
-  auto add_storage_key = [&](const VarNode *key) {
-    if (storage_keys_seen.insert(key).second)
-      storage_keys.push_back(key);
+  std::vector<Var> storages;
+  StorageSet storages_seen;
+  auto add_storage = [&](const Var &storage) {
+    if (storages_seen.insert(storage).second)
+      storages.push_back(storage);
   };
   for (size_t i = 0; i < n; ++i) {
     for (const auto &region : nodes[i]->GetReadRegions()) {
-      add_storage_key(StorageKey(region->buffer));
+      add_storage(region->buffer->data);
     }
     for (const auto &region : nodes[i]->GetWriteRegions()) {
-      add_storage_key(StorageKey(region->buffer));
+      add_storage(region->buffer->data);
     }
   }
 
-  using CoveredKey =
-      std::tuple<const VarNode *, const TaskNode *, const TaskNode *>;
-  std::function<void(IRStructure *, std::vector<For> &, std::set<CoveredKey> &)>
+  std::function<void(IRStructure *, std::vector<For> &, CoveredDependencyMap &)>
       collect_subtree_deps = [&](IRStructure *node, std::vector<For> &stack,
-                                 std::set<CoveredKey> &out) {
+                                 CoveredDependencyMap &out) {
         if (!node || !node->IsControl())
           return;
         auto *ctrl = static_cast<ControlNode *>(node);
@@ -343,9 +340,9 @@ static std::vector<DepInfo> AnalyzeDependenciesImpl(
             AnalyzeDependenciesImpl(children, stack, manual_buffer_versions,
                                     dependency_cache, ctrl, timing);
         for (const auto &cdep : child_deps) {
-          const VarNode *ckey = StorageKey(cdep.buffer);
+          auto &covered_pairs = out[cdep.storage];
           for (const auto &[cprod, ccons] : cdep.task_pairs) {
-            out.emplace(ckey, cprod.task(), ccons.task());
+            covered_pairs.emplace(cprod.task(), ccons.task());
           }
         }
         for (auto *child : children)
@@ -353,23 +350,23 @@ static std::vector<DepInfo> AnalyzeDependenciesImpl(
         stack.pop_back();
       };
   auto subtree_covered = [&](IRStructure *node) {
-    std::set<CoveredKey> covered;
+    CoveredDependencyMap covered;
     std::vector<For> stack = loop_stack;
     collect_subtree_deps(node, stack, covered);
     return covered;
   };
 
-  for (const auto *storage_key : storage_keys) {
-    auto it = manual_buffer_versions.find(GetRef<Var>(storage_key));
+  for (const Var &storage : storages) {
+    auto it = manual_buffer_versions.find(storage);
     int manual_versions = it == manual_buffer_versions.end() ? 0 : (*it).second;
 
     auto touches = [&](size_t u) {
       for (const auto &region : nodes[u]->GetReadRegions()) {
-        if (RegionUsesStorage(region, storage_key))
+        if (RegionUsesStorage(region, storage))
           return true;
       }
       for (const auto &region : nodes[u]->GetWriteRegions()) {
-        if (RegionUsesStorage(region, storage_key))
+        if (RegionUsesStorage(region, storage))
           return true;
       }
       return false;
@@ -386,17 +383,16 @@ static std::vector<DepInfo> AnalyzeDependenciesImpl(
         if (!manual_versions && loop_stack.empty() && i >= j)
           continue;
 
-        auto a_w = CollectAccessPoints(nodes[i], storage_key, true,
+        auto a_w = CollectAccessPoints(nodes[i], storage, true,
                                        /*producer_side=*/true, timing);
-        auto a_r = CollectAccessPoints(nodes[i], storage_key, false,
+        auto a_r = CollectAccessPoints(nodes[i], storage, false,
                                        /*producer_side=*/true, timing);
-        auto b_r = CollectAccessPoints(nodes[j], storage_key, false,
+        auto b_r = CollectAccessPoints(nodes[j], storage, false,
                                        /*producer_side=*/false, timing);
-        auto b_w = CollectAccessPoints(nodes[j], storage_key, true,
+        auto b_w = CollectAccessPoints(nodes[j], storage, true,
                                        /*producer_side=*/false, timing);
 
         std::set<std::pair<BufferAccessPoint, BufferAccessPoint>> pairs;
-        std::optional<Buffer> dep_buffer;
         int64_t latency = -1;
         int min_manual_dist = std::numeric_limits<int>::max();
 
@@ -406,10 +402,10 @@ static std::vector<DepInfo> AnalyzeDependenciesImpl(
                             bool b_write) {
           for (const auto &a : a_pts) {
             std::vector<BufferRegion> a_regions =
-                TaskRegionsForStorage(a.task(), storage_key, a_write);
+                TaskRegionsForStorage(a.task(), storage, a_write);
             for (const auto &b : b_pts) {
               std::vector<BufferRegion> b_regions =
-                  TaskRegionsForStorage(b.task(), storage_key, b_write);
+                  TaskRegionsForStorage(b.task(), storage, b_write);
               for (const auto &rA : a_regions) {
                 for (const auto &rB : b_regions) {
                   if (manual_versions) {
@@ -432,11 +428,6 @@ static std::vector<DepInfo> AnalyzeDependenciesImpl(
                                                  loop_stack, i >= j ? -1 : 0)) {
                     continue;
                   }
-                  // For alias buffers that share one data Var, use the
-                  // write-side logical buffer as the dependency buffer.
-                  if (!dep_buffer.has_value()) {
-                    dep_buffer = a_write ? rA->buffer : rB->buffer;
-                  }
                   pairs.emplace(a, b);
                   int64_t l =
                       a.timestamp + a.task()->GetLatency() - b.timestamp;
@@ -457,9 +448,11 @@ static std::vector<DepInfo> AnalyzeDependenciesImpl(
         // node's own subtree.
         if (i == j && nodes[i]->IsControl()) {
           const auto &covered = subtree_covered(nodes[i]);
+          auto covered_storage = covered.find(storage);
           for (auto it = pairs.begin(); it != pairs.end();) {
-            if (covered.count(
-                    {storage_key, it->first.task(), it->second.task()})) {
+            if (covered_storage != covered.end() &&
+                covered_storage->second.count(
+                    {it->first.task(), it->second.task()})) {
               it = pairs.erase(it);
             } else {
               ++it;
@@ -468,12 +461,9 @@ static std::vector<DepInfo> AnalyzeDependenciesImpl(
         }
 
         if (!pairs.empty() && latency >= 0) {
-          ICHECK(dep_buffer.has_value())
-              << "Dependency found without a representative write buffer for "
-              << storage_key->name_hint;
           int distance = manual_versions ? min_manual_dist : (i >= j ? -1 : 0);
           deps.push_back(
-              {nodes[i], nodes[j], dep_buffer.value(),
+              {nodes[i], nodes[j], storage,
                std::vector<std::pair<BufferAccessPoint, BufferAccessPoint>>(
                    pairs.begin(), pairs.end()),
                distance, latency});

@@ -51,8 +51,26 @@ using namespace ffi;
 
 namespace {
 
-using BufferSet = std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>;
 using StorageSet = std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>;
+
+Array<Var> NormalizeEligibleStorages(const Any &annotation) {
+  Array<Var> result;
+  StorageSet seen;
+  for (const Any &item : Downcast<Array<Any>>(annotation)) {
+    Var storage;
+    if (auto buffer = item.try_cast<Buffer>()) {
+      storage = buffer.value()->data;
+    } else if (auto var = item.try_cast<Var>()) {
+      storage = var.value();
+    } else {
+      LOG(FATAL) << "'" << kMultiBufferEligible
+                 << "' entries must be Buffer or Var objects, got " << item;
+    }
+    if (seen.insert(storage).second)
+      result.push_back(storage);
+  }
+  return result;
+}
 
 // ---------------------------------------------------------------------------
 // WriteFirstClassifier: program-order classification of a storage's access
@@ -78,8 +96,8 @@ enum class AccessOrder {
 
 class WriteFirstClassifier : public StmtExprVisitor {
 public:
-  AccessOrder Classify(const Stmt &s, const Buffer &buf) {
-    target_storage_ = buf->data;
+  AccessOrder Classify(const Stmt &s, const Var &storage) {
+    target_storage_ = storage;
     result_ = AccessOrder::kUntouched;
     StmtExprVisitor::VisitStmt(s);
     return result_;
@@ -393,29 +411,40 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// BufferAccessCollector: one-shot scan of a Stmt to collect every buffer that
-// is read or written anywhere inside it (program order doesn't matter).
+// StorageAccessCollector: one-shot scan of a Stmt to collect every on-chip
+// storage that is read or written anywhere inside it, preserving first-access
+// order.
 // ---------------------------------------------------------------------------
-class BufferAccessCollector : public StmtExprVisitor {
+class StorageAccessCollector : public StmtExprVisitor {
 public:
-  BufferSet touched;
+  std::vector<Var> touched;
 
   void Run(const Stmt &s) { StmtExprVisitor::VisitStmt(s); }
 
 private:
+  StorageSet seen_;
+
+  void Record(const Buffer &buffer) {
+    if (!IsAscendOnChipBuffer(buffer))
+      return;
+    const Var &storage = buffer->data;
+    if (seen_.insert(storage).second)
+      touched.push_back(storage);
+  }
+
   void VisitExpr_(const BufferLoadNode *op) final {
-    touched.insert(op->buffer);
+    Record(op->buffer);
     StmtExprVisitor::VisitExpr_(op);
   }
   void VisitStmt_(const BufferStoreNode *op) final {
-    touched.insert(op->buffer);
+    Record(op->buffer);
     StmtExprVisitor::VisitStmt_(op);
   }
   void VisitStmt_(const SBlockNode *op) final {
     for (const auto &r : op->reads)
-      touched.insert(r->buffer);
+      Record(r->buffer);
     for (const auto &w : op->writes)
-      touched.insert(w->buffer);
+      Record(w->buffer);
     StmtExprVisitor::VisitStmt_(op);
   }
   void VisitExpr_(const CallNode *op) final {
@@ -423,10 +452,10 @@ private:
     static const auto access_ptr_op = Op::Get("tl.access_ptr");
     if (op->op.same_as(region_op) && !op->args.empty()) {
       if (const auto *bl = op->args[0].as<BufferLoadNode>())
-        touched.insert(bl->buffer);
+        Record(bl->buffer);
     } else if (op->op.same_as(access_ptr_op) && !op->args.empty()) {
       if (const auto *bl = op->args[0].as<BufferLoadNode>())
-        touched.insert(bl->buffer);
+        Record(bl->buffer);
     }
     StmtExprVisitor::VisitExpr_(op);
   }
@@ -464,37 +493,31 @@ private:
   // synchronization directly.
   StorageSet manual_buffers_;
 
-  static bool IsOnChipMultiBufferScope(const Buffer &b) {
-    return IsSharedBuffer(b) || IsL1Buffer(b) || IsL0CBuffer(b) ||
-           IsL0ABuffer(b) || IsL0BBuffer(b);
-  }
-
-  static BufferSet CollectTouched(const Stmt &s) {
-    BufferAccessCollector c;
+  static std::vector<Var> CollectTouched(const Stmt &s) {
+    StorageAccessCollector c;
     c.Run(s);
     return std::move(c.touched);
   }
 
   static StorageSet CollectTouchedStorages(const Stmt &s) {
     StorageSet storages;
-    for (const Buffer &buffer : CollectTouched(s))
-      storages.insert(buffer->data);
+    for (const Var &storage : CollectTouched(s))
+      storages.insert(storage);
     return storages;
   }
 
-  // Walk `s` and collect every buffer that any nested For has already claimed
-  // via "multi_buffer_eligible". Used so that an outer For doesn't
-  // re-claim a buffer that an inner For will multi-buffer — the storage is
+  // Walk `s` and collect every storage that any nested For has already claimed
+  // via kMultiBufferEligible. Used so that an outer For doesn't re-claim a
+  // storage that an inner For will multi-buffer — the storage is
   // owned by the innermost claimant.
   static StorageSet CollectInnerClaimed(const Stmt &s) {
     struct Visitor : public StmtVisitor {
       StorageSet claimed;
       void VisitStmt_(const ForNode *op) final {
-        auto v = op->annotations.Get("multi_buffer_eligible");
+        auto v = op->annotations.Get(kMultiBufferEligible);
         if (v.has_value()) {
-          for (const auto &b : v.value().cast<Array<Buffer>>()) {
-            claimed.insert(b->data);
-          }
+          for (const Var &storage : NormalizeEligibleStorages(v.value()))
+            claimed.insert(storage);
         }
         StmtVisitor::VisitStmt_(op);
       }
@@ -545,45 +568,43 @@ private:
     // additional candidates (the user pins unwanted ones to a single version
     // via T.annotate_buffer_versions instead).
     auto inner_claimed = CollectInnerClaimed(new_body);
-    Array<Buffer> eligible;
+    Array<Var> eligible;
     StorageSet already;
-    if (auto v = op->annotations.Get("multi_buffer_eligible")) {
-      for (const auto &b : v.value().cast<Array<Buffer>>()) {
-        if (!inner_claimed.count(b->data) && already.insert(b->data).second)
-          eligible.push_back(b);
+    if (auto v = op->annotations.Get(kMultiBufferEligible)) {
+      for (const Var &storage : NormalizeEligibleStorages(v.value())) {
+        if (!inner_claimed.count(storage) && already.insert(storage).second)
+          eligible.push_back(storage);
       }
     }
 
-    auto touched = CollectTouched(new_body);
-    for (const auto &buf : touched) {
-      if (already.count(buf->data))
+    std::vector<Var> touched = CollectTouched(new_body);
+    for (const Var &storage : touched) {
+      if (already.count(storage))
         continue;
       // Manually multi-buffered buffers are never pass-versioned.
-      if (manual_buffers_.count(buf->data))
+      if (manual_buffers_.count(storage))
         continue;
-      if (!IsOnChipMultiBufferScope(buf))
-        continue;
-      if (parent_used.count(buf->data))
+      if (parent_used.count(storage))
         continue;
       // An inner For has already claimed this buffer for multi-buffering;
       // the outer For must not also claim it.
-      if (inner_claimed.count(buf->data))
+      if (inner_claimed.count(storage))
         continue;
       WriteFirstClassifier cls;
-      auto order = cls.Classify(new_body, buf);
+      auto order = cls.Classify(new_body, storage);
       // kMaybeWriteFirst is also safe for multi-buffering: each iteration
       // either skips the buffer or writes-first to it.
       if (order == AccessOrder::kWriteFirst ||
           order == AccessOrder::kMaybeWriteFirst) {
-        already.insert(buf->data);
-        eligible.push_back(buf);
+        already.insert(storage);
+        eligible.push_back(storage);
       }
     }
 
     For for_node = GetRef<For>(op);
     auto *n = for_node.CopyOnWrite();
     n->body = new_body;
-    n->annotations.Set("multi_buffer_eligible", eligible);
+    n->annotations.Set(kMultiBufferEligible, eligible);
     return for_node;
   }
 

@@ -67,7 +67,9 @@ struct BufferAccessPoint {
 struct DepInfo {
   IRStructure *prod_node;
   IRStructure *cons_node;
-  Buffer buffer;
+  // Storage identity shared by every Buffer alias participating in this
+  // dependency.
+  Var storage;
   // Conflicting (producer access, consumer access) pairs. Each pair is a
   // concrete producer→consumer ordering that needs a sync.
   std::vector<std::pair<BufferAccessPoint, BufferAccessPoint>> task_pairs;

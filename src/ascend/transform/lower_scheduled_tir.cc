@@ -353,7 +353,7 @@ Map<String, ffi::Any>
 FilterSchedulingAnnotations(const Map<String, ffi::Any> &annotations) {
   Map<String, ffi::Any> result = annotations;
   result.erase("num_stages");
-  result.erase("multi_buffer_eligible");
+  result.erase(kMultiBufferEligible);
   result.erase("no_conflict");
   return result;
 }

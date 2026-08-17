@@ -39,6 +39,9 @@ constexpr const char *kBufferVersionsMap = "tl.buffer_versions_map";
 /*! \brief Manual-version annotation and physical-version staging key. */
 constexpr const char *kManualMultiBuffer = "tl.manual_multi_buffer";
 
+/*! \brief Loop-local list of storage Vars eligible for automatic versioning. */
+constexpr const char *kMultiBufferEligible = "multi_buffer_eligible";
+
 /*! \brief Storage data Var -> positive compile-time version count. */
 using BufferVersionMap = ffi::Map<tirx::Var, int>;
 

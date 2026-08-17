@@ -60,8 +60,8 @@
 #include "buffer_version.h"
 #include "layout/layout.h"
 #include "op/builtin.h"
-#include "op/utils.h"
 #include "support/check.h"
+#include "tir/transforms/ir_utils.h"
 #include "transform/common/attr.h"
 
 namespace tvm {
@@ -196,20 +196,22 @@ void AppendSyncTaskNodes(std::vector<std::shared_ptr<IRStructure>> *result,
   }
 }
 
-struct MultiVersionBufferInfo {
-  Buffer buffer;
+struct MultiBufferInfo {
+  Var storage;
   int num_versions;
-  Buffer new_buffer;
   std::vector<For> claim_loops;
 
-  MultiVersionBufferInfo(Buffer buffer, int num_versions, Buffer new_buffer,
-                         std::vector<For> claim_loops = {})
-      : buffer(buffer), num_versions(num_versions), new_buffer(new_buffer),
+  MultiBufferInfo(Var storage, int num_versions,
+                  std::vector<For> claim_loops = {})
+      : storage(std::move(storage)), num_versions(num_versions),
         claim_loops(std::move(claim_loops)) {}
 };
 
-using MultiVersionBufferMap = std::unordered_map<Buffer, MultiVersionBufferInfo,
-                                                 ObjectPtrHash, ObjectPtrEqual>;
+using MultiBufferInfoMap =
+    std::unordered_map<Var, MultiBufferInfo, ObjectPtrHash, ObjectPtrEqual>;
+using VersionedBufferMap =
+    std::unordered_map<Buffer, Buffer, ObjectPtrHash, ObjectPtrEqual>;
+using BufferSet = std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>;
 
 struct FlagInfo {
   CoreMask core_mask;
@@ -505,8 +507,11 @@ public:
   void Build(std::vector<std::shared_ptr<IRStructure>> &root);
 
   const FlagInfoList &GetFlagInfos() const { return flag_infos_; }
-  const std::vector<MultiVersionBufferInfo> &GetBufferInfos() const {
-    return buffer_infos_;
+  const std::vector<MultiBufferInfo> &GetMultiBufferInfos() const {
+    return multi_buffer_infos_;
+  }
+  const VersionedBufferMap &GetVersionedBuffers() const {
+    return versioned_buffers_;
   }
 
 private:
@@ -532,7 +537,7 @@ private:
                     const ControlNode *cache_key);
 
   std::optional<int> GetClaimedBufferVersion(const ControlNode *control,
-                                             const Var &data) const;
+                                             const Var &storage) const;
 
   void AddPromotedChildClosure(DepClosure &out, const IRStructure *child,
                                const DepClosure &child_closure) const;
@@ -626,9 +631,10 @@ private:
   CrossCoreFlagReservation cross_core_flag_reservation_;
 
   FlagInfoList flag_infos_;
-  std::vector<MultiVersionBufferInfo> buffer_infos_;
+  std::vector<MultiBufferInfo> multi_buffer_infos_;
 
-  MultiVersionBufferMap buffer_info_map_;
+  MultiBufferInfoMap active_multi_buffers_;
+  VersionedBufferMap versioned_buffers_;
   std::vector<SyncPoint> sync_points_;
   std::set<std::pair<size_t, size_t>> reusable_pairs_;
   DependencyCache dependency_cache_;
@@ -666,36 +672,63 @@ inline Stmt MakeAscendCrossCoreWaitFlag(int mode_id, const std::string &pipe,
                        {Integer(mode_id), StringImm(pipe), flag_id}));
 }
 
+Buffer CreateVersionedBuffer(const Buffer &buffer, int num_versions) {
+  ObjectPtr<BufferNode> versioned =
+      tvm::ffi::make_object<BufferNode>(*(buffer.get()));
+  versioned->shape.insert(versioned->shape.begin(), PrimExpr(num_versions));
+  if (!versioned->strides.empty()) {
+    ICHECK(versioned->strides.size() + 1 == versioned->shape.size());
+    PrimExpr stride_0 = versioned->strides[0] * versioned->shape[1];
+    versioned->strides.insert(versioned->strides.begin(), stride_0);
+  }
+  return Buffer(versioned);
+}
+
+Buffer GetOrCreateVersionedBuffer(const Buffer &buffer, int num_versions,
+                                  VersionedBufferMap *versioned_buffers) {
+  auto existing = versioned_buffers->find(buffer);
+  if (existing != versioned_buffers->end())
+    return existing->second;
+  Buffer versioned = CreateVersionedBuffer(buffer, num_versions);
+  versioned_buffers->emplace(buffer, versioned);
+  return versioned;
+}
+
 class MultiBufferAccessRewriter : public StmtExprMutator {
 public:
-  explicit MultiBufferAccessRewriter(const MultiVersionBufferMap &multi_buffer)
-      : multi_buffer_(multi_buffer) {}
+  MultiBufferAccessRewriter(const MultiBufferInfoMap &multi_buffer_infos,
+                            VersionedBufferMap *versioned_buffers)
+      : multi_buffer_infos_(multi_buffer_infos),
+        versioned_buffers_(versioned_buffers) {}
 
 private:
+  const MultiBufferInfo *GetMultiBufferInfo(const Buffer &buffer) const {
+    auto it = multi_buffer_infos_.find(buffer->data);
+    return it == multi_buffer_infos_.end() ? nullptr : &it->second;
+  }
+
   PrimExpr VisitExpr_(const BufferLoadNode *op) override {
     BufferLoad load = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
-    auto it = multi_buffer_.find(load->buffer);
-    if (it != multi_buffer_.end()) {
-      const auto &info = it->second;
+    if (const MultiBufferInfo *info = GetMultiBufferInfo(load->buffer)) {
       auto *n = load.CopyOnWrite();
-      n->buffer = info.new_buffer;
-      PrimExpr iteration = CalculateIterationCount(info.claim_loops);
+      n->buffer = GetOrCreateVersionedBuffer(n->buffer, info->num_versions,
+                                             versioned_buffers_);
+      PrimExpr iteration = CalculateIterationCount(info->claim_loops);
       n->indices.insert(n->indices.begin(),
-                        indexmod(iteration, Integer(info.num_versions)));
+                        indexmod(iteration, Integer(info->num_versions)));
     }
     return load;
   }
 
   Stmt VisitStmt_(const BufferStoreNode *op) override {
     BufferStore store = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
-    auto it = multi_buffer_.find(store->buffer);
-    if (it != multi_buffer_.end()) {
-      const auto &info = it->second;
+    if (const MultiBufferInfo *info = GetMultiBufferInfo(store->buffer)) {
       auto *n = store.CopyOnWrite();
-      n->buffer = info.new_buffer;
-      PrimExpr iteration = CalculateIterationCount(info.claim_loops);
+      n->buffer = GetOrCreateVersionedBuffer(n->buffer, info->num_versions,
+                                             versioned_buffers_);
+      PrimExpr iteration = CalculateIterationCount(info->claim_loops);
       n->indices.insert(n->indices.begin(),
-                        indexmod(iteration, Integer(info.num_versions)));
+                        indexmod(iteration, Integer(info->num_versions)));
     }
     return store;
   }
@@ -704,8 +737,7 @@ private:
     static const auto region_op = Op::Get("tl.tileop.region");
     if (op->op.same_as(region_op) && op->args.size() >= 2) {
       if (const auto *buffer_load = op->args[0].as<BufferLoadNode>()) {
-        auto it = multi_buffer_.find(buffer_load->buffer);
-        if (it != multi_buffer_.end()) {
+        if (GetMultiBufferInfo(buffer_load->buffer)) {
           ffi::Array<PrimExpr> new_args;
           new_args.push_back(VisitExpr(op->args[0]));
           new_args.push_back(VisitExpr(op->args[1]));
@@ -720,7 +752,8 @@ private:
     return StmtExprMutator::VisitExpr_(op);
   }
 
-  const MultiVersionBufferMap &multi_buffer_;
+  const MultiBufferInfoMap &multi_buffer_infos_;
+  VersionedBufferMap *versioned_buffers_;
 };
 
 Layout ExpandLayoutToBuffer(const Buffer &layout_buffer,
@@ -773,12 +806,10 @@ bool AddLayoutForBuffer(Map<Buffer, Layout> *layout_map, const Buffer &buffer) {
 // StmtMutator to rewrite alloc_buffers in SBlock nodes for double buffering
 class AllocBufferRewriter : public StmtMutator {
 public:
-  AllocBufferRewriter(const std::vector<MultiVersionBufferInfo> &buffer_infos)
-      : buffer_infos_(buffer_infos) {
-    for (const auto &info : buffer_infos_) {
-      buffer_remap_[info.buffer] = info.new_buffer;
-    }
-  }
+  AllocBufferRewriter(const MultiBufferInfoMap &multi_buffer_infos,
+                      VersionedBufferMap *versioned_buffers)
+      : multi_buffer_infos_(multi_buffer_infos),
+        versioned_buffers_(versioned_buffers) {}
 
 private:
   Stmt VisitStmt_(const SBlockNode *op) override {
@@ -797,9 +828,10 @@ private:
       }
     }
     for (auto buffer : op->alloc_buffers) {
-      auto it = buffer_remap_.find(buffer);
-      if (it != buffer_remap_.end()) {
-        new_alloc_buffers.push_back(it->second);
+      auto info = multi_buffer_infos_.find(buffer->data);
+      if (info != multi_buffer_infos_.end()) {
+        new_alloc_buffers.push_back(GetOrCreateVersionedBuffer(
+            buffer, info->second.num_versions, versioned_buffers_));
         needs_update = true;
       } else {
         new_alloc_buffers.push_back(buffer);
@@ -825,27 +857,40 @@ private:
     return Stmt(new_block);
   }
 
-  const std::vector<MultiVersionBufferInfo> &buffer_infos_;
-  std::unordered_map<Buffer, Buffer, ObjectPtrHash, ObjectPtrEqual>
-      buffer_remap_;
+  const MultiBufferInfoMap &multi_buffer_infos_;
+  VersionedBufferMap *versioned_buffers_;
 };
 
 class BroadcastMultiBufferRewriter : public StmtExprMutator {
 public:
-  explicit BroadcastMultiBufferRewriter(
-      const std::vector<MultiVersionBufferInfo> &buffer_infos) {
-    for (const auto &info : buffer_infos) {
-      multi_buffer_[info.buffer] = info.new_buffer;
-    }
+  BroadcastMultiBufferRewriter(const MultiBufferInfoMap &multi_buffer_infos,
+                               VersionedBufferMap versioned_buffers)
+      : multi_buffer_infos_(multi_buffer_infos),
+        versioned_buffers_(std::move(versioned_buffers)) {
+    for (const auto &[_, versioned] : versioned_buffers_)
+      already_versioned_.insert(versioned);
   }
 
 private:
+  const MultiBufferInfo *GetMultiBufferInfo(const Buffer &buffer) const {
+    if (already_versioned_.count(buffer))
+      return nullptr;
+    auto it = multi_buffer_infos_.find(buffer->data);
+    return it == multi_buffer_infos_.end() ? nullptr : &it->second;
+  }
+
+  Buffer GetVersionedBuffer(const Buffer &buffer, const MultiBufferInfo &info) {
+    Buffer versioned = GetOrCreateVersionedBuffer(buffer, info.num_versions,
+                                                  &versioned_buffers_);
+    already_versioned_.insert(versioned);
+    return versioned;
+  }
+
   PrimExpr VisitExpr_(const BufferLoadNode *op) override {
     BufferLoad load = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
-    auto it = multi_buffer_.find(load->buffer);
-    if (it != multi_buffer_.end()) {
+    if (const MultiBufferInfo *info = GetMultiBufferInfo(load->buffer)) {
       auto *n = load.CopyOnWrite();
-      n->buffer = it->second;
+      n->buffer = GetVersionedBuffer(n->buffer, *info);
       n->indices.insert(n->indices.begin(), IntImm(DataType::Int(32), 0));
     }
     return load;
@@ -853,10 +898,9 @@ private:
 
   Stmt VisitStmt_(const BufferStoreNode *op) override {
     BufferStore store = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
-    auto it = multi_buffer_.find(store->buffer);
-    if (it != multi_buffer_.end()) {
+    if (const MultiBufferInfo *info = GetMultiBufferInfo(store->buffer)) {
       auto *n = store.CopyOnWrite();
-      n->buffer = it->second;
+      n->buffer = GetVersionedBuffer(n->buffer, *info);
       n->indices.insert(n->indices.begin(), IntImm(DataType::Int(32), 0));
     }
     return store;
@@ -866,13 +910,12 @@ private:
     static const auto region_op = Op::Get("tl.tileop.region");
     if (op->op.same_as(region_op) && op->args.size() >= 2) {
       if (const auto *buffer_load = op->args[0].as<BufferLoadNode>()) {
-        auto it = multi_buffer_.find(buffer_load->buffer);
-        if (it != multi_buffer_.end()) {
-          auto num_versions = it->second->shape[0];
+        if (const MultiBufferInfo *info =
+                GetMultiBufferInfo(buffer_load->buffer)) {
           ffi::Array<PrimExpr> new_args;
           new_args.push_back(VisitExpr(op->args[0]));
           new_args.push_back(VisitExpr(op->args[1]));
-          new_args.push_back(num_versions);
+          new_args.push_back(Integer(info->num_versions));
           for (size_t i = 2; i < op->args.size(); i++) {
             new_args.push_back(VisitExpr(op->args[i]));
           }
@@ -883,26 +926,43 @@ private:
     return StmtExprMutator::VisitExpr_(op);
   }
 
-  std::unordered_map<Buffer, Buffer, ObjectPtrHash, ObjectPtrEqual>
-      multi_buffer_;
+  const MultiBufferInfoMap &multi_buffer_infos_;
+  VersionedBufferMap versioned_buffers_;
+  BufferSet already_versioned_;
 };
 
-static Stmt
-RewriteAllocBuffers(const Stmt &stmt,
-                    const std::vector<MultiVersionBufferInfo> &buffer_infos) {
-  if (buffer_infos.empty()) {
+MultiBufferInfoMap BuildMultiBufferInfoMap(
+    const std::vector<MultiBufferInfo> &multi_buffer_infos) {
+  MultiBufferInfoMap result;
+  for (const MultiBufferInfo &info : multi_buffer_infos) {
+    bool inserted = result.emplace(info.storage, info).second;
+    ICHECK(inserted) << "Automatic multi-buffer storage " << info.storage
+                     << " is claimed by more than one loop";
+  }
+  return result;
+}
+
+static Stmt RewriteAllocBuffers(Stmt stmt,
+                                const MultiBufferInfoMap &multi_buffer_infos,
+                                VersionedBufferMap *versioned_buffers) {
+  if (multi_buffer_infos.empty()) {
     return stmt;
   }
-  AllocBufferRewriter rewriter(buffer_infos);
-  return rewriter(stmt);
+  AllocBufferRewriter rewriter(multi_buffer_infos, versioned_buffers);
+  return rewriter(std::move(stmt));
 }
 
 Stmt MaterializeMultiVersionBuffers(
-    Stmt stmt, const std::vector<MultiVersionBufferInfo> &buffer_infos) {
-  if (buffer_infos.empty())
+    Stmt stmt, const std::vector<MultiBufferInfo> &multi_buffer_infos,
+    VersionedBufferMap versioned_buffers) {
+  if (multi_buffer_infos.empty())
     return stmt;
-  stmt = RewriteAllocBuffers(stmt, buffer_infos);
-  return BroadcastMultiBufferRewriter(buffer_infos)(std::move(stmt));
+  MultiBufferInfoMap multi_buffer_info_map =
+      BuildMultiBufferInfoMap(multi_buffer_infos);
+  stmt = RewriteAllocBuffers(std::move(stmt), multi_buffer_info_map,
+                             &versioned_buffers);
+  return BroadcastMultiBufferRewriter(
+      multi_buffer_info_map, std::move(versioned_buffers))(std::move(stmt));
 }
 
 // Collect every mode-0 CrossCore flag range used explicitly by the source
@@ -984,20 +1044,21 @@ static void AddBufferVersion(BufferVersionMap *buffer_versions, const Var &data,
 
 static BufferVersionMap BuildPhysicalBufferVersions(
     const BufferVersionMap &manual_buffer_versions,
-    const std::vector<MultiVersionBufferInfo> &automatic_buffer_versions) {
+    const std::vector<MultiBufferInfo> &automatic_multi_buffers) {
   BufferVersionMap result;
   for (const auto &[data, num_versions] : manual_buffer_versions) {
     AddBufferVersion(&result, data, num_versions);
   }
-  for (const MultiVersionBufferInfo &info : automatic_buffer_versions) {
-    AddBufferVersion(&result, info.new_buffer->data, info.num_versions);
+  for (const MultiBufferInfo &info : automatic_multi_buffers) {
+    AddBufferVersion(&result, info.storage, info.num_versions);
   }
   return result;
 }
 
 struct SyncKernelUpdate {
   ScheduledTIR scheduled_tir;
-  std::vector<MultiVersionBufferInfo> buffer_infos;
+  std::vector<MultiBufferInfo> multi_buffer_infos;
+  VersionedBufferMap versioned_buffers;
 };
 
 static SyncKernelUpdate InsertKernelSync(const Stmt &kernel_body,
@@ -1041,31 +1102,20 @@ static SyncKernelUpdate InsertKernelSync(const Stmt &kernel_body,
   sync_root.insert(sync_root.end(), suffix.begin(), suffix.end());
   for (size_t i = 0; i < sync_root.size(); ++i)
     sync_root[i]->SetIndex(i);
-  const std::vector<MultiVersionBufferInfo> &buffer_infos =
-      inserter.GetBufferInfos();
+  const std::vector<MultiBufferInfo> &multi_buffer_infos =
+      inserter.GetMultiBufferInfos();
   BufferVersionMap buffer_versions = BuildPhysicalBufferVersions(
-      metadata.manual_buffer_versions, buffer_infos);
+      metadata.manual_buffer_versions, multi_buffer_infos);
   metadata.buffer_versions = {};
   metadata.manual_buffer_versions = std::move(buffer_versions);
   SyncKernelUpdate update;
   update.scheduled_tir = std::move(scheduled_tir);
-  update.buffer_infos = buffer_infos;
+  update.multi_buffer_infos = multi_buffer_infos;
+  update.versioned_buffers = inserter.GetVersionedBuffers();
   return update;
 }
 
 // Synchronization analysis and insertion.
-
-Buffer CreateNewBuffer(const Buffer &buffer, int num_versions) {
-  ObjectPtr<BufferNode> new_buffer =
-      tvm::ffi::make_object<BufferNode>(*(buffer.get()));
-  new_buffer->shape.insert(new_buffer->shape.begin(), PrimExpr(num_versions));
-  if (!new_buffer->strides.empty()) {
-    ICHECK(new_buffer->strides.size() + 1 == new_buffer->shape.size());
-    PrimExpr stride_0 = new_buffer->strides[0] * new_buffer->shape[1];
-    new_buffer->strides.insert(new_buffer->strides.begin(), stride_0);
-  }
-  return Buffer(new_buffer);
-}
 
 void SyncInserter::InsertStatement(IRStructure *node, Stmt stmt,
                                    bool at_beginning, CoreMask core,
@@ -1220,6 +1270,11 @@ void SyncInserter::CollectAllInsertionSites(
   }
 }
 
+bool IsRegisterStorage(const Var &storage) {
+  std::string scope = GetPtrStorageScope(storage);
+  return scope == "local" || scope == "local.var" || scope == "local.fragment";
+}
+
 std::vector<SyncPoint>
 SyncInserter::CollectSyncPoints(const std::vector<IRStructure *> &nodes,
                                 const ControlNode *cache_key) {
@@ -1238,7 +1293,7 @@ SyncInserter::CollectSyncPoints(const std::vector<IRStructure *> &nodes,
 
   std::vector<SyncPoint> sync_points;
   for (const auto &dep : deps) {
-    if (IsLocalBuffer(dep.buffer, true) || IsFragmentBuffer(dep.buffer)) {
+    if (IsRegisterStorage(dep.storage)) {
       continue;
     }
 
@@ -1246,20 +1301,20 @@ SyncInserter::CollectSyncPoints(const std::vector<IRStructure *> &nodes,
     if (dep.distance >= 0) {
       distance = dep.distance;
     } else if (std::optional<int> num_versions =
-                   GetClaimedBufferVersion(cache_key, dep.buffer->data)) {
+                   GetClaimedBufferVersion(cache_key, dep.storage)) {
       distance = num_versions.value();
     } else {
       distance = 1;
     }
     int num_versions = 1;
     std::vector<For> flag_loops;
-    auto buffer_info_it = buffer_info_map_.find(dep.buffer);
-    if (buffer_info_it != buffer_info_map_.end()) {
-      const auto &info = buffer_info_it->second;
+    auto multi_buffer = active_multi_buffers_.find(dep.storage);
+    if (multi_buffer != active_multi_buffers_.end()) {
+      const MultiBufferInfo &info = multi_buffer->second;
       num_versions = info.num_versions;
       flag_loops = info.claim_loops;
     } else {
-      auto it = manual_buffer_versions_.find(dep.buffer->data);
+      auto it = manual_buffer_versions_.find(dep.storage);
       if (it != manual_buffer_versions_.end()) {
         if (dep.distance > 0) {
           num_versions = dep.distance;
@@ -1298,18 +1353,18 @@ SyncInserter::CollectSyncPoints(const std::vector<IRStructure *> &nodes,
 
 std::optional<int>
 SyncInserter::GetClaimedBufferVersion(const ControlNode *control,
-                                      const Var &data) const {
+                                      const Var &storage) const {
   if (control == nullptr)
     return std::nullopt;
 
-  auto claims = control->control->annotations.Get("multi_buffer_eligible");
+  auto claims = control->control->annotations.Get(kMultiBufferEligible);
   if (!claims.has_value())
     return std::nullopt;
 
-  for (const Buffer &buffer : claims.value().cast<Array<Buffer>>()) {
-    if (!buffer->data.same_as(data))
+  for (const Var &claimed_storage : claims.value().cast<Array<Var>>()) {
+    if (!claimed_storage.same_as(storage))
       continue;
-    auto selected = buffer_versions_.find(data);
+    auto selected = buffer_versions_.find(storage);
     if (selected == buffer_versions_.end())
       return std::nullopt;
     return (*selected).second;
@@ -1847,44 +1902,21 @@ SyncAnalysisResult SyncInserter::AnalyzeNode(IRStructure *node) {
       return {DepClosure(sites_.size()), {}};
     loop_stack_.push_back(ctrl->control);
 
-    // Create new buffers for multi-buffer before recursing so nested accesses
-    // can use the claim-level iteration for both data and flags.
-    std::vector<Buffer> scoped_buffers;
-    std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> scoped_storages;
-    for (auto &region : ctrl->GetWriteRegions()) {
-      auto &buffer = region.get()->buffer;
-      if (buffer_info_map_.find(buffer) != buffer_info_map_.end())
+    // Activate one versioning record per claimed storage before recursing so
+    // every Buffer alias uses the same claim-level iteration for data and
+    // flags.
+    std::vector<Var> scoped_storages;
+    for (const BufferRegion &region : ctrl->GetWriteRegions()) {
+      const Var &storage = region->buffer->data;
+      if (active_multi_buffers_.count(storage))
         continue;
-      std::optional<int> num_versions =
-          GetClaimedBufferVersion(ctrl, buffer->data);
+      std::optional<int> num_versions = GetClaimedBufferVersion(ctrl, storage);
       if (!num_versions.has_value())
         continue;
-      auto new_buffer = CreateNewBuffer(buffer, num_versions.value());
-      MultiVersionBufferInfo info(buffer, num_versions.value(), new_buffer,
-                                  loop_stack_);
-      buffer_info_map_.emplace(buffer, info);
-      buffer_infos_.push_back(std::move(info));
-      scoped_buffers.push_back(buffer);
-      scoped_storages.insert(buffer->data);
-    }
-    // View/reshape aliases share storage (->data) with a multi-buffered write
-    // buffer; give them the same versioning so their accesses stay consistent.
-    for (auto &region : ctrl->GetReadRegions()) {
-      const auto &buffer = region.get()->buffer;
-      if (buffer_info_map_.find(buffer) != buffer_info_map_.end())
-        continue;
-      if (!scoped_storages.count(buffer->data))
-        continue;
-      std::optional<int> num_versions =
-          GetClaimedBufferVersion(ctrl, buffer->data);
-      if (!num_versions.has_value())
-        continue;
-      MultiVersionBufferInfo info(buffer, num_versions.value(),
-                                  CreateNewBuffer(buffer, num_versions.value()),
-                                  loop_stack_);
-      buffer_info_map_.emplace(buffer, info);
-      buffer_infos_.push_back(std::move(info));
-      scoped_buffers.push_back(buffer);
+      MultiBufferInfo info(storage, num_versions.value(), loop_stack_);
+      active_multi_buffers_.emplace(storage, info);
+      multi_buffer_infos_.push_back(std::move(info));
+      scoped_storages.push_back(storage);
     }
 
     std::vector<IRStructure *> nodes;
@@ -1893,8 +1925,8 @@ SyncAnalysisResult SyncInserter::AnalyzeNode(IRStructure *node) {
     SyncAnalysisResult result =
         AnalyzeNodeList(std::move(nodes), ctrl, /*is_loop_body=*/true);
 
-    for (const auto &buffer : scoped_buffers)
-      buffer_info_map_.erase(buffer);
+    for (const Var &storage : scoped_storages)
+      active_multi_buffers_.erase(storage);
     loop_stack_.pop_back();
     if (!ctrl->BodyHasLoopBreak()) {
       for (size_t index : result.visible_sync_points) {
@@ -1908,7 +1940,8 @@ SyncAnalysisResult SyncInserter::AnalyzeNode(IRStructure *node) {
 
   if (node->IsTask()) {
     auto *task = static_cast<TaskNode *>(node);
-    MultiBufferAccessRewriter rewriter(buffer_info_map_);
+    MultiBufferAccessRewriter rewriter(active_multi_buffers_,
+                                       &versioned_buffers_);
     task->stmt = rewriter(task->stmt);
     return {DepClosure(sites_.size()), {}};
   }
@@ -1933,7 +1966,7 @@ void SyncInserter::Build(std::vector<std::shared_ptr<IRStructure>> &root) {
   RebuildIRStructureParents(root);
 
   ICHECK(loop_stack_.empty());
-  ICHECK(buffer_info_map_.empty());
+  ICHECK(active_multi_buffers_.empty());
 }
 
 } // namespace
@@ -1952,8 +1985,9 @@ tvm::transform::Pass InsertSync() {
           SyncKernelUpdate update =
               InsertKernelSync(context.root->body, std::move(scheduled_tir));
           Stmt serialized = EncodeScheduledTIR(std::move(update.scheduled_tir));
-          serialized = MaterializeMultiVersionBuffers(std::move(serialized),
-                                                      update.buffer_infos);
+          serialized = MaterializeMultiVersionBuffers(
+              std::move(serialized), update.multi_buffer_infos,
+              std::move(update.versioned_buffers));
           const auto *rewritten_root = serialized.as<SBlockNode>();
           ICHECK(rewritten_root)
               << "Multi-buffer materialization must preserve tilelang_root";

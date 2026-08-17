@@ -34,7 +34,6 @@
 #include <cstdint>
 #include <unordered_map>
 #include <utility>
-#include <vector>
 
 #include "arith/ir_mutator_with_analyzer.h"
 #include "op/builtin.h"
@@ -51,18 +50,12 @@ namespace {
 
 constexpr int kVersionAlignmentBits = 256;
 
-// A single storage Var may back several Buffer objects (the allocation plus
-// any T.view / T.reshape aliases), so collect every alias sharing the Var
-// rather than assuming a unique owner.
-using AllocationTable =
-    std::unordered_map<Var, std::vector<Buffer>, ObjectPtrHash, ObjectPtrEqual>;
-
 bool IsUnifiedBuffer(const Var &data) {
   String scope = GetPtrStorageScope(data);
   return scope == "shared" || scope == "shared.dyn";
 }
 
-class StorageMetadataCollector : public StmtExprVisitor {
+class BufferVersionCollector : public StmtExprVisitor {
 public:
   void VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key == tl::attr::kBufferVersion) {
@@ -82,13 +75,45 @@ public:
     StmtExprVisitor::VisitStmt_(op);
   }
 
+  BufferVersionMap versions_;
+};
+
+struct StorageAllocationInfo {
+  bool has_allocation{false};
+  Optional<Buffer> version_carrier;
+};
+
+using StorageAllocationTable =
+    std::unordered_map<Var, StorageAllocationInfo, ObjectPtrHash,
+                       ObjectPtrEqual>;
+
+class VersionedStorageAllocationCollector : public StmtExprVisitor {
+public:
+  explicit VersionedStorageAllocationCollector(BufferVersionMap versions)
+      : versions_(std::move(versions)) {}
+
   void VisitStmt_(const AllocBufferNode *op) final {
-    allocations_[op->buffer->data].push_back(op->buffer);
+    const Buffer &buffer = op->buffer;
+    auto version = versions_.find(buffer->data);
+    if (version != versions_.end()) {
+      StorageAllocationInfo &info = allocations_[buffer->data];
+      info.has_allocation = true;
+      if (!info.version_carrier.has_value() && !buffer->shape.empty()) {
+        arith::Analyzer analyzer;
+        if (analyzer.CanProveEqual(
+                buffer->shape[0],
+                make_const(buffer->shape[0].dtype(), (*version).second))) {
+          info.version_carrier = buffer;
+        }
+      }
+    }
     StmtExprVisitor::VisitStmt_(op);
   }
 
+  StorageAllocationTable allocations_;
+
+private:
   BufferVersionMap versions_;
-  AllocationTable allocations_;
 };
 
 // Physical layout of one versioned storage, kept in *bit* units so aliases
@@ -106,42 +131,24 @@ struct StorageLayout {
 using StorageLayoutTable =
     std::unordered_map<Var, StorageLayout, ObjectPtrHash, ObjectPtrEqual>;
 
-// Return an alias whose leading axis provably enumerates the `num_versions`
-// physical versions (its trailing axes are then one logical slot). Such an
-// alias means the versions occupy N equal, contiguous slots that this pass may
-// realign. Returns nullopt when no alias exposes the version axis (e.g. a flat
-// count-only manual buffer that hand-lays-out its own slots).
-Optional<Buffer> FindVersionCarryingAlias(const std::vector<Buffer> &aliases,
-                                          int num_versions,
-                                          arith::Analyzer *analyzer) {
-  for (const Buffer &buffer : aliases) {
-    if (buffer->shape.empty()) {
-      continue;
-    }
-    if (analyzer->CanProveEqual(
-            buffer->shape[0],
-            make_const(buffer->shape[0].dtype(), num_versions))) {
-      return buffer;
-    }
-  }
-  return std::nullopt;
-}
-
 // Rewrite to a physical one-dimensional view before the generic FlattenBuffer
 // pass. Merely changing a leading-axis stride would handle [versions, ...],
 // but not manually versioned flat buffers or aliases that hide that axis.
 class BufferVersionLayoutRewriter : public arith::IRMutatorWithAnalyzer {
 public:
   static PrimFunc Rewrite(PrimFunc func) {
-    StorageMetadataCollector collector;
-    collector(func->body);
-    if (collector.versions_.empty()) {
+    BufferVersionCollector version_collector;
+    version_collector(func->body);
+    if (version_collector.versions_.empty()) {
       return func;
     }
+    VersionedStorageAllocationCollector allocation_collector(
+        version_collector.versions_);
+    allocation_collector(func->body);
 
     arith::Analyzer layout_analyzer;
     StorageLayoutTable layouts;
-    for (const auto &[data, num_versions] : collector.versions_) {
+    for (const auto &[data, num_versions] : version_collector.versions_) {
       // This pass only realigns Unified Buffer versions; L1/L0 versioned
       // storages keep their own layout. Skip before looking up the allocation
       // so that non-UB versioned buffers (which need no UB alloc here) do not
@@ -150,8 +157,9 @@ public:
         continue;
       }
 
-      auto allocation = collector.allocations_.find(data);
-      ICHECK(allocation != collector.allocations_.end())
+      auto allocation = allocation_collector.allocations_.find(data);
+      ICHECK(allocation != allocation_collector.allocations_.end() &&
+             allocation->second.has_allocation)
           << "No allocation owner found for versioned storage " << data;
 
       // The pass only owns the layout of a storage whose accesses lay out the
@@ -162,9 +170,7 @@ public:
       // intentionally decouples the ring size from the shape and hand-lays-out
       // disjoint slots plus padding/workspace; it has no such version-carrying
       // alias, so leave its layout untouched.
-      const std::vector<Buffer> &aliases = allocation->second;
-      Optional<Buffer> version_alias =
-          FindVersionCarryingAlias(aliases, num_versions, &layout_analyzer);
+      Optional<Buffer> version_alias = allocation->second.version_carrier;
       if (!version_alias.has_value()) {
         continue;
       }

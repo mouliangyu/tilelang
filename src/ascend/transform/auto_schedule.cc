@@ -203,18 +203,17 @@ public:
   }
 
 private:
-  void RecordSelectedBufferVersion(const Buffer &buffer, int num_versions) {
+  void RecordSelectedBufferVersion(const Var &storage, int num_versions) {
     if (num_versions <= 1)
       return;
-    const Var &data = buffer->data;
-    auto existing = selected_buffer_versions_.find(data);
+    auto existing = selected_buffer_versions_.find(storage);
     if (existing != selected_buffer_versions_.end()) {
       ICHECK_EQ((*existing).second, num_versions)
           << "AutoSchedule selected conflicting version counts for storage "
-          << data;
+          << storage;
       return;
     }
-    selected_buffer_versions_.Set(data, num_versions);
+    selected_buffer_versions_.Set(storage, num_versions);
   }
 
   std::map<std::string, int64_t> memory_limits_;
@@ -622,30 +621,28 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     resource_flags.push_back(static_cast<int64_t>(node->GetPipeMask()));
   }
 
-  // Multi-buffer eligible set from AnnotateMultiBufferEligible pass.
-  // The pass runs before AutoSchedule and records on the For loop
-  // which on-chip buffers are safe to multi-buffer (written before any
-  // read inside the loop, not referenced outside).
-  std::set<const VarNode *> eligible_storage_set;
+  // Storage Vars eligible for automatic multi-buffering. The annotation is
+  // normalized by AnnotateMultiBufferEligible before AutoSchedule.
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> eligible_storages;
   {
-    auto v = ctrl->control->annotations.Get("multi_buffer_eligible");
+    auto v = ctrl->control->annotations.Get(kMultiBufferEligible);
     if (v.has_value()) {
-      for (const auto &b : v.value().cast<Array<Buffer>>()) {
-        eligible_storage_set.insert(b->data.get());
-      }
+      for (const Var &storage : v.value().cast<Array<Var>>())
+        eligible_storages.insert(storage);
     }
   }
 
-  // Collect all shared buffers and detect multi-buffer candidates.
-  // Then we need to add variables and constraints in Z3 scheduler for these
-  // buffers.
-  std::vector<int64_t> buffer_sizes;
-  // Insertion-order-preserving storage->buffers map. The ordered key vector
-  // is iterated in first-encountered (program) order rather than pointer
-  // order, so buffer id assignment fed to Z3 is deterministic run-to-run.
-  std::vector<const VarNode *> storage_keys_ordered;
-  std::unordered_map<const VarNode *, std::vector<Buffer>> storage_to_buffers;
-  std::map<Buffer, size_t> buffer_var_id;
+  // Keep one representative Buffer per storage for shape/scope accounting.
+  // Version variables and dependency distances are keyed directly by storage.
+  struct StorageResource {
+    Var storage;
+    Buffer representative;
+  };
+  std::vector<int64_t> storage_sizes;
+  std::vector<StorageResource> storage_resources;
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> seen_storages;
+  std::unordered_map<Var, size_t, ObjectPtrHash, ObjectPtrEqual>
+      storage_version_id;
   // Build memory groups from memory_limits_ map.
   // std::map iteration is ordered by key: "shared" then "shared.l1".
   std::map<std::string, int> scope_to_group;
@@ -660,7 +657,8 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
       group_indices.push_back({});
     }
   }
-  std::map<Buffer, int> annotated_buffer_versions;
+  std::unordered_map<Var, int, ObjectPtrHash, ObjectPtrEqual>
+      annotated_storage_versions;
   auto get_buffer_size = [](const Buffer &buffer) -> int64_t {
     // Bits-based: dtype.bits()*lanes()/8 truncates sub-byte dtypes to 0
     // (fp4 -> 0). Accumulate elements, then ceil(elements*bits/8).
@@ -690,28 +688,13 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
         !IsL0CBuffer(buffer) && !IsL0ABuffer(buffer) && !IsL0BBuffer(buffer)) {
       return; // Only consider on-chip buffers for multi-buffer
     }
-    const VarNode *key = buffer->data.get();
-    auto it = storage_to_buffers.find(key);
-    if (it == storage_to_buffers.end()) {
-      storage_keys_ordered.push_back(key);
-      it = storage_to_buffers.emplace(key, std::vector<Buffer>{}).first;
-    }
-    auto &aliases = it->second;
-    bool seen_alias = false;
-    for (const auto &alias : aliases) {
-      if (alias.same_as(buffer)) {
-        seen_alias = true;
-        break;
-      }
-    }
-    if (!seen_alias)
-      aliases.push_back(buffer);
+    if (seen_storages.insert(buffer->data).second)
+      storage_resources.push_back({buffer->data, buffer});
   });
 
-  for (const auto *storage_key : storage_keys_ordered) {
-    const auto &buffers = storage_to_buffers.at(storage_key);
-    ICHECK(!buffers.empty());
-    const Buffer &buffer = buffers.front();
+  for (const StorageResource &resource : storage_resources) {
+    const Var &storage = resource.storage;
+    const Buffer &buffer = resource.representative;
     std::string scope;
     if (IsL1Buffer(buffer)) {
       scope = "shared.l1";
@@ -725,32 +708,22 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
       scope = "shared";
     }
     int group_id = scope_to_group[scope];
-    if (!eligible_storage_set.count(storage_key)) {
+    if (!eligible_storages.count(storage)) {
       // These buffers cannot be multi-buffered, and cannot share memory with
       // other buffers either, so we directly reduce the capacity of the
       // memory group by their size
       group_capacities[group_id] -= get_buffer_size(buffer);
     } else {
-      // Alias buffers created by T.view/T.reshape share one storage Var. They
-      // must share one version variable so dependency distances and barrier
-      // ring sizes stay consistent no matter which logical Buffer appears at
-      // an access point.
-      // Check if this buffer has a manually annotated version count
-      auto override_it =
-          buffer_version_overrides_.find(ffi::GetRef<Var>(storage_key));
+      auto override_it = buffer_version_overrides_.find(storage);
       if (override_it != buffer_version_overrides_.end()) {
         int override_val = (*override_it).second;
-        for (const auto &alias : buffers) {
-          annotated_buffer_versions[alias] = override_val;
-        }
+        annotated_storage_versions[storage] = override_val;
         group_capacities[group_id] -= get_buffer_size(buffer) * override_val;
       } else {
-        size_t id = buffer_sizes.size();
-        for (const auto &alias : buffers) {
-          buffer_var_id[alias] = id;
-        }
+        size_t id = storage_sizes.size();
+        storage_version_id.emplace(storage, id);
         group_indices[group_id].push_back((int64_t)id);
-        buffer_sizes.push_back(get_buffer_size(buffer));
+        storage_sizes.push_back(get_buffer_size(buffer));
       }
     }
   }
@@ -772,7 +745,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
       }
       int64_t min_usage = 0;
       for (int64_t idx : idxs) {
-        min_usage += buffer_sizes[idx];
+        min_usage += storage_sizes[idx];
       }
       if (min_usage > capacity) {
         LOG(FATAL) << "Z3 loop scheduling failed: scope \"" << group_scopes[g]
@@ -838,17 +811,15 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     if (dep.distance >= 0) {
       data_deps.emplace_back(i, j, dep.distance, dep.latency);
     } else {
-      const Buffer &buffer = dep.buffer;
-      auto it = buffer_var_id.find(buffer);
+      auto it = storage_version_id.find(dep.storage);
       int64_t distance = 1;
-      if (it != buffer_var_id.end()) {
-        // Encode the buffer id in the negative distance for the Z3
+      if (it != storage_version_id.end()) {
+        // Encode the storage-version id in the negative distance for the Z3
         // scheduler to recognize.
         distance = -(int64_t)it->second - 1;
       } else {
-        // Check if this buffer has a manually annotated version count.
-        auto ann_it = annotated_buffer_versions.find(buffer);
-        if (ann_it != annotated_buffer_versions.end()) {
+        auto ann_it = annotated_storage_versions.find(dep.storage);
+        if (ann_it != annotated_storage_versions.end()) {
           distance = ann_it->second;
         }
       }
@@ -911,7 +882,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   ffi::Array<ffi::Array<int64_t>>
       tvm_data_deps; // each element is [i, j, distance]
   ffi::Array<ffi::Array<int64_t>> tvm_resource_deps;
-  ffi::Array<int64_t> tvm_buffer_sizes;
+  ffi::Array<int64_t> tvm_storage_sizes;
 
   for (auto val : latencies) {
     tvm_latencies.push_back(val);
@@ -943,8 +914,8 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     pair.push_back(dep.second);
     tvm_stage_order_deps.push_back(pair);
   }
-  for (auto val : buffer_sizes) {
-    tvm_buffer_sizes.push_back(val);
+  for (int64_t size : storage_sizes) {
+    tvm_storage_sizes.push_back(size);
   }
 
   // Build memory groups for FFI: each inner array is [capacity, idx0, idx1,
@@ -960,17 +931,17 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   }
 
   // Extract results
-  // Python function returns (start_times, buffer_versions, best_ii) as a
+  // Python function returns (start_times, storage_versions, best_ii) as a
   // 3-tuple. Stages are computed in C++ from start_times and II — see below.
   auto return_val =
       z3_schedule_loop_func
           .value()(num_stages, tvm_latencies, tvm_iis, tvm_resource_flags,
-                   tvm_data_deps, tvm_resource_deps, tvm_buffer_sizes,
+                   tvm_data_deps, tvm_resource_deps, tvm_storage_sizes,
                    tvm_memory_groups, tvm_stage_order_deps, enable_offset)
           .cast<ffi::Tuple<ffi::Array<int64_t>, ffi::Array<int>, int64_t>>();
 
   ffi::Array<int64_t> start_times = return_val.get<0>();
-  ffi::Array<int> buffer_versions = return_val.get<1>();
+  ffi::Array<int> storage_versions = return_val.get<1>();
   int64_t ii = return_val.get<2>();
 
   // Derive a per-task stage from (start_time / ii). Z3 schedules
@@ -1074,12 +1045,12 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
         ctrl->children[u]->SubstituteVar(old_var, new_var);
     }
     // Emit the clones defs-before-uses
-    std::set<const VarNode *> clone_writes;
+    std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> clone_writes;
     for (auto &c : stage_clones)
       for (auto &w : c->GetWriteVars())
-        clone_writes.insert(w.get());
+        clone_writes.insert(w);
     std::vector<bool> emitted(stage_clones.size(), false);
-    std::set<const VarNode *> available;
+    std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> available;
     size_t done = 0;
     while (done < stage_clones.size()) {
       bool progress = false;
@@ -1088,7 +1059,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
           continue;
         bool ready = true;
         for (auto &rv : stage_clones[ci]->GetReadVars()) {
-          if (clone_writes.count(rv.get()) && !available.count(rv.get())) {
+          if (clone_writes.count(rv) && !available.count(rv)) {
             ready = false;
             break;
           }
@@ -1096,7 +1067,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
         if (!ready)
           continue;
         for (auto &w : stage_clones[ci]->GetWriteVars())
-          available.insert(w.get());
+          available.insert(w);
         new_clones.push_back(stage_clones[ci]);
         emitted[ci] = true;
         ++done;
@@ -1128,11 +1099,17 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   ctrl->SetII(overall_latency);
   ctrl->SetLatency(overall_latency);
   GetAutoScheduleExtraInfo(ctrl)->SetIIperIter(ii);
-  for (auto &[buffer, versions] : annotated_buffer_versions) {
-    RecordSelectedBufferVersion(buffer, versions);
-  }
-  for (auto &[buffer, id] : buffer_var_id) {
-    RecordSelectedBufferVersion(buffer, buffer_versions[id]);
+  for (const StorageResource &resource : storage_resources) {
+    const Var &storage = resource.storage;
+    auto annotated = annotated_storage_versions.find(storage);
+    if (annotated != annotated_storage_versions.end()) {
+      RecordSelectedBufferVersion(storage, annotated->second);
+      continue;
+    }
+    auto selected = storage_version_id.find(storage);
+    if (selected != storage_version_id.end()) {
+      RecordSelectedBufferVersion(storage, storage_versions[selected->second]);
+    }
   }
 }
 
