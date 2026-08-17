@@ -21,9 +21,7 @@ from .tile_schedule import (  # noqa: F401
     AscendMGroupedTileScheduler,
     AscendTileScheduler,
 )
-from .cube import Cube, CubeFrame  # noqa: F401
-from .vector_frame import Vector, VectorFrame  # noqa: F401
-from .vf import SimdVF, SimdVFFrame, SimtVF, SimtVFFrame  # noqa: F401
+from .frame import Cube, CubeFrame, SimdVF, SimdVFFrame, SimtVF, SimtVFFrame, Vector, VectorFrame  # noqa: F401
 
 from . import simd as simd  # noqa: F401 (exposed as T.simd.*)
 from . import vmi as vmi  # noqa: F401 (exposed as T.vmi.*)

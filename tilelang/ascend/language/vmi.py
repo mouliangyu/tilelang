@@ -12,7 +12,7 @@ from tvm.script.ir_builder import IRBuilder
 
 from tilelang.language.builtin import access_ptr
 from tilelang.language.dtypes import dtype as _dtype
-from .vf import inside_simdvf as _inside_simdvf
+from .frame import inside_simdvf as _inside_simdvf
 
 _Op = tirx.op.Op.get
 

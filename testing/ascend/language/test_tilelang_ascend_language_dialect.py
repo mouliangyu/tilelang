@@ -38,9 +38,9 @@ def test_ascend_language_composes_common_and_ascend_symbols():
 def test_ascend_whole_module_implementations_live_under_language():
     from tilelang.ascend import language as T
 
-    assert T.SimtVF.__module__ == "tilelang.ascend.language.vf"
-    assert T.Cube.__module__ == "tilelang.ascend.language.cube"
-    assert T.Vector.__module__ == "tilelang.ascend.language.vector_frame"
+    assert T.SimtVF.__module__ == "tilelang.ascend.language.frame"
+    assert T.Cube.__module__ == "tilelang.ascend.language.frame"
+    assert T.Vector.__module__ == "tilelang.ascend.language.frame"
 
 
 def test_ascend_intrinsics_live_in_themed_dialect_submodules():

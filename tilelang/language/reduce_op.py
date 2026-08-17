@@ -95,7 +95,7 @@ def reduce(
         if is_shared(buffer) and is_shared(out):
             # Deferred: the Ascend dialect package imports tilelang.language.common,
             # which imports this module, so a module-scope import would cycle.
-            from tilelang.ascend.language.vf import inside_simdvf
+            from tilelang.ascend.language.frame import inside_simdvf
 
             if inside_simdvf():
                 # Inside SimdVF: reduce directly on shared buffers (no fragment wrapping)

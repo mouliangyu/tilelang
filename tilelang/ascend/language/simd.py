@@ -96,7 +96,7 @@ def _mask_bits(dtype_like) -> int:
 # Auto default-mask cache: one bound pset per element-bit width, reused across maskless
 # ops as long as the frame it was bound into is still an enclosing scope. The TVMScript
 # parser hands out a fresh Python wrapper per frame access, so identity is compared with
-# ``same_as`` (underlying-object equality), not ``id()``. Reset per SimdVF block by vf.py.
+# ``same_as`` (underlying-object equality), not ``id()``. Reset per SimdVF block by its frame.
 _default_mask_cache: dict = {}  # elem_bits -> (declaring_frame, mask_var)
 
 
