@@ -150,21 +150,22 @@ public:
   }
 
   std::vector<std::shared_ptr<IRStructure>> Decode(const Stmt &body) {
-    std::vector<std::shared_ptr<IRStructure>> root = DecodeList(body);
-    RebuildIRStructureParents(root);
-    return root;
+    return DecodeList(body, nullptr);
   }
 
 private:
-  std::vector<std::shared_ptr<IRStructure>> DecodeList(const Stmt &stmt) {
+  std::vector<std::shared_ptr<IRStructure>> DecodeList(const Stmt &stmt,
+                                                       IRStructure *parent) {
     std::vector<std::shared_ptr<IRStructure>> saved;
     saved.swap(result_);
     VisitStmt(stmt);
     std::vector<std::shared_ptr<IRStructure>> decoded;
     decoded.swap(result_);
     result_.swap(saved);
-    for (size_t i = 0; i < decoded.size(); ++i)
+    for (size_t i = 0; i < decoded.size(); ++i) {
       decoded[i]->SetIndex(i);
+      decoded[i]->SetParent(parent);
+    }
     return decoded;
   }
 
@@ -270,7 +271,7 @@ private:
           MakeGuard(loop_node->loop_var,
                     Range::FromMinExtent(loop_node->min, loop_node->extent));
       auto non_empty_scope = MakeGuard(loop_node->extent > 0);
-      control->children = DecodeList(loop_node->body);
+      control->children = DecodeList(loop_node->body, control.get());
     }
     return control;
   }
@@ -312,10 +313,12 @@ private:
   }
 
   std::shared_ptr<ControlNode> MakeControlNode() const {
-    if (!make_extra_info_)
-      return MakePlainControlNode();
-    auto control = std::make_shared<ControlNode>(make_extra_info_());
-    control->task = MakeTaskNode();
+    std::shared_ptr<ControlNode> control =
+        make_extra_info_ ? std::make_shared<ControlNode>(make_extra_info_())
+                         : MakePlainControlNode();
+    if (make_extra_info_)
+      control->task = MakeTaskNode();
+    control->task->SetParent(control.get());
     return control;
   }
 

@@ -163,8 +163,7 @@ private:
 public:
   // Recursive scheduling function
   // Directly schedules the entire IRStructure tree recursively in place
-  void ScheduleRecursive(std::shared_ptr<IRStructure> &node,
-                         std::vector<For> &loop_stack);
+  void ScheduleRecursive(std::shared_ptr<IRStructure> &node);
 
   // Schedule an ordered child list in place (root list or a ControlNode body):
   // gather + recurse into each child, then Z3-schedule and write the reordered
@@ -176,8 +175,7 @@ public:
   Z3SchedulePython(const std::vector<std::shared_ptr<IRStructure>> &children);
 
   // Distance-aware Z3 scheduler for a ControlNode loop body.
-  void Z3SchedulePythonLoop(ControlNode *ctrl,
-                            const std::vector<For> &loop_stack);
+  void Z3SchedulePythonLoop(ControlNode *ctrl);
 
   // Set memory limit for a given buffer scope (e.g. "shared", "shared.l1")
   void SetMemoryLimit(const std::string &scope, int64_t bytes) {
@@ -246,20 +244,35 @@ AutoScheduleExtraInfo *GetAutoScheduleExtraInfo(IRStructure *node) {
   return node->GetExtraInfo<AutoScheduleExtraInfo>();
 }
 
-const AutoScheduleExtraInfo *GetAutoScheduleExtraInfo(const IRStructure *node) {
-  return node->GetExtraInfo<AutoScheduleExtraInfo>();
+int64_t GetTaskTimestamp(IRStructure *subtree_root, TaskNode *task,
+                         bool producer_side) {
+  std::vector<IRStructure *> path = task->PathFrom(subtree_root);
+  int64_t timestamp = 0;
+  for (size_t i = 0; i + 1 < path.size(); ++i) {
+    ICHECK(path[i]->IsControl());
+    auto *control = static_cast<ControlNode *>(path[i]);
+    if (producer_side) {
+      int64_t trip_count = control->GetTripCount();
+      int64_t ii_per_iter = GetAutoScheduleExtraInfo(control)->GetIIperIter();
+      timestamp += (trip_count > 0 ? trip_count - 1 : 0) * ii_per_iter;
+    }
+    timestamp += GetAutoScheduleExtraInfo(path[i + 1])->GetStartTime();
+  }
+  return timestamp;
 }
 
-int64_t GetAutoScheduleStartTime(const IRStructure *node) {
-  return GetAutoScheduleExtraInfo(node)->GetStartTime();
+int64_t GetDependencyLatency(const DepInfo &dependency) {
+  int64_t latency = 0;
+  for (const auto &[producer, consumer] : dependency.task_pairs) {
+    int64_t producer_time =
+        GetTaskTimestamp(dependency.prod_node, producer, true);
+    int64_t consumer_time =
+        GetTaskTimestamp(dependency.cons_node, consumer, false);
+    latency = std::max(latency,
+                       producer_time + producer->GetLatency() - consumer_time);
+  }
+  return latency;
 }
-
-int64_t GetAutoScheduleIIperIter(const ControlNode *node) {
-  return GetAutoScheduleExtraInfo(node)->GetIIperIter();
-}
-
-const DependencyTiming kAutoScheduleDependencyTiming{GetAutoScheduleStartTime,
-                                                     GetAutoScheduleIIperIter};
 
 std::unique_ptr<IRExtraInfo> MakeAutoScheduleExtraInfo() {
   return std::make_unique<AutoScheduleExtraInfo>();
@@ -337,23 +350,22 @@ schedule candidates.
 void ScheduleBuilder::ScheduleList(
     std::vector<std::shared_ptr<IRStructure>> &children) {
   dependency_cache_.clear();
-  std::vector<For> loop_stack;
   std::vector<std::shared_ptr<IRStructure>> origin_children = children;
   for (size_t i = 0; i < origin_children.size(); ++i) {
     origin_children[i]->SetIndex(i);
+    origin_children[i]->SetParent(nullptr);
   }
   for (auto &child : origin_children) {
-    ScheduleRecursive(child, loop_stack);
+    ScheduleRecursive(child);
   }
   children = Z3SchedulePython(origin_children);
   for (size_t i = 0; i < children.size(); ++i) {
     children[i]->SetIndex(i);
+    children[i]->SetParent(nullptr);
   }
-  RebuildIRStructureParents(children);
 }
 
-void ScheduleBuilder::ScheduleRecursive(std::shared_ptr<IRStructure> &node,
-                                        std::vector<For> &loop_stack) {
+void ScheduleBuilder::ScheduleRecursive(std::shared_ptr<IRStructure> &node) {
   if (!node)
     return;
 
@@ -364,17 +376,15 @@ void ScheduleBuilder::ScheduleRecursive(std::shared_ptr<IRStructure> &node,
     std::vector<std::shared_ptr<IRStructure>> origin_children = ctrl->children;
     for (size_t i = 0; i < origin_children.size(); ++i) {
       origin_children[i]->SetIndex(i);
+      origin_children[i]->SetParent(ctrl);
     }
-    // Children see this loop in their loop stack; this node's own Z3 schedule
-    // sees only its enclosing ancestors (not itself), so pop before scheduling.
-    loop_stack.push_back(ctrl->control);
     for (auto &child : origin_children) {
-      ScheduleRecursive(child, loop_stack);
+      ScheduleRecursive(child);
     }
-    loop_stack.pop_back();
-    Z3SchedulePythonLoop(ctrl, loop_stack);
+    Z3SchedulePythonLoop(ctrl);
     for (size_t i = 0; i < ctrl->children.size(); ++i) {
       ctrl->children[i]->SetIndex(i);
+      ctrl->children[i]->SetParent(ctrl);
     }
     return;
   }
@@ -469,8 +479,7 @@ std::vector<std::shared_ptr<IRStructure>> ScheduleBuilder::Z3SchedulePython(
 
     // Buffer-region data dependencies
     auto deps = AnalyzeDependencies(
-        nodes, /*loop_stack=*/{}, manual_buffer_versions_, &dependency_cache_,
-        /*cache_key=*/nullptr, &kAutoScheduleDependencyTiming);
+        nodes, /*loop=*/nullptr, manual_buffer_versions_, &dependency_cache_);
     std::unordered_map<IRStructure *, size_t> node_idx;
     for (size_t i = 0; i < n; ++i) {
       node_idx[nodes[i]] = i;
@@ -478,7 +487,7 @@ std::vector<std::shared_ptr<IRStructure>> ScheduleBuilder::Z3SchedulePython(
     for (const auto &dep : deps) {
       size_t i = node_idx[dep.prod_node];
       size_t j = node_idx[dep.cons_node];
-      data_deps.emplace_back(i, j, dep.latency);
+      data_deps.emplace_back(i, j, GetDependencyLatency(dep));
     }
 
     // Collect resource dependencies
@@ -562,8 +571,7 @@ std::vector<std::shared_ptr<IRStructure>> ScheduleBuilder::Z3SchedulePython(
 
 // Z3-based scheduler for loops that calls Python implementation via FFI
 // with distance-aware dependencies
-void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
-                                           const std::vector<For> &loop_stack) {
+void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl) {
   if (ctrl->children.empty()) {
     LOG(WARNING)
         << "Z3SchedulePythonLoop called on a control node without children";
@@ -619,17 +627,6 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     latencies.push_back(node->GetLatency());
     iis.push_back(node->GetII());
     resource_flags.push_back(static_cast<int64_t>(node->GetPipeMask()));
-  }
-
-  // Storage Vars eligible for automatic multi-buffering. The annotation is
-  // normalized by AnnotateMultiBufferEligible before AutoSchedule.
-  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> eligible_storages;
-  {
-    auto v = ctrl->control->annotations.Get(kMultiBufferEligible);
-    if (v.has_value()) {
-      for (const Var &storage : v.value().cast<Array<Var>>())
-        eligible_storages.insert(storage);
-    }
   }
 
   // Keep one representative Buffer per storage for shape/scope accounting.
@@ -708,7 +705,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
       scope = "shared";
     }
     int group_id = scope_to_group[scope];
-    if (!eligible_storages.count(storage)) {
+    if (!ctrl->IsMultiBufferEligible(storage)) {
       // These buffers cannot be multi-buffered, and cannot share memory with
       // other buffers either, so we directly reduce the capacity of the
       // memory group by their size
@@ -796,11 +793,8 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   }
 
   // Buffer-region data dependencies
-  std::vector<For> current_loop_stack = loop_stack;
-  current_loop_stack.push_back(ctrl->control);
-  auto deps = AnalyzeDependencies(nodes, current_loop_stack,
-                                  manual_buffer_versions_, &dependency_cache_,
-                                  ctrl, &kAutoScheduleDependencyTiming);
+  auto deps = AnalyzeDependencies(nodes, ctrl, manual_buffer_versions_,
+                                  &dependency_cache_);
   std::unordered_map<IRStructure *, size_t> node_idx;
   for (size_t i = 0; i < n; ++i) {
     node_idx[nodes[i]] = i;
@@ -808,8 +802,9 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   for (const auto &dep : deps) {
     size_t i = node_idx[dep.prod_node];
     size_t j = node_idx[dep.cons_node];
+    int64_t latency = GetDependencyLatency(dep);
     if (dep.distance >= 0) {
-      data_deps.emplace_back(i, j, dep.distance, dep.latency);
+      data_deps.emplace_back(i, j, dep.distance, latency);
     } else {
       auto it = storage_version_id.find(dep.storage);
       int64_t distance = 1;
@@ -823,7 +818,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
           distance = ann_it->second;
         }
       }
-      data_deps.emplace_back(i, j, distance, dep.latency);
+      data_deps.emplace_back(i, j, distance, latency);
     }
   }
 

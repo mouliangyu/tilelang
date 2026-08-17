@@ -110,11 +110,6 @@ SyncInsertionExtraInfo *GetSyncInsertionExtraInfo(IRStructure *node) {
   return node->GetExtraInfo<SyncInsertionExtraInfo>();
 }
 
-const SyncInsertionExtraInfo *
-GetSyncInsertionExtraInfo(const IRStructure *node) {
-  return node->GetExtraInfo<SyncInsertionExtraInfo>();
-}
-
 std::unique_ptr<IRExtraInfo> MakeSyncInsertionExtraInfo() {
   return std::make_unique<SyncInsertionExtraInfo>();
 }
@@ -199,12 +194,11 @@ void AppendSyncTaskNodes(std::vector<std::shared_ptr<IRStructure>> *result,
 struct MultiBufferInfo {
   Var storage;
   int num_versions;
-  std::vector<For> claim_loops;
+  ControlNode *claim_loop;
 
-  MultiBufferInfo(Var storage, int num_versions,
-                  std::vector<For> claim_loops = {})
+  MultiBufferInfo(Var storage, int num_versions, ControlNode *claim_loop)
       : storage(std::move(storage)), num_versions(num_versions),
-        claim_loops(std::move(claim_loops)) {}
+        claim_loop(claim_loop) {}
 };
 
 using MultiBufferInfoMap =
@@ -234,60 +228,60 @@ std::string GetHardEvent(const std::string &producer_pipe,
                          const std::string &consumer_pipe);
 
 struct SyncInsertionSite {
-  IRStructure *node;
+  IRStructure *path_begin;
+  IRStructure *path_end;
   bool at_beginning;
   CoreMask core;
   std::string pipe;
-  std::vector<const IRStructure *> chain;
 
-  SyncInsertionSite(const BufferAccessPoint &pt, bool at_beginning,
-                    CoreMask core, std::string pipe)
-      : node(nullptr), at_beginning(at_beginning), core(core),
-        pipe(std::move(pipe)) {
+  SyncInsertionSite(IRStructure *path_begin, TaskNode *task, bool at_beginning,
+                    CoreMask core)
+      : path_begin(path_begin), path_end(nullptr), at_beginning(at_beginning),
+        core(core) {
+    ICHECK(path_begin != nullptr);
+    ICHECK(task != nullptr);
     ICHECK(IsConcreteCore(core));
-    for (const IRStructure *path_node : pt.path) {
-      node = const_cast<IRStructure *>(path_node);
-      chain.push_back(node);
-      if (node->HasConditions())
+    pipe = GetResourcePipeName(task->GetPipeMask());
+    for (IRStructure *path_node : task->PathFrom(path_begin)) {
+      path_end = path_node;
+      if (path_end->HasConditions())
         break;
-      if (node->IsControl() &&
-          static_cast<const ControlNode *>(node)->BodyHasLoopBreak()) {
+      if (path_end->IsControl() &&
+          static_cast<ControlNode *>(path_end)->BodyHasLoopBreak()) {
         break;
       }
     }
-    if (!node)
-      LOG(FATAL) << "Failed to find insertion node for access points.";
+    ICHECK(path_end != nullptr) << "Failed to find a sync insertion node";
   }
 
-  int Compare(const SyncInsertionSite &other) const {
-    size_t n = std::min(chain.size(), other.chain.size());
-    for (size_t i = 0; i < n; ++i) {
-      if (chain[i] != other.chain[i]) {
-        if (chain[i]->GetStage() != other.chain[i]->GetStage())
-          return chain[i]->GetStage() < other.chain[i]->GetStage() ? -1 : +1;
-        if (chain[i]->GetIndex() != other.chain[i]->GetIndex())
-          return chain[i]->GetIndex() < other.chain[i]->GetIndex() ? -1 : +1;
-        return chain[i] < other.chain[i] ? -1 : +1;
-      }
-    }
-    if (chain.size() < other.chain.size())
-      return at_beginning ? -1 : +1;
-    if (chain.size() > other.chain.size())
-      return other.at_beginning ? +1 : -1;
-    return other.at_beginning - at_beginning;
+  std::vector<IRStructure *> Path() const {
+    return path_end->PathFrom(path_begin);
   }
 
   bool operator<(const SyncInsertionSite &other) const {
-    int cmp = Compare(other);
-    if (cmp != 0)
-      return cmp < 0;
+    int parent_order = CompareIRStructure(path_begin->GetParent(),
+                                          other.path_begin->GetParent());
+    if (parent_order != 0)
+      return parent_order < 0;
+
+    int path_end_order = CompareIRStructure(path_end, other.path_end);
+    if (path_end_order == -2)
+      return at_beginning;
+    if (path_end_order == 2)
+      return !other.at_beginning;
+    if (path_end_order != 0)
+      return path_end_order < 0;
+    if (at_beginning != other.at_beginning)
+      return at_beginning;
     if (core != other.core)
       return core < other.core;
     return pipe < other.pipe;
   }
 
   bool operator==(const SyncInsertionSite &other) const {
-    return Compare(other) == 0 && core == other.core && pipe == other.pipe;
+    return path_begin == other.path_begin && path_end == other.path_end &&
+           at_beginning == other.at_beginning && core == other.core &&
+           pipe == other.pipe;
   }
 
   PrimExpr GetGuard() const {
@@ -295,13 +289,14 @@ struct SyncInsertionSite {
     auto append = [&](PrimExpr term) {
       guard = guard.defined() ? guard && term : term;
     };
-    // The final chain node is the insertion node itself. Guards come only from
+    // The path end is the insertion node itself. Guards come only from
     // enclosing loops that we descended through to reach it.
-    for (size_t i = 0; i + 1 < chain.size(); ++i) {
-      const auto *node = chain[i];
+    std::vector<IRStructure *> path = Path();
+    for (size_t i = 0; i + 1 < path.size(); ++i) {
+      IRStructure *node = path[i];
       if (!node || !node->IsControl() || node->HasConditions())
         continue;
-      const auto *ctrl = static_cast<const ControlNode *>(node);
+      auto *ctrl = static_cast<ControlNode *>(node);
       if (ctrl->BodyHasLoopBreak())
         continue;
       const ForNode *for_node = ctrl->control.get();
@@ -355,30 +350,28 @@ struct DepEdge {
 struct SyncPoint {
   DepEdge edge;
   int num_versions;
-  std::vector<For> flag_loops;
+  ControlNode *flag_loop;
   size_t reuse_src;
   size_t reuse_dst;
   size_t allocation_index;
 
-  SyncPoint(DepEdge edge, int num_versions, std::vector<For> flag_loops)
-      : edge(std::move(edge)), num_versions(num_versions),
-        flag_loops(std::move(flag_loops)), reuse_src(this->edge.src),
-        reuse_dst(this->edge.dst) {}
+  SyncPoint(DepEdge edge, int num_versions, ControlNode *flag_loop)
+      : edge(std::move(edge)), num_versions(num_versions), flag_loop(flag_loop),
+        reuse_src(this->edge.src), reuse_dst(this->edge.dst) {}
 
-  PrimExpr FlagIteration() const { return CalculateIterationCount(flag_loops); }
+  PrimExpr FlagIteration() const { return CalculateIterationCount(flag_loop); }
 
   bool operator<(const SyncPoint &other) const {
     if (edge < other.edge)
       return true;
     if (other.edge < edge)
       return false;
-    if (flag_loops.size() != other.flag_loops.size())
-      return flag_loops.size() < other.flag_loops.size();
-    for (size_t i = 0; i < flag_loops.size(); ++i) {
-      if (!flag_loops[i].same_as(other.flag_loops[i]))
-        return flag_loops[i].get() < other.flag_loops[i].get();
-    }
-    return num_versions < other.num_versions;
+    int loop_order = CompareIRStructure(flag_loop, other.flag_loop);
+    if (loop_order != 0)
+      return loop_order < 0;
+    if (num_versions != other.num_versions)
+      return num_versions < other.num_versions;
+    return false;
   }
 };
 
@@ -515,9 +508,8 @@ public:
   }
 
 private:
-  void CollectInsertionSites(IRStructure *node,
-                             std::vector<const IRStructure *> &path,
-                             SyncInsertionSiteList &sites) const;
+  void AddInsertionSites(IRStructure *path_begin, TaskNode *task,
+                         SyncInsertionSiteList &sites) const;
   void CollectAllInsertionSites(const std::vector<IRStructure *> &nodes);
 
   static void SortAndUniqueSites(SyncInsertionSiteList &sites) {
@@ -533,13 +525,12 @@ private:
   }
 
   std::vector<SyncPoint>
-  CollectSyncPoints(const std::vector<IRStructure *> &nodes,
-                    const ControlNode *cache_key);
+  CollectSyncPoints(const std::vector<IRStructure *> &nodes, ControlNode *loop);
 
-  std::optional<int> GetClaimedBufferVersion(const ControlNode *control,
+  std::optional<int> GetClaimedBufferVersion(ControlNode *control,
                                              const Var &storage) const;
 
-  void AddPromotedChildClosure(DepClosure &out, const IRStructure *child,
+  void AddPromotedChildClosure(DepClosure &out, IRStructure *child,
                                const DepClosure &child_closure) const;
 
   std::vector<size_t>
@@ -552,19 +543,8 @@ private:
   static void OptimizeSyncPoints(std::vector<SyncPoint> &sync_points,
                                  DepClosure &closure, int max_distance);
 
-  static bool HasSameLoopNest(const std::vector<For> &a,
-                              const std::vector<For> &b) {
-    if (a.size() != b.size())
-      return false;
-    for (size_t i = 0; i < a.size(); ++i) {
-      if (!a[i].same_as(b[i]))
-        return false;
-    }
-    return true;
-  }
-
   void OptimizeFlagVersions(std::vector<SyncPoint> &sync_points,
-                            const DepClosure &closure) const;
+                            const DepClosure &closure, ControlNode *loop) const;
 
   bool IsCrossCore(const SyncPoint &sp) const {
     return sp.edge.Src(sites_).core != sp.edge.Dst(sites_).core;
@@ -615,13 +595,13 @@ private:
   void InsertSyncPoints();
   void InsertStatement(IRStructure *node, Stmt stmt, bool at_beginning,
                        CoreMask core, const PrimExpr &guard = PrimExpr());
-  void MaterializeInsertions(std::vector<std::shared_ptr<IRStructure>> &nodes);
+  void MaterializeInsertions(std::vector<std::shared_ptr<IRStructure>> &nodes,
+                             ControlNode *parent);
 
   SyncAnalysisResult AnalyzeNode(IRStructure *node);
 
   SyncAnalysisResult AnalyzeNodeList(std::vector<IRStructure *> nodes,
-                                     const ControlNode *cache_key,
-                                     bool is_loop_body);
+                                     ControlNode *loop);
 
   static constexpr int kIntraCoreFlagLimit = 8;
   static constexpr int kCrossCoreFlagLimit = 16;
@@ -638,7 +618,6 @@ private:
   std::vector<SyncPoint> sync_points_;
   std::set<std::pair<size_t, size_t>> reusable_pairs_;
   DependencyCache dependency_cache_;
-  std::vector<For> loop_stack_;
   SyncInsertionSiteList sites_;
   std::vector<FlagAllocation> allocations_;
 };
@@ -713,7 +692,7 @@ private:
       auto *n = load.CopyOnWrite();
       n->buffer = GetOrCreateVersionedBuffer(n->buffer, info->num_versions,
                                              versioned_buffers_);
-      PrimExpr iteration = CalculateIterationCount(info->claim_loops);
+      PrimExpr iteration = CalculateIterationCount(info->claim_loop);
       n->indices.insert(n->indices.begin(),
                         indexmod(iteration, Integer(info->num_versions)));
     }
@@ -726,7 +705,7 @@ private:
       auto *n = store.CopyOnWrite();
       n->buffer = GetOrCreateVersionedBuffer(n->buffer, info->num_versions,
                                              versioned_buffers_);
-      PrimExpr iteration = CalculateIterationCount(info->claim_loops);
+      PrimExpr iteration = CalculateIterationCount(info->claim_loop);
       n->indices.insert(n->indices.begin(),
                         indexmod(iteration, Integer(info->num_versions)));
     }
@@ -1069,7 +1048,7 @@ static SyncKernelUpdate InsertKernelSync(const Stmt &kernel_body,
       CollectExplicitCrossCoreFlags(kernel_body);
   std::vector<TaskNode *> scheduled_tasks;
   CollectAllTaskNodes(sync_root, scheduled_tasks);
-  for (const TaskNode *task : scheduled_tasks) {
+  for (TaskNode *task : scheduled_tasks) {
     ICHECK_NE(task->GetCoreMask(), kCoreUnassigned)
         << "InsertSync found a scheduled T.Task without core_mask. Run "
            "tl.transform.AssignCore immediately after AutoSchedule.";
@@ -1100,8 +1079,10 @@ static SyncKernelUpdate InsertKernelSync(const Stmt &kernel_body,
   }
   sync_root.insert(sync_root.begin(), prefix.begin(), prefix.end());
   sync_root.insert(sync_root.end(), suffix.begin(), suffix.end());
-  for (size_t i = 0; i < sync_root.size(); ++i)
+  for (size_t i = 0; i < sync_root.size(); ++i) {
     sync_root[i]->SetIndex(i);
+    sync_root[i]->SetParent(nullptr);
+  }
   const std::vector<MultiBufferInfo> &multi_buffer_infos =
       inserter.GetMultiBufferInfos();
   BufferVersionMap buffer_versions = BuildPhysicalBufferVersions(
@@ -1134,13 +1115,13 @@ void SyncInserter::InsertStatement(IRStructure *node, Stmt stmt,
 }
 
 void SyncInserter::MaterializeInsertions(
-    std::vector<std::shared_ptr<IRStructure>> &nodes) {
+    std::vector<std::shared_ptr<IRStructure>> &nodes, ControlNode *parent) {
   std::vector<std::shared_ptr<IRStructure>> materialized;
   materialized.reserve(nodes.size());
   for (const std::shared_ptr<IRStructure> &node : nodes) {
     if (node->IsControl()) {
       auto *control = static_cast<ControlNode *>(node.get());
-      MaterializeInsertions(control->children);
+      MaterializeInsertions(control->children, control);
     }
 
     const SyncInsertionExtraInfo *insertions =
@@ -1175,8 +1156,10 @@ void SyncInserter::MaterializeInsertions(
                         migrated_core);
   }
 
-  for (size_t i = 0; i < materialized.size(); ++i)
+  for (size_t i = 0; i < materialized.size(); ++i) {
     materialized[i]->SetIndex(i);
+    materialized[i]->SetParent(parent);
+  }
   nodes = std::move(materialized);
 }
 
@@ -1220,53 +1203,28 @@ std::string GetHardEvent(const std::string &producer_pipe,
   return event;
 }
 
-void SyncInserter::CollectInsertionSites(IRStructure *node,
-                                         std::vector<const IRStructure *> &path,
-                                         SyncInsertionSiteList &sites) const {
-  if (!node)
-    return;
-  if (node->IsTask()) {
-    std::vector<const IRStructure *> task_path = path;
-    task_path.push_back(node);
-    BufferAccessPoint pt(0, std::move(task_path));
-    auto *task = static_cast<const TaskNode *>(node);
-    CoreMask core_mask = task->GetCoreMask();
-    std::string pipe = GetResourcePipeName(task->GetPipeMask());
-    std::vector<CoreMask> cores;
+void SyncInserter::AddInsertionSites(IRStructure *path_begin, TaskNode *task,
+                                     SyncInsertionSiteList &sites) const {
+  CoreMask core_mask = task->GetCoreMask();
+  for (bool at_beginning : {false, true}) {
     for (CoreMask core : kConcreteCores) {
       if (HasCore(core_mask, core))
-        cores.push_back(core);
+        sites.emplace_back(path_begin, task, at_beginning, core);
     }
-    for (bool at_beginning : {false, true}) {
-      for (CoreMask core : cores) {
-        sites.emplace_back(pt, at_beginning, core, pipe);
-      }
-    }
-    return;
   }
-  auto *ctrl = static_cast<ControlNode *>(node);
-  path.push_back(node);
-  for (const auto &child : ctrl->children) {
-    CollectInsertionSites(child.get(), path, sites);
-  }
-  path.pop_back();
 }
 
 void SyncInserter::CollectAllInsertionSites(
     const std::vector<IRStructure *> &nodes) {
-  std::vector<const IRStructure *> path;
+  std::vector<TaskNode *> tasks;
   for (IRStructure *node : nodes) {
-    CollectInsertionSites(node, path, sites_);
+    CollectAllTaskNodes(node, tasks);
   }
-  for (IRStructure *node : nodes) {
-    if (!node || !node->IsControl())
-      continue;
-    auto *ctrl = static_cast<ControlNode *>(node);
-    std::vector<IRStructure *> children;
-    children.reserve(ctrl->children.size());
-    for (const auto &child : ctrl->children)
-      children.push_back(child.get());
-    CollectAllInsertionSites(children);
+  for (TaskNode *task : tasks) {
+    for (IRStructure *path_begin = task; path_begin != nullptr;
+         path_begin = path_begin->GetParent()) {
+      AddInsertionSites(path_begin, task, sites_);
+    }
   }
 }
 
@@ -1277,9 +1235,9 @@ bool IsRegisterStorage(const Var &storage) {
 
 std::vector<SyncPoint>
 SyncInserter::CollectSyncPoints(const std::vector<IRStructure *> &nodes,
-                                const ControlNode *cache_key) {
-  auto deps = AnalyzeDependencies(nodes, loop_stack_, manual_buffer_versions_,
-                                  &dependency_cache_, cache_key);
+                                ControlNode *loop) {
+  auto deps = AnalyzeDependencies(nodes, loop, manual_buffer_versions_,
+                                  &dependency_cache_);
 
   // Expand a task mask into the concrete cores on which it participates.
   auto expand_cores = [](CoreMask task_mask) {
@@ -1301,18 +1259,18 @@ SyncInserter::CollectSyncPoints(const std::vector<IRStructure *> &nodes,
     if (dep.distance >= 0) {
       distance = dep.distance;
     } else if (std::optional<int> num_versions =
-                   GetClaimedBufferVersion(cache_key, dep.storage)) {
+                   GetClaimedBufferVersion(loop, dep.storage)) {
       distance = num_versions.value();
     } else {
       distance = 1;
     }
     int num_versions = 1;
-    std::vector<For> flag_loops;
+    ControlNode *flag_loop = nullptr;
     auto multi_buffer = active_multi_buffers_.find(dep.storage);
     if (multi_buffer != active_multi_buffers_.end()) {
       const MultiBufferInfo &info = multi_buffer->second;
       num_versions = info.num_versions;
-      flag_loops = info.claim_loops;
+      flag_loop = info.claim_loop;
     } else {
       auto it = manual_buffer_versions_.find(dep.storage);
       if (it != manual_buffer_versions_.end()) {
@@ -1321,29 +1279,29 @@ SyncInserter::CollectSyncPoints(const std::vector<IRStructure *> &nodes,
         } else {
           num_versions = static_cast<int>((*it).second);
         }
-        flag_loops = loop_stack_;
+        flag_loop = loop;
       }
     }
 
-    for (const auto &[ppt, cpt] : dep.task_pairs) {
-      std::string prod_pipe = GetResourcePipeName(ppt.task()->GetPipeMask());
-      std::string cons_pipe = GetResourcePipeName(cpt.task()->GetPipeMask());
+    for (const auto &[prod_task, cons_task] : dep.task_pairs) {
+      std::string prod_pipe = GetResourcePipeName(prod_task->GetPipeMask());
+      std::string cons_pipe = GetResourcePipeName(cons_task->GetPipeMask());
       std::string hard_event = GetHardEvent(prod_pipe, cons_pipe);
       bool fix_unit_flag = hard_event.find("FIX") != std::string::npos &&
-                           (HasUnitFlagCtrl(ppt.task()->stmt) ||
-                            HasUnitFlagCtrl(cpt.task()->stmt));
-      for (CoreMask prod_core : expand_cores(ppt.task()->GetCoreMask())) {
-        for (CoreMask cons_core : expand_cores(cpt.task()->GetCoreMask())) {
+                           (HasUnitFlagCtrl(prod_task->stmt) ||
+                            HasUnitFlagCtrl(cons_task->stmt));
+      for (CoreMask prod_core : expand_cores(prod_task->GetCoreMask())) {
+        for (CoreMask cons_core : expand_cores(cons_task->GetCoreMask())) {
           // Intra-core FIX unit-flag syncs are handled by the hardware.
           if (prod_core == cons_core && fix_unit_flag)
             continue;
-          size_t prod_site =
-              FindSiteId(SyncInsertionSite(ppt, false, prod_core, prod_pipe));
-          size_t cons_site =
-              FindSiteId(SyncInsertionSite(cpt, true, cons_core, cons_pipe));
+          size_t prod_site = FindSiteId(
+              SyncInsertionSite(dep.prod_node, prod_task, false, prod_core));
+          size_t cons_site = FindSiteId(
+              SyncInsertionSite(dep.cons_node, cons_task, true, cons_core));
           sync_points.emplace_back(
               DepEdge(prod_site, cons_site, distance, true), num_versions,
-              flag_loops);
+              flag_loop);
         }
       }
     }
@@ -1352,36 +1310,26 @@ SyncInserter::CollectSyncPoints(const std::vector<IRStructure *> &nodes,
 }
 
 std::optional<int>
-SyncInserter::GetClaimedBufferVersion(const ControlNode *control,
+SyncInserter::GetClaimedBufferVersion(ControlNode *control,
                                       const Var &storage) const {
-  if (control == nullptr)
+  if (control == nullptr || !control->IsMultiBufferEligible(storage))
     return std::nullopt;
-
-  auto claims = control->control->annotations.Get(kMultiBufferEligible);
-  if (!claims.has_value())
+  auto selected = buffer_versions_.find(storage);
+  if (selected == buffer_versions_.end())
     return std::nullopt;
-
-  for (const Var &claimed_storage : claims.value().cast<Array<Var>>()) {
-    if (!claimed_storage.same_as(storage))
-      continue;
-    auto selected = buffer_versions_.find(storage);
-    if (selected == buffer_versions_.end())
-      return std::nullopt;
-    return (*selected).second;
-  }
-  return std::nullopt;
+  return (*selected).second;
 }
 
 void SyncInserter::AddPromotedChildClosure(
-    DepClosure &out, const IRStructure *child,
+    DepClosure &out, IRStructure *child,
     const DepClosure &child_closure) const {
   if (child->HasConditions() ||
       (child->IsControl() &&
-       static_cast<const ControlNode *>(child)->BodyHasLoopBreak()))
+       static_cast<ControlNode *>(child)->BodyHasLoopBreak()))
     return;
   auto promote = [&](const SyncInsertionSite &site) {
     SyncInsertionSite promoted = site;
-    promoted.chain.insert(promoted.chain.begin(), child);
+    promoted.path_begin = child;
     return promoted;
   };
 
@@ -1395,9 +1343,11 @@ void SyncInserter::AddPromotedChildClosure(
 std::vector<size_t>
 SyncInserter::CollectSiteIds(const std::vector<IRStructure *> &nodes) const {
   SyncInsertionSiteList level_sites;
-  std::vector<const IRStructure *> path;
   for (IRStructure *node : nodes) {
-    CollectInsertionSites(node, path, level_sites);
+    std::vector<TaskNode *> tasks;
+    CollectAllTaskNodes(node, tasks);
+    for (TaskNode *task : tasks)
+      AddInsertionSites(node, task, level_sites);
   }
   SortAndUniqueSites(level_sites);
 
@@ -1416,10 +1366,10 @@ void SyncInserter::AddSamePipeEdges(DepClosure &closure,
     const SyncInsertionSite &site = sites_[site_id];
     by_pipe[{site.core, site.pipe}].push_back(site_id);
   }
-  // This level's iteration stage of a site (the outermost node in its chain is
-  // the one carried by the loop being pipelined at this level).
+  // The path start is the node carried by the loop being pipelined at this
+  // level, so its stage is the site's logical iteration stage.
   auto level_stage = [](const SyncInsertionSite &s) {
-    return s.chain.empty() ? 0 : s.chain.front()->GetStage();
+    return s.path_begin->GetStage();
   };
   for (auto &[_, pipe_sites] : by_pipe) {
     // A single pipe issues its sites in physical (iteration, position) order.
@@ -1461,20 +1411,21 @@ void SyncInserter::OptimizeSyncPoints(std::vector<SyncPoint> &sync_points,
 }
 
 void SyncInserter::OptimizeFlagVersions(std::vector<SyncPoint> &sync_points,
-                                        const DepClosure &closure) const {
+                                        const DepClosure &closure,
+                                        ControlNode *loop) const {
   for (auto &sp : sync_points) {
     const SyncInsertionSite &src = sp.edge.Src(sites_);
     const SyncInsertionSite &dst = sp.edge.Dst(sites_);
     if (src.pipe == dst.pipe)
       continue;
-    bool is_innermost = HasSameLoopNest(loop_stack_, sp.flag_loops);
+    bool is_innermost = loop == sp.flag_loop;
     int innermost_num_versions = is_innermost ? sp.num_versions : 1;
     int min_distance = closure.MinDistance(sp.edge.dst, sp.edge.src);
     // If the loop trip count is no larger than the number of flag versions, the
     // flag is never reused across iterations, so an absent/loose reverse
     // ordering is harmless — no version bound is needed.
-    if (!loop_stack_.empty()) {
-      const ForNode *inner = loop_stack_.back().get();
+    if (loop != nullptr) {
+      const ForNode *inner = loop->control.get();
       PrimExpr step = inner->step.has_value()
                           ? inner->step.value()
                           : IntImm(inner->extent.dtype(), 1);
@@ -1520,8 +1471,7 @@ bool SyncInserter::CanReuse(const SyncPoint &a, const SyncPoint &b,
     // A mixed same/cross-iteration handshake alternates on one flag ring. Its
     // local lifetime proof is valid only when both points use the same ring.
     if (!allow_mixed_iter || !IsCrossCore(a) || !IsCrossCore(b) ||
-        a.num_versions != b.num_versions ||
-        !HasSameLoopNest(a.flag_loops, b.flag_loops))
+        a.num_versions != b.num_versions || a.flag_loop != b.flag_loop)
       return false;
     const SyncPoint &cross_iter = a_cross_iter ? a : b;
     const SyncPoint &same_iter = a_cross_iter ? b : a;
@@ -1551,14 +1501,14 @@ void SyncInserter::PromoteReuseSites(SyncPoint &sp, IRStructure *node) const {
   SyncInsertionSite src = sites_[sp.reuse_src];
   SyncInsertionSite dst = sites_[sp.reuse_dst];
   if (!node->HasConditions()) {
-    src.chain.insert(src.chain.begin(), node);
-    dst.chain.insert(dst.chain.begin(), node);
+    src.path_begin = node;
+    dst.path_begin = node;
   } else {
     bool cross_iter = sp.edge.distance > 0;
     auto collapse = [&](SyncInsertionSite &site, bool at_beginning) {
-      site.node = node;
+      site.path_begin = node;
+      site.path_end = node;
       site.at_beginning = at_beginning;
-      site.chain = {node};
     };
     collapse(src, !cross_iter);
     collapse(dst, cross_iter);
@@ -1785,7 +1735,7 @@ void SyncInserter::InsertSyncPoints() {
         continue;
       }
       Stmt pipe_barrier = MakeAscendPipeBarrier(prod_pipe);
-      InsertStatement(dst.node, pipe_barrier, true, dst.core, cons_guard);
+      InsertStatement(dst.path_end, pipe_barrier, true, dst.core, cons_guard);
       continue;
     }
 
@@ -1797,13 +1747,13 @@ void SyncInserter::InsertSyncPoints() {
     if (IsCrossCore(sp)) {
       if (src.core == kCoreVector) {
         Stmt set_stmt = MakeAscendCrossCoreSetFlag(4, prod_pipe, event_id);
-        InsertStatement(src.node, set_stmt, false, src.core, prod_guard);
+        InsertStatement(src.path_end, set_stmt, false, src.core, prod_guard);
         for (int sid = 0; sid < 2; ++sid) {
           Stmt wait_stmt = MakeAscendCrossCoreWaitFlag(
               4, cons_pipe,
               indexmod(flag_iteration, Integer(sp.num_versions)) +
                   Integer(base_id + 16 * sid));
-          InsertStatement(dst.node, wait_stmt, true, dst.core, cons_guard);
+          InsertStatement(dst.path_end, wait_stmt, true, dst.core, cons_guard);
         }
       } else {
         for (int sid = 0; sid < 2; ++sid) {
@@ -1811,24 +1761,24 @@ void SyncInserter::InsertSyncPoints() {
               4, prod_pipe,
               indexmod(flag_iteration, Integer(sp.num_versions)) +
                   Integer(base_id + 16 * sid));
-          InsertStatement(src.node, set_stmt, false, src.core, prod_guard);
+          InsertStatement(src.path_end, set_stmt, false, src.core, prod_guard);
         }
         Stmt wait_stmt = MakeAscendCrossCoreWaitFlag(4, cons_pipe, event_id);
-        InsertStatement(dst.node, wait_stmt, true, dst.core, cons_guard);
+        InsertStatement(dst.path_end, wait_stmt, true, dst.core, cons_guard);
       }
       continue;
     }
 
     Stmt set_stmt = MakeAscendSetFlag(hard_event, event_id);
-    InsertStatement(src.node, set_stmt, false, src.core, prod_guard);
+    InsertStatement(src.path_end, set_stmt, false, src.core, prod_guard);
     Stmt wait_stmt = MakeAscendWaitFlag(hard_event, event_id);
-    InsertStatement(dst.node, wait_stmt, true, dst.core, cons_guard);
+    InsertStatement(dst.path_end, wait_stmt, true, dst.core, cons_guard);
   }
 }
 
 SyncAnalysisResult
 SyncInserter::AnalyzeNodeList(std::vector<IRStructure *> nodes,
-                              const ControlNode *cache_key, bool is_loop_body) {
+                              ControlNode *loop) {
   SyncAnalysisResult result{DepClosure(sites_.size()), {}};
   std::vector<size_t> task_site_ids = CollectSiteIds(nodes);
 
@@ -1839,7 +1789,7 @@ SyncInserter::AnalyzeNodeList(std::vector<IRStructure *> nodes,
     child_sync_points.push_back(std::move(child_result.visible_sync_points));
   }
 
-  if (is_loop_body) {
+  if (loop != nullptr) {
     // Sort nodes by stage (smallest first) to match SW-pipelining order — the
     // earliest stage produces a value first across iterations.
     std::stable_sort(nodes.begin(), nodes.end(),
@@ -1848,16 +1798,15 @@ SyncInserter::AnalyzeNodeList(std::vector<IRStructure *> nodes,
                      });
   }
 
-  std::vector<SyncPoint> local_sync_points =
-      CollectSyncPoints(nodes, cache_key);
-  int max_distance = loop_stack_.empty() ? 0 : 1;
+  std::vector<SyncPoint> local_sync_points = CollectSyncPoints(nodes, loop);
+  int max_distance = loop == nullptr ? 0 : 1;
   for (const auto &sp : local_sync_points) {
     max_distance = std::max(max_distance, sp.edge.distance);
   }
   AddSamePipeEdges(result.closure, task_site_ids, max_distance);
   OptimizeSyncPoints(local_sync_points, result.closure, max_distance);
-  if (is_loop_body)
-    OptimizeFlagVersions(local_sync_points, result.closure);
+  if (loop != nullptr)
+    OptimizeFlagVersions(local_sync_points, result.closure, loop);
 
   std::vector<size_t> local_points;
   local_points.reserve(local_sync_points.size());
@@ -1900,7 +1849,6 @@ SyncAnalysisResult SyncInserter::AnalyzeNode(IRStructure *node) {
     auto *ctrl = static_cast<ControlNode *>(node);
     if (ctrl->children.empty() || !ctrl->control.defined())
       return {DepClosure(sites_.size()), {}};
-    loop_stack_.push_back(ctrl->control);
 
     // Activate one versioning record per claimed storage before recursing so
     // every Buffer alias uses the same claim-level iteration for data and
@@ -1913,7 +1861,7 @@ SyncAnalysisResult SyncInserter::AnalyzeNode(IRStructure *node) {
       std::optional<int> num_versions = GetClaimedBufferVersion(ctrl, storage);
       if (!num_versions.has_value())
         continue;
-      MultiBufferInfo info(storage, num_versions.value(), loop_stack_);
+      MultiBufferInfo info(storage, num_versions.value(), ctrl);
       active_multi_buffers_.emplace(storage, info);
       multi_buffer_infos_.push_back(std::move(info));
       scoped_storages.push_back(storage);
@@ -1922,12 +1870,10 @@ SyncAnalysisResult SyncInserter::AnalyzeNode(IRStructure *node) {
     std::vector<IRStructure *> nodes;
     for (auto &child : ctrl->children)
       nodes.push_back(child.get());
-    SyncAnalysisResult result =
-        AnalyzeNodeList(std::move(nodes), ctrl, /*is_loop_body=*/true);
+    SyncAnalysisResult result = AnalyzeNodeList(std::move(nodes), ctrl);
 
     for (const Var &storage : scoped_storages)
       active_multi_buffers_.erase(storage);
-    loop_stack_.pop_back();
     if (!ctrl->BodyHasLoopBreak()) {
       for (size_t index : result.visible_sync_points) {
         PromoteReuseSites(sync_points_[index], node);
@@ -1958,14 +1904,11 @@ void SyncInserter::Build(std::vector<std::shared_ptr<IRStructure>> &root) {
 
   CollectAllInsertionSites(nodes);
   SortAndUniqueSites(sites_);
-  AnalyzeNodeList(std::move(nodes), /*cache_key=*/nullptr,
-                  /*is_loop_body=*/false);
+  AnalyzeNodeList(std::move(nodes), /*loop=*/nullptr);
   PlanFlagAllocations();
   InsertSyncPoints();
-  MaterializeInsertions(root);
-  RebuildIRStructureParents(root);
+  MaterializeInsertions(root, nullptr);
 
-  ICHECK(loop_stack_.empty());
   ICHECK(active_multi_buffers_.empty());
 }
 
@@ -1984,7 +1927,9 @@ tvm::transform::Pass InsertSync() {
               context.root, context.outer_ctx, MakeSyncInsertionExtraInfo);
           SyncKernelUpdate update =
               InsertKernelSync(context.root->body, std::move(scheduled_tir));
-          Stmt serialized = EncodeScheduledTIR(std::move(update.scheduled_tir));
+          // MultiBufferInfo keeps claim-loop pointers into this tree. Keep the
+          // owning ScheduledTIR alive until buffer materialization completes.
+          Stmt serialized = EncodeScheduledTIR(update.scheduled_tir);
           serialized = MaterializeMultiVersionBuffers(
               std::move(serialized), update.multi_buffer_infos,
               std::move(update.versioned_buffers));

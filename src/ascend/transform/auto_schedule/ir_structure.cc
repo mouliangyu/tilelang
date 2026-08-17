@@ -64,46 +64,62 @@ namespace tl {
 
 using namespace tirx;
 
-namespace {
-
-void RebuildIRStructureParentsImpl(
-    const std::vector<std::shared_ptr<IRStructure>> &nodes,
-    IRStructure *parent) {
-  for (const std::shared_ptr<IRStructure> &node : nodes) {
-    if (!node)
-      continue;
-    node->SetParent(parent);
-    if (!node->IsControl())
-      continue;
-    auto *control = static_cast<ControlNode *>(node.get());
-    if (control->task)
-      control->task->SetParent(control);
-    RebuildIRStructureParentsImpl(control->children, control);
-  }
-}
-
-} // namespace
-
-std::vector<IRStructure *> IRStructure::Path() {
+std::vector<IRStructure *> IRStructure::PathFrom(IRStructure *ancestor) {
   std::vector<IRStructure *> path;
-  for (IRStructure *node = this; node != nullptr; node = node->GetParent())
+  for (IRStructure *node = this; node != nullptr; node = node->GetParent()) {
     path.push_back(node);
-  std::reverse(path.begin(), path.end());
-  return path;
+    if (node == ancestor) {
+      std::reverse(path.begin(), path.end());
+      return path;
+    }
+  }
+  if (ancestor == nullptr) {
+    std::reverse(path.begin(), path.end());
+    return path;
+  }
+  LOG(FATAL) << "The requested IRStructure path start is not an ancestor";
+  return {};
 }
 
-std::vector<const IRStructure *> IRStructure::Path() const {
-  std::vector<const IRStructure *> path;
-  for (const IRStructure *node = this; node != nullptr;
-       node = node->GetParent())
-    path.push_back(node);
-  std::reverse(path.begin(), path.end());
-  return path;
+int CompareIRStructure(IRStructure *lhs, IRStructure *rhs) {
+  if (lhs == rhs)
+    return 0;
+  if (lhs == nullptr)
+    return -2;
+  if (rhs == nullptr)
+    return 2;
+
+  std::vector<IRStructure *> lhs_path = lhs->PathFrom();
+  std::vector<IRStructure *> rhs_path = rhs->PathFrom();
+  size_t common_size = std::min(lhs_path.size(), rhs_path.size());
+  bool same_nodes = true;
+  for (size_t i = 0; i < common_size; ++i) {
+    same_nodes &= lhs_path[i] == rhs_path[i];
+    if (lhs_path[i]->GetStage() != rhs_path[i]->GetStage())
+      return lhs_path[i]->GetStage() < rhs_path[i]->GetStage() ? -1 : 1;
+    if (lhs_path[i]->GetIndex() != rhs_path[i]->GetIndex())
+      return lhs_path[i]->GetIndex() < rhs_path[i]->GetIndex() ? -1 : 1;
+  }
+  if (lhs_path.size() == rhs_path.size())
+    return 0;
+  if (lhs_path.size() < rhs_path.size())
+    return same_nodes ? -2 : -1;
+  return same_nodes ? 2 : 1;
 }
 
-void RebuildIRStructureParents(
-    const std::vector<std::shared_ptr<IRStructure>> &roots) {
-  RebuildIRStructureParentsImpl(roots, nullptr);
+PrimExpr CalculateIterationCount(ControlNode *loop) {
+  PrimExpr total_iter = IntImm(DataType::Int(32), 0);
+  PrimExpr total_multiplier = IntImm(DataType::Int(32), 1);
+  for (; loop != nullptr; loop = loop->GetParentControl()) {
+    const ForNode *for_node = loop->control.get();
+    PrimExpr step = for_node->step.has_value() ? for_node->step.value()
+                                               : IntImm(DataType::Int(32), 1);
+    total_iter =
+        total_iter +
+        indexdiv(for_node->loop_var - for_node->min, step) * total_multiplier;
+    total_multiplier = total_multiplier * for_node->extent;
+  }
+  return total_iter;
 }
 
 std::shared_ptr<IRStructure> TaskNode::Clone() const {
@@ -135,14 +151,19 @@ std::shared_ptr<IRStructure> ControlNode::Clone() const {
   new_ctrl->control = control;
   // Clone children
   new_ctrl->children.reserve(children.size());
-  for (const auto &child : children) {
-    new_ctrl->children.push_back(child ? child->Clone() : nullptr);
+  for (size_t i = 0; i < children.size(); ++i) {
+    std::shared_ptr<IRStructure> child =
+        children[i] ? children[i]->Clone() : nullptr;
+    if (child) {
+      child->SetIndex(i);
+      child->SetParent(new_ctrl.get());
+    }
+    new_ctrl->children.push_back(std::move(child));
   }
   if (task) {
     new_ctrl->task = std::static_pointer_cast<TaskNode>(task->Clone());
     new_ctrl->task->SetParent(new_ctrl.get());
   }
-  RebuildIRStructureParentsImpl(new_ctrl->children, new_ctrl.get());
   new_ctrl->CopyBaseMetadataFrom(*this);
   return new_ctrl;
 }

@@ -27,7 +27,6 @@
 #include <algorithm>
 #include <functional>
 #include <limits>
-#include <optional>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -48,60 +47,27 @@ namespace tl {
 
 using namespace tirx;
 
-using TaskAccessPredicate = std::function<bool(const TaskNode *task)>;
 using StorageSet =
     std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
 
-using CoveredTaskPair = std::pair<const TaskNode *, const TaskNode *>;
 using CoveredDependencyMap =
-    std::unordered_map<Var, std::set<CoveredTaskPair>, ffi::ObjectPtrHash,
+    std::unordered_map<Var, std::set<DependencyTaskPair>, ffi::ObjectPtrHash,
                        ffi::ObjectPtrEqual>;
-
-PrimExpr CalculateIterationCount(const std::vector<For> &loops) {
-  PrimExpr total_iter = IntImm(DataType::Int(32), 0);
-  PrimExpr total_multiplier = IntImm(DataType::Int(32), 1);
-  for (size_t i = loops.size(); i-- > 0;) {
-    const ForNode *for_node = loops[i].get();
-    PrimExpr step = for_node->step.has_value() ? for_node->step.value()
-                                               : IntImm(DataType::Int(32), 1);
-    total_iter =
-        total_iter +
-        indexdiv(for_node->loop_var - for_node->min, step) * total_multiplier;
-    total_multiplier = total_multiplier * for_node->extent;
-  }
-  return total_iter;
-}
-
-// BufferAccessPoint::task — defined here so the inline `static_cast` sees the
-// full TaskNode definition via ir_structure.h.
-const TaskNode *BufferAccessPoint::task() const {
-  ICHECK(!path.empty() && path.back() && path.back()->IsTask());
-  return static_cast<const TaskNode *>(path.back());
-}
-
-// ============================================================================
-// Dependency analysis implementation
-// ============================================================================
 
 inline bool RegionUsesStorage(const BufferRegion &region, const Var &storage) {
   return region->buffer->data.same_as(storage);
 }
 
-TaskAccessPredicate MakeStorageAccessPredicate(const Var &storage,
-                                               bool is_write) {
-  return [storage, is_write](const TaskNode *task) -> bool {
-    const auto &regions =
-        is_write ? task->GetWriteRegions() : task->GetReadRegions();
-    for (const auto &region : regions) {
-      if (RegionUsesStorage(region, storage))
-        return true;
-    }
-    return false;
-  };
+bool TaskAccessesStorage(TaskNode *task, const Var &storage, bool is_write) {
+  const auto &regions =
+      is_write ? task->GetWriteRegions() : task->GetReadRegions();
+  return std::any_of(regions.begin(), regions.end(), [&](const auto &region) {
+    return RegionUsesStorage(region, storage);
+  });
 }
 
 std::vector<BufferRegion>
-TaskRegionsForStorage(const TaskNode *task, const Var &storage, bool is_write) {
+TaskRegionsForStorage(TaskNode *task, const Var &storage, bool is_write) {
   std::vector<BufferRegion> result;
   const auto &regions =
       is_write ? task->GetWriteRegions() : task->GetReadRegions();
@@ -113,57 +79,18 @@ TaskRegionsForStorage(const TaskNode *task, const Var &storage, bool is_write) {
   return result;
 }
 
-// Collect access points for every task touching `storage`. Unlike the old
-// first/last-only collection, this gathers ALL matching points; the caller
-// pairs producer/consumer points and lets the closure prune redundancy.
-// `producer_side` shifts a loop body's timing to its last iteration so a
-// producer's latency is measured from the final write.
-static void CollectAllAccessPointsImpl(const IRStructure *node,
-                                       const TaskAccessPredicate &pred,
-                                       std::set<BufferAccessPoint> &result,
-                                       std::vector<const IRStructure *> &path,
-                                       int64_t time_offset, bool producer_side,
-                                       const DependencyTiming *timing) {
-  if (!node)
-    return;
-
-  if (node->IsTask()) {
-    const TaskNode *task = static_cast<const TaskNode *>(node);
-    if (pred(task)) {
-      std::vector<const IRStructure *> point_path = path;
-      point_path.push_back(node);
-      result.emplace(time_offset, std::move(point_path));
-    }
-    return;
-  }
-
-  const ControlNode *ctrl = static_cast<const ControlNode *>(node);
-  path.push_back(node);
-
-  int64_t body_offset = time_offset;
-  if (producer_side) {
-    int64_t trip_count = ctrl->GetTripCount();
-    int64_t ii_per_iter = timing ? timing->IIperIter(ctrl) : 0;
-    body_offset += (trip_count > 0 ? (trip_count - 1) : 0) * ii_per_iter;
-  }
-
-  for (const auto &child : ctrl->children) {
-    int64_t start_time = timing ? timing->StartTime(child.get()) : 0;
-    CollectAllAccessPointsImpl(child.get(), pred, result, path,
-                               body_offset + start_time, producer_side, timing);
-  }
-
-  path.pop_back();
-}
-
-std::set<BufferAccessPoint>
-CollectAccessPoints(const IRStructure *node, const Var &storage, bool is_write,
-                    bool producer_side, const DependencyTiming *timing) {
-  std::set<BufferAccessPoint> result;
-  std::vector<const IRStructure *> path;
-  CollectAllAccessPointsImpl(node,
-                             MakeStorageAccessPredicate(storage, is_write),
-                             result, path, 0, producer_side, timing);
+// Collect every leaf task touching `storage`. Dependency consumers can recover
+// paths and schedule-local timestamps from the task's parent chain.
+std::vector<TaskNode *> CollectAccessTasks(IRStructure *node,
+                                           const Var &storage, bool is_write) {
+  std::vector<TaskNode *> result;
+  CollectAllTaskNodes(node, result);
+  result.erase(std::remove_if(result.begin(), result.end(),
+                              [&](auto *task) {
+                                return !TaskAccessesStorage(task, storage,
+                                                            is_write);
+                              }),
+               result.end());
   return result;
 }
 
@@ -175,11 +102,11 @@ CollectAccessPoints(const IRStructure *node, const Var &storage, bool is_write,
 // when its two operands match the two queried regions (order-insensitive, since
 // non-overlap is symmetric) and the cross mode agrees.
 static bool DeclaredNoConflict(const BufferRegion &a_region,
-                               const BufferRegion &b_region,
-                               const std::vector<For> &loop_stack, bool cross) {
-  if (loop_stack.empty())
+                               const BufferRegion &b_region, ControlNode *loop,
+                               bool cross) {
+  if (loop == nullptr)
     return false;
-  auto ann = loop_stack.back()->annotations.Get("no_conflict");
+  auto ann = loop->control->annotations.Get("no_conflict");
   if (!ann.has_value())
     return false;
 
@@ -207,21 +134,6 @@ static bool DeclaredNoConflict(const BufferRegion &a_region,
   return false;
 }
 
-static bool
-IsCurrentLoopMultiBufferEligible(const Var &storage,
-                                 const std::vector<For> &loop_stack) {
-  if (loop_stack.empty())
-    return false;
-  auto ann = loop_stack.back()->annotations.Get(kMultiBufferEligible);
-  if (!ann.has_value())
-    return false;
-  for (const Var &eligible : ann.value().cast<Array<Var>>()) {
-    if (eligible.same_as(storage))
-      return true;
-  }
-  return false;
-}
-
 // Check whether a_region and b_region are provably disjoint under their
 // per-side outer contexts. Cross-iteration checks normally relate the
 // innermost loop variable. For a buffer claimed by the current loop's
@@ -231,7 +143,7 @@ IsCurrentLoopMultiBufferEligible(const Var &storage,
 // producer + offset.
 bool RegionsMayConflict(const ConstrSet &a_ctx, const BufferRegion &a_region,
                         const ConstrSet &b_ctx, const BufferRegion &b_region,
-                        const std::vector<For> &loop_stack, int offset) {
+                        ControlNode *loop, int offset) {
   if (!a_region->buffer->data.same_as(b_region->buffer->data))
     return false;
 
@@ -241,9 +153,9 @@ bool RegionsMayConflict(const ConstrSet &a_ctx, const BufferRegion &a_region,
     return true;
 
   const bool cross = offset != 0;
-  if (cross && loop_stack.empty())
+  if (cross && loop == nullptr)
     return false;
-  if (DeclaredNoConflict(a_region, b_region, loop_stack, cross))
+  if (DeclaredNoConflict(a_region, b_region, loop, cross))
     return false;
 
   const Array<Range> &a_rng = a_region->region;
@@ -260,14 +172,15 @@ bool RegionsMayConflict(const ConstrSet &a_ctx, const BufferRegion &a_region,
   ConstrSet loop_ctx;
   if (cross) {
     bool use_complete_loop_nest =
-        IsCurrentLoopMultiBufferEligible(a_region->buffer->data, loop_stack);
-    Var pivot_lv = use_complete_loop_nest ? loop_stack.front()->loop_var
-                                          : loop_stack.back()->loop_var;
+        loop->IsMultiBufferEligible(a_region->buffer->data);
+    ControlNode *pivot_loop =
+        use_complete_loop_nest ? loop->GetOutermostControl() : loop;
+    Var pivot_lv = pivot_loop->control->loop_var;
     a_local_ctx = a_local_ctx.RenameFrom("_p", a_sub, pivot_lv);
     b_local_ctx = b_local_ctx.RenameFrom("_c", b_sub, pivot_lv);
     PrimExpr iteration = use_complete_loop_nest
-                             ? CalculateIterationCount(loop_stack)
-                             : PrimExpr(loop_stack.back()->loop_var);
+                             ? CalculateIterationCount(loop)
+                             : PrimExpr(loop->control->loop_var);
     PrimExpr p = Substitute(iteration, a_sub);
     PrimExpr c = Substitute(iteration, b_sub);
     loop_ctx.AddConstr(
@@ -297,14 +210,15 @@ bool RegionsMayConflict(const ConstrSet &a_ctx, const BufferRegion &a_region,
            ana.z3_prover.CanProve(any_dim_disjoint));
 }
 
-static std::vector<DepInfo> AnalyzeDependenciesImpl(
-    const std::vector<IRStructure *> &nodes, const std::vector<For> &loop_stack,
-    const BufferVersionMap &manual_buffer_versions,
-    DependencyCache &dependency_cache, const ControlNode *cache_key,
-    const DependencyTiming *timing) {
-  if (cache_key) {
-    auto cache_it = dependency_cache.find(cache_key);
-    if (cache_it != dependency_cache.end())
+std::vector<DepInfo>
+AnalyzeDependencies(const std::vector<IRStructure *> &nodes, ControlNode *loop,
+                    const BufferVersionMap &manual_buffer_versions,
+                    DependencyCache *dependency_cache) {
+  DependencyCache local_cache;
+  DependencyCache &cache = dependency_cache ? *dependency_cache : local_cache;
+  if (loop) {
+    auto cache_it = cache.find(loop);
+    if (cache_it != cache.end())
       return cache_it->second;
   }
 
@@ -326,33 +240,27 @@ static std::vector<DepInfo> AnalyzeDependenciesImpl(
     }
   }
 
-  std::function<void(IRStructure *, std::vector<For> &, CoveredDependencyMap &)>
-      collect_subtree_deps = [&](IRStructure *node, std::vector<For> &stack,
-                                 CoveredDependencyMap &out) {
+  std::function<void(IRStructure *, CoveredDependencyMap &)>
+      collect_subtree_deps = [&](IRStructure *node, CoveredDependencyMap &out) {
         if (!node || !node->IsControl())
           return;
         auto *ctrl = static_cast<ControlNode *>(node);
         std::vector<IRStructure *> children;
         for (const auto &child : ctrl->children)
           children.push_back(child.get());
-        stack.push_back(ctrl->control);
         auto child_deps =
-            AnalyzeDependenciesImpl(children, stack, manual_buffer_versions,
-                                    dependency_cache, ctrl, timing);
+            AnalyzeDependencies(children, ctrl, manual_buffer_versions, &cache);
         for (const auto &cdep : child_deps) {
           auto &covered_pairs = out[cdep.storage];
-          for (const auto &[cprod, ccons] : cdep.task_pairs) {
-            covered_pairs.emplace(cprod.task(), ccons.task());
-          }
+          for (const auto &[cprod, ccons] : cdep.task_pairs)
+            covered_pairs.emplace(cprod, ccons);
         }
         for (auto *child : children)
-          collect_subtree_deps(child, stack, out);
-        stack.pop_back();
+          collect_subtree_deps(child, out);
       };
   auto subtree_covered = [&](IRStructure *node) {
     CoveredDependencyMap covered;
-    std::vector<For> stack = loop_stack;
-    collect_subtree_deps(node, stack, covered);
+    collect_subtree_deps(node, covered);
     return covered;
   };
 
@@ -360,52 +268,42 @@ static std::vector<DepInfo> AnalyzeDependenciesImpl(
     auto it = manual_buffer_versions.find(storage);
     int manual_versions = it == manual_buffer_versions.end() ? 0 : (*it).second;
 
-    auto touches = [&](size_t u) {
-      for (const auto &region : nodes[u]->GetReadRegions()) {
-        if (RegionUsesStorage(region, storage))
-          return true;
-      }
-      for (const auto &region : nodes[u]->GetWriteRegions()) {
-        if (RegionUsesStorage(region, storage))
-          return true;
-      }
-      return false;
+    struct AccessTasks {
+      std::vector<TaskNode *> reads;
+      std::vector<TaskNode *> writes;
+
+      bool TouchesStorage() const { return !reads.empty() || !writes.empty(); }
     };
+    std::vector<AccessTasks> accesses(n);
+    for (size_t i = 0; i < n; ++i) {
+      accesses[i].reads = CollectAccessTasks(nodes[i], storage, false);
+      accesses[i].writes = CollectAccessTasks(nodes[i], storage, true);
+    }
 
     for (size_t i = 0; i < n; ++i) {
-      if (!touches(i))
+      if (!accesses[i].TouchesStorage())
         continue;
       for (size_t j = 0; j < n; ++j) {
-        if (i == j && loop_stack.empty())
+        if (i == j && loop == nullptr)
           continue;
-        if (!touches(j))
+        if (!accesses[j].TouchesStorage())
           continue;
-        if (!manual_versions && loop_stack.empty() && i >= j)
+        if (!manual_versions && loop == nullptr && i >= j)
           continue;
 
-        auto a_w = CollectAccessPoints(nodes[i], storage, true,
-                                       /*producer_side=*/true, timing);
-        auto a_r = CollectAccessPoints(nodes[i], storage, false,
-                                       /*producer_side=*/true, timing);
-        auto b_r = CollectAccessPoints(nodes[j], storage, false,
-                                       /*producer_side=*/false, timing);
-        auto b_w = CollectAccessPoints(nodes[j], storage, true,
-                                       /*producer_side=*/false, timing);
-
-        std::set<std::pair<BufferAccessPoint, BufferAccessPoint>> pairs;
-        int64_t latency = -1;
+        std::set<DependencyTaskPair> pairs;
         int min_manual_dist = std::numeric_limits<int>::max();
 
-        auto consider = [&](const std::set<BufferAccessPoint> &a_pts,
+        auto consider = [&](const std::vector<TaskNode *> &a_tasks,
                             bool a_write,
-                            const std::set<BufferAccessPoint> &b_pts,
+                            const std::vector<TaskNode *> &b_tasks,
                             bool b_write) {
-          for (const auto &a : a_pts) {
+          for (TaskNode *a : a_tasks) {
             std::vector<BufferRegion> a_regions =
-                TaskRegionsForStorage(a.task(), storage, a_write);
-            for (const auto &b : b_pts) {
+                TaskRegionsForStorage(a, storage, a_write);
+            for (TaskNode *b : b_tasks) {
               std::vector<BufferRegion> b_regions =
-                  TaskRegionsForStorage(b.task(), storage, b_write);
+                  TaskRegionsForStorage(b, storage, b_write);
               for (const auto &rA : a_regions) {
                 for (const auto &rB : b_regions) {
                   if (manual_versions) {
@@ -413,9 +311,8 @@ static std::vector<DepInfo> AnalyzeDependenciesImpl(
                     // access pair collides.
                     int dist = -1;
                     for (int d = (i < j ? 0 : 1); d <= manual_versions; ++d) {
-                      if (RegionsMayConflict(a.task()->outer_ctx, rA,
-                                             b.task()->outer_ctx, rB,
-                                             loop_stack, d)) {
+                      if (RegionsMayConflict(a->outer_ctx, rA, b->outer_ctx, rB,
+                                             loop, d)) {
                         dist = d;
                         break;
                       }
@@ -423,26 +320,22 @@ static std::vector<DepInfo> AnalyzeDependenciesImpl(
                     if (dist < 0)
                       continue;
                     min_manual_dist = std::min(min_manual_dist, dist);
-                  } else if (!RegionsMayConflict(a.task()->outer_ctx, rA,
-                                                 b.task()->outer_ctx, rB,
-                                                 loop_stack, i >= j ? -1 : 0)) {
+                  } else if (!RegionsMayConflict(a->outer_ctx, rA, b->outer_ctx,
+                                                 rB, loop, i >= j ? -1 : 0)) {
                     continue;
                   }
                   pairs.emplace(a, b);
-                  int64_t l =
-                      a.timestamp + a.task()->GetLatency() - b.timestamp;
-                  if (l < 0)
-                    l = 0;
-                  if (l > latency)
-                    latency = l;
                 }
               }
             }
           }
         };
-        consider(a_w, /*a_write=*/true, b_r, /*b_write=*/false);
-        consider(a_w, /*a_write=*/true, b_w, /*b_write=*/true);
-        consider(a_r, /*a_write=*/false, b_w, /*b_write=*/true);
+        consider(accesses[i].writes, /*a_write=*/true, accesses[j].reads,
+                 /*b_write=*/false);
+        consider(accesses[i].writes, /*a_write=*/true, accesses[j].writes,
+                 /*b_write=*/true);
+        consider(accesses[i].reads, /*a_write=*/false, accesses[j].writes,
+                 /*b_write=*/true);
 
         // Self-dependency on a control node: drop pairs already covered by the
         // node's own subtree.
@@ -451,8 +344,7 @@ static std::vector<DepInfo> AnalyzeDependenciesImpl(
           auto covered_storage = covered.find(storage);
           for (auto it = pairs.begin(); it != pairs.end();) {
             if (covered_storage != covered.end() &&
-                covered_storage->second.count(
-                    {it->first.task(), it->second.task()})) {
+                covered_storage->second.count(*it)) {
               it = pairs.erase(it);
             } else {
               ++it;
@@ -460,31 +352,19 @@ static std::vector<DepInfo> AnalyzeDependenciesImpl(
           }
         }
 
-        if (!pairs.empty() && latency >= 0) {
+        if (!pairs.empty()) {
           int distance = manual_versions ? min_manual_dist : (i >= j ? -1 : 0);
           deps.push_back(
               {nodes[i], nodes[j], storage,
-               std::vector<std::pair<BufferAccessPoint, BufferAccessPoint>>(
-                   pairs.begin(), pairs.end()),
-               distance, latency});
+               std::vector<DependencyTaskPair>(pairs.begin(), pairs.end()),
+               distance});
         }
       }
     }
   }
-  if (cache_key)
-    dependency_cache.emplace(cache_key, deps);
+  if (loop)
+    cache.emplace(loop, deps);
   return deps;
-}
-
-std::vector<DepInfo> AnalyzeDependencies(
-    const std::vector<IRStructure *> &nodes, const std::vector<For> &loop_stack,
-    const BufferVersionMap &manual_buffer_versions,
-    DependencyCache *dependency_cache, const ControlNode *cache_key,
-    const DependencyTiming *timing) {
-  DependencyCache local_cache;
-  DependencyCache &cache = dependency_cache ? *dependency_cache : local_cache;
-  return AnalyzeDependenciesImpl(nodes, loop_stack, manual_buffer_versions,
-                                 cache, cache_key, timing);
 }
 
 } // namespace tl

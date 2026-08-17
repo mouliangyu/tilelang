@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 
+#include "../buffer_version.h"
 #include "../core_mask.h"
 
 namespace tvm {
@@ -109,12 +110,6 @@ inline uint16_t PipeSpecialRegisterMask(uint16_t pipe_mask) {
   add_pipe(ResourcePipe::kScalar, SpecialRegister::kPipeScalar);
   return mask;
 }
-
-// Structure to represent a specific access to a buffer (used for ordering
-// accesses). `path` records the chain of IRStructure nodes traversed from the
-// queried subtree's root down to (and including) the task — only real IR-tree
-// nodes; synthetic helpers introduced during traversal are excluded. The task
-// itself is always the last element of `path`.
 
 // Helper function to compare if two regions are equal
 inline bool RegionsEqual(const Region &a, const Region &b) {
@@ -264,23 +259,18 @@ public:
   // The parent does not own this node; ownership remains with the parent's
   // shared_ptr fields. Root nodes have no parent.
   IRStructure *GetParent() { return parent_; }
-  const IRStructure *GetParent() const { return parent_; }
   void SetParent(IRStructure *parent) {
     ICHECK(parent != this) << "An IRStructure node cannot parent itself";
     parent_ = parent;
   }
 
-  // Return the structural path from the root to this node, inclusive.
-  std::vector<IRStructure *> Path();
-  std::vector<const IRStructure *> Path() const;
+  // Return the structural path from an ancestor to this node, inclusive. A
+  // null ancestor means the root of this node's tree.
+  std::vector<IRStructure *> PathFrom(IRStructure *ancestor = nullptr);
 
   template <typename T> T *GetExtraInfo() {
     ICHECK(extra_info_ != nullptr) << "Expected pass-local IR extra info";
     return static_cast<T *>(extra_info_.get());
-  }
-  template <typename T> const T *GetExtraInfo() const {
-    ICHECK(extra_info_ != nullptr) << "Expected pass-local IR extra info";
-    return static_cast<const T *>(extra_info_.get());
   }
 
   // Guard deltas introduced at this node relative to its nearest
@@ -769,12 +759,42 @@ public:
       task->outer_ctx.Populate(analyzer);
     return GetSerialTripCount(control, &analyzer);
   }
+
+  ControlNode *GetParentControl() {
+    IRStructure *parent = GetParent();
+    if (parent == nullptr)
+      return nullptr;
+    ICHECK(parent->IsControl());
+    return static_cast<ControlNode *>(parent);
+  }
+
+  ControlNode *GetOutermostControl() {
+    ControlNode *outermost = this;
+    while (ControlNode *parent = outermost->GetParentControl())
+      outermost = parent;
+    return outermost;
+  }
+
+  bool IsMultiBufferEligible(const Var &storage) const {
+    auto annotation = control->annotations.Get(kMultiBufferEligible);
+    if (!annotation.has_value())
+      return false;
+    for (const Var &eligible : annotation.value().cast<Array<Var>>()) {
+      if (eligible.same_as(storage))
+        return true;
+    }
+    return false;
+  }
 };
 
-// Rebuild every non-owning parent link in a forest. Call this after attaching,
-// removing, or replacing nodes through public child vectors.
-void RebuildIRStructureParents(
-    const std::vector<std::shared_ptr<IRStructure>> &roots);
+// Compare root-to-node (stage, index) paths. Returns -2 when lhs is an
+// ancestor of rhs, +2 when rhs is an ancestor of lhs, and -1/+1 for ordinary
+// lexicographic order. A null node is the virtual root above every tree.
+int CompareIRStructure(IRStructure *lhs, IRStructure *rhs);
+
+// Flatten the current iteration over a loop and all of its ancestors. The
+// kernel top level (null) has iteration zero.
+PrimExpr CalculateIterationCount(ControlNode *loop = nullptr);
 
 inline bool IsRegisterRegion(const BufferRegion &region) {
   String scope = region->buffer.scope();
