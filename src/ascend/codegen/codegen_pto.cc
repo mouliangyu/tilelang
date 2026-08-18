@@ -5,6 +5,7 @@
 #include "ascend/codegen/codegen_pto.h"
 
 #include "backend/common/codegen/codegen_utils.h"
+#include "backend/common/target_utils.h"
 #include "op/builtin.h"
 #include "support/check.h"
 #include "tvm/ir/repr.h"
@@ -34,15 +35,42 @@ using namespace tirx;
 
 namespace {
 
+std::string PtoFP8TypeName(DataType t) {
+  ICHECK(tl::IsAscendVectorizableFP8(t))
+      << "PTO Ascend FP8 type expected, got " << t;
+
+  std::string lanes_suffix;
+  switch (t.lanes()) {
+  case 1:
+    break;
+  case 2:
+  case 4:
+  case 8:
+    lanes_suffix = "x" + std::to_string(t.lanes());
+    break;
+  default:
+    LOG(FATAL) << "PTO Ascend FP8 types support lanes 1, 2, 4, and 8 only, got "
+               << t;
+  }
+
+  if (t.is_float8_e4m3() || t.is_float8_e4m3fn())
+    return "pto.f8e4m3" + lanes_suffix;
+  if (t.is_float8_e5m2())
+    return "pto.f8e5m2" + lanes_suffix;
+  LOG(FATAL) << "Unsupported PTO Ascend FP8 type: " << t;
+  return "";
+}
+
 std::string PtoTypeName(DataType t) {
+  if (tl::IsAscendVectorizableFP8(t))
+    return PtoFP8TypeName(t);
+
   ICHECK(t.is_scalar()) << "PTO scalar type expected, got " << t;
   if (t.is_float()) {
     if (t.bits() == 32)
       return "pto.f32";
     if (t.bits() == 16)
       return "pto.f16";
-  } else if (t.is_float8_e4m3fn()) {
-    return "pto.f8e4m3";
   } else if (t.is_bfloat16()) {
     return "pto.bf16";
   } else if (t.is_uint()) {
@@ -102,8 +130,11 @@ DataType ParsePTODtype(const std::string &dtype_name) {
     return DataType::Float(16);
   if (dtype_name == "bfloat16" || dtype_name == "bfloat16_t")
     return DataType::BFloat(16);
-  if (dtype_name == "float8_e4m3fn" || dtype_name == "float8_e4m3_t")
-    return DataType(DataType::kFloat8_e4m3fn, 8, 1);
+  if (dtype_name == "float8_e4m3" || dtype_name == "float8_e4m3fn" ||
+      dtype_name == "float8_e4m3_t")
+    return DataType::Float8E4M3FN();
+  if (dtype_name == "float8_e5m2" || dtype_name == "float8_e5m2_t")
+    return DataType::Float8E5M2();
   if (dtype_name == "int64")
     return DataType::Int(64);
   if (dtype_name == "int32")
@@ -138,6 +169,32 @@ bool StartsWith(const std::string &value, const std::string &prefix) {
 
 bool IsFloat32(DataType t) {
   return t.is_float() && t.bits() == 32 && t.lanes() == 1;
+}
+
+bool IsSupportedPTOFloatMinMaxType(DataType t) {
+  if (t.is_scalar())
+    return t.is_float16() || IsFloat32(t) || t.is_bfloat16();
+  return t.lanes() == 2 && (t.is_float16() || t.is_bfloat16());
+}
+
+bool IsSupportedPTOSIMTUnaryMathType(DataType t) {
+  return IsFloat32(t) || (t.is_float16() && (t.is_scalar() || t.lanes() == 2));
+}
+
+bool IsSupportedPTOScalarUnaryMathType(DataType t) {
+  return t.is_scalar() && (t.is_float16() || IsFloat32(t) || t.is_bfloat16());
+}
+
+bool IsSupportedSIMTLocalStorageType(DataType t) {
+  return IsFloat32(t) || (t.is_scalar() && tl::IsAscendVectorizableFP8(t));
+}
+
+bool IsSupportedSIMTFP8ContiguousLaneCount(int lanes) {
+  return lanes == 2 || lanes == 4 || lanes == 8;
+}
+
+bool IsPowerOfTwo(int64_t value) {
+  return value > 0 && (value & (value - 1)) == 0;
 }
 
 void CheckContiguousRampStride(const PrimExpr &index, const char *access_kind) {
@@ -949,10 +1006,17 @@ void CodeGenTileLangPTO::EmitPtoBufferAllocation(const Buffer &buffer) {
     PrintIndent();
     const bool persistent =
         persistent_buffer_vars_.count(buffer->data.get()) != 0;
-    if (inside_simtvf_body_ || persistent) {
+    if (inside_simtvf_body_) {
+      ICHECK(IsSupportedSIMTLocalStorageType(buffer->dtype))
+          << "PTO SIMT local allocation currently supports float32 and "
+             "float8_e4m3fn/float8_e5m2 only, got "
+          << buffer->dtype;
+      stream << vid << " = pto.alloc_buffer((" << opt_size.value() << ",), "
+             << PtoTypeName(buffer->dtype) << ")\n";
+    } else if (persistent) {
       ICHECK(IsFloat32(buffer->dtype))
-          << "PTO SIMT/persistent local allocation currently supports "
-             "float32 only, got "
+          << "PTO persistent local allocation currently supports float32 "
+             "only, got "
           << buffer->dtype;
       stream << vid << " = pto.alloc_buffer((" << opt_size.value()
              << ",), pto.f32)\n";
@@ -1363,17 +1427,36 @@ CodeGenTileLangPTO::EmitPTOAllReduceExpr_(const std::string &func_name,
   const size_t begin = func_name.find("tl::AscendAllReduce");
   ICHECK_NE(begin, std::string::npos)
       << "Cannot parse AscendAllReduce template arguments from: " << func_name;
-  ICHECK_NE(func_name.find("tl::AscendAllReduce<tl::SumOp", begin),
-            std::string::npos)
-      << "PTO codegen currently maps only sum reductions to "
-         "pto.simt_allreduce_sum";
+  struct ReductionInfo {
+    const char *tir_name;
+    const char *pto_name;
+  };
+  const ReductionInfo reductions[] = {
+      {"tl::SumOp", "pto.simt_allreduce_sum"},
+      {"tl::MaxOp", "pto.simt_allreduce_max"},
+      {"tl::MinOp", "pto.simt_allreduce_min"},
+  };
+  const ReductionInfo *reduction = nullptr;
+  for (const ReductionInfo &candidate : reductions) {
+    const std::string prefix =
+        std::string("tl::AscendAllReduce<") + candidate.tir_name;
+    if (func_name.find(prefix, begin) != std::string::npos) {
+      reduction = &candidate;
+      break;
+    }
+  }
+  ICHECK(reduction != nullptr)
+      << "PTO codegen currently maps only sum, max, and min AscendAllReduce "
+         "reductions, got "
+      << func_name;
 
   long long parsed_threads = 0;       // NOLINT(runtime/int)
   long long parsed_scale = 1;         // NOLINT(runtime/int)
   long long parsed_thread_offset = 0; // NOLINT(runtime/int)
-  const char *pattern = "tl::AscendAllReduce<tl::SumOp, %lld, %lld, %lld";
+  const std::string pattern = std::string("tl::AscendAllReduce<") +
+                              reduction->tir_name + ", %lld, %lld, %lld";
   const int parsed =
-      std::sscanf(func_name.c_str() + begin, pattern, &parsed_threads,
+      std::sscanf(func_name.c_str() + begin, pattern.c_str(), &parsed_threads,
                   &parsed_scale, &parsed_thread_offset);
   ICHECK_GE(parsed, 1)
       << "AscendAllReduce expects at least a threads template parameter: "
@@ -1388,12 +1471,15 @@ CodeGenTileLangPTO::EmitPTOAllReduceExpr_(const std::string &func_name,
   if (op->args.size() >= 3U) {
     scratch = RemoveOutermostParentheses(PrintExpr_(op->args[2]));
   } else {
-    ICHECK_LE(threads, scale)
-        << "AscendAllReduce with threads > scale requires a scratch pointer";
+    const bool warp_fast_path =
+        threads <= 32 && IsPowerOfTwo(threads) && IsPowerOfTwo(scale);
+    ICHECK(threads <= scale || warp_fast_path)
+        << "AscendAllReduce requires a scratch pointer outside the identity "
+           "and power-of-two single-warp paths";
   }
 
   std::ostringstream os;
-  os << "pto.simt_allreduce_sum(" << value << ", threads=" << threads
+  os << reduction->pto_name << "(" << value << ", threads=" << threads
      << ", scale=" << scale << ", thread_offset=" << thread_offset
      << ", scratch=" << scratch << ")";
   return os.str();
@@ -1588,18 +1674,8 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
       op->op.same_as(builtin_call_pure_extern_)) {
     ICHECK_GE(op->args.size(), 1U);
     std::string func_name = Downcast<StringImm>(op->args[0])->value;
-    if ((func_name == "sqrt" || func_name == "sqrtf") &&
-        op->args.size() == 2U) {
-      std::string value = PrintExpr_(op->args[1]);
-      os << (inside_simtvf_body_ ? "pto.sqrt(" : "scalar.sqrt(") << value
-         << ")";
-      return;
-    }
-    if ((func_name == "rsqrt" || func_name == "rsqrtf") &&
-        op->args.size() == 2U) {
-      std::string value = PrintExpr_(op->args[1]);
-      os << "(1.0 / " << (inside_simtvf_body_ ? "pto.sqrt(" : "scalar.sqrt(")
-         << value << "))";
+    if (op->args.size() == 2U &&
+        TryEmitPtoUnaryMath_(func_name, op->args[1], os)) {
       return;
     }
     if (func_name.find("tl::AscendAllReduce") != std::string::npos) {
@@ -1826,18 +1902,8 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
   if (auto opt_call_op = op->op.as<Op>()) {
     const auto &call_op = opt_call_op.value();
     std::string op_name = call_op->name;
-    if ((op_name == "tir.rsqrt" || op_name == "tirx.rsqrt") &&
-        op->args.size() == 1U) {
-      std::string value = PrintExpr_(op->args[0]);
-      os << "(1.0 / " << (inside_simtvf_body_ ? "pto.sqrt(" : "scalar.sqrt(")
-         << value << "))";
-      return;
-    }
-    if ((op_name == "tir.sqrt" || op_name == "tirx.sqrt") &&
-        op->args.size() == 1U) {
-      std::string value = PrintExpr_(op->args[0]);
-      os << (inside_simtvf_body_ ? "pto.sqrt(" : "scalar.sqrt(") << value
-         << ")";
+    if (op->args.size() == 1U &&
+        TryEmitPtoUnaryMath_(op_name, op->args[0], os)) {
       return;
     }
     if (StartsWith(op_name, "tl.vmi.")) {
@@ -1865,28 +1931,252 @@ void CodeGenTileLangPTO::VisitExpr_(const CastNode *op,
                                     std::ostream &os) { // NOLINT(*)
   DataType from = op->value.dtype();
   DataType to = op->dtype;
-  bool from_integer = from.is_int() || from.is_uint();
-  bool to_integer = to.is_int() || to.is_uint();
-  if (inside_simtvf_body_ && from.is_scalar() && to.is_scalar() &&
-      from_integer && to.is_float() && !op->value.as<IntImmNode>()) {
-    // Python float(...) cannot consume a PTODSL runtime SSA value. Use the
-    // explicit SIMT conversion op for dynamic integer-to-float casts.
-    os << "pto.convert(";
-    PrintExpr_(op->value, os);
-    os << ", " << PtoTypeName(to)
-       << ", rounding=\"r\", saturation=\"nosat\", signedness=\""
-       << (from.is_uint() ? "unsigned" : "signed") << "\")";
-    return;
-  }
-  if (from_integer && to_integer && from.lanes() == to.lanes() &&
-      from.bits() < to.bits()) {
-    // Address-index widening casts should not become Python int(...), because
-    // that coerces PTODSL runtime values and breaks tracing.
+  ICHECK_EQ(to.lanes(), from.lanes())
+      << "PTO cast expects source and target to have the same lane count, got "
+      << from << " -> " << to;
+
+  if (from == to) {
     PrintExpr_(op->value, os);
     return;
   }
 
+  const bool from_fp8 = tl::IsAscendVectorizableFP8(from);
+  const bool to_fp8 = tl::IsAscendVectorizableFP8(to);
+  if (from_fp8 || to_fp8) {
+    ICHECK(inside_simtvf_body_)
+        << "PTO FP8 cast is currently supported only inside SIMT, got " << from
+        << " -> " << to;
+    if (from.is_float() && from.bits() == 32 && from.lanes() == 2 && to_fp8) {
+      os << "pto.convert(";
+      PrintExpr_(op->value, os);
+      os << ", " << PtoFP8TypeName(to)
+         << ", rounding=\"r\", saturation=\"sat\")";
+      return;
+    }
+    LOG(FATAL) << "PTO SIMT FP8 cast currently supports float32x2 to "
+                  "float8_e4m3fnx2/float8_e5m2x2 only, got "
+               << from << " -> " << to;
+  }
+
+  const bool from_integer = from.is_int() || from.is_uint();
+  const bool to_integer = to.is_int() || to.is_uint();
+  const bool from_float = from.is_float() || from.is_bfloat16();
+  const bool to_float = to.is_float() || to.is_bfloat16();
+
+  if (to.is_bool()) {
+    ICHECK(from.is_scalar() && (from_integer || from_float))
+        << "PTO bool cast expects a scalar numeric source, got " << from;
+    if (const auto *imm = op->value.as<IntImmNode>()) {
+      os << (imm->value != 0 ? "True" : "False");
+      return;
+    }
+    if (const auto *imm = op->value.as<FloatImmNode>()) {
+      os << (imm->value != 0.0 ? "True" : "False");
+      return;
+    }
+    os << "(";
+    PrintExpr_(op->value, os);
+    os << " != pto.const(0, dtype=" << PtoTypeName(from) << "))";
+    return;
+  }
+
+  if (from.is_bool() && to_integer) {
+    ICHECK(from.is_scalar() && to.is_scalar())
+        << "PTO bool-to-integer cast expects scalar types, got " << from
+        << " -> " << to;
+    if (const auto *imm = op->value.as<IntImmNode>()) {
+      os << "pto.const(" << (imm->value != 0 ? 1 : 0)
+         << ", dtype=" << PtoTypeName(to) << ")";
+      return;
+    }
+    os << "scalar.select(";
+    PrintExpr_(op->value, os);
+    os << ", pto.const(1, dtype=" << PtoTypeName(to)
+       << "), pto.const(0, dtype=" << PtoTypeName(to) << "))";
+    return;
+  }
+
+  if (from_integer && to_integer) {
+    ICHECK(from.is_scalar() && to.is_scalar())
+        << "PTO integer cast currently supports scalar values only, got "
+        << from << " -> " << to;
+    os << "scalar.cast(";
+    PrintExpr_(op->value, os);
+    os << ", " << PtoTypeName(to) << ")";
+    return;
+  }
+
+  if (from_integer && to_float) {
+    ICHECK(from.is_scalar() && to.is_scalar())
+        << "PTO integer-to-float cast currently supports scalar values only, "
+           "got "
+        << from << " -> " << to;
+    if (const auto *imm = op->value.as<IntImmNode>()) {
+      os << "pto.const(" << imm->value << ", dtype=" << PtoTypeName(to) << ")";
+      return;
+    }
+    if (inside_simtvf_body_) {
+      // pto.convert is a SIMT operation and cannot represent a conversion in
+      // the regular scalar domain.
+      os << "pto.convert(";
+      PrintExpr_(op->value, os);
+      os << ", " << PtoTypeName(to)
+         << ", rounding=\"r\", saturation=\"nosat\", signedness=\""
+         << (from.is_uint() ? "unsigned" : "signed") << "\")";
+      return;
+    } else {
+      // TODO: Emit scalar.sitofp/uitofp for the corresponding TIR
+      // arith.sitofp/uitofp once the PTODSL scalar.xxx and pto.xxx
+      // interfaces are unified.
+      ICHECK(false)
+          << "PTO dynamic integer-to-float cast outside SIMT is temporarily "
+             "unsupported, got "
+          << from << " -> " << to;
+    }
+  }
+
+  const bool supported_float_cast = from.is_scalar() && to.is_scalar() &&
+                                    ((IsFloat32(from) && to.is_bfloat16()) ||
+                                     (from.is_bfloat16() && IsFloat32(to)));
+  if (supported_float_cast) {
+    if (const auto *imm = op->value.as<FloatImmNode>()) {
+      os << "pto.const(float.fromhex('" << FlexibleHexFormat(imm->value)
+         << "'), dtype=" << PtoTypeName(to) << ")";
+      return;
+    }
+    os << "scalar.cast(";
+    PrintExpr_(op->value, os);
+    os << ", " << PtoTypeName(to) << ")";
+    return;
+  }
+
+  LOG(FATAL) << "Unsupported PTO cast: " << from << " -> " << to;
+}
+
+void CodeGenTileLangPTO::VisitExpr_(const FloatImmNode *op,
+                                    std::ostream &os) { // NOLINT(*)
+  if (op->dtype.is_bfloat16()) {
+    // The base class prints float16 literals via Python float(...), which has
+    // no bf16 equivalent; emit an explicitly typed PTO constant instead.
+    std::ostringstream temp;
+    temp << "pto.const(float.fromhex('" << FlexibleHexFormat(op->value)
+         << "'), dtype=pto.bf16)";
+    MarkConst(temp.str());
+    os << temp.str();
+    return;
+  }
   CodeGenTileLangPY::VisitExpr_(op, os);
+}
+
+void CodeGenTileLangPTO::VisitExpr_(const MinNode *op,
+                                    std::ostream &os) { // NOLINT(*)
+  if (op->dtype.is_int() || op->dtype.is_uint()) {
+    // pto.fmin/fmax only accept floating dtypes and there is no SIMT-domain
+    // integer min/max op yet, so integer min/max go through the runtime
+    // scalar helpers.
+    // TODO: switch to the unified pto.min/max once the scalar/SIMT op
+    // unification lands and scalar.min/max are deprecated.
+    os << "scalar.min(";
+    PrintExpr_(op->a, os);
+    os << ", ";
+    PrintExpr_(op->b, os);
+    os << ")";
+    return;
+  }
+  PrintPtoFloatMinMax_("min", op->dtype, op->a, op->b, os);
+}
+
+void CodeGenTileLangPTO::VisitExpr_(const MaxNode *op,
+                                    std::ostream &os) { // NOLINT(*)
+  if (op->dtype.is_int() || op->dtype.is_uint()) {
+    // TODO: switch to the unified pto.min/max once the scalar/SIMT op
+    // unification lands and scalar.min/max are deprecated.
+    os << "scalar.max(";
+    PrintExpr_(op->a, os);
+    os << ", ";
+    PrintExpr_(op->b, os);
+    os << ")";
+    return;
+  }
+  PrintPtoFloatMinMax_("max", op->dtype, op->a, op->b, os);
+}
+
+void CodeGenTileLangPTO::PrintPtoFloatMinMax_(const char *op_name,
+                                              DataType dtype, PrimExpr lhs,
+                                              PrimExpr rhs,
+                                              std::ostream &os) { // NOLINT(*)
+  ICHECK(IsSupportedPTOFloatMinMaxType(dtype))
+      << "PTO floating min/max currently supports f16, f32, bf16, "
+         "vector<2xf16>, and vector<2xbf16>, got "
+      << dtype;
+
+  if (!inside_simtvf_body_) {
+    ICHECK(dtype.is_scalar())
+        << "PTO floating min/max outside SIMT requires a scalar dtype, got "
+        << dtype;
+    os << "scalar." << op_name << "(";
+    PrintExpr_(lhs, os);
+    os << ", ";
+    PrintExpr_(rhs, os);
+    os << ")";
+    return;
+  }
+
+  // TODO: Use the unified pto.min/max once the scalar/SIMT op unification
+  // lands; pto.fmin/fmax and scalar.min/max both collapse into the unified
+  // operations.
+  os << "pto.f" << op_name << "(";
+  PrintExpr_(lhs, os);
+  os << ", ";
+  PrintExpr_(rhs, os);
+  os << ")";
+}
+
+bool CodeGenTileLangPTO::TryEmitPtoUnaryMath_(const std::string &name,
+                                              const PrimExpr &arg,
+                                              std::ostream &os) { // NOLINT(*)
+  // Unary math mapping shared by the extern C path (call_pure_extern) and
+  // the tirx intrinsic path. Add new functions as table entries only.
+  struct UnaryMathForm {
+    const char *simt;   // form emitted inside T.SimtVF bodies
+    const char *scalar; // form emitted in the scalar domain
+    bool reciprocal;    // emit (1.0 / fn(x)) instead of fn(x)
+  };
+  static const std::unordered_map<std::string, UnaryMathForm> kForms = {
+      {"expf", {"pto.exp(", "scalar.exp(", false}},
+      {"tirx.exp", {"pto.exp(", "scalar.exp(", false}},
+      {"logf", {"pto.log(", "scalar.log(", false}},
+      {"tirx.log", {"pto.log(", "scalar.log(", false}},
+      {"sqrt", {"pto.sqrt(", "scalar.sqrt(", false}},
+      {"sqrtf", {"pto.sqrt(", "scalar.sqrt(", false}},
+      {"tirx.sqrt", {"pto.sqrt(", "scalar.sqrt(", false}},
+      {"rsqrt", {"pto.sqrt(", "scalar.sqrt(", true}},
+      {"rsqrtf", {"pto.sqrt(", "scalar.sqrt(", true}},
+      {"tirx.rsqrt", {"pto.sqrt(", "scalar.sqrt(", true}},
+  };
+  auto it = kForms.find(name);
+  if (it == kForms.end()) {
+    return false;
+  }
+  DataType dtype = arg.dtype();
+  if (inside_simtvf_body_) {
+    ICHECK(IsSupportedPTOSIMTUnaryMathType(dtype))
+        << "PTO SIMT " << name
+        << " currently supports f16, f32, and vector<2xf16>, got " << dtype;
+  } else {
+    ICHECK(IsSupportedPTOScalarUnaryMathType(dtype))
+        << "PTO scalar " << name
+        << " currently supports scalar f16, f32, and bf16, got " << dtype;
+  }
+  const UnaryMathForm &form = it->second;
+  std::string value = PrintExpr_(arg);
+  const char *fn = inside_simtvf_body_ ? form.simt : form.scalar;
+  if (form.reciprocal) {
+    os << "(1.0 / " << fn << value << "))";
+  } else {
+    os << fn << value << ")";
+  }
+  return true;
 }
 
 void CodeGenTileLangPTO::VisitExpr_(const AndNode *op,
@@ -2227,9 +2517,19 @@ void CodeGenTileLangPTO::EmitScalarizedLoad(const BufferLoadNode *op,
       << element_dtype;
 
   if (inside_simtvf_body_) {
-    ICHECK(IsFloat32(element_dtype))
-        << "PTO SIMT vector BufferLoad currently supports float32 only, got "
+    ICHECK(IsSupportedSIMTLocalStorageType(element_dtype))
+        << "PTO SIMT vector BufferLoad currently supports float32 and "
+           "float8_e4m3fn/float8_e5m2 storage only, got "
         << element_dtype;
+    ICHECK_EQ(value_dtype.element_of(), element_dtype)
+        << "PTO SIMT vector BufferLoad expects the value element dtype to "
+           "match the buffer element dtype, got "
+        << value_dtype << " vs " << element_dtype;
+    ICHECK(!tl::IsAscendVectorizableFP8(element_dtype) ||
+           IsSupportedSIMTFP8ContiguousLaneCount(value_dtype.lanes()))
+        << "PTO SIMT FP8 BufferLoad currently supports contiguous lanes 2, 4, "
+           "and 8 only, got "
+        << value_dtype;
     std::string scope = ScopeOfBuffer(op->buffer.get());
     const int lanes = value_dtype.lanes();
     std::string index_str =
@@ -2325,9 +2625,20 @@ void CodeGenTileLangPTO::EmitScalarizedStore(const BufferStoreNode *op) {
       << op->buffer->dtype;
 
   if (inside_simtvf_body_) {
-    ICHECK(IsFloat32(op->buffer->dtype))
-        << "PTO SIMT vector BufferStore currently supports float32 only, got "
+    DataType value_dtype = op->value.dtype();
+    ICHECK(IsSupportedSIMTLocalStorageType(op->buffer->dtype))
+        << "PTO SIMT vector BufferStore currently supports float32 and "
+           "float8_e4m3fn/float8_e5m2 storage only, got "
         << op->buffer->dtype;
+    ICHECK_EQ(value_dtype.element_of(), op->buffer->dtype)
+        << "PTO SIMT vector BufferStore expects the value element dtype to "
+           "match the buffer element dtype, got "
+        << value_dtype << " vs " << op->buffer->dtype;
+    ICHECK(!tl::IsAscendVectorizableFP8(op->buffer->dtype) ||
+           IsSupportedSIMTFP8ContiguousLaneCount(value_dtype.lanes()))
+        << "PTO SIMT FP8 BufferStore currently supports contiguous lanes 2, "
+           "4, and 8 only, got "
+        << value_dtype;
     std::string scope = ScopeOfBuffer(op->buffer.get());
     std::string value = RemoveOutermostParentheses(PrintExpr_(op->value));
     std::string index_str =

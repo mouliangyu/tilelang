@@ -19,6 +19,7 @@ alloc_reducer softmax, and T.assume facts feeding the bounds/vectorization prove
 block verifies bit-correctness and reports effective bandwidth.
 """
 
+import argparse
 import math
 
 import tilelang
@@ -300,6 +301,7 @@ def compress_and_update_state_decode(
     compress_ratio: int | None = None,
     verify: bool = False,
     dump_source: bool = False,
+    target: str | None = None,
 ) -> torch.Tensor:
     """
     Args:
@@ -326,20 +328,34 @@ def compress_and_update_state_decode(
 
     get_kernel = _compress_and_update_state_decode_tl_ascend
 
-    store_kernel = get_kernel(
+    store_config = dict(
         DIM=dim,
         COMPRESS_RATIO=compress_ratio,
         OVERLAP_RATIO=overlap_ratio,
         HAS_APE=has_ape,
         STAGE="store",
     )
-    compute_kernel = get_kernel(
+    compute_config = dict(
         DIM=dim,
         COMPRESS_RATIO=compress_ratio,
         OVERLAP_RATIO=overlap_ratio,
         HAS_APE=has_ape,
         STAGE="compute",
     )
+    if target is None:
+        store_kernel = get_kernel(**store_config)
+        compute_kernel = get_kernel(**compute_config)
+    else:
+        store_kernel = tilelang.compile(
+            get_kernel.get_tir(**store_config),
+            target=target,
+            compile_flags=get_kernel.compile_flags,
+        )
+        compute_kernel = tilelang.compile(
+            get_kernel.get_tir(**compute_config),
+            target=target,
+            compile_flags=get_kernel.compile_flags,
+        )
     # print(store_kernel.get_kernel_source())
     if dump_source:
         print(compute_kernel.get_kernel_source())
@@ -424,6 +440,7 @@ def run_compress_decode(
     all_seq_do_compress: bool,
     verify: bool = True,
     dump_source: bool = False,
+    target: str | None = None,
 ) -> None:
     inputs = _make_decode_bench_inputs(
         overlap_ratio=overlap_ratio,
@@ -448,6 +465,7 @@ def run_compress_decode(
         max_seqlen_q,
         verify=verify,
         dump_source=dump_source,
+        target=target,
     )
 
 
@@ -456,6 +474,7 @@ def run_regression_perf(
     compress_ratio: int = 4,
     dim: int = 128,
     all_seq_do_compress: bool = False,
+    target: str | None = None,
 ) -> float:
     """Benchmark the two-stage compress kernel; return latency (ms)."""
     # Keep token selection and the resulting compression work deterministic.
@@ -484,6 +503,7 @@ def run_regression_perf(
         context_lens,
         max_seqlen_q,
         verify=False,
+        target=target,
     )
     torch.npu.synchronize()
 
@@ -498,6 +518,7 @@ def run_regression_perf(
             context_lens,
             max_seqlen_q,
             verify=False,
+            target=target,
         )
 
     latency_ms = do_bench(run_kernel, backend="msprof", _n_warmup=20, _n_repeat=20)
@@ -508,12 +529,16 @@ def run_regression_perf(
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--target", choices=["ascend", "pto"], default="ascend")
+    args = parser.parse_args()
+
     # Correctness: sparse-compress (few tokens) and dense-compress (all tokens).
     print("--- verify (all_seq_do_compress=False) ---")
-    run_compress_decode(2, 4, 128, all_seq_do_compress=False)
+    run_compress_decode(2, 4, 128, all_seq_do_compress=False, target=args.target)
     print("--- verify (all_seq_do_compress=True) ---")
-    run_compress_decode(2, 4, 128, all_seq_do_compress=True)
+    run_compress_decode(2, 4, 128, all_seq_do_compress=True, target=args.target)
 
     # Performance regression.
     print("--- perf ---")
-    run_regression_perf()
+    run_regression_perf(target=args.target)

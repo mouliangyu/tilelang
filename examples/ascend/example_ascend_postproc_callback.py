@@ -1,8 +1,8 @@
-"""Example: Using register_ascend_postproc_callback to modify generated Ascend code.
+"""Example: Using postproc callbacks to modify generated Ascend and PTO code.
 
 This example demonstrates how to register a post-processing callback that
-intercepts and modifies the generated Ascend C (.asc) source code before
-compilation. This is useful for:
+intercepts and modifies generated backend source code before compilation. This
+is useful for:
 - Debugging generated code
 - Injecting custom pragmas or directives
 - Adding custom headers or comments
@@ -30,14 +30,17 @@ def vector_add(N):
 
 
 CUSTOM_MARKER = "// [POSTPROC] Modified by register_ascend_postproc_callback"
+CUSTOM_MARKER_PTO = "# [POSTPROC] Modified by register_ascend_postproc_callback"
 
 
 @register_ascend_postproc_callback
-def my_ascend_postproc(code, target):
-    """Post-process the generated Ascend C code."""
-    print(f"\n--- Postproc callback invoked (code length: {len(code)} chars) ---")
-    code = CUSTOM_MARKER + "\n" + code
-    return code
+def my_ascend_family_postproc(code, target):
+    """Post-process generated AscendC or PTODSL source."""
+    is_pto = "pto" in target.keys
+    backend = "PTO" if is_pto else "Ascend"
+    marker = CUSTOM_MARKER_PTO if is_pto else CUSTOM_MARKER
+    print(f"\n--- {backend} postproc callback invoked (code length: {len(code)} chars) ---")
+    return marker + "\n" + code
 
 
 if __name__ == "__main__":

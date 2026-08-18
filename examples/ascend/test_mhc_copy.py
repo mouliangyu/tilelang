@@ -84,15 +84,17 @@ def _sinkhorn_ref(x: torch.Tensor, repeat: int, eps: float) -> torch.Tensor:
     return comb
 
 
+@pytest.mark.parametrize("target", ["ascend", pytest.param("pto", marks=pytest.mark.pto)])
 @pytest.mark.parametrize("num_tokens", [1, 4])
 @pytest.mark.parametrize("hidden_size", [4])
-def test_mhc_sinkhorn_copy(num_tokens, hidden_size):
+def test_mhc_sinkhorn_copy(target, num_tokens, hidden_size):
     """Test GM→UB→GM copy with (N, 4, 4) float32 — row_bytes=16 < 32."""
     repeat = 3
     eps = 1e-6
     token_block_size = 1
 
-    kernel = _sinkhorn_fwd_kernel(hidden_size, token_block_size, repeat, eps)
+    prim = _sinkhorn_fwd_kernel.get_tir(hidden_size, token_block_size, repeat, eps)
+    kernel = tilelang.compile(prim, target=target)
 
     device = torch.device("npu")
     x = torch.randn(num_tokens, hidden_size, hidden_size, dtype=torch.float32, device=device)
@@ -137,12 +139,14 @@ def _expand_ref(x: torch.Tensor, mhc: int) -> torch.Tensor:
     return x.unsqueeze(1).expand(-1, mhc, -1).contiguous()
 
 
+@pytest.mark.parametrize("target", ["ascend", pytest.param("pto", marks=pytest.mark.pto)])
 @pytest.mark.parametrize("num_tokens", [1, 8])
 @pytest.mark.parametrize("hidden", [128, 256])
 @pytest.mark.parametrize("mhc_mult", [2, 4])
-def test_mhc_expand_copy(num_tokens, hidden, mhc_mult):
+def test_mhc_expand_copy(target, num_tokens, hidden, mhc_mult):
     """Test UB→GM copy into strided 3D output buffer."""
-    kernel = _expand_fwd_kernel(hidden, mhc_mult)
+    prim = _expand_fwd_kernel.get_tir(hidden, mhc_mult)
+    kernel = tilelang.compile(prim, target=target)
 
     device = torch.device("npu")
     x = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device=device)
@@ -157,12 +161,12 @@ def test_mhc_expand_copy(num_tokens, hidden, mhc_mult):
 if __name__ == "__main__":
     print("=== Sinkhorn copy tests ===")
     for n in [1, 4]:
-        test_mhc_sinkhorn_copy(n, 4)
+        test_mhc_sinkhorn_copy("ascend", n, 4)
         print(f"  PASS: num_tokens={n}, hidden_size=4")
 
     print("=== Expand copy tests ===")
     for n in [1, 8]:
         for h in [128, 256]:
             for mhc in [2, 4]:
-                test_mhc_expand_copy(n, h, mhc)
+                test_mhc_expand_copy("ascend", n, h, mhc)
                 print(f"  PASS: num_tokens={n}, hidden={h}, mhc={mhc}")

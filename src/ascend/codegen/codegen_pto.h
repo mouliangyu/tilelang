@@ -41,8 +41,12 @@ protected:
                   std::ostream &os) override;                     // NOLINT(*)
   void VisitExpr_(const CastNode *op, std::ostream &os) override; // NOLINT(*)
   void VisitExpr_(const CallNode *op, std::ostream &os) override; // NOLINT(*)
-  void VisitExpr_(const AndNode *op, std::ostream &os) override;  // NOLINT(*)
-  void VisitExpr_(const OrNode *op, std::ostream &os) override;   // NOLINT(*)
+  void VisitExpr_(const FloatImmNode *op,
+                  std::ostream &os) override;                    // NOLINT(*)
+  void VisitExpr_(const MinNode *op, std::ostream &os) override; // NOLINT(*)
+  void VisitExpr_(const MaxNode *op, std::ostream &os) override; // NOLINT(*)
+  void VisitExpr_(const AndNode *op, std::ostream &os) override; // NOLINT(*)
+  void VisitExpr_(const OrNode *op, std::ostream &os) override;  // NOLINT(*)
   void VisitExpr_(const SelectNode *op,
                   std::ostream &os) override; // NOLINT(*)
 
@@ -91,6 +95,12 @@ private:
   void PrintBinaryExpr_(const std::string &opstr, DataType dtype, PrimExpr lhs,
                         PrimExpr rhs,
                         std::ostream &os) override; // NOLINT(*)
+  void PrintPtoFloatMinMax_(const char *op_name, DataType dtype, PrimExpr lhs,
+                            PrimExpr rhs, std::ostream &os); // NOLINT(*)
+  // Table-driven unary math mapping (sqrt/rsqrt/exp/log, extern C names and
+  // tirx intrinsic names). Returns false when `name` is not covered.
+  bool TryEmitPtoUnaryMath_(const std::string &name, const PrimExpr &arg,
+                            std::ostream &os); // NOLINT(*)
 
   std::string current_function_name_;
   bool inside_simtvf_body_{false};
