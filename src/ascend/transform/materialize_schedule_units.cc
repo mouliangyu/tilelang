@@ -279,7 +279,8 @@ ValidatedTask ValidateTask(const AttrStmtNode *op, bool inside_per_core_task) {
          "multiple pipes (mask="
       << issue_pipe_mask
       << "). Split the statements into separate T.Task regions. Body=" << task;
-  ICHECK((resource_usage.hbm_mask & (resource_usage.hbm_mask - 1)) == 0)
+  uint16_t hbm_core_affinity = resource_usage.hbm_mask & kHbmCoreAffinityMask;
+  ICHECK((hbm_core_affinity & (hbm_core_affinity - 1)) == 0)
       << "T.Task requires one Ascend core affinity, but its body uses both AIC "
          "and AIV HBM paths. Split GM-to-L1 and GM-to-UB operations into "
          "separate T.Task regions. Body="

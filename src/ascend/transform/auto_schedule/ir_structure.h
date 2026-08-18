@@ -74,7 +74,13 @@ enum class HbmPort : uint16_t {
   kNone = 0,
   kAiv = 1 << 0, // AIV HBM port: GM<->UB
   kAic = 1 << 1, // AIC HBM port: GM->L1 / L0C->GM
+  // UB->GM and L0C->GM share the HBM store path even though their commands
+  // issue from different cores and hardware pipes.
+  kStore = 1 << 2,
 };
+
+constexpr uint16_t kHbmCoreAffinityMask =
+    static_cast<uint16_t>(HbmPort::kAiv) | static_cast<uint16_t>(HbmPort::kAic);
 
 // Special scalar "registers" written by config/control intrinsics and read by
 // their consumers. Pipe-order registers model a scalar synchronization call

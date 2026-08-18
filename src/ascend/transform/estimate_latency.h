@@ -65,19 +65,21 @@ struct AscendLatencyParams {
   int64_t valu_bandwidth{256};
   int64_t vector_queue_depth{16};
 
-  // DMA/FixPipe issue latency. MTE1 and MTE2 are measured with cannsim
-  // trace_tools; MTE3 is scaled from the MTE2 correction; FixPipe is measured
-  // on a 64KB FP32 L0C-to-destination transfer.
+  // DMA/FixPipe issue latency. The legacy single-copy values come from
+  // cannsim. Dual-copy values below are real-device dependency latencies.
   int64_t mte1_base_latency{5};
   int64_t mte2_base_latency{634};
   int64_t mte3_base_latency{418};
   int64_t fixpipe_base_latency{730};
+  // Real-device L0C->GM latency fit.
+  int64_t fixpipe_l0c_to_gm_base_latency{295};
   // Descriptor overhead is already absorbed into measured base latency.
   int64_t mte_descriptor_cycles{0};
 
   // Physical path bandwidths from the A5 data-path table (p.4): L1 can feed
   // L0A/L0B at 256 B/cycle and BT/FP at 32 B/cycle; AIC MTE2 reaches L1 at
-  // 256 B/cycle; each AIV MTE2/MTE3 path sustains 128 B/cycle.
+  // 256 B/cycle; each AIV MTE2/MTE3 path and a single-destination
+  // FixPipe-to-AIV path sustain 128 B/cycle.
   int64_t l1_to_l0a_bandwidth{256};
   int64_t l1_to_l0b_bandwidth{256};
   int64_t l1_to_bt_bandwidth{32};
@@ -87,6 +89,50 @@ struct AscendLatencyParams {
   int64_t aiv_mte3_to_gm_bandwidth{128};
   int64_t aiv_mte3_to_aic_l1_bandwidth{128};
   int64_t fixpipe_bandwidth{128};
+
+  // Real-device dual-copy endpoint model. Effective bandwidth is the minimum
+  // of the shared endpoint and both AIV paths. FIX is row-width limited for
+  // either split.
+  //
+  // Strided N-split rows travel in 128-byte MTE transactions: the row rate
+  // peaks when the per-AIV width is a whole multiple of 128 B and dips
+  // between multiples. A row narrower than one transaction pays a measured
+  // half-rate plateau; from two transactions (256 B) up the row streams at
+  // the wide steady rate. Values are aggregate dual-copy payload bytes per
+  // cycle.
+  int64_t fixpipe_dual_bandwidth{256};
+  int64_t fixpipe_dual_width_scale{2};
+  int64_t fixpipe_dual_unknown_width_bandwidth{128};
+  int64_t mte2_gm_to_ub_dual_n_transaction_bytes{128};
+  int64_t mte2_gm_to_ub_dual_n_peak_bandwidth{102};
+  int64_t mte2_gm_to_ub_dual_n_plateau_bandwidth{50};
+  int64_t mte2_gm_to_ub_dual_n_wide_bandwidth{100};
+  int64_t mte2_gm_to_ub_dual_n_unknown_bandwidth{48};
+  int64_t mte3_ub_to_gm_dual_bandwidth{120};
+  int64_t mte3_ub_to_gm_dual_n_transaction_bytes{128};
+  int64_t mte3_ub_to_gm_dual_n_peak_bandwidth{86};
+  int64_t mte3_ub_to_gm_dual_n_plateau_bandwidth{40};
+  int64_t mte3_ub_to_gm_dual_n_wide_bandwidth{110};
+  int64_t mte3_ub_to_gm_dual_n_unknown_bandwidth{40};
+  int64_t mte3_ub_to_l1_dual_bandwidth{256};
+  // Raw N-split UB->L1: below 160 B per-AIV rows the rate is 3/4 of the
+  // width; from 160 B up the row streams at the full width rate, capped by
+  // the 256 B/cycle endpoint.
+  int64_t mte3_ub_to_l1_raw_n_full_width_bytes{160};
+  int64_t mte3_ub_to_l1_raw_n_width_numerator{3};
+  int64_t mte3_ub_to_l1_raw_n_width_denominator{4};
+  int64_t mte3_ub_to_l1_raw_n_unknown_bandwidth{48};
+
+  // Dual-copy completion bases from real-device measurements. UB->GM has a
+  // separate narrow-N value because 64-byte strided rows incur a large first
+  // descriptor completion penalty even though their steady-state II is
+  // already represented by the width-limited bandwidth above.
+  int64_t mte2_gm_to_ub_dual_base_latency{90};
+  int64_t mte2_gm_to_ub_dual_n_base_latency{75};
+  int64_t mte3_ub_to_gm_dual_base_latency{180};
+  int64_t mte3_ub_to_gm_dual_narrow_base_latency{440};
+  int64_t mte3_ub_to_l1_dual_base_latency{43};
+  int64_t fixpipe_dual_base_latency{55};
 
   // Measured two-segment DMA latency model:
   //   latency(bytes) = bytes <= knee ? flat : seg_base + bytes / seg_bw.

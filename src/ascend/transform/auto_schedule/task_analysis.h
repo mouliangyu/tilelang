@@ -248,15 +248,17 @@ inline uint16_t GetCallPipeMask(const Call &call) {
   return 0;
 }
 
-inline uint16_t GetHbmPortBit(const Buffer &src, const Buffer &dst) {
-  bool aiv = (IsGlobalBuffer(src) && IsSharedBuffer(dst)) ||
-             (IsSharedBuffer(src) && IsGlobalBuffer(dst));
-  bool aic = (IsGlobalBuffer(src) && IsL1Buffer(dst)) ||
-             (IsL0CBuffer(src) && IsGlobalBuffer(dst));
-  if (aiv)
+inline uint16_t GetHbmResourceMask(const Buffer &src, const Buffer &dst) {
+  if (IsGlobalBuffer(src) && IsSharedBuffer(dst))
     return static_cast<uint16_t>(HbmPort::kAiv);
-  if (aic)
+  if (IsSharedBuffer(src) && IsGlobalBuffer(dst))
+    return static_cast<uint16_t>(HbmPort::kAiv) |
+           static_cast<uint16_t>(HbmPort::kStore);
+  if (IsGlobalBuffer(src) && IsL1Buffer(dst))
     return static_cast<uint16_t>(HbmPort::kAic);
+  if (IsL0CBuffer(src) && IsGlobalBuffer(dst))
+    return static_cast<uint16_t>(HbmPort::kAic) |
+           static_cast<uint16_t>(HbmPort::kStore);
   return 0;
 }
 
@@ -336,7 +338,7 @@ private:
     if (op->op.same_as(copy_op)) {
       Copy copy_obj(op->args, op->annotations);
       const CopyNode *copy = copy_obj.get();
-      usage_.hbm_mask |= GetHbmPortBit(copy->src, copy->dst);
+      usage_.hbm_mask |= GetHbmResourceMask(copy->src, copy->dst);
       if (copy_obj->GetDataSelect() != 0)
         usage_.reads_pad_value = true;
       if (IsGlobalBuffer(copy->dst))

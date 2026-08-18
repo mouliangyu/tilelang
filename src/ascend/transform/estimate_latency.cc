@@ -84,7 +84,14 @@ struct TaskCostFeatures {
   struct CopyInfo {
     String src_scope;
     String dst_scope;
+    // Full logical payload across both AIVs for a dual copy; ordinary copies
+    // retain their single physical payload.
     int64_t bytes;
+    int dual_dst_ctl;
+    // Proven lower bound for one AIV's physically contiguous segment. Zero
+    // means that a dynamic tail could be narrower at runtime.
+    int64_t contiguous_bytes_lower_bound;
+    bool is_nd2nz_post_copy;
   };
 
   std::vector<CubeShape> cube_shapes;
@@ -238,6 +245,129 @@ private:
     }
   }
 
+  static bool IsDualCopy(const TaskCostFeatures::CopyInfo &info) {
+    return info.dual_dst_ctl == 1 || info.dual_dst_ctl == 2;
+  }
+
+  static int64_t ScaleBandwidth(int64_t bytes, int64_t numerator,
+                                int64_t denominator) {
+    if (bytes <= 0 || numerator <= 0 || denominator <= 0)
+      return 0;
+    if (bytes > std::numeric_limits<int64_t>::max() / numerator)
+      return std::numeric_limits<int64_t>::max() / denominator;
+    return std::max<int64_t>(bytes * numerator / denominator, 1);
+  }
+
+  // A strided N-split row of `width` bytes travels in whole
+  // `transaction_bytes`-sized MTE transactions. The measured row rate peaks
+  // at whole transaction multiples and scales with the occupied fraction
+  // between them:
+  //   rate = peak * width / (transaction_bytes * ceil(width / transaction)).
+  static int64_t TransactionBandwidth(int64_t width, int64_t transaction_bytes,
+                                      int64_t peak_bandwidth) {
+    if (width <= 0 || transaction_bytes <= 0 || peak_bandwidth <= 0)
+      return 0;
+    int64_t transactions = (width + transaction_bytes - 1) / transaction_bytes;
+    if (width > std::numeric_limits<int64_t>::max() / peak_bandwidth)
+      return std::numeric_limits<int64_t>::max();
+    return std::max<int64_t>(
+        width * peak_bandwidth / (transaction_bytes * transactions), 1);
+  }
+
+  // A dual copy is limited by both endpoints: a shared GM/FixPipe port and
+  // the aggregate service rate of the two AIV paths. M-split regions are
+  // physically contiguous and coalesce. N-split keeps a row stride, so the
+  // proven per-AIV contiguous width selects the measured row-rate limit:
+  // a sub-transaction plateau, a 128B-transaction sawtooth, then the wide
+  // steady rate from two transactions up.
+  int64_t
+  BandwidthOverrideForCopy(AscendPath path,
+                           const TaskCostFeatures::CopyInfo &info) const {
+    if (!IsDualCopy(info))
+      return 0;
+
+    int64_t width = info.contiguous_bytes_lower_bound;
+    switch (path) {
+    case AscendPath::kGmToUb: {
+      int64_t shared_bandwidth = params_.mte2_gm_to_ub_seg_bw > 0
+                                     ? params_.mte2_gm_to_ub_seg_bw
+                                     : params_.aiv_mte2_to_ub_bandwidth;
+      if (info.dual_dst_ctl == 1)
+        return shared_bandwidth;
+      if (width <= 0)
+        return params_.mte2_gm_to_ub_dual_n_unknown_bandwidth;
+      if (width < params_.mte2_gm_to_ub_dual_n_transaction_bytes)
+        return params_.mte2_gm_to_ub_dual_n_plateau_bandwidth;
+      if (width >= 2 * params_.mte2_gm_to_ub_dual_n_transaction_bytes)
+        return std::min(shared_bandwidth,
+                        params_.mte2_gm_to_ub_dual_n_wide_bandwidth);
+      return std::min(shared_bandwidth,
+                      TransactionBandwidth(
+                          width, params_.mte2_gm_to_ub_dual_n_transaction_bytes,
+                          params_.mte2_gm_to_ub_dual_n_peak_bandwidth));
+    }
+    case AscendPath::kUbToGm: {
+      int64_t shared_bandwidth = params_.mte3_ub_to_gm_dual_bandwidth;
+      if (info.dual_dst_ctl == 1)
+        return shared_bandwidth;
+      if (width <= 0)
+        return params_.mte3_ub_to_gm_dual_n_unknown_bandwidth;
+      if (width < params_.mte3_ub_to_gm_dual_n_transaction_bytes)
+        return params_.mte3_ub_to_gm_dual_n_plateau_bandwidth;
+      if (width >= 2 * params_.mte3_ub_to_gm_dual_n_transaction_bytes)
+        return std::min(shared_bandwidth,
+                        params_.mte3_ub_to_gm_dual_n_wide_bandwidth);
+      return std::min(shared_bandwidth,
+                      TransactionBandwidth(
+                          width, params_.mte3_ub_to_gm_dual_n_transaction_bytes,
+                          params_.mte3_ub_to_gm_dual_n_peak_bandwidth));
+    }
+    case AscendPath::kUbToL1:
+      if (info.is_nd2nz_post_copy || info.dual_dst_ctl == 1)
+        return params_.mte3_ub_to_l1_dual_bandwidth;
+      if (width >= params_.mte3_ub_to_l1_raw_n_full_width_bytes)
+        return std::min(params_.mte3_ub_to_l1_dual_bandwidth, width);
+      if (width <= 0)
+        return params_.mte3_ub_to_l1_raw_n_unknown_bandwidth;
+      return std::min(
+          params_.mte3_ub_to_l1_dual_bandwidth,
+          ScaleBandwidth(width, params_.mte3_ub_to_l1_raw_n_width_numerator,
+                         params_.mte3_ub_to_l1_raw_n_width_denominator));
+    case AscendPath::kL0cToUb: {
+      int64_t aiv_bandwidth =
+          width > 0 ? ScaleBandwidth(width, params_.fixpipe_dual_width_scale, 1)
+                    : params_.fixpipe_dual_unknown_width_bandwidth;
+      return std::min(params_.fixpipe_dual_bandwidth, aiv_bandwidth);
+    }
+    default:
+      return 0;
+    }
+  }
+
+  int64_t
+  BaseLatencyOverrideForCopy(AscendPath path,
+                             const TaskCostFeatures::CopyInfo &info) const {
+    if (!IsDualCopy(info))
+      return 0;
+    switch (path) {
+    case AscendPath::kGmToUb:
+      return info.dual_dst_ctl == 2 ? params_.mte2_gm_to_ub_dual_n_base_latency
+                                    : params_.mte2_gm_to_ub_dual_base_latency;
+    case AscendPath::kUbToGm:
+      if (info.dual_dst_ctl == 2 && (info.contiguous_bytes_lower_bound <= 0 ||
+                                     info.contiguous_bytes_lower_bound < 128)) {
+        return params_.mte3_ub_to_gm_dual_narrow_base_latency;
+      }
+      return params_.mte3_ub_to_gm_dual_base_latency;
+    case AscendPath::kUbToL1:
+      return params_.mte3_ub_to_l1_dual_base_latency;
+    case AscendPath::kL0cToUb:
+      return params_.fixpipe_dual_base_latency;
+    default:
+      return 0;
+    }
+  }
+
   // Two-segment (knee) parameters for a path: {knee, flat, seg_base, seg_bw}.
   // seg_bw == 0 means "no two-segment fit for this path" and the caller falls
   // back to the legacy single-segment base + bytes/bw model.
@@ -265,7 +395,14 @@ private:
 
   // Latency (cycles) for moving `bytes` over `path`. Uses the two-segment knee
   // model when the path has a measured fit, else the legacy single segment.
-  int64_t MemLatencyForPath(AscendPath path, int64_t bytes) const {
+  int64_t MemLatencyForPath(AscendPath path, int64_t bytes,
+                            int64_t bandwidth_override = 0,
+                            int64_t base_latency_override = 0) const {
+    if (bandwidth_override > 0) {
+      int64_t base = base_latency_override > 0 ? base_latency_override
+                                               : BaseLatencyForPath(path);
+      return base + safe_div_ceil(bytes, bandwidth_override);
+    }
     SegParams sp = SegParamsForPath(path);
     if (sp.seg_bw > 0) {
       if (bytes <= sp.knee)
@@ -290,8 +427,9 @@ private:
     case AscendPath::kL1ToFpBuf:
       return params_.mte1_base_latency;
     case AscendPath::kL0cToUb:
-    case AscendPath::kL0cToGm:
       return params_.fixpipe_base_latency;
+    case AscendPath::kL0cToGm:
+      return params_.fixpipe_l0c_to_gm_base_latency;
     default:
       return 0;
     }
@@ -410,20 +548,34 @@ private:
     // 1. Memory latency: per-physical-path, base + bytes / bandwidth.
     //    Bytes are aggregated per path for the II step.
     // -----------------------------------------------------------------
-    std::unordered_map<int, int64_t> bytes_per_path;
+    struct PathIICost {
+      int64_t bytes{0};
+      int64_t override_cycles{0};
+    };
+    std::unordered_map<int, PathIICost> ii_cost_per_path;
     int64_t memory_latency = 0;
 
-    auto add_memory_access = [&](AscendPath path, int64_t bytes) {
-      int64_t lat =
-          params_.mte_descriptor_cycles + MemLatencyForPath(path, bytes);
+    auto add_memory_access = [&](AscendPath path, int64_t bytes,
+                                 int64_t bandwidth_override,
+                                 int64_t base_latency_override) {
+      int64_t lat = params_.mte_descriptor_cycles +
+                    MemLatencyForPath(path, bytes, bandwidth_override,
+                                      base_latency_override);
       memory_latency += lat;
-      bytes_per_path[static_cast<int>(path)] += bytes;
+      PathIICost &cost = ii_cost_per_path[static_cast<int>(path)];
+      if (bandwidth_override > 0) {
+        cost.override_cycles += safe_div_ceil(bytes, bandwidth_override);
+      } else {
+        cost.bytes += bytes;
+      }
     };
 
     if (!cost_features.copy_infos.empty()) {
       for (const TaskCostFeatures::CopyInfo &info : cost_features.copy_infos) {
-        add_memory_access(ClassifyCopy(info.src_scope, info.dst_scope),
-                          info.bytes);
+        AscendPath path = ClassifyCopy(info.src_scope, info.dst_scope);
+        add_memory_access(path, info.bytes,
+                          BandwidthOverrideForCopy(path, info),
+                          BaseLatencyOverrideForCopy(path, info));
       }
     } else {
       auto visit_region = [&](const BufferRegion &region, bool is_read) {
@@ -431,7 +583,7 @@ private:
         String scope = buffer.scope();
         AscendPath path = ClassifyRegion(scope, pipe_mask, is_read);
         int64_t bytes = CalculateAccessBytes(region, analyzer);
-        add_memory_access(path, bytes);
+        add_memory_access(path, bytes, 0, 0);
       };
       for (const auto &r : task->GetReadRegions())
         visit_region(r, /*is_read=*/true);
@@ -507,13 +659,15 @@ private:
     // -----------------------------------------------------------------
     int64_t ii = 1;
     int64_t memory_ii = 1;
-    for (const auto &kv : bytes_per_path) {
+    for (const auto &kv : ii_cost_per_path) {
       AscendPath path = static_cast<AscendPath>(kv.first);
+      const PathIICost &cost = kv.second;
       // Steady-state throughput: the saturated large-packet rate (seg_bw)
       // when the path has a two-segment fit, else the headline bandwidth.
       SegParams sp = SegParamsForPath(path);
       int64_t bw = sp.seg_bw > 0 ? sp.seg_bw : BandwidthForPath(path);
-      memory_ii = std::max(memory_ii, safe_div_ceil(kv.second, bw));
+      int64_t path_ii = cost.override_cycles + safe_div_ceil(cost.bytes, bw);
+      memory_ii = std::max(memory_ii, path_ii);
     }
 
     int64_t cube_ii = params_.cube_min_ii;
@@ -920,11 +1074,68 @@ private:
   explicit CostFeatureAnalyzer(arith::Analyzer *arith_analyzer)
       : arith_analyzer_(arith_analyzer) {}
 
+  static int64_t SafeTwice(int64_t value) {
+    if (value <= 0)
+      return 0;
+    return value > std::numeric_limits<int64_t>::max() / 2
+               ? std::numeric_limits<int64_t>::max()
+               : value * 2;
+  }
+
+  static int64_t SafeMultiply(int64_t lhs, int64_t rhs) {
+    if (lhs <= 0 || rhs <= 0)
+      return 0;
+    return lhs > std::numeric_limits<int64_t>::max() / rhs
+               ? std::numeric_limits<int64_t>::max()
+               : lhs * rhs;
+  }
+
+  int64_t EstimateExprUpperBound(const PrimExpr &expr) const {
+    if (const int64_t *value = as_const_int(expr))
+      return std::max<int64_t>(*value, 0);
+    arith::ConstIntBound bound = arith_analyzer_->const_int_bound(expr);
+    if (bound->max_value >= 0 &&
+        bound->max_value != arith::ConstIntBound::kPosInf) {
+      return bound->max_value;
+    }
+    return 1;
+  }
+
+  int64_t EstimateExprPositiveLowerBound(const PrimExpr &expr) const {
+    if (const int64_t *value = as_const_int(expr))
+      return std::max<int64_t>(*value, 0);
+    arith::ConstIntBound bound = arith_analyzer_->const_int_bound(expr);
+    return bound->min_value > 0 ? bound->min_value : 0;
+  }
+
   int64_t CalculateCopyBytes(const CopyNode *copy) const {
     RegionElementUpperBound src_estimate = EstimateRegionElementUpperBound(
         copy->src, copy->src_range, arith_analyzer_);
     RegionElementUpperBound dst_estimate = EstimateRegionElementUpperBound(
         copy->dst, copy->dst_range, arith_analyzer_);
+
+    if (copy->GetDualDstCtl() == 1 || copy->GetDualDstCtl() == 2) {
+      // The frontend represents one side as a full logical region and the
+      // other as one AIV's half region. Normalize to the physical aggregate:
+      //   full source -> half dst: min(src, 2 * dst)
+      //   half source -> full dst: min(2 * src, dst)
+      // `double` identifies the latter form. Prefer whichever reliable side
+      // is available for a dynamic tail instead of accepting the fallback 1.
+      bool source_is_half = copy->annotations.Get("double").has_value();
+      int64_t src_elements = source_is_half ? SafeTwice(src_estimate.elements)
+                                            : src_estimate.elements;
+      int64_t dst_elements = source_is_half ? dst_estimate.elements
+                                            : SafeTwice(dst_estimate.elements);
+      int64_t elements = 1;
+      if (src_estimate.reliable && dst_estimate.reliable) {
+        elements = std::min(src_elements, dst_elements);
+      } else if (src_estimate.reliable) {
+        elements = src_elements;
+      } else if (dst_estimate.reliable) {
+        elements = dst_elements;
+      }
+      return ElementsToBytes(elements, DataType(copy->dst->dtype));
+    }
 
     int64_t elements = src_estimate.elements;
     PrimExpr src_elements = RegionElementCountExpr(copy->src_range);
@@ -940,6 +1151,55 @@ private:
     return ElementsToBytes(elements, DataType(copy->dst->dtype));
   }
 
+  int64_t CalculateDualContiguousBytesLowerBound(const CopyNode *copy) const {
+    if (copy->GetDualDstCtl() == 0 || copy->dst_range.empty())
+      return 0;
+
+    if (copy->src_range.empty())
+      return 0;
+    int64_t src_extent =
+        EstimateExprPositiveLowerBound(copy->src_range.back()->extent);
+    int64_t dst_extent =
+        EstimateExprPositiveLowerBound(copy->dst_range.back()->extent);
+    if (src_extent <= 0 || dst_extent <= 0)
+      return 0;
+    return ElementsToBytes(std::min(src_extent, dst_extent),
+                           DataType(copy->dst->dtype));
+  }
+
+  void RecordNd2NzPostCopy(const CallNode *op) {
+    ICHECK(op->args.size() == 6 || op->args.size() == 8)
+        << "tl.ascend_nd2nz_post_copy expects 6 ordinary or 8 dual "
+           "arguments before RewriteDualCopy";
+    const auto *dtype = op->args[5].as<StringImmNode>();
+    ICHECK(dtype) << "tl.ascend_nd2nz_post_copy dtype must be a StringImm";
+    int64_t element_bytes = dtype->value == "float" ? 4 : 2;
+    int64_t rows = EstimateExprUpperBound(op->args[2]);
+    int64_t cols = EstimateExprUpperBound(op->args[3]);
+    int64_t per_aiv_bytes =
+        SafeMultiply(SafeMultiply(rows, cols), element_bytes);
+
+    int dual_dst_ctl = 0;
+    int64_t aggregate_bytes = per_aiv_bytes;
+    int64_t contiguous_bytes_lower_bound = 0;
+    if (op->args.size() == 8) {
+      const int64_t *split = as_const_int(op->args[6]);
+      ICHECK(split && (*split == 0 || *split == 1))
+          << "dual tl.ascend_nd2nz_post_copy split axis must be 0 or 1";
+      dual_dst_ctl = *split == 0 ? 1 : 2;
+      aggregate_bytes = SafeTwice(per_aiv_bytes);
+      // The post-copy instruction traverses one NZ D-group per burst; rows
+      // are 32-byte blocks, independent of the logical ND row width.
+      int64_t rows_lower = EstimateExprPositiveLowerBound(op->args[2]);
+      contiguous_bytes_lower_bound = SafeMultiply(rows_lower, 32);
+    }
+
+    features_.copy_infos.push_back({String("shared.dyn"), String("shared.l1"),
+                                    aggregate_bytes, dual_dst_ctl,
+                                    contiguous_bytes_lower_bound,
+                                    /*is_nd2nz_post_copy=*/true});
+  }
+
   void VisitExpr_(const CallNode *op) final {
     static const auto copy_op = Op::Get("tl.tileop.copy");
     static const auto gemm_op = Op::Get("tl.tileop.gemm");
@@ -947,7 +1207,11 @@ private:
       Copy copy_obj(op->args, op->annotations);
       const CopyNode *copy = copy_obj.get();
       features_.copy_infos.push_back(
-          {copy->src.scope(), copy->dst.scope(), CalculateCopyBytes(copy)});
+          {copy->src.scope(), copy->dst.scope(), CalculateCopyBytes(copy),
+           copy->GetDualDstCtl(), CalculateDualContiguousBytesLowerBound(copy),
+           /*is_nd2nz_post_copy=*/false});
+    } else if (op->op.same_as(tl::ascend_nd2nz_post_copy())) {
+      RecordNd2NzPostCopy(op);
     } else if (op->op.same_as(gemm_op)) {
       int64_t m = op->args[5].as<IntImmNode>()->value;
       int64_t n = op->args[6].as<IntImmNode>()->value;
