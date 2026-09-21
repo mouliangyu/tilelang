@@ -1656,6 +1656,11 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
     int64_t shift = 0;
     ICHECK(TryGetConstInt(op->args[1], &shift) && shift >= 0)
         << "PTO codegen only supports constant non-negative shift_left";
+    ICHECK(shift < op->dtype.bits())
+        << "PTO codegen cannot emit shift_left by " << shift << " for "
+        << op->dtype;
+    // A shift by bits - 1 makes 1LL << shift wrap to the sign bit, which is
+    // still the correct multiplier modulo 2^bits for a wrapping left shift.
     PrintBinaryExpr_("*", op->dtype, op->args[0],
                      IntImm(op->args[0].dtype(), 1LL << shift), os);
     return;
@@ -1665,6 +1670,18 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
     int64_t shift = 0;
     ICHECK(TryGetConstInt(op->args[1], &shift) && shift >= 0)
         << "PTO codegen only supports constant non-negative shift_right";
+    const int bits = op->dtype.bits();
+    ICHECK(shift < bits) << "PTO codegen cannot emit shift_right by " << shift
+                         << " for " << op->dtype;
+    if (shift == bits - 1) {
+      // The divisor 1 << shift is not representable for the full-width shift
+      // (it wraps to the sign bit), so emit the value the arithmetic shift
+      // keeps: -1 for negative inputs and 0 otherwise.
+      os << "scalar.select((" << PrintExpr_(op->args[0]) << ") < 0, "
+         << "pto.const(-1, dtype=" << PtoTypeName(op->dtype) << "), "
+         << "pto.const(0, dtype=" << PtoTypeName(op->dtype) << "))";
+      return;
+    }
     PrintBinaryExpr_("//", op->dtype, op->args[0],
                      IntImm(op->args[0].dtype(), 1LL << shift), os);
     return;
@@ -1710,10 +1727,14 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
     DataType dtype = GetAnnotatedPointerDtype(op->args[0], op->args[1].dtype());
     ICHECK(dtype.is_scalar())
         << "PTO atomic operations support scalar values only";
-    ICHECK((dtype.is_float() && (dtype.bits() == 16 || dtype.bits() == 32)) ||
-           ((dtype.is_int() || dtype.is_uint()) && dtype.bits() == 32))
-        << "PTO atomic operations support float16, float32, int32, and "
-           "uint32, got "
+    const bool supported_float =
+        dtype.is_float() && (dtype.bits() == 16 || dtype.bits() == 32);
+    const bool supported_integer =
+        (dtype.is_int() || dtype.is_uint()) &&
+        (dtype.bits() == 32 || dtype.bits() == 64);
+    ICHECK(supported_float || supported_integer)
+        << "PTO atomic operations support float16, float32, int32, uint32, "
+           "int64, and uint64, got "
         << dtype;
 
     const char *pto_atomic_op =
